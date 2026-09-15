@@ -17,6 +17,15 @@
 | `docs` | 架构设计、推理流程、部署总结等中文文档 |
 | `openspec` | 需求规格和变更提案 |
 
+## GitHub 仓库
+
+远程地址：[https://github.com/jusitfy0913/dp-tool](https://github.com/jusitfy0913/dp-tool)
+
+仓库里是 **C++ / Python 训练和推理源码**，方便在别的电脑继续开发。  
+**没有**把编译结果推上去，例如 `TRTForge.exe`、`*.dll`、`trtexec/gui/bin`、TensorRT 引擎、训练权重、数据集。
+
+本地编译仍在本机的 `trtexec/gui/bin` 进行，不要把这个目录提交到 Git。
+
 ## 二次开发包
 
 需要把 `trtexec` 发给其他开发同事、但**不提供封装后的推理源码**时，使用：
