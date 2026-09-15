@@ -1,0 +1,1711 @@
+{
+  "version": "2.11",
+  "children": [
+    {
+      "type": "frame",
+      "id": "bi8Au",
+      "x": 0,
+      "y": 0,
+      "name": "TRTForge Annotation Workbench Prototype",
+      "clip": true,
+      "width": 1440,
+      "height": 900,
+      "fill": "#05070D",
+      "layout": "none",
+      "children": [
+        {
+          "type": "frame",
+          "id": "y9dUW",
+          "x": 0,
+          "y": 0,
+          "name": "Top Command Bar",
+          "width": 1440,
+          "height": 64,
+          "fill": "#0B1220",
+          "stroke": {
+            "thickness": {
+              "bottom": 1
+            },
+            "fill": "#263244"
+          },
+          "gap": 14,
+          "padding": [
+            0,
+            20
+          ],
+          "alignItems": "center",
+          "children": [
+            {
+              "type": "text",
+              "id": "yFj2H",
+              "name": "Brand",
+              "fill": "#F8FAFC",
+              "content": "TRTForge 标注工作台",
+              "fontFamily": "Geist",
+              "fontSize": 22,
+              "fontWeight": "700"
+            },
+            {
+              "type": "text",
+              "id": "CGHZd",
+              "name": "Task Status",
+              "fill": "#94A3B8",
+              "content": "项目: 轴承缺陷检测 · 任务: OBB · 数据集: 128 张",
+              "fontFamily": "IBM Plex Mono",
+              "fontSize": 12,
+              "fontWeight": "500"
+            },
+            {
+              "type": "frame",
+              "id": "n4mE8k",
+              "name": "Top Spacer",
+              "width": "fill_container",
+              "height": 1,
+              "fill": "#00000000"
+            },
+            {
+              "type": "frame",
+              "id": "umV6N",
+              "name": "Export Dataset Button",
+              "width": 132,
+              "height": 36,
+              "fill": "#A855F7",
+              "justifyContent": "center",
+              "alignItems": "center",
+              "children": [
+                {
+                  "type": "text",
+                  "id": "XHh7O",
+                  "name": "primaryBtnText",
+                  "fill": "#FFFFFF",
+                  "content": "导出 YOLO",
+                  "fontFamily": "Geist",
+                  "fontSize": 13,
+                  "fontWeight": "700"
+                }
+              ]
+            },
+            {
+              "type": "frame",
+              "id": "n7g9W",
+              "name": "Save Button",
+              "width": 92,
+              "height": 36,
+              "fill": "#111827",
+              "stroke": {
+                "thickness": 1,
+                "fill": "#334155"
+              },
+              "justifyContent": "center",
+              "alignItems": "center",
+              "children": [
+                {
+                  "type": "text",
+                  "id": "RcSsI",
+                  "name": "secondaryBtnText",
+                  "fill": "#E2E8F0",
+                  "content": "保存项目",
+                  "fontFamily": "Geist",
+                  "fontSize": 13,
+                  "fontWeight": "600"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "type": "frame",
+          "id": "xgUMG",
+          "x": 0,
+          "y": 64,
+          "name": "Left Drawing Toolbar",
+          "width": 64,
+          "height": 716,
+          "fill": "#080D16",
+          "stroke": {
+            "thickness": {
+              "right": 1
+            },
+            "fill": "#263244"
+          },
+          "layout": "vertical",
+          "gap": 10,
+          "padding": [
+            14,
+            0
+          ],
+          "alignItems": "center",
+          "children": [
+            {
+              "type": "frame",
+              "id": "KPX6c",
+              "name": "Tool Select Active",
+              "width": 40,
+              "height": 40,
+              "fill": "#A855F7",
+              "justifyContent": "center",
+              "alignItems": "center",
+              "children": [
+                {
+                  "type": "text",
+                  "id": "NnZI5",
+                  "name": "toolSelText",
+                  "fill": "#FFFFFF",
+                  "content": "选",
+                  "fontFamily": "Geist",
+                  "fontSize": 13,
+                  "fontWeight": "700"
+                }
+              ]
+            },
+            {
+              "type": "frame",
+              "id": "prNzL",
+              "name": "Tool Pan",
+              "width": 40,
+              "height": 40,
+              "fill": "#111827",
+              "stroke": {
+                "thickness": 1,
+                "fill": "#334155"
+              },
+              "justifyContent": "center",
+              "alignItems": "center",
+              "children": [
+                {
+                  "type": "text",
+                  "id": "H66m3v",
+                  "name": "toolPanText",
+                  "fill": "#CBD5E1",
+                  "content": "移",
+                  "fontFamily": "Geist",
+                  "fontSize": 13,
+                  "fontWeight": "600"
+                }
+              ]
+            },
+            {
+              "type": "frame",
+              "id": "AqbTl",
+              "name": "Tool Rectangle",
+              "width": 40,
+              "height": 40,
+              "fill": "#111827",
+              "stroke": {
+                "thickness": 1,
+                "fill": "#334155"
+              },
+              "justifyContent": "center",
+              "alignItems": "center",
+              "children": [
+                {
+                  "type": "text",
+                  "id": "WtEf0",
+                  "name": "toolRectText",
+                  "fill": "#CBD5E1",
+                  "content": "矩",
+                  "fontFamily": "Geist",
+                  "fontSize": 13,
+                  "fontWeight": "600"
+                }
+              ]
+            },
+            {
+              "type": "frame",
+              "id": "JTR9C",
+              "name": "Tool Rotated Rect",
+              "width": 40,
+              "height": 40,
+              "fill": "#111827",
+              "stroke": {
+                "thickness": 1,
+                "fill": "#334155"
+              },
+              "justifyContent": "center",
+              "alignItems": "center",
+              "children": [
+                {
+                  "type": "text",
+                  "id": "r94yQx",
+                  "name": "toolObbText",
+                  "fill": "#CBD5E1",
+                  "content": "旋",
+                  "fontFamily": "Geist",
+                  "fontSize": 13,
+                  "fontWeight": "600"
+                }
+              ]
+            },
+            {
+              "type": "frame",
+              "id": "bHHHo",
+              "name": "Tool Polygon",
+              "width": 40,
+              "height": 40,
+              "fill": "#111827",
+              "stroke": {
+                "thickness": 1,
+                "fill": "#334155"
+              },
+              "justifyContent": "center",
+              "alignItems": "center",
+              "children": [
+                {
+                  "type": "text",
+                  "id": "zhnTH",
+                  "name": "toolPolyText",
+                  "fill": "#CBD5E1",
+                  "content": "多",
+                  "fontFamily": "Geist",
+                  "fontSize": 13,
+                  "fontWeight": "600"
+                }
+              ]
+            },
+            {
+              "type": "frame",
+              "id": "Eee90",
+              "name": "Tool Line",
+              "width": 40,
+              "height": 40,
+              "fill": "#111827",
+              "stroke": {
+                "thickness": 1,
+                "fill": "#334155"
+              },
+              "justifyContent": "center",
+              "alignItems": "center",
+              "children": [
+                {
+                  "type": "text",
+                  "id": "lWF4i",
+                  "name": "toolLineText",
+                  "fill": "#CBD5E1",
+                  "content": "线",
+                  "fontFamily": "Geist",
+                  "fontSize": 13,
+                  "fontWeight": "600"
+                }
+              ]
+            },
+            {
+              "type": "frame",
+              "id": "Y8tkm",
+              "name": "Tool Point",
+              "width": 40,
+              "height": 40,
+              "fill": "#111827",
+              "stroke": {
+                "thickness": 1,
+                "fill": "#334155"
+              },
+              "justifyContent": "center",
+              "alignItems": "center",
+              "children": [
+                {
+                  "type": "text",
+                  "id": "jp3mM",
+                  "name": "toolPointText",
+                  "fill": "#CBD5E1",
+                  "content": "点",
+                  "fontFamily": "Geist",
+                  "fontSize": 13,
+                  "fontWeight": "600"
+                }
+              ]
+            },
+            {
+              "type": "frame",
+              "id": "BXz4D",
+              "name": "Tool COCO17 Pose",
+              "width": 40,
+              "height": 40,
+              "fill": "#111827",
+              "stroke": {
+                "thickness": 1,
+                "fill": "#334155"
+              },
+              "justifyContent": "center",
+              "alignItems": "center",
+              "children": [
+                {
+                  "type": "text",
+                  "id": "tHdha",
+                  "name": "toolPoseText",
+                  "fill": "#CBD5E1",
+                  "content": "姿",
+                  "fontFamily": "Geist",
+                  "fontSize": 13,
+                  "fontWeight": "600"
+                }
+              ]
+            },
+            {
+              "type": "frame",
+              "id": "Cirst",
+              "name": "Tool Undo",
+              "width": 40,
+              "height": 40,
+              "fill": "#1E293B",
+              "stroke": {
+                "thickness": 1,
+                "fill": "#475569"
+              },
+              "justifyContent": "center",
+              "alignItems": "center",
+              "children": [
+                {
+                  "type": "text",
+                  "id": "QCfur",
+                  "name": "toolUndoText",
+                  "fill": "#E2E8F0",
+                  "content": "撤",
+                  "fontFamily": "Geist",
+                  "fontSize": 13,
+                  "fontWeight": "600"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "type": "frame",
+          "id": "tdi6s",
+          "x": 64,
+          "y": 64,
+          "name": "Central Canvas Workspace",
+          "clip": true,
+          "width": 1056,
+          "height": 716,
+          "fill": "#0F172A",
+          "layout": "none",
+          "children": [
+            {
+              "type": "frame",
+              "id": "ONIhv",
+              "x": 20,
+              "y": 18,
+              "name": "Zoom Badge",
+              "width": 104,
+              "height": 30,
+              "fill": "#0B1220DD",
+              "stroke": {
+                "thickness": 1,
+                "fill": "#334155"
+              },
+              "justifyContent": "center",
+              "alignItems": "center",
+              "children": [
+                {
+                  "type": "text",
+                  "id": "nsFs7",
+                  "name": "zoomText",
+                  "fill": "#C4B5FD",
+                  "content": "45% · OBB",
+                  "fontFamily": "IBM Plex Mono",
+                  "fontSize": 12,
+                  "fontWeight": "600"
+                }
+              ]
+            },
+            {
+              "type": "frame",
+              "id": "C2T2g8",
+              "x": 96,
+              "y": 58,
+              "name": "Image Stage",
+              "clip": true,
+              "width": 864,
+              "height": 590,
+              "fill": "#D7EEF2",
+              "stroke": {
+                "thickness": 1,
+                "fill": "#5B7C86"
+              }
+            },
+            {
+              "type": "line",
+              "id": "G6vgxt",
+              "x": 528,
+              "y": 58,
+              "name": "Canvas Vertical Guide",
+              "width": 0,
+              "height": 590,
+              "stroke": {
+                "thickness": 1,
+                "fill": "#34D39966"
+              }
+            },
+            {
+              "type": "line",
+              "id": "yUAv1",
+              "x": 96,
+              "y": 353,
+              "name": "Canvas Horizontal Guide",
+              "width": 864,
+              "height": 0,
+              "stroke": {
+                "thickness": 1,
+                "fill": "#34D39944"
+              }
+            },
+            {
+              "type": "ellipse",
+              "id": "NtZCX",
+              "x": 355,
+              "y": 222,
+              "name": "Sample Part Outer",
+              "fill": "#3F4656AA",
+              "width": 154,
+              "height": 154,
+              "stroke": {
+                "thickness": 2,
+                "fill": "#1F2937"
+              }
+            },
+            {
+              "type": "ellipse",
+              "id": "MT0vM",
+              "x": 397,
+              "y": 264,
+              "name": "Sample Part Inner",
+              "fill": "#D7EEF2",
+              "width": 70,
+              "height": 70,
+              "stroke": {
+                "thickness": 2,
+                "fill": "#293241"
+              }
+            },
+            {
+              "type": "rectangle",
+              "id": "k7Zdv",
+              "x": 318,
+              "y": 198,
+              "name": "Detection Rectangle",
+              "fill": "#A855F71A",
+              "width": 250,
+              "height": 214,
+              "stroke": {
+                "thickness": 2,
+                "fill": "#A855F7"
+              }
+            },
+            {
+              "type": "frame",
+              "id": "XjG0h",
+              "x": 318,
+              "y": 174,
+              "name": "Detection Label",
+              "width": 112,
+              "height": 24,
+              "fill": "#A855F7",
+              "justifyContent": "center",
+              "alignItems": "center",
+              "children": [
+                {
+                  "type": "text",
+                  "id": "lPJvJ",
+                  "name": "detLabelText",
+                  "fill": "#FFFFFF",
+                  "content": "bearing 0.96",
+                  "fontFamily": "IBM Plex Mono",
+                  "fontSize": 11,
+                  "fontWeight": "700"
+                }
+              ]
+            },
+            {
+              "type": "rectangle",
+              "id": "d7nYX",
+              "x": 358,
+              "y": 210,
+              "name": "Rotated OBB Preview",
+              "rotation": -18,
+              "fill": "#22D3EE18",
+              "width": 168,
+              "height": 126,
+              "stroke": {
+                "thickness": 2,
+                "fill": "#22D3EE"
+              }
+            },
+            {
+              "type": "path",
+              "id": "Olb28",
+              "x": 372,
+              "y": 230,
+              "name": "Segmentation Polygon Preview",
+              "geometry": "M58 0c34 4 60 34 52 66-9 34-48 40-84 22-31-16-34-56-6-76 10-7 22-11 38-12z",
+              "fill": "#F9731644",
+              "width": 118,
+              "height": 100,
+              "stroke": {
+                "thickness": 2,
+                "fill": "#FB923C"
+              }
+            },
+            {
+              "type": "ellipse",
+              "id": "R6YnGk",
+              "x": 425,
+              "y": 248,
+              "name": "Pose Keypoint 1",
+              "fill": "#FACC15",
+              "width": 9,
+              "height": 9
+            },
+            {
+              "type": "ellipse",
+              "id": "f5O14L",
+              "x": 452,
+              "y": 276,
+              "name": "Pose Keypoint 2",
+              "fill": "#FACC15",
+              "width": 9,
+              "height": 9
+            },
+            {
+              "type": "line",
+              "id": "GLz6N",
+              "x": 429,
+              "y": 252,
+              "name": "Pose Skeleton Edge",
+              "width": 27,
+              "height": 28,
+              "stroke": {
+                "thickness": 2,
+                "fill": "#FACC15"
+              }
+            },
+            {
+              "type": "text",
+              "id": "vNflu",
+              "x": 96,
+              "y": 678,
+              "name": "Canvas Hint",
+              "fill": "#94A3B8",
+              "textGrowth": "fixed-width",
+              "width": 860,
+              "content": "画布支持：矩形 / 旋转矩形 / 多边形 / 线 / 点 / COCO17姿态点。单项目单任务，导出时按任务生成标准格式。",
+              "fontFamily": "Geist",
+              "fontSize": 13,
+              "fontWeight": "500"
+            },
+            {
+              "type": "rectangle",
+              "id": "bq0MH",
+              "x": 146,
+              "y": 18,
+              "name": "Quick Workflow Background",
+              "fill": "#0B1220DD",
+              "width": 650,
+              "height": 30,
+              "stroke": {
+                "thickness": 1,
+                "fill": "#334155"
+              }
+            },
+            {
+              "type": "text",
+              "id": "RIsb2",
+              "x": 158,
+              "y": 25,
+              "name": "Quick Workflow Text",
+              "fill": "#E2E8F0",
+              "textGrowth": "fixed-width-height",
+              "width": 620,
+              "height": 16,
+              "content": "新建项目  /  导入图片目录  /  导入 COCO-VOC-YOLO  /  自动划分  /  导出训练集",
+              "fontFamily": "Geist",
+              "fontSize": 12,
+              "fontWeight": "700"
+            },
+            {
+              "type": "rectangle",
+              "id": "UO8Td",
+              "x": 810,
+              "y": 18,
+              "name": "VOC Warning Background",
+              "fill": "#2A160B",
+              "width": 224,
+              "height": 30,
+              "stroke": {
+                "thickness": 1,
+                "fill": "#F97316"
+              }
+            },
+            {
+              "type": "text",
+              "id": "oP4cR",
+              "x": 828,
+              "y": 25,
+              "name": "VOC Warning Text",
+              "fill": "#FDBA74",
+              "textGrowth": "fixed-width-height",
+              "width": 190,
+              "height": 16,
+              "content": "VOC 仅检测水平框",
+              "textAlign": "center",
+              "fontFamily": "IBM Plex Mono",
+              "fontSize": 11,
+              "fontWeight": "700"
+            },
+            {
+              "type": "rectangle",
+              "id": "bSMPa",
+              "x": 96,
+              "y": 628,
+              "name": "Task Tabs Background",
+              "fill": "#0B1220",
+              "width": 424,
+              "height": 32,
+              "stroke": {
+                "thickness": 1,
+                "fill": "#334155"
+              }
+            },
+            {
+              "type": "text",
+              "id": "sPKTk",
+              "x": 112,
+              "y": 637,
+              "name": "Task Tabs Text",
+              "fill": "#C4B5FD",
+              "textGrowth": "fixed-width-height",
+              "width": 392,
+              "height": 14,
+              "content": "Detect     Segment     Pose     [ OBB ]",
+              "fontFamily": "IBM Plex Mono",
+              "fontSize": 11,
+              "fontWeight": "700"
+            }
+          ]
+        },
+        {
+          "type": "frame",
+          "id": "Lp7T9",
+          "x": 1120,
+          "y": 64,
+          "name": "Right Inspector Panel",
+          "width": 320,
+          "height": 716,
+          "fill": "#0B1220",
+          "stroke": {
+            "thickness": {
+              "left": 1
+            },
+            "fill": "#263244"
+          },
+          "layout": "vertical",
+          "gap": 12,
+          "padding": 14,
+          "children": [
+            {
+              "type": "frame",
+              "id": "rdeie",
+              "name": "Task Project Card",
+              "width": "fill_container",
+              "height": 118,
+              "fill": "#111827",
+              "stroke": {
+                "thickness": 1,
+                "fill": "#263244"
+              },
+              "layout": "vertical",
+              "gap": 8,
+              "padding": 12,
+              "children": [
+                {
+                  "type": "text",
+                  "id": "lqxrE",
+                  "name": "taskTitle",
+                  "fill": "#F8FAFC",
+                  "content": "项目与任务",
+                  "fontFamily": "Geist",
+                  "fontSize": 14,
+                  "fontWeight": "700"
+                },
+                {
+                  "type": "frame",
+                  "id": "Egj0j",
+                  "name": "taskMode",
+                  "width": "fill_container",
+                  "height": 30,
+                  "fill": "#172033",
+                  "gap": 8,
+                  "padding": [
+                    0,
+                    10
+                  ],
+                  "alignItems": "center",
+                  "children": [
+                    {
+                      "type": "text",
+                      "id": "OW0WI",
+                      "name": "taskModeText",
+                      "fill": "#C4B5FD",
+                      "content": "当前任务: OBB 旋转框",
+                      "fontFamily": "Geist",
+                      "fontSize": 12,
+                      "fontWeight": "600"
+                    }
+                  ]
+                },
+                {
+                  "type": "text",
+                  "id": "phWH2",
+                  "name": "taskNote",
+                  "fill": "#94A3B8",
+                  "textGrowth": "fixed-width",
+                  "width": 260,
+                  "content": "单项目单任务 · 类别可手动维护或导入 labels_*.json",
+                  "fontFamily": "Geist",
+                  "fontSize": 11,
+                  "fontWeight": "normal"
+                }
+              ]
+            },
+            {
+              "type": "frame",
+              "id": "GnBnR",
+              "name": "Class List Card",
+              "width": "fill_container",
+              "height": 166,
+              "fill": "#111827",
+              "stroke": {
+                "thickness": 1,
+                "fill": "#263244"
+              },
+              "layout": "vertical",
+              "gap": 8,
+              "padding": 12,
+              "children": [
+                {
+                  "type": "text",
+                  "id": "O77QsF",
+                  "name": "classTitle",
+                  "fill": "#F8FAFC",
+                  "content": "类别列表",
+                  "fontFamily": "Geist",
+                  "fontSize": 14,
+                  "fontWeight": "700"
+                },
+                {
+                  "type": "frame",
+                  "id": "YfSFj",
+                  "name": "classRow1",
+                  "width": "fill_container",
+                  "height": 28,
+                  "fill": "#A855F722",
+                  "stroke": {
+                    "thickness": 1,
+                    "fill": "#A855F7"
+                  },
+                  "gap": 8,
+                  "padding": [
+                    0,
+                    10
+                  ],
+                  "alignItems": "center",
+                  "children": [
+                    {
+                      "type": "text",
+                      "id": "z8L7g",
+                      "name": "classRow1Text",
+                      "fill": "#F5F3FF",
+                      "content": "01  bearing  ✓ 当前选中",
+                      "fontFamily": "IBM Plex Mono",
+                      "fontSize": 12,
+                      "fontWeight": "700"
+                    }
+                  ]
+                },
+                {
+                  "type": "frame",
+                  "id": "vPD3x",
+                  "name": "classRow2",
+                  "width": "fill_container",
+                  "height": 28,
+                  "fill": "#0F172A",
+                  "stroke": {
+                    "thickness": 1,
+                    "fill": "#263244"
+                  },
+                  "gap": 8,
+                  "padding": [
+                    0,
+                    10
+                  ],
+                  "alignItems": "center",
+                  "children": [
+                    {
+                      "type": "text",
+                      "id": "BNdBh",
+                      "name": "classRow2Text",
+                      "fill": "#CBD5E1",
+                      "content": "02  scratch",
+                      "fontFamily": "IBM Plex Mono",
+                      "fontSize": 12,
+                      "fontWeight": "500"
+                    }
+                  ]
+                },
+                {
+                  "type": "text",
+                  "id": "Y33is",
+                  "name": "classAction",
+                  "fill": "#22D3EE",
+                  "content": "+ 新增类别    导入 labels_*.json",
+                  "fontFamily": "Geist",
+                  "fontSize": 12,
+                  "fontWeight": "600"
+                }
+              ]
+            },
+            {
+              "type": "frame",
+              "id": "XXcSD",
+              "name": "Object List Card",
+              "width": "fill_container",
+              "height": 196,
+              "fill": "#111827",
+              "stroke": {
+                "thickness": 1,
+                "fill": "#263244"
+              },
+              "layout": "vertical",
+              "gap": 8,
+              "padding": 12,
+              "children": [
+                {
+                  "type": "text",
+                  "id": "z4bO4l",
+                  "name": "objectTitle",
+                  "fill": "#F8FAFC",
+                  "content": "当前图片对象",
+                  "fontFamily": "Geist",
+                  "fontSize": 14,
+                  "fontWeight": "700"
+                },
+                {
+                  "type": "frame",
+                  "id": "f4u1LU",
+                  "name": "obj1",
+                  "width": "fill_container",
+                  "height": 34,
+                  "fill": "#172033",
+                  "gap": 8,
+                  "padding": [
+                    0,
+                    10
+                  ],
+                  "alignItems": "center",
+                  "children": [
+                    {
+                      "type": "text",
+                      "id": "StA4O",
+                      "name": "obj1Text",
+                      "fill": "#E9D5FF",
+                      "content": "#1 OBB · bearing · train · 已确认",
+                      "fontFamily": "IBM Plex Mono",
+                      "fontSize": 11,
+                      "fontWeight": "600"
+                    }
+                  ]
+                },
+                {
+                  "type": "frame",
+                  "id": "iiMVK",
+                  "name": "obj2",
+                  "width": "fill_container",
+                  "height": 34,
+                  "fill": "#0F172A",
+                  "stroke": {
+                    "thickness": 1,
+                    "fill": "#263244"
+                  },
+                  "gap": 8,
+                  "padding": [
+                    0,
+                    10
+                  ],
+                  "alignItems": "center",
+                  "children": [
+                    {
+                      "type": "text",
+                      "id": "U7fIO8",
+                      "name": "obj2Text",
+                      "fill": "#CBD5E1",
+                      "content": "#2 Polygon · bearing · train",
+                      "fontFamily": "IBM Plex Mono",
+                      "fontSize": 11,
+                      "fontWeight": "500"
+                    }
+                  ]
+                },
+                {
+                  "type": "frame",
+                  "id": "raA6Y",
+                  "name": "obj3",
+                  "width": "fill_container",
+                  "height": 34,
+                  "fill": "#0F172A",
+                  "stroke": {
+                    "thickness": 1,
+                    "fill": "#263244"
+                  },
+                  "gap": 8,
+                  "padding": [
+                    0,
+                    10
+                  ],
+                  "alignItems": "center",
+                  "children": [
+                    {
+                      "type": "text",
+                      "id": "x7O7jD",
+                      "name": "obj3Text",
+                      "fill": "#CBD5E1",
+                      "content": "#3 Pose points · COCO17",
+                      "fontFamily": "IBM Plex Mono",
+                      "fontSize": 11,
+                      "fontWeight": "500"
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "type": "frame",
+              "id": "Xda1z",
+              "name": "Attributes Split Card",
+              "width": "fill_container",
+              "height": "fill_container",
+              "fill": "#111827",
+              "stroke": {
+                "thickness": 1,
+                "fill": "#263244"
+              },
+              "layout": "vertical",
+              "gap": 8,
+              "padding": 12,
+              "children": [
+                {
+                  "type": "text",
+                  "id": "sSFxi",
+                  "name": "attrTitle",
+                  "fill": "#F8FAFC",
+                  "content": "属性与划分",
+                  "fontFamily": "Geist",
+                  "fontSize": 14,
+                  "fontWeight": "700"
+                },
+                {
+                  "type": "text",
+                  "id": "yO6pf",
+                  "name": "attrText",
+                  "fill": "#CBD5E1",
+                  "textGrowth": "fixed-width",
+                  "width": 260,
+                  "content": "标签: bearing\n描述: 轴承外圈区域，旋转框标注\n对象: #1 OBB\n分组: 1\n集合: train\n格式: YOLO OBB\n状态: 弹窗确认后已更新",
+                  "fontFamily": "IBM Plex Mono",
+                  "fontSize": 12,
+                  "fontWeight": "500"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "type": "frame",
+          "id": "i7sOM",
+          "x": 0,
+          "y": 780,
+          "name": "Bottom Image Strip",
+          "width": 1440,
+          "height": 120,
+          "fill": "#090F1A",
+          "stroke": {
+            "thickness": {
+              "top": 1
+            },
+            "fill": "#263244"
+          },
+          "gap": 12,
+          "padding": [
+            12,
+            16
+          ],
+          "children": [
+            {
+              "type": "frame",
+              "id": "LRVKz",
+              "name": "Dataset Split Summary",
+              "width": 276,
+              "height": 96,
+              "fill": "#111827",
+              "stroke": {
+                "thickness": 1,
+                "fill": "#263244"
+              },
+              "layout": "vertical",
+              "gap": 4,
+              "padding": 8,
+              "children": [
+                {
+                  "type": "text",
+                  "id": "w2dI1X",
+                  "name": "splitTitle",
+                  "fill": "#F8FAFC",
+                  "content": "数据集划分",
+                  "fontFamily": "Geist",
+                  "fontSize": 12,
+                  "fontWeight": "700"
+                },
+                {
+                  "type": "text",
+                  "id": "CPrXY",
+                  "name": "splitText",
+                  "fill": "#94A3B8",
+                  "textGrowth": "fixed-width",
+                  "width": 248,
+                  "content": "自动比例 8 / 1 / 1 · 随机种子 2026\n可手动调整单张图片 train / val / test",
+                  "lineHeight": 1.1,
+                  "fontFamily": "IBM Plex Mono",
+                  "fontSize": 9,
+                  "fontWeight": "500"
+                },
+                {
+                  "type": "frame",
+                  "id": "GSkag",
+                  "name": "trainBar",
+                  "width": "fill_container",
+                  "height": 8,
+                  "fill": "#172033",
+                  "children": [
+                    {
+                      "type": "frame",
+                      "id": "jX2JX",
+                      "name": "trainFill",
+                      "width": 184,
+                      "height": 8,
+                      "fill": "#A855F7"
+                    },
+                    {
+                      "type": "frame",
+                      "id": "jh3Yl",
+                      "name": "valFill",
+                      "width": 32,
+                      "height": 8,
+                      "fill": "#22D3EE"
+                    },
+                    {
+                      "type": "frame",
+                      "id": "L5aGT",
+                      "name": "testFill",
+                      "width": 32,
+                      "height": 8,
+                      "fill": "#F97316"
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "type": "frame",
+              "id": "JOX6J",
+              "name": "Selected Image Thumb",
+              "width": 118,
+              "height": "fill_container",
+              "fill": "#D7EEF2",
+              "stroke": {
+                "thickness": 2,
+                "fill": "#A855F7"
+              },
+              "layout": "vertical",
+              "padding": 6,
+              "justifyContent": "end",
+              "children": [
+                {
+                  "type": "text",
+                  "id": "x9WPE",
+                  "name": "thumb1Text",
+                  "fill": "#111827",
+                  "content": "000128.jpg\ntrain",
+                  "fontFamily": "IBM Plex Mono",
+                  "fontSize": 10,
+                  "fontWeight": "700"
+                }
+              ]
+            },
+            {
+              "type": "frame",
+              "id": "Cbj4O",
+              "name": "Image Thumb 2",
+              "width": 118,
+              "height": "fill_container",
+              "fill": "#1E293B",
+              "stroke": {
+                "thickness": 1,
+                "fill": "#334155"
+              },
+              "layout": "vertical",
+              "padding": 6,
+              "justifyContent": "end",
+              "children": [
+                {
+                  "type": "text",
+                  "id": "PrJX3",
+                  "name": "thumb2Text",
+                  "fill": "#CBD5E1",
+                  "content": "000129.jpg\nval",
+                  "fontFamily": "IBM Plex Mono",
+                  "fontSize": 10,
+                  "fontWeight": "600"
+                }
+              ]
+            },
+            {
+              "type": "frame",
+              "id": "F8wp1",
+              "name": "Image Thumb 3",
+              "width": 118,
+              "height": "fill_container",
+              "fill": "#1E293B",
+              "stroke": {
+                "thickness": 1,
+                "fill": "#334155"
+              },
+              "layout": "vertical",
+              "padding": 6,
+              "justifyContent": "end",
+              "children": [
+                {
+                  "type": "text",
+                  "id": "gRf1k",
+                  "name": "thumb3Text",
+                  "fill": "#CBD5E1",
+                  "content": "000130.jpg\ntest",
+                  "fontFamily": "IBM Plex Mono",
+                  "fontSize": 10,
+                  "fontWeight": "600"
+                }
+              ]
+            },
+            {
+              "type": "frame",
+              "id": "NSiRP",
+              "name": "Image Thumb 4",
+              "width": 118,
+              "height": "fill_container",
+              "fill": "#1E293B",
+              "stroke": {
+                "thickness": 1,
+                "fill": "#334155"
+              },
+              "layout": "vertical",
+              "padding": 6,
+              "justifyContent": "end",
+              "children": [
+                {
+                  "type": "text",
+                  "id": "A8FrG",
+                  "name": "thumb4Text",
+                  "fill": "#CBD5E1",
+                  "content": "000131.jpg\ntrain",
+                  "fontFamily": "IBM Plex Mono",
+                  "fontSize": 10,
+                  "fontWeight": "600"
+                }
+              ]
+            },
+            {
+              "type": "frame",
+              "id": "GWaAf",
+              "name": "Bottom Spacer",
+              "width": "fill_container",
+              "height": 1,
+              "fill": "#00000000"
+            },
+            {
+              "type": "frame",
+              "id": "tMZOg",
+              "name": "Export Standard Card",
+              "width": 286,
+              "height": 96,
+              "fill": "#111827",
+              "stroke": {
+                "thickness": 1,
+                "fill": "#263244"
+              },
+              "layout": "vertical",
+              "gap": 4,
+              "padding": 8,
+              "children": [
+                {
+                  "type": "text",
+                  "id": "Kbyq9",
+                  "name": "exportTitle",
+                  "fill": "#F8FAFC",
+                  "content": "标准格式导出",
+                  "fontFamily": "Geist",
+                  "fontSize": 12,
+                  "fontWeight": "700"
+                },
+                {
+                  "type": "text",
+                  "id": "Yx6ZB",
+                  "name": "exportText",
+                  "fill": "#94A3B8",
+                  "textGrowth": "fixed-width",
+                  "width": 254,
+                  "content": "YOLO: detect / segment / pose / obb\nCOCO: detect / segment / pose\nVOC: 仅标准水平框检测",
+                  "lineHeight": 1.1,
+                  "fontFamily": "IBM Plex Mono",
+                  "fontSize": 9,
+                  "fontWeight": "500"
+                },
+                {
+                  "type": "frame",
+                  "id": "DlBcy",
+                  "name": "exportBtn",
+                  "width": "fill_container",
+                  "height": 20,
+                  "fill": "#A855F7",
+                  "justifyContent": "center",
+                  "alignItems": "center",
+                  "children": [
+                    {
+                      "type": "text",
+                      "id": "l0I60A",
+                      "name": "exportBtnText",
+                      "fill": "#FFFFFF",
+                      "content": "复制图片并生成 dataset.yaml",
+                      "fontFamily": "Geist",
+                      "fontSize": 9,
+                      "fontWeight": "700"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "type": "frame",
+          "id": "lMocm",
+          "x": 1030,
+          "y": 18,
+          "name": "Format Compatibility Pill",
+          "width": 172,
+          "height": 28,
+          "fill": "#172033",
+          "stroke": {
+            "thickness": 1,
+            "fill": "#334155"
+          },
+          "justifyContent": "center",
+          "alignItems": "center",
+          "children": [
+            {
+              "type": "text",
+              "id": "Bu8UF",
+              "name": "modePillText",
+              "fill": "#C4B5FD",
+              "content": "COCO / VOC / YOLO",
+              "fontFamily": "IBM Plex Mono",
+              "fontSize": 11,
+              "fontWeight": "600"
+            }
+          ]
+        },
+        {
+          "type": "frame",
+          "id": "p0iJhJ",
+          "x": 64,
+          "y": 64,
+          "name": "Annotation Confirm Overlay",
+          "width": 1056,
+          "height": 716,
+          "fill": "#00000055"
+        },
+        {
+          "type": "frame",
+          "id": "ZnSPM",
+          "x": 430,
+          "y": 190,
+          "name": "Draw Shape Confirm Dialog",
+          "width": 430,
+          "height": 326,
+          "fill": "#171717",
+          "stroke": {
+            "thickness": 1,
+            "fill": "#404040"
+          },
+          "layout": "vertical",
+          "gap": 12,
+          "padding": 16,
+          "children": [
+            {
+              "type": "frame",
+              "id": "oLym3",
+              "name": "Dialog Header",
+              "width": "fill_container",
+              "height": 28,
+              "fill": "#202020",
+              "gap": 10,
+              "padding": [
+                0,
+                10
+              ],
+              "alignItems": "center",
+              "children": [
+                {
+                  "type": "text",
+                  "id": "atDs2",
+                  "name": "modalTitle",
+                  "fill": "#F8FAFC",
+                  "content": "标注确认 · 绘制完成后弹出",
+                  "fontFamily": "Geist",
+                  "fontSize": 14,
+                  "fontWeight": "700"
+                },
+                {
+                  "type": "frame",
+                  "id": "HNAVJ",
+                  "name": "modalSpacer",
+                  "width": "fill_container",
+                  "height": 1,
+                  "fill": "#00000000"
+                },
+                {
+                  "type": "text",
+                  "id": "wXXzY",
+                  "name": "modalClose",
+                  "fill": "#A3A3A3",
+                  "content": "×",
+                  "fontFamily": "Geist",
+                  "fontSize": 16,
+                  "fontWeight": "700"
+                }
+              ]
+            },
+            {
+              "type": "text",
+              "id": "U2CEr7",
+              "name": "fieldLabel1",
+              "fill": "#D4D4D4",
+              "content": "标签 / Label",
+              "fontFamily": "Geist",
+              "fontSize": 12,
+              "fontWeight": "600"
+            },
+            {
+              "type": "frame",
+              "id": "t751Ax",
+              "name": "Label Input",
+              "width": "fill_container",
+              "height": 36,
+              "fill": "#0B1220",
+              "stroke": {
+                "thickness": 1,
+                "fill": "#A855F7"
+              },
+              "padding": [
+                0,
+                12
+              ],
+              "alignItems": "center",
+              "children": [
+                {
+                  "type": "text",
+                  "id": "xpcSm",
+                  "name": "inputLabelText",
+                  "fill": "#F5F3FF",
+                  "content": "bearing  （可输入或下拉选择已有类别）",
+                  "fontFamily": "Geist",
+                  "fontSize": 13,
+                  "fontWeight": "600"
+                }
+              ]
+            },
+            {
+              "type": "text",
+              "id": "wPoFY",
+              "name": "fieldLabel2",
+              "fill": "#D4D4D4",
+              "content": "描述 / Description",
+              "fontFamily": "Geist",
+              "fontSize": 12,
+              "fontWeight": "600"
+            },
+            {
+              "type": "frame",
+              "id": "i8RVyh",
+              "name": "Description Input",
+              "width": "fill_container",
+              "height": 64,
+              "fill": "#0F172A",
+              "stroke": {
+                "thickness": 1,
+                "fill": "#334155"
+              },
+              "layout": "vertical",
+              "padding": 10,
+              "children": [
+                {
+                  "type": "text",
+                  "id": "vkoIU",
+                  "name": "descText",
+                  "fill": "#CBD5E1",
+                  "textGrowth": "fixed-width",
+                  "width": 360,
+                  "content": "轴承外圈区域，旋转框标注；用于 YOLO OBB 训练。",
+                  "fontFamily": "Geist",
+                  "fontSize": 12,
+                  "fontWeight": "500"
+                }
+              ]
+            },
+            {
+              "type": "frame",
+              "id": "s2kgJ",
+              "name": "Dialog Meta Row",
+              "width": "fill_container",
+              "height": 34,
+              "fill": "#00000000",
+              "gap": 10,
+              "children": [
+                {
+                  "type": "frame",
+                  "id": "FovWV",
+                  "name": "Group Input",
+                  "width": 132,
+                  "height": 34,
+                  "fill": "#0F172A",
+                  "stroke": {
+                    "thickness": 1,
+                    "fill": "#334155"
+                  },
+                  "justifyContent": "center",
+                  "alignItems": "center",
+                  "children": [
+                    {
+                      "type": "text",
+                      "id": "h6G5Vy",
+                      "name": "groupText",
+                      "fill": "#CBD5E1",
+                      "content": "Group: 1",
+                      "fontFamily": "IBM Plex Mono",
+                      "fontSize": 11,
+                      "fontWeight": "600"
+                    }
+                  ]
+                },
+                {
+                  "type": "frame",
+                  "id": "CUCyE",
+                  "name": "Split Input",
+                  "width": 132,
+                  "height": 34,
+                  "fill": "#0F172A",
+                  "stroke": {
+                    "thickness": 1,
+                    "fill": "#334155"
+                  },
+                  "justifyContent": "center",
+                  "alignItems": "center",
+                  "children": [
+                    {
+                      "type": "text",
+                      "id": "l1e8h",
+                      "name": "splitText",
+                      "fill": "#C4B5FD",
+                      "content": "Set: train",
+                      "fontFamily": "IBM Plex Mono",
+                      "fontSize": 11,
+                      "fontWeight": "600"
+                    }
+                  ]
+                },
+                {
+                  "type": "frame",
+                  "id": "G6aeZ",
+                  "name": "Score Input",
+                  "width": 108,
+                  "height": 34,
+                  "fill": "#0F172A",
+                  "stroke": {
+                    "thickness": 1,
+                    "fill": "#334155"
+                  },
+                  "justifyContent": "center",
+                  "alignItems": "center",
+                  "children": [
+                    {
+                      "type": "text",
+                      "id": "P9NL0",
+                      "name": "scoreText",
+                      "fill": "#94A3B8",
+                      "content": "Score: -",
+                      "fontFamily": "IBM Plex Mono",
+                      "fontSize": 11,
+                      "fontWeight": "600"
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "type": "frame",
+              "id": "aDOYc",
+              "name": "Dialog Button Row",
+              "width": "fill_container",
+              "height": 38,
+              "fill": "#00000000",
+              "gap": 10,
+              "justifyContent": "end",
+              "children": [
+                {
+                  "type": "frame",
+                  "id": "HlrkK",
+                  "name": "cancelBtn",
+                  "width": 84,
+                  "height": 34,
+                  "fill": "#262626",
+                  "stroke": {
+                    "thickness": 1,
+                    "fill": "#525252"
+                  },
+                  "justifyContent": "center",
+                  "alignItems": "center",
+                  "children": [
+                    {
+                      "type": "text",
+                      "id": "RZVL4",
+                      "name": "cancelText",
+                      "fill": "#D4D4D4",
+                      "content": "取消",
+                      "fontFamily": "Geist",
+                      "fontSize": 13,
+                      "fontWeight": "600"
+                    }
+                  ]
+                },
+                {
+                  "type": "frame",
+                  "id": "bSpvi",
+                  "name": "okBtn",
+                  "width": 104,
+                  "height": 34,
+                  "fill": "#A855F7",
+                  "justifyContent": "center",
+                  "alignItems": "center",
+                  "children": [
+                    {
+                      "type": "text",
+                      "id": "wgnzW",
+                      "name": "okText",
+                      "fill": "#FFFFFF",
+                      "content": "确定并更新",
+                      "fontFamily": "Geist",
+                      "fontSize": 13,
+                      "fontWeight": "700"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "type": "line",
+          "id": "qhF78",
+          "x": 860,
+          "y": 360,
+          "name": "Dialog Sync Arrow",
+          "width": 238,
+          "height": -78,
+          "stroke": {
+            "thickness": 2,
+            "fill": "#22D3EE"
+          }
+        },
+        {
+          "type": "frame",
+          "id": "C9WTCW",
+          "x": 900,
+          "y": 260,
+          "name": "Confirm Sync Badge",
+          "width": 190,
+          "height": 34,
+          "fill": "#082F49",
+          "stroke": {
+            "thickness": 1,
+            "fill": "#22D3EE"
+          },
+          "justifyContent": "center",
+          "alignItems": "center",
+          "children": [
+            {
+              "type": "text",
+              "id": "gLHQl",
+              "name": "syncText",
+              "fill": "#BAE6FD",
+              "content": "确定后同步右侧信息",
+              "fontFamily": "Geist",
+              "fontSize": 12,
+              "fontWeight": "700"
+            }
+          ]
+        },
+        {
+          "type": "rectangle",
+          "id": "ewduB",
+          "x": 1126,
+          "y": 135,
+          "name": "Right Panel Update Highlight",
+          "fill": "#22D3EE0F",
+          "width": 306,
+          "height": 382,
+          "stroke": {
+            "thickness": 1,
+            "fill": "#22D3EE88"
+          }
+        },
+        {
+          "type": "frame",
+          "id": "ezCIK",
+          "x": 430,
+          "y": 528,
+          "name": "Draw Confirm Flow Note",
+          "width": 430,
+          "height": 44,
+          "fill": "#0B1220EE",
+          "stroke": {
+            "thickness": 1,
+            "fill": "#334155"
+          },
+          "justifyContent": "center",
+          "alignItems": "center",
+          "children": [
+            {
+              "type": "text",
+              "id": "gP2nV",
+              "name": "flowNoteText",
+              "fill": "#E2E8F0",
+              "textGrowth": "fixed-width",
+              "width": 400,
+              "content": "交互流程：画框完成 → 弹窗填写标签/描述 → 确定 → 标签列表、对象列表、属性描述同步刷新",
+              "textAlign": "center",
+              "fontFamily": "Geist",
+              "fontSize": 12,
+              "fontWeight": "600"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

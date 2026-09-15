@@ -1,0 +1,25 @@
+{
+  "version": 4,
+  "cmakeMinimumRequired": { "major": 3, "minor": 21, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "vs2022-x64",
+      "displayName": "OCR Inference - Visual Studio 2022 x64",
+      "generator": "Visual Studio 17 2022",
+      "architecture": { "value": "x64", "strategy": "set" },
+      "binaryDir": "${sourceDir}/../../build/ocr-vs2022-x64",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "OPENCV_DIR": "D:/thirdparty/opencv",
+        "OCR_INFER_BUILD_EXAMPLES": "ON"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "vs2022-x64",
+      "configurePreset": "vs2022-x64",
+      "configuration": "Release"
+    }
+  ]
+}

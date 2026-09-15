@@ -1,0 +1,112 @@
+# Visual Studio / Qt / CMake local build cache
+.vs/
+**/.vs/
+build/
+**/build/
+# TRTForge：本地 VS/CMake 生成目录（勿提交）
+trtexec/gui/build/
+trtexec/gui/dist/
+# 二次开发包输出（体积大，勿提交）
+dist/
+cmake-build-*/
+**/cmake-build-*/
+CMakeFiles/
+**/CMakeFiles/
+CMakeCache.txt
+**/CMakeCache.txt
+
+# Visual Studio generated files
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+*.VC.db
+*.VC.opendb
+*.vsidx
+
+# Python cache / virtual environments
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+
+# Training / inference temporary outputs
+runs/
+**/runs/
+trtexec/gui/logs/
+*.log
+*.tmp
+*.temp
+
+# IDE and OS local files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Local secrets and machine-specific environment files
+.env
+.env.*
+*.key
+*.pem
+
+# Compiled binaries and runtime output (do not push)
+trtexec/gui/bin/
+**/bin/Debug/
+**/bin/Release/
+*.dll
+*.exe
+*.lib
+*.exp
+*.pdb
+*.ilk
+*.obj
+*.idb
+*.ipch
+*.engine
+*.trt
+*.onnx
+*.ckpt
+*.pt
+*.pth
+
+# Archives, videos, datasets, local model dumps
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.7z
+*.mp4
+*.avi
+*.mov
+数据集合/
+PCB缺陷检测数据集/
+pre_trained/
+trtmodel/
+results/
+**/results/
+**/datasets/
+
+# Local / broken copies, not the training source of truth
+ultralytics/
+anomalib/anomalib-master/
+anomalib/anomalib-tensorrt-cpp-main/
+anomalib/bottle/
+
+# Editor / agent local folders
+.cursor/
+.claude/
+.crush/
+
+# Python package leftovers
+*.egg-info/
+**/*.egg-info/
+
+# Anomalib example notebooks are Git LFS pointers without local objects
+anomalib/anomalib-main/examples/notebooks/

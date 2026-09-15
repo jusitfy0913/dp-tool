@@ -1,0 +1,42 @@
+{
+  "version": 4,
+  "cmakeMinimumRequired": { "major": 3, "minor": 21, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "vs2022-x64",
+      "displayName": "Visual Studio 2022 - x64 (Release)",
+      "generator": "Visual Studio 17 2022",
+      "architecture": { "value": "x64", "strategy": "set" },
+      "binaryDir": "${sourceDir}/build/vs2022-x64",
+      "environment": {
+        "CUDAFLAGS": "--allow-unsupported-compiler",
+        "CUDAHOSTCXX": ""
+      },
+      "cacheVariables": {
+        "CMAKE_CUDA_FLAGS": "--allow-unsupported-compiler -D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH",
+        "CMAKE_BUILD_TYPE": "Release",
+        "QT_DIR_HINT": "D:/QT/6.8.3/msvc2022_64",
+        "CUDA_TOOLKIT_ROOT_DIR": "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v11.8",
+        "OPENCV_DIR": "D:/thirdparty/opencv",
+        "TRTFORGE_BUILD_OCR_INFER": "OFF"
+      }
+    },
+    {
+      "name": "ninja-release",
+      "displayName": "Ninja - Release",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/ninja-release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "QT_DIR_HINT": "D:/QT/6.8.3/msvc2022_64",
+        "CUDA_TOOLKIT_ROOT_DIR": "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v11.8",
+        "OPENCV_DIR": "D:/thirdparty/opencv",
+        "TRTFORGE_BUILD_OCR_INFER": "OFF"
+      }
+    }
+  ],
+  "buildPresets": [
+    { "name": "vs2022-x64", "configurePreset": "vs2022-x64", "configuration": "Release" },
+    { "name": "ninja-release", "configurePreset": "ninja-release" }
+  ]
+}

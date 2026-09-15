@@ -1,0 +1,49 @@
+{
+  "version": "4.0.0-beta.5",
+  "flags": {},
+  "checked": false,
+  "shapes": [
+    {
+      "label": "person",
+      "score": null,
+      "points": [
+        [
+          74.41176470588232,
+          382.3529411764706
+        ],
+        [
+          52.058823529411825,
+          911.7647058823529
+        ],
+        [
+          240.29411764705878,
+          898.8235294117646
+        ],
+        [
+          226.17647058823536,
+          369.4117647058824
+        ],
+        [
+          126.17647058823536,
+          370.5882352941177
+        ]
+      ],
+      "group_id": null,
+      "description": "人",
+      "difficult": false,
+      "shape_type": "polygon",
+      "flags": {},
+      "attributes": {},
+      "kie_linking": []
+    }
+  ],
+  "imagePath": "bus.jpg",
+  "imageData": null,
+  "imageHeight": 1080,
+  "imageWidth": 810,
+  "description": "",
+  "vqaData": {
+    "bus": null,
+    "person": null
+  }
+}

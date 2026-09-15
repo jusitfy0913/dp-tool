@@ -1,0 +1,23 @@
+ckpt_path: model.ckpt
+data:
+  path: contamination
+  transform: null
+  image_size:
+    - 256
+    - 256
+output: ./outputs
+# visualization_mode: simple
+show: true
+model:
+  class_path: anomalib.models.Padim
+  init_args:
+    layers:
+      - layer1
+      - layer2
+      - layer3
+    input_size:
+      - 256
+      - 256
+    backbone: resnet18
+    pre_trained: true
+    n_features: null
