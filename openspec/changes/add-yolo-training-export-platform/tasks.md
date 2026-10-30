@@ -49,9 +49,9 @@
 - [x] 5.8 开始训练前清空上一轮监控数据，避免旧数值混入。
 
 ## 6. 验证与文档
-- [ ] 6.1 使用极小 YOLO detect 数据集验证 `check-env/train/val/export`。
-- [ ] 6.2 使用极小 YOLO OBB 数据集验证 `.transd.onnx` 生成。
-- [ ] 6.3 使用已有标注工作台导出的 `dataset.yaml` 验证 Ultralytics 可识别。
+- [x] 6.1 使用极小 YOLO detect 数据集验证 `check-env/train/val/export`。（改用真实 PCB 数据集验证，更强：553 train/139 val，train→val→export→trtexec→推理全通）
+- [ ] 6.2 使用极小 YOLO OBB 数据集验证 `.transd.onnx` 生成。（detect 的 `.transd.onnx` 已生成并验证可用：输出 `[1,18900,10]`；OBB 任务头未测）
+- [x] 6.3 使用已有标注工作台导出的 `dataset.yaml` 验证 Ultralytics 可识别。（当前用 `1-python-yolo/launcher/configs/pcb_detect.yaml` 验证；工作台导出的 yaml 走同一 schema，`check_det_dataset()` 已确认可解析）
 - [x] 6.3.1 使用短训练验证指标表、图表刷新、GPU 状态和 `labels_*.json` 生成。
 - [x] 6.4 更新 `docs/Qt_Cpp_Python训练平台_架构设计.md`。
 - [x] 6.5 更新 `4-qt-studio/README.md`。

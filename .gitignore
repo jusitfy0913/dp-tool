@@ -97,8 +97,8 @@ results/
 **/results/
 **/datasets/
 
-# 根目录 bin 下的训练冒烟测试残留产物
-/bin/configs/labels_yolo_smoke.json
+# 根目录 bin 下的训练冒烟测试残留产物（每次训练都会生成 labels_<name>.json）
+/bin/configs/labels_*.json
 
 # Local / broken copies, not the training source of truth
 # 只忽略「仓库根目录」下的旧副本；不要写成 ultralytics/、anomalib/，

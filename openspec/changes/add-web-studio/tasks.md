@@ -83,7 +83,7 @@
 - [x] 9.3 真实 launcher 自检子进程 + WebSocket 事件流端到端跑通（实测通过）
 - [x] 9.4 目录越权访问被拦截（实测通过）
 - [x] 9.5 未装 node 的机器上能正常打开全部页面（前端零构建，已确认）
-- [ ] 9.6 完整训练一轮 YOLO 并导出 ONNX（训练已用合成数据跑通，ONNX 导出未验；待用 `PCB data/` 真实数据集补齐）
+- [x] 9.6 完整训练一轮 YOLO 并导出 ONNX（已用 `PCB data/PCB缺陷检测` 真实数据集完成：30 epoch，mAP50=0.945，ONNX 复测精度一致，并编译出可用引擎）
 - [x] 9.7 用真实 `.trt` 引擎跑一次推理（PatchCore / PaDiM / EfficientAd 三模型均已跑通，准确率 1.0 / 0.9844 / 1.0）
 - [x] 9.8 关闭浏览器后训练不被杀掉；服务退出后无残留进程（设计如此并已验证子进程隔离）
 - [x] 9.9 用真实 launcher 验证后端拼的参数能被 argparse 接受（YOLO / Anomalib 均产出规范 `DATA_NOT_FOUND`，非 exit 2）

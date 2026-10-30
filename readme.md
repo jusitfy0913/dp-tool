@@ -127,6 +127,39 @@ python tf_anomalib_launcher.py --mode check-env
 
 ## 版本更新记录
 
+### v1.3 — 2026-10-30（PCB 真实数据集全链路打通 + 三个阻断级 bug 修复）
+
+本次用现场采集的 `PCB data/PCB缺陷检测`（553 train / 139 val，6 类，原图 3034×1586）跑通了
+「训练 → ONNX → TensorRT 引擎 → Web 推理」全流程，并修复过程中暴露的三个真实缺陷。
+
+**实测数据（YOLOv8n @960, T1000 8GB, FP16）**
+
+| 阶段 | 结果 |
+| --- | --- |
+| 训练 | 30 epoch，约 27 分钟，最终 P=0.951 / R=0.930 / mAP50=0.945 / mAP50-95=0.514 |
+| ONNX | 12.39 MB，输入 `[1,3,960,960]`，输出 `[1,10,18900]`；转置版 `[1,18900,10]` |
+| ONNX 复测精度 | P=0.9499 / R=0.9295 / mAP50=0.9451（与 `.pt` 一致，导出无损） |
+| 引擎编译 | 515 秒，10.28 MB |
+| 引擎性能 | median 8.41 ms / 125 qps（ONNX Runtime 为 47.2 ms，快 5.6 倍） |
+| 端到端推理 | 4 张验证图各检出 3 个 `missing_hole`，置信度 0.76~0.95，与文件名标注吻合 |
+
+| 缺陷 | 老版本表现 | 新版本修复 | 影响 |
+| --- | --- | --- | --- |
+| YOLO 引擎输出布局 | 用 `best.onnx` 编译引擎时，`yolo_infer.dll` 把类别数算成 `18900-4`，越界读显存，**静默**输出 `confidence=957`、`top=-725` 的垃圾框 | 文档明确「必须用 `.transd.onnx` 编译」；`app.py` 新增 `_check_yolo_output_sane()`，置信度越界直接返回 HTTP 400 并指明原因 | 从「看起来成功、结果全错」变为「明确报错 + 可执行提示」 |
+| `--project` 相对路径 | Ultralytics 8.4 对相对路径再拼 `<runs_dir>/<task>/`，`runs/pcb` 实际落到 `runs/detect/runs/pcb` | launcher 在 `build_train_kwargs()` 里先解析成绝对路径 | 产物路径从 `runs/detect/runs/pcb/...` 回到 `runs/pcb/...` |
+| Web 启动脚本选错解释器 | `Get-Command python.exe` 命中 Microsoft Store 的 0 字节存根，服务**静默起不来**（端口不监听、无报错） | `run_web_studio.ps1` 改为「已知 conda 环境优先 + 真实可用性探测」，跳过 `WindowsApps` 目录和 0 字节文件 | 按 README 一键启动即可用 |
+
+**新增工具**
+
+| 脚本 | 用途 |
+| --- | --- |
+| `6-web/backend/tools/verify_pcb_chain.py` | PCB 全链路验证：调 Web 推理接口，汇总框数/类别/置信度，输出标注图与 JSON 报告 |
+| `6-web/backend/tools/diag_yolo_dll.py` | 绕过 Web 层直接调 `yolo_infer.dll`，dump `frame_stat` 与 box 原始内存，用于定位布局/结构体问题 |
+| `6-web/backend/tools/check_engine_layout_guard.py` | 对比「错误引擎」与「正确引擎」在推理接口上的返回，验证防护生效 |
+| `1-python-yolo/launcher/configs/pcb_detect.yaml` | PCB 数据集配置（含统计信息与 imgsz 选择建议） |
+
+**注意**：PCB 数据集原图的缺陷只有约 70px，`imgsz=640` 时会缩到约 15px，建议 **960 及以上**。
+
 ### v1.2 — 2026-10-30（异常检测模型对比与阈值校准）
 
 本次为功能性大版本更新，核心是三模型实测对比 + 阈值校准修复。
@@ -372,7 +405,7 @@ Anomalib 训练导出继续沿用 `QProcess + TRTFORGE_JSON`，不把 Python 嵌
 - 训练成功结束后，界面会弹窗汇总本次 `run_dir`、`best.pt`、`last.pt`、`results.csv` 和常见曲线图片等产物。
 - 训练监控页会在每个 epoch 结束后追加深色指标行，并用带坐标轴、刻度数字和网格线的曲线控件实时更新 F1、P、R、mAP、GPU 显存等小图；混淆矩阵使用最新 PNG 缩略图控件显示；双击单个小图可在图表区放大，再双击恢复多图。
 - GPU 区会实时显示显存占用和利用率进度条；标签 JSON 区会显示等待生成、生成成功路径或未生成/写入失败原因。每次开始训练会先清空上一轮监控数据；标签 JSON 不覆盖 `labels_coco.json`，同名时自动追加时间戳。
-- `.transd.onnx` 仅用于 TRTForge/TensorRT 自定义推理链路，不要再用 Ultralytics `YOLO()` 直接加载推理。
+- `.transd.onnx` 仅用于 TRTForge/TensorRT 自定义推理链路，不要再用 Ultralytics `YOLO()` 直接加载推理。反过来，**编译 YOLO 的 TensorRT 引擎时必须用它**：`yolo_infer.dll` 按 `[1, 候选框数, 4+类别数]` 解析输出，直接用 `best.onnx`（`[1, 4+类别数, 候选框数]`）编译会让类别数被算成 `候选框数-4`，解码越界读显存且**不报错**，输出 `confidence=957`、`top=-725` 这类垃圾框。Web 接口已加校验，遇到这种情况返回 HTTP 400 并提示改用 `.transd.onnx`。
 - TRTForge 推理演示已对中文路径做兼容处理：`.trt` 引擎按 UTF-8 转宽路径读取，图像通过 Qt 读字节后解码，视频中文路径会临时转存到 ASCII 路径再交给 OpenCV，标签 JSON 继续使用 Qt `QFile` 读取。
 - TRTForge 推理演示加载 YOLO / Anomalib TensorRT 引擎时会把耗时的 `yi_create` / `ai_create` 放到推理 worker 线程执行，并显示“正在加载模型”的进度提示，避免模型加载期间 Qt 主界面无响应。
 - TRTForge 推理演示显示窗口支持滚轮缩放、鼠标左键按住拖动画面、左键双击恢复适配窗口，便于查看大图细节和检测框。

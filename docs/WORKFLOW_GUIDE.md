@@ -232,7 +232,11 @@ python tf_yolo_launcher.py --mode export --model runs\trtforge\my_yolo\weights\b
   --imgsz 640 --opset 12
 ```
 
-> `.transd.onnx` 仅用于 TRTForge 自定义推理链路，**不要用 `YOLO()` 直接加载**。
+> `.transd.onnx` 仅用于 TRTForge 自定义推理链路，**不要用 `YOLO()` 直接加载**
+> （Ultralytics 认的是原始输出布局，转置后会解析失败）。
+>
+> 但反过来：**编译 TensorRT 引擎时必须用它**，见 §5.1。导出后目录里应有
+> `best.onnx` 和 `best.transd.onnx` 两个文件；如果只有前者，加 `--make-transd` 重跑。
 
 ### 4.2 Anomalib
 
@@ -249,8 +253,8 @@ python tf_yolo_launcher.py --mode export --model runs\trtforge\my_yolo\weights\b
 ```powershell
 $trt = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v11.8\bin\trtexec.exe"
 
-# YOLO
-& $trt --onnx="model.onnx" --saveEngine="model_fp16.engine" --fp16 `
+# YOLO —— 必须用 .transd.onnx 编译，不能用 model.onnx
+& $trt --onnx="model.transd.onnx" --saveEngine="model_fp16.engine" --fp16 `
   --minShapes=images:1x3x640x640 --optShapes=images:1x3x640x640 `
   --maxShapes=images:8x3x640x640 --workspace=4096
 
@@ -259,6 +263,25 @@ $trt = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v11.8\bin\trtexec.exe
   --minShapes=input:1x3x256x256 --optShapes=input:1x3x256x256 `
   --maxShapes=input:8x3x256x256 --workspace=4096
 ```
+
+> ⚠️ **YOLO 引擎只能用 `.transd.onnx` 编译，这是最容易踩的坑。**
+>
+> | | 输出 shape | `yolo_infer.dll` 能否正确解析 |
+> | --- | --- | --- |
+> | `best.onnx` | `[1, 4+类别数, 候选框数]` | ❌ 不能 |
+> | `best.transd.onnx` | `[1, 候选框数, 4+类别数]` | ✅ 能 |
+>
+> DLL 里按 `bbox_head_dims_[2] - 4` 推算类别数。用 `best.onnx` 时这个值会变成
+> `18900 - 4 = 18896`，解码 kernel 越界读显存，**不报任何错误**，却吐出
+> `confidence = 957.26`、坐标 `top = -725` 这类垃圾框。
+>
+> 实测（PCB 6 类模型 @960）：
+>
+> - 错误引擎：5 个框，置信度 `[957.258, 956.779, 304.125, ...]` → Web 接口返回 **HTTP 400**
+> - 正确引擎：3 个框，置信度 `[0.948, 0.761, 0.822]` → 正常
+>
+> `--mode export` 默认就会顺带生成 `.transd.onnx`（`--make-transd` 默认开启）。
+> 如果没生成，加 `--make-transd` 重跑导出即可。
 
 ### 5.2 预期耗时（T1000 实测）
 

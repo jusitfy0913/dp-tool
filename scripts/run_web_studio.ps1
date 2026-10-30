@@ -34,19 +34,42 @@ if (-not (Test-Path (Join-Path $BackendDir "app.py"))) {
     throw "找不到后端入口：$BackendDir\app.py"
 }
 
-# 解释器：显式参数 > 环境变量 > PATH > 常见 conda 环境
-if (-not $PythonExe) { $PythonExe = $env:TRTFORGE_PYTHON }
-if (-not $PythonExe) {
-    $candidate = Get-Command python.exe -ErrorAction SilentlyContinue
-    if ($candidate) { $PythonExe = $candidate.Source }
-}
-if (-not $PythonExe -or -not (Test-Path $PythonExe)) {
-    foreach ($p in @("D:\Anaconda3\envs\dpenv\python.exe", "D:\Anaconda3\python.exe")) {
-        if (Test-Path $p) { $PythonExe = $p; break }
+# 解释器：显式参数 > 环境变量 > 已知 conda 环境 > PATH
+#
+# 注意顺序：PATH 里的 python.exe 很可能是 Microsoft Store 的 0 字节存根
+# （C:\Users\<user>\AppData\Local\Microsoft\WindowsApps\python.exe）。
+# 命中它时进程会直接退出、端口不监听，而且没有任何报错，排查成本极高。
+# 所以这里先试已知的 conda 环境，PATH 放最后，并且做一次真实可用性探测。
+function Test-PythonUsable([string]$Exe) {
+    if (-not $Exe) { return $false }
+    if (-not (Test-Path $Exe)) { return $false }
+    if ($Exe -like "*\WindowsApps\*") { return $false }
+    if ((Get-Item $Exe).Length -eq 0) { return $false }
+    try {
+        $null = & $Exe -c "import sys" 2>$null
+        return ($LASTEXITCODE -eq 0)
+    } catch {
+        return $false
     }
 }
-if (-not $PythonExe -or -not (Test-Path $PythonExe)) {
-    throw "找不到 Python。请用 -PythonExe 指定，或设置环境变量 TRTFORGE_PYTHON。"
+
+$candidates = New-Object System.Collections.Generic.List[string]
+if ($PythonExe) { $candidates.Add($PythonExe) }
+if ($env:TRTFORGE_PYTHON) { $candidates.Add($env:TRTFORGE_PYTHON) }
+foreach ($p in @(
+    "D:\Anaconda3\envs\dpenv\python.exe",
+    "D:\Anaconda3\envs\pytorch\python.exe",
+    "D:\Anaconda3\python.exe"
+)) { $candidates.Add($p) }
+$pathPython = Get-Command python.exe -ErrorAction SilentlyContinue
+if ($pathPython) { $candidates.Add($pathPython.Source) }
+
+$PythonExe = ""
+foreach ($c in $candidates) {
+    if (Test-PythonUsable $c) { $PythonExe = $c; break }
+}
+if (-not $PythonExe) {
+    throw "找不到可用的 Python。请用 -PythonExe 指定，或设置环境变量 TRTFORGE_PYTHON。"
 }
 
 if ($Port -le 0) {

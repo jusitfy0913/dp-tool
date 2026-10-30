@@ -482,13 +482,21 @@ def build_train_kwargs(args: argparse.Namespace) -> Dict[str, Any]:
         emit_error("DATA_NOT_FOUND", "dataset.yaml 不存在或未选择", path=args.data or "")
         raise FileNotFoundError(args.data or "dataset.yaml")
 
+    # Ultralytics 8.4 的 get_save_dir() 对「相对路径的 project」会再拼一层
+    # <runs_dir>/<task>/，于是 --project runs/pcb 实际落到
+    # runs/detect/runs/pcb（路径重复，用户按文档找不到产物）。
+    # 这里提前解析成绝对路径，让它走 absolute 分支，行为回到直觉预期。
+    project_dir = args.project
+    if project_dir and not Path(project_dir).is_absolute():
+        project_dir = str(Path(project_dir).resolve())
+
     kwargs: Dict[str, Any] = {
         "data": args.data,
         "epochs": args.epochs,
         "imgsz": args.imgsz,
         "batch": parse_batch(args.batch),
         "device": args.device,
-        "project": args.project,
+        "project": project_dir,
         "name": args.name,
         "patience": args.patience,
         "workers": args.workers,

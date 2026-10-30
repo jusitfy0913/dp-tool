@@ -1,0 +1,25 @@
+# 现场采集的 PCB 缺陷数据集（YOLO detect 格式）
+#
+# 数据来源：PCB data/PCB缺陷检测（该目录已被 .gitignore 排除，不入库）
+# 换机器时只需修改下面的 path，其余字段无需改动。
+#
+# 数据集统计（2026-10-30 实测）：
+#   train 553 图 / 554 标注（有 1 个孤立标注 04_mouse_bite_17.txt 无对应图片，Ultralytics 会自动忽略）
+#   val   139 图 / 139 标注
+#   类别分布均衡，每类约 490 个实例
+#   原图尺寸 3034x1586，缺陷目标较小（bbox 归一化宽约 0.023，约 70px）
+#
+# 注意 imgsz 选择：640 时缺陷仅剩约 15px，建议 960 或 1280 以获得更好的小目标召回。
+
+path: "D:/test/deeplearning/dp-tool/PCB data/PCB缺陷检测"
+train: images/train
+val: images/val
+
+nc: 6
+names:
+  - missing_hole
+  - mouse_bite
+  - open_circuit
+  - short
+  - spur
+  - spurious_copper

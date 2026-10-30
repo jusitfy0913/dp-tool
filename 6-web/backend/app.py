@@ -378,6 +378,52 @@ def _save_upload(upload: UploadFile) -> tuple[bytes, Path]:
     return data, Path(handle.name)
 
 
+def _check_yolo_output_sane(result: dict, img_w: int, img_h: int) -> None:
+    """拦截「引擎输出布局不对」这类静默错误。
+
+    背景：`yolo_infer.dll` 按 `[1, num_bboxes, 4 + num_classes]` 解析输出。
+    如果引擎是用**未转置**的 ONNX（`[1, 4 + num_classes, num_bboxes]`）编译的，
+    DLL 会把类别数推算成 `num_bboxes - 4`（PCB 模型上是 18896）并越界读内存，
+    产出 `confidence > 1`、坐标为负的垃圾框，而且**不返回任何错误码**。
+
+    这里把这种"看起来成功、实际全错"的情况显式变成 400，
+    并在提示里指明正确做法（用 `.transd.onnx` 编译）。
+    """
+    boxes = result.get("boxes") or []
+    if not boxes:
+        return
+
+    bad_conf = [b for b in boxes if not (0.0 <= float(b.get("confidence", 0.0)) <= 1.0)]
+    if bad_conf:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "检测结果不可信（置信度不在 0~1 之间），通常说明引擎的 ONNX 输出布局不对。"
+                "YOLO 引擎必须用 launcher 导出的 `.transd.onnx` 编译"
+                "（输出为 [1, 候选框数, 4+类别数]）；直接用 `model.onnx` 编译会让解码越界。"
+            ),
+        )
+
+    # 框贴边小幅越界是 letterbox 还原的舍入误差，超过图像 1% 才算异常
+    pad = max(img_w, img_h) * 0.01
+    outside = [
+        b
+        for b in boxes
+        if float(b.get("right", 0)) < -pad
+        or float(b.get("bottom", 0)) < -pad
+        or float(b.get("left", 0)) > img_w + pad
+        or float(b.get("top", 0)) > img_h + pad
+    ]
+    if outside:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "检测框全部落在图像之外，引擎输出布局可能不对。"
+                "请确认是用 `.transd.onnx` 编译的引擎，而不是 `model.onnx`。"
+            ),
+        )
+
+
 @app.post("/api/infer/yolo")
 def infer_yolo(
     image: UploadFile = File(...),
@@ -401,6 +447,7 @@ def infer_yolo(
     try:
         array = infer.decode_image(data)
         result = infer.run_yolo(engine, task, array, conf=conf, nms=nms)
+        _check_yolo_output_sane(result, array.shape[1], array.shape[0])
         annotated = infer.draw_yolo(array, result["boxes"])
     except infer.InferError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
