@@ -23,7 +23,7 @@
 - [x] 4.2 `git mv trtexec/gui/inference/anomalib_infer 3-cpp-tensorrt/anomalib_infer`
 - [x] 4.3 核对 `3-cpp-tensorrt/yolo_infer/CMakeLists.txt:80` 与 `anomalib_infer/CMakeLists.txt:70` 的 `TRTFORGE_BIN_DIR` 指向 `../../4-qt-studio/bin`
 - [x] 4.4 核对两个子工程的 `RUNTIME/ARCHIVE_OUTPUT_DIRECTORY` 均已指向该目录
-- [ ] 4.5 单独配置并编译 `yolo_infer`、`anomalib_infer`，确认产物落在 `4-qt-studio/bin`（本机工具链阻塞，见 §9）
+- [x] 4.5 单独配置并编译 `yolo_infer`、`anomalib_infer`，确认产物落在 `4-qt-studio/bin`（已用 `build_infer_dlls.ps1` 绕过 Qt 依赖单独编译出 DLL）
 
 ## 5. 四级 4-qt-studio
 - [x] 5.1 `git mv trtexec/gui 4-qt-studio`（保留 `bin` 产物目录与 `src/include` 结构不变）

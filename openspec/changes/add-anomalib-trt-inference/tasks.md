@@ -28,4 +28,4 @@
 - [x] 5.2 新增 `trtforge_metadata.py`，统一 metadata 写入、ONNX 预处理和输出解析
 - [x] 5.3 在 `anomalib-main` 根目录新增 `compare_ckpt_onnx_inference.py`
 - [x] 5.4 TRTForge metadata loader 兼容 `input_size` 新字段并优化缺失提示
-- [ ] 5.5 运行训练导出和 ckpt/onnx 对比脚本完成样例验证
+- [ ] 5.5 运行训练导出和 ckpt/onnx 对比脚本完成样例验证（三模型训练与 ONNX 导出已验证，`compare_ckpt_onnx_inference.py` 未执行）

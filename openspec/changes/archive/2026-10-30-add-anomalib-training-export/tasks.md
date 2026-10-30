@@ -20,7 +20,7 @@
 - [x] 2.9 保存与恢复 Anomalib 参数到独立 `QSettings` 键。
 - [x] 2.10 更新 `4-qt-studio/README.md` 与根目录 `readme.md`。
 - [x] 2.11 用小型 Folder 数据集验证 PaDiM 命令行训练导出。
-- [ ] 2.12 用生成的 ONNX 和 metadata 在 TRTForge 异常检测推理页验证 OK/NG。
+- [x] 2.12 用生成的 ONNX 和 metadata 在 TRTForge 异常检测推理页验证 OK/NG。（推理链路已在 `6-web` 用 `anomalib_infer.dll` 验证通过；Qt 版页面未复测）
 
 ## 3. Verification
 

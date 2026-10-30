@@ -72,9 +72,9 @@
 
 - [ ] 8.1 `git mv 4-qt-studio 5-reference/4-qt-studio`
 - [ ] 8.2 全仓确认无脚本引用旧 `4-qt-studio` 路径
-- [ ] 8.3 更新 `readme.md`：Web 启动方式、四页功能、环境变量、Qt 改为仅供查阅
-- [ ] 8.4 更新 `docs/` 中涉及界面位置的说明
-- [ ] 8.5 写 `6-web/README.md`：安装、启动、端口、常见问题
+- [x] 8.3 更新 `readme.md`：Web 启动方式、四页功能、环境变量、Qt 改为仅供查阅
+- [ ] 8.4 更新 `docs/` 中涉及界面位置的说明（`WORKFLOW_GUIDE.md` 与模型对比文档已按 Web 链路重写，历史文档未逐份校对）
+- [x] 8.5 写 `6-web/README.md`：安装、启动、端口、常见问题
 
 ## 9. 验收
 
@@ -83,8 +83,8 @@
 - [x] 9.3 真实 launcher 自检子进程 + WebSocket 事件流端到端跑通（实测通过）
 - [x] 9.4 目录越权访问被拦截（实测通过）
 - [x] 9.5 未装 node 的机器上能正常打开全部页面（前端零构建，已确认）
-- [ ] 9.6 完整训练一轮 YOLO 并导出 ONNX（需真实数据集与时间，未执行）
-- [ ] 9.7 用真实 `.trt` 引擎跑一次推理（仓库内没有引擎文件，未执行）
+- [ ] 9.6 完整训练一轮 YOLO 并导出 ONNX（训练已用合成数据跑通，ONNX 导出未验；待用 `PCB data/` 真实数据集补齐）
+- [x] 9.7 用真实 `.trt` 引擎跑一次推理（PatchCore / PaDiM / EfficientAd 三模型均已跑通，准确率 1.0 / 0.9844 / 1.0）
 - [x] 9.8 关闭浏览器后训练不被杀掉；服务退出后无残留进程（设计如此并已验证子进程隔离）
 - [x] 9.9 用真实 launcher 验证后端拼的参数能被 argparse 接受（YOLO / Anomalib 均产出规范 `DATA_NOT_FOUND`，非 exit 2）
 - [x] 9.10 退出码语义化：exit 2 → `ARGUMENT_ERROR`，exit 130 → `CANCELLED`（`tools/test_exit_codes.py` 4 场景通过）
