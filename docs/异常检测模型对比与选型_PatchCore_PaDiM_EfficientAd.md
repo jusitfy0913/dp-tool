@@ -43,7 +43,8 @@
 └── ground_truth/      像素级标注（本对比未使用）
 ```
 
-> EfficientAd 额外需要 `datasets/imagenette`（9469 张，10 类，约 1485MB，首次运行自动下载）。
+> EfficientAd 额外需要 `datasets/imagenette`（9469 张，10 类，约 1485MB）。
+> **注意：该目录不存在时训练直接报错，不会自动下载**——必须先建空目录，详见第 3 节。
 
 ---
 
@@ -114,8 +115,36 @@ if not train_root.is_dir():
 
 - 默认路径：`2-python-anomaly/anomalib-main/datasets/imagenette`
 - 下载源：`https://s3.amazonaws.com/fast-ai-imageclas/imagenette2.tgz`
-- 测速：约 4 MB/s，总耗时 6~10 分钟
-- **缺失时会直接报 `FileNotFoundError`，不会静默降级**
+- 测速：约 4 MB/s，总耗时 6~10 分钟，解压后 9469 张 / 10 类
+
+**这里有个容易踩的坑**：launcher 在模型自动下载**之前**就先检查目录是否存在：
+
+```python
+# tf_anomalib_launcher.py:453-454
+if model_name == "efficientad" and not imagenet_dir.exists():
+    raise FileNotFoundError(f"EfficientAd imagenet_dir 不存在：{imagenet_dir}")
+```
+
+所以实际行为分两种：
+
+| 情况 | 结果 |
+| --- | --- |
+| `datasets/imagenette` **目录不存在** | **直接报 `DATA_NOT_FOUND` / `exit=1`**，不下载（已实测确认） |
+| 目录存在但为空 / 缺 `imagenette2/train` | 自动下载并解压（约 1485MB） |
+
+界面或日志里会看到：
+
+```text
+TRTFORGE_JSON {"type":"error","code":"DATA_NOT_FOUND","message":"EfficientAd imagenet_dir 不存在：..."}
+```
+
+**结论：首次使用必须先手动建出这个空目录**，否则「自动下载」根本不会触发：
+
+```powershell
+New-Item -ItemType Directory -Force -Path 2-python-anomaly\anomalib-main\datasets\imagenette
+```
+
+然后再跑训练，就会自动下载。
 
 ---
 
@@ -240,6 +269,16 @@ anomalib 把后处理归一化也编进了导出的 ONNX 图里，而这个归�
 | --- | --- | --- |
 | `--imagenet-dir` | **仅 efficientad** | imagenette 根目录，默认 `<anomalib-main>/datasets/imagenette`，缺失会报错 |
 
+> ⚠️ **两条链路的默认 epoch 不一致，不要混用**：
+>
+> | 入口 | PatchCore | PaDiM | EfficientAd |
+> | --- | --- | --- | --- |
+> | `tf_anomalib_launcher.py --max-epochs auto` | 1 | 1 | **20** |
+> | `anomalib-main/train.py` 独立脚本 | 50 | 1 | **5** |
+>
+> 本工程训练页 / Web 工作站走的是 **launcher**，以 launcher 的 1 / 1 / 20 为准。
+> `train.py` 是另一条独立命令行链路，不参与界面集成。
+
 ### 6.3 各模型特殊规则（源码级）
 
 | 规则 | 源码位置 | 说明 |
@@ -265,8 +304,10 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run_web_studio.ps1
 
 界面上需要注意：
 
-- **选 EfficientAd 时**，如果 `datasets/imagenette` 不存在，首次训练会自动下载 1485MB，请预留时间和磁盘。
+- **选 EfficientAd 时**，Web 界面**没有 `imagenet_dir` 输入框**，固定使用 `2-python-anomaly/anomalib-main/datasets/imagenette`。如果该目录不存在，会直接报 `FileNotFoundError`（launcher 不会自动创建）。务必先建出空目录，见本文第 3 节。
 - **阈值**默认已自动校准，不需要手动填 0.5。
+- Web 界面只暴露 `root` / 三个子目录 / `input_size` / `max_epochs` / `project` / `run_name`。
+  `train_batch_size`、`val_split_ratio`、`calib_limit`、`imagenet_dir` 等走后端默认值，需要调整时请用命令行方式（7.2 节）。
 
 ### 7.2 方式 B：命令行
 
@@ -390,7 +431,7 @@ flowchart LR
 | 问题 | 现象 | 处理 |
 | --- | --- | --- |
 | PatchCore 分数饱和 | 正常图 raw_score 全为 0.0 | 属预期行为，不要用于趋势判断 |
-| EfficientAd 缺 imagenette | `FileNotFoundError` | 首次训练自动下载，或手动放到 `datasets/imagenette` |
+| EfficientAd 缺 imagenette | `DATA_NOT_FOUND`（目录不存在时**不会**自动下载） | 先 `New-Item -ItemType Directory` 建空目录，再跑训练即自动下载 |
 | EfficientAd 日志刷屏 | 反复打印 `Calculate Validation Dataset Quantiles` | 正常阶段，不是卡死 |
 | PaDiM 编译最慢 | 引擎最小但编译 1023 秒 | 预留时间，不要误以为卡住 |
 | Windows 符号链接失败 | `latest` 目录创建报权限错 | launcher 已打补丁，改为直接返回 `vN` 目录 |

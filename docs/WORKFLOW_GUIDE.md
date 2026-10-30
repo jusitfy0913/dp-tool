@@ -119,6 +119,23 @@ python -c "import torch; print(torch.__version__, torch.cuda.is_available(), tor
 - `test/abnormal` 也参与阈值校准，**至少要 10 张以上**，否则阈值偏保守
 - 目录名 `good` / `abnormal` 是 anomalib Folder 数据集的约定，不要随意改
 
+### 2.4 EfficientAd 专用：imagenette 辅助数据
+
+只有 EfficientAd 需要这份额外数据（用于计算教师网络通道归一化统计）。**必须注意先后顺序**：launcher 会在模型创建前检查目录是否存在，**目录不存在时直接报错，不会自动下载**。
+
+```powershell
+# 第一步：先建出空目录（关键，否则训练直接 FileNotFoundError）
+New-Item -ItemType Directory -Force -Path 2-python-anomaly\anomalib-main\datasets\imagenette
+
+# 第二步：正常跑 EfficientAd 训练，此时会自动下载 imagenette2.tgz（约 1485MB / 6~10 分钟）
+```
+
+| 情况 | 结果 |
+| --- | --- |
+| `datasets/imagenette` 目录不存在 | **报 `DATA_NOT_FOUND` / `exit=1`**，不下载 |
+| 目录存在但缺 `imagenette2/train` | 自动下载 + 解压，解压后 9469 张 / 10 类 |
+| 已就绪 | 直接使用，不会重复下载 |
+
 ### 2.3 数据集划分
 
 YOLO 训练页支持自动划分 `train / val / test`，默认 `80 / 10 / 10`。
@@ -329,6 +346,7 @@ Invoke-WebRequest http://127.0.0.1:8060/api/capabilities
 | DLL 加载失败 | 缺 `os.add_dll_directory` | 确认 OpenCV / CUDA `bin` 已加入 |
 | `LNK1104` | DLL 被运行中的进程占用 | 先停 Web 服务 |
 | 异常图判成 OK | 阈值过高 | 确认 `--calibrate-metadata true`，或重跑校准 |
+| `imagenet_dir 不存在` | EfficientAd 目录缺失（`DATA_NOT_FOUND`），launcher 不会自动下载 | 先 `New-Item -ItemType Directory` 建空目录（见 2.4） |
 | 正常图分数全为 0 | PatchCore 分数饱和 | 属预期；要趋势监控请换 EfficientAd |
 | 引擎编译卡住不动 | builder 在 CPU 侧搜索 tactic | 看 GPU 显存仍在占用即正常，耐心等 |
 
