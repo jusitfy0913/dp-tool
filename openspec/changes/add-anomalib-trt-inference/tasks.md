@@ -17,7 +17,7 @@
 
 ## 4. Build And Documentation
 - [x] 4.1 更新 `CMakeLists.txt` 加入新增文件
-- [x] 4.2 更新 `readme.md`、`trtexec/gui/README.md` 和推理流程文档
+- [x] 4.2 更新 `readme.md`、`4-qt-studio/README.md` 和推理流程文档
 - [x] 4.3 使用可用样例或编译检查验证改动
 - [x] 4.4 新增 `anomalib_infer.dll` 子工程，导出 `ai_*` C API
 - [x] 4.5 将 `AnomalyInferWorker` 改为调用 `anomalib_infer.dll` 的 Qt 薄适配层

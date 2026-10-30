@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TRTForge Web Studio</title>
+<link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="logo">TRT</span>
+    <div>
+      <h1>TRTForge Web Studio</h1>
+      <p class="sub">缺陷检测 · 训练与推理</p>
+    </div>
+  </div>
+  <div class="status" id="envStatus">
+    <span class="dot" id="envDot"></span>
+    <span id="envText">检测环境…</span>
+  </div>
+</header>
+
+<nav class="tabs">
+  <button class="tab active" data-tab="train">训练导出</button>
+  <button class="tab" data-tab="infer">推理演示</button>
+  <button class="tab" data-tab="about">环境说明</button>
+</nav>
+
+<main>
+  <!-- ==================== 训练页 ==================== -->
+  <section class="panel active" id="panel-train">
+    <div class="layout">
+      <form class="card" id="trainForm">
+        <h2>训练参数</h2>
+
+        <label>训练类型
+          <select id="trainKind">
+            <option value="yolo">YOLO 目标检测 / 分割 / 姿态 / OBB</option>
+            <option value="anomalib">Anomalib 异常检测</option>
+          </select>
+        </label>
+
+        <label>Python 解释器
+          <div class="row">
+            <input type="text" id="pythonPath" placeholder="留空则自动探测，例如 D:\Anaconda3\envs\dpenv\python.exe">
+          </div>
+        </label>
+
+        <!-- YOLO 专用 -->
+        <div class="group" id="yoloGroup">
+          <label>任务类型
+            <select id="yoloTask">
+              <option value="detect">detect 检测</option>
+              <option value="segment">segment 分割</option>
+              <option value="pose">pose 姿态</option>
+              <option value="obb">obb 旋转框</option>
+            </select>
+          </label>
+          <label>模型 / 权重
+            <input type="text" id="yoloModel" value="yolov8n.pt">
+          </label>
+          <label>dataset.yaml
+            <div class="row">
+              <input type="text" id="yoloData" placeholder="导出的 dataset.yaml 绝对路径">
+              <button type="button" class="mini" data-browse="yoloData">浏览</button>
+            </div>
+          </label>
+          <div class="grid2">
+            <label>epochs <input type="number" id="yoloEpochs" value="100" min="1"></label>
+            <label>imgsz <input type="number" id="yoloImgsz" value="640" min="32" step="32"></label>
+            <label>batch <input type="text" id="yoloBatch" value="16"></label>
+            <label>device <input type="text" id="yoloDevice" value="0"></label>
+          </div>
+        </div>
+
+        <!-- Anomalib 专用 -->
+        <div class="group hidden" id="anomalibGroup">
+          <label>Anomalib 模型
+            <select id="anomModel">
+              <option value="patchcore">PatchCore</option>
+              <option value="padim">PaDiM</option>
+              <option value="efficientad">EfficientAd</option>
+            </select>
+          </label>
+          <label>数据集 root（Folder）
+            <div class="row">
+              <input type="text" id="anomRoot" placeholder="包含 train/good、test/abnormal 的目录">
+              <button type="button" class="mini" data-browse="anomRoot">浏览</button>
+            </div>
+          </label>
+          <div class="grid2">
+            <label>normal_dir <input type="text" id="anomNormal" value="train/good"></label>
+            <label>abnormal_dir <input type="text" id="anomAbnormal" value="test/abnormal"></label>
+            <label>normal_test_dir <input type="text" id="anomNormalTest" value="test/good"></label>
+            <label>input_size <input type="number" id="anomInputSize" value="256" step="32"></label>
+            <label>max_epochs <input type="text" id="anomMaxEpochs" value="auto"></label>
+          </div>
+        </div>
+
+        <div class="grid2">
+          <label>输出目录 project <input type="text" id="project" value="runs/trtforge"></label>
+          <label>实验名称 name <input type="text" id="runName" value="exp"></label>
+        </div>
+
+        <div class="actions">
+          <button type="submit" class="primary" id="btnTrain">开始训练</button>
+          <button type="button" id="btnCheckEnv">检测环境</button>
+          <button type="button" id="btnStop" disabled>停止</button>
+        </div>
+        <p class="hint" id="trainHint"></p>
+      </form>
+
+      <div class="card grow">
+        <h2>训练日志 <span class="badge" id="runBadge">未开始</span></h2>
+        <div class="progress"><div class="bar" id="progressBar"></div></div>
+        <div class="metrics" id="metrics"></div>
+        <pre class="log" id="logBox"></pre>
+      </div>
+    </div>
+  </section>
+
+  <!-- ==================== 推理页 ==================== -->
+  <section class="panel" id="panel-infer">
+    <div class="layout">
+      <form class="card" id="inferForm">
+        <h2>推理设置</h2>
+
+        <label>推理类型
+          <select id="inferKind">
+            <option value="yolo">YOLO（需 .trt 引擎）</option>
+            <option value="anomalib">Anomalib（需 .trt + metadata.json）</option>
+          </select>
+        </label>
+
+        <div class="group" id="inferYoloGroup">
+          <label>引擎文件 .trt
+            <div class="row">
+              <input type="text" id="yoloEngine" placeholder="yolo 引擎路径">
+              <button type="button" class="mini" data-browse="yoloEngine" data-mode="file">浏览</button>
+            </div>
+          </label>
+          <label>任务类型
+            <select id="inferTask">
+              <option value="detect">detect</option>
+              <option value="segment">segment</option>
+              <option value="pose">pose</option>
+              <option value="obb">obb</option>
+            </select>
+          </label>
+          <div class="grid2">
+            <label>conf <input type="number" id="inferConf" value="0.25" step="0.05" min="0" max="1"></label>
+            <label>nms <input type="number" id="inferNms" value="0.45" step="0.05" min="0" max="1"></label>
+          </div>
+        </div>
+
+        <div class="group hidden" id="inferAnomGroup">
+          <label>引擎文件 .trt
+            <div class="row">
+              <input type="text" id="anomEngine" placeholder="anomalib 引擎路径">
+              <button type="button" class="mini" data-browse="anomEngine" data-mode="file">浏览</button>
+            </div>
+          </label>
+          <label>metadata.json
+            <div class="row">
+              <input type="text" id="anomMetadata" placeholder="与引擎同目录的 metadata.json">
+              <button type="button" class="mini" data-browse="anomMetadata" data-mode="file">浏览</button>
+            </div>
+          </label>
+          <label>模型类型
+            <select id="anomModelType">
+              <option value="Auto">Auto</option>
+              <option value="PatchCore">PatchCore</option>
+              <option value="PaDiM">PaDiM</option>
+              <option value="EfficientAd">EfficientAd</option>
+            </select>
+          </label>
+        </div>
+
+        <label>图片
+          <input type="file" id="inferImage" accept=".jpg,.jpeg,.png,.bmp">
+        </label>
+
+        <div class="actions">
+          <button type="submit" class="primary" id="btnInfer">开始推理</button>
+        </div>
+        <p class="hint" id="inferHint"></p>
+      </form>
+
+      <div class="card grow">
+        <h2>结果 <span class="badge" id="inferBadge">待推理</span></h2>
+        <div class="metrics" id="inferMetrics"></div>
+        <div class="images">
+          <figure><img id="imgSource" alt="原图"><figcaption>原图</figcaption></figure>
+          <figure><img id="imgResult" alt="结果"><figcaption id="capResult">结果</figcaption></figure>
+        </div>
+        <div class="images" id="maskRow" style="display:none">
+          <figure><img id="imgMask" alt="异常轮廓"><figcaption>异常轮廓</figcaption></figure>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ==================== 环境说明 ==================== -->
+  <section class="panel" id="panel-about">
+    <div class="card">
+      <h2>当前环境</h2>
+      <pre class="log" id="capBox">加载中…</pre>
+      <h2>环境变量（需要时重启服务生效）</h2>
+      <table class="env">
+        <tr><td><code>TRTFORGE_PYTHON</code></td><td>训练用 python.exe</td></tr>
+        <tr><td><code>OPENCV_DIR</code></td><td>OpenCV 根目录，如 <code>E:\thirdparty\opencv</code></td></tr>
+        <tr><td><code>CUDA_PATH</code></td><td>CUDA 根目录，如 <code>C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v11.8</code></td></tr>
+        <tr><td><code>TRTFORGE_REPO_ROOT</code></td><td>仓库根目录（默认从本文件位置推导）</td></tr>
+        <tr><td><code>TRTFORGE_BROWSE_ROOTS</code></td><td>额外允许浏览的目录，多个用分号分隔</td></tr>
+      </table>
+    </div>
+  </section>
+</main>
+
+<!-- 目录浏览弹窗 -->
+<div class="modal hidden" id="browseModal">
+  <div class="modal-box">
+    <header>
+      <h3>选择路径</h3>
+      <button type="button" class="mini" id="browseClose">关闭</button>
+    </header>
+    <div class="current" id="browseCurrent"></div>
+    <ul class="filelist" id="browseList"></ul>
+    <footer>
+      <button type="button" id="browseUp">上一级</button>
+      <button type="button" class="primary" id="browsePick">选择当前目录</button>
+    </footer>
+  </div>
+</div>
+
+<script type="module" src="/static/js/main.js"></script>
+</body>
+</html>

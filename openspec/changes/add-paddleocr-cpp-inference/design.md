@@ -1,11 +1,11 @@
 ## Context
-TRTForge 推理演示当前采用独立推理 DLL 方案：YOLO 使用 `yolo_infer.dll` 的 `yi_*` C API，Anomalib 使用 `anomalib_infer.dll` 的 `ai_*` C API。PaddleOCR C++ 推理位于 `PaddleOCR-main/deploy/cpp_infer`，内部是 API → Pipeline → Predictor → `PaddleInfer` 的 Paddle Inference 链路。
+TRTForge 推理演示当前采用独立推理 DLL 方案：YOLO 使用 `yolo_infer.dll` 的 `yi_*` C API，Anomalib 使用 `anomalib_infer.dll` 的 `ai_*` C API。PaddleOCR C++ 推理位于 `ocr/PaddleOCR-main/deploy/cpp_infer`，内部是 API → Pipeline → Predictor → `PaddleInfer` 的 Paddle Inference 链路。
 
 用户确认的关键路径：
-- Paddle Inference 根目录：`trtexec/gui/bin/paddle_inference`
-- Paddle Inference 链接库：`trtexec/gui/bin/paddle_inference/paddle/lib/paddle_inference.lib`
-- OCR 检测模型示例目录：`trtexec/gui/bin/paddle_inference/ch_PP-OCRv4_det_infer`
-- OCR 测试图片根目录：`PaddleOCR-main/docs/datasets/images`
+- Paddle Inference 根目录：`4-qt-studio/bin/paddle_inference`
+- Paddle Inference 链接库：`4-qt-studio/bin/paddle_inference/paddle/lib/paddle_inference.lib`
+- OCR 检测模型示例目录：`4-qt-studio/bin/paddle_inference/ch_PP-OCRv4_det_infer`
+- OCR 测试图片根目录：`ocr/PaddleOCR-main/docs/datasets/images`
 
 ## Goals / Non-Goals
 - Goals:
@@ -20,7 +20,7 @@ TRTForge 推理演示当前采用独立推理 DLL 方案：YOLO 使用 `yolo_inf
   - 不修改仓库根目录下的 `bin`、`include`、`lib`。
 
 ## Decisions
-- 新增独立 `trtexec/gui/inference/ocr_infer` 子工程。
+- 新增独立 `ocr/ocr_infer` 子工程。
   - 原因：OCR 输出与 YOLO boxes、Anomalib heatmap 都不同，独立 DLL 更清晰，也方便外部复用。
 - 新增 `OcrInferWorker`，不复用 `InferWorker`。
   - 原因：OCR 需要模型目录配置、文本行结果、原始 JSON、双画布和列表展示。
@@ -142,7 +142,7 @@ typedef struct {
 
 ## Validation Plan
 - OpenSpec：`openspec validate add-paddleocr-cpp-inference --strict`
-- CMake：配置 `trtexec/gui`，确认 `ocr_infer` 能参与生成。
+- CMake：配置 `4-qt-studio`，确认 `ocr_infer` 能参与生成。
 - DLL：示例程序调用 `oi_create`、`oi_infer_file`、`oi_infer_bgr`、`oi_destroy`。
 - 数据契约：检查 `lines[i]` 与 `raw_json_utf8` 中对应数组完全一致。
 - GUI：图片、视频、相机输入能显示 OCR 框和结果列表。

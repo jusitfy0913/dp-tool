@@ -2,7 +2,7 @@
 
 > **产品定位**：工业视觉场景的 AI 缺陷检测桌面工作站，覆盖**数据标注 → 数据集导出 → YOLO/Anomalib 训练与导出 → ONNX 转 TensorRT → C++ 推理验证**闭环。  
 > **可执行程序名**：`TRTForge.exe`（源代码与工程目录仍常用名称「TRTForge」）。  
-> **配套文档**：[引擎构建参数详解](../trtexec/gui/docs/TRT_Forge_参数说明.md) · [GUI 模块说明](../trtexec/gui/README.md)
+> **配套文档**：[引擎构建参数详解](../4-qt-studio/docs/TRT_Forge_参数说明.md) · [GUI 模块说明](../4-qt-studio/README.md)
 
 **阅读提示**：下文含多张 **Mermaid 流程图与结构图**，请使用支持 Mermaid 的 Markdown 预览（如 VS Code + Markdown Preview Mermaid、Typora 等）查看。文中「界面截图」可在本地软件截取后，按 `docs/images/trtforge_manual/截图说明.txt` 命名放入同目录，即可与占位说明一一对应。
 
@@ -53,7 +53,7 @@ flowchart LR
 
 ## PaddleOCR OCR 推理补充
 
-`INFERENCE` 页新增 `OCR 文本识别 OCR` 模式。使用时先选择检测模型目录，例如 `trtexec/gui/bin/paddle_inference/ch_PP-OCRv4_det_infer`，再选择识别模型目录，例如 `trtexec/gui/bin/paddle_inference/ch_PP-OCRv4_rec_infer`。文本行方向分类为可选能力，当前测试建议先留空；只有拿到与当前 Paddle Inference 兼容、且带 `inference.yml` 的新版文本行方向模型时再启用。随后选择图片、视频或相机输入并点击「开始推理」。
+`INFERENCE` 页新增 `OCR 文本识别 OCR` 模式。使用时先选择检测模型目录，例如 `4-qt-studio/bin/paddle_inference/ch_PP-OCRv4_det_infer`，再选择识别模型目录，例如 `4-qt-studio/bin/paddle_inference/ch_PP-OCRv4_rec_infer`。文本行方向分类为可选能力，当前测试建议先留空；只有拿到与当前 Paddle Inference 兼容、且带 `inference.yml` 的新版文本行方向模型时再启用。随后选择图片、视频或相机输入并点击「开始推理」。
 
 OCR 结果包含两部分：画布上显示文本行多边形框和序号，右侧列表逐行显示文本、置信度、方向角和多边形坐标。画布与右侧结果列表之间的分隔条可拖动调整比例；点击某一条 OCR 结果时，画布中对应文本框会高亮显示。底层 `ocr_infer.dll` 会保证每一行的 `polygon`、`text`、`score`、`angle` 一一对应，便于外部调用者保存原始结果或与 PaddleOCR 输出做对齐验证。
 
@@ -84,7 +84,7 @@ flowchart LR
 
 1. 运行生成的 `TRTForge_Setup_*_x64.exe`，按向导安装（默认常至 `Program Files\TRTForge`）。  
 2. 安装目录内需包含：`TRTForge.exe`、Qt/TRT/CUDA/OpenCV 等 DLL、`yolo_infer.dll`、`anomalib_infer.dll`、`ocr_infer.dll`、`bin/paddle_inference`、`configs`、`training/scripts` 下两个 `tf_*_launcher.py` 等。  
-3. 详细制包说明见 `trtexec/gui/README.md` 中「制作 Windows 安装包」。
+3. 详细制包说明见 `4-qt-studio/README.md` 中「制作 Windows 安装包」。
 
 ### 2.3 首次启动检查清单
 
@@ -122,7 +122,7 @@ flowchart TB
 
 ### 3.2 日志与落盘
 
-关键操作日志除界面显示外，会按日期写入 UTF-8 日志文件（默认相对程序工程：`trtexec/gui/logs/YYYY-MM-DD/trtforge_YYYY-MM-DD.log`）。现场排障时可附带该文件。
+关键操作日志除界面显示外，会按日期写入 UTF-8 日志文件（默认相对程序工程：`4-qt-studio/logs/YYYY-MM-DD/trtforge_YYYY-MM-DD.log`）。现场排障时可附带该文件。
 
 ---
 
@@ -310,13 +310,13 @@ flowchart TB
 | 训练找不到脚本 | 确认 `training\scripts` 两个 py 与 exe 同根目录 |
 | Quadro 能否转 TRT | 可以，与其它 NVIDIA CUDA GPU 类似；保证驱动与 CUDA/TRT 版本匹配 |
 | 构建取消慢 | TensorRT 在部分阶段无法立即中断，需等待当前 tactic 阶段结束 |
-| 界面与文档版本不一 | 以本仓库 `trtexec/gui` 当前版本为准，并参阅参数说明文档 |
+| 界面与文档版本不一 | 以本仓库 `4-qt-studio` 当前版本为准，并参阅参数说明文档 |
 
 ---
 
 ## 10. 全界面参数与操作详解（逐项：是什么 / 怎么点）
 
-本章按**真实界面控件名称**编写，便于边看软件边查。与 [`trtexec/gui/docs/TRT_Forge_参数说明.md`](../trtexec/gui/docs/TRT_Forge_参数说明.md) 中 **INT8/BEST 下拉、运行时模式实际生效** 等描述如有出入，**以当前可执行文件界面为准**（当前引擎页已移除 INT8/BEST 精度项，并提示 INT8 需用 `trtexec` 做标定；额外参数里的 `--int8` / `--best` 会被忽略并告警）。
+本章按**真实界面控件名称**编写，便于边看软件边查。与 [`4-qt-studio/docs/TRT_Forge_参数说明.md`](../4-qt-studio/docs/TRT_Forge_参数说明.md) 中 **INT8/BEST 下拉、运行时模式实际生效** 等描述如有出入，**以当前可执行文件界面为准**（当前引擎页已移除 INT8/BEST 精度项，并提示 INT8 需用 `trtexec` 做标定；额外参数里的 `--int8` / `--best` 会被忽略并告警）。
 
 ### 10.1 主窗口与公共操作
 
@@ -507,6 +507,18 @@ flowchart LR
 | **输出目录 project** | **目录** | 训练输出根，如 `runs/trtforge` |
 | **实验名称 name** | 文本 | 每次运行子目录名；用于 `labels_<name>.json` 等 |
 
+**Anomalib 数据填写示例（仓库自带 bottle 数据集）**
+
+| 控件 | 填什么 |
+| --- | --- |
+| 训练类型 | `Anomalib 异常检测` |
+| Anomalib 模型 | `PatchCore` / `PaDiM` / `EfficientAd` |
+| 数据（Folder root） | `2-python-anomaly\anomalib-main\datasets\bottle` 的绝对路径 |
+| normal_dir / abnormal_dir / normal_test_dir | 保持默认 `train/good`、`test/abnormal`、`test/good` |
+| 输出目录 project | `results` |
+
+该目录布局必须是 `train/good`、`test/good`、`test/abnormal`。数据缺失时 launcher 会返回 `DATA_NOT_FOUND`，界面日志里能看到具体路径。
+
 #### 卡片「02 / 训练、验证与导出参数」
 
 **YOLO 区域**
@@ -610,13 +622,13 @@ flowchart TD
 
 | 内容 | 路径 |
 | --- | --- |
-| 引擎参数完整说明 | `trtexec/gui/docs/TRT_Forge_参数说明.md` |
-| GUI 技术 README | `trtexec/gui/README.md` |
+| 引擎参数完整说明 | `4-qt-studio/docs/TRT_Forge_参数说明.md` |
+| GUI 技术 README | `4-qt-studio/README.md` |
 | YOLO TRT 推理流程说明 | `docs/trtexec_gui_YOLO_TRT推理流程说明.md` |
 | 推理 DLL 与打包说明 | `docs/TRTForge_yolo_infer与anomalib_infer_DLL调用与源码打包说明.md` |
 | 软件结构优化计划 | `docs/DefectVision_AI_Studio_软件结构优化计划.md` |
-| 安装包构建脚本 | `trtexec/gui/installer/build_installer.ps1` |
+| 安装包构建脚本 | `4-qt-studio/installer/build_installer.ps1` |
 
 ---
 
-*文档版本：与仓库 `trtexec/gui` 主分支功能同步撰写；含全界面控件级说明（§10）。若界面迭代，请同步更新截图占位与表格。*
+*文档版本：与仓库 `4-qt-studio` 主分支功能同步撰写；含全界面控件级说明（§10）。若界面迭代，请同步更新截图占位与表格。*

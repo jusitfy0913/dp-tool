@@ -2,7 +2,7 @@
 
 ## Why
 
-TRTForge 已经具备标注、数据集导出、ONNX 转 TensorRT 引擎和推理验证能力，但还缺少从 YOLO 数据集到训练权重、验证指标、ONNX 产物的统一入口。用户目前需要把 `ultralytics-main` 集成进 TRTForge，并让 Qt/C++ 能稳定调用 Python 训练流程。
+TRTForge 已经具备标注、数据集导出、ONNX 转 TensorRT 引擎和推理验证能力，但还缺少从 YOLO 数据集到训练权重、验证指标、ONNX 产物的统一入口。用户目前需要把 `1-python-yolo/ultralytics-main` 集成进 TRTForge，并让 Qt/C++ 能稳定调用 Python 训练流程。
 
 训练任务耗时长、依赖复杂，若直接嵌入 Python 会增加 Qt 主程序崩溃风险。因此本变更采用方案 A：Qt 通过 `QProcess` 调用独立 Python 子进程，并预留方案 C：后续替换为本地训练服务。
 
@@ -20,13 +20,13 @@ TRTForge 已经具备标注、数据集导出、ONNX 转 TensorRT 引擎和推�
 
 - Affected specs: `yolo-training-platform`
 - Affected design files: `pencil-new.pen`
-- Affected docs: `docs/Qt_Cpp_Python训练平台_架构设计.md`、`trtexec/gui/README.md`
+- Affected docs: `docs/Qt_Cpp_Python训练平台_架构设计.md`、`4-qt-studio/README.md`
 - Affected future code:
-  - `trtexec/gui/training/scripts/tf_yolo_launcher.py`
-  - `trtexec/gui/include/*Training*.h`
-  - `trtexec/gui/src/training/*`
-  - `trtexec/gui/src/MainWindow.cpp`
+  - `1-python-yolo/launcher/tf_yolo_launcher.py`
+  - `4-qt-studio/include/*Training*.h`
+  - `4-qt-studio/src/training/*`
+  - `4-qt-studio/src/MainWindow.cpp`
 - Constraints:
   - 不修改仓库根目录 `bin/`、`include/`、`lib/`。
-  - 不直接大改 `ultralytics-main` 源码。
+  - 不直接大改 `1-python-yolo/ultralytics-main` 源码。
   - 所有脚本和文档使用 UTF-8。

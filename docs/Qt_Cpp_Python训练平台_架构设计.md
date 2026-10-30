@@ -2,7 +2,7 @@
 
 > 文档版本：v1.0  ·  日期：2026-04-23  ·  编码：UTF-8
 >
-> 适用范围：在现有 [trtexec/gui](../trtexec/gui) C++/Qt 工程基础上，扩展「数据标注 → 数据集划分 → Python 训练 → 实时回读 → PT/ONNX/TRT 产出」完整闭环。
+> 适用范围：在现有 [4-qt-studio](../4-qt-studio) C++/Qt 工程基础上，扩展「数据标注 → 数据集划分 → Python 训练 → 实时回读 → PT/ONNX/TRT 产出」完整闭环。
 
 ---
 
@@ -94,8 +94,8 @@ graph LR
 
 ### 0.5 对本工程的结论
 
-- 训练侧：保持 Python + Ultralytics（PyTorch），即 [ultralytics-main/yolo_obb.py](../ultralytics-main/yolo_obb.py) 路线。
-- 部署侧：保持 PT → ONNX → TRT → C++ SDK，即 [trtexec/gui/inference/yolo_infer/src/yolo.hpp](../trtexec/gui/inference/yolo_infer/src/yolo.hpp) 路线，业界金标准。
+- 训练侧：保持 Python + Ultralytics（PyTorch），即 [1-python-yolo/ultralytics-main/yolo_obb.py](../1-python-yolo/ultralytics-main/yolo_obb.py) 路线。
+- 部署侧：保持 PT → ONNX → TRT → C++ SDK，即 [3-cpp-tensorrt/yolo_infer/src/yolo.hpp](../3-cpp-tensorrt/yolo_infer/src/yolo.hpp) 路线，业界金标准。
 - 增强方向（融入本方案后续章节）：INT8 量化、CUDA 预处理、动态 shape、可选引入 Triton、可选引入 EfficientAD 异常检测、用 W&B / MLflow 管理实验。
 
 ---
@@ -154,7 +154,7 @@ flowchart TB
     end
 
     subgraph trtChain [TensorRT 链路 C++]
-        Trtexec[trtexec/CUDA]
+        Trtexec["3-cpp-tensorrt/trtexec + CUDA"]
         InferSDK[现有 yolo_infer]
     end
 
@@ -198,7 +198,7 @@ flowchart TB
 ## 四、目录结构规划
 
 ```
-trtexec/gui/
+4-qt-studio/
   ├─ runtime/
   │   └─ python/                          # 绿色 Python 环境（方案 B）
   │       ├─ python.exe
@@ -206,7 +206,7 @@ trtexec/gui/
   ├─ training/                            # 新增训练子系统
   │   ├─ scripts/
   │   │   ├─ train_launcher.py            # 统一训练入口（被 C++ 调起）
-  │   │   ├─ export_onnx.py               # 复用 ultralytics-main/yolo_obb.py 思路
+  │   │   ├─ export_onnx.py               # 复用 1-python-yolo/ultralytics-main/yolo_obb.py 思路
   │   │   ├─ split_dataset.py             # 训/验/测集划分（也可由 C++ 直接做）
   │   │   └─ protocol.py                  # 与 C++ 通信的 JSONL 协议常量
   │   └─ tasks/                           # 任务模板：detect/obb/pose/segment
@@ -297,7 +297,7 @@ runtime\python\python.exe training\scripts\train_launcher.py ^
 {"type":"event","name":"finished","exit":0}
 ```
 
-- 训练结束自动调用 `export_onnx.py`，复用现有 [ultralytics-main/yolo_obb.py](../ultralytics-main/yolo_obb.py) 中 `apply_onnx_last_output_transpose` 的逻辑产出 `.transd.onnx`。
+- 训练结束自动调用 `export_onnx.py`，复用现有 [1-python-yolo/ultralytics-main/yolo_obb.py](../1-python-yolo/ultralytics-main/yolo_obb.py) 中 `apply_onnx_last_output_transpose` 的逻辑产出 `.transd.onnx`。
 - `protocol.py` 仅维护字段常量，避免 C++ / Python 两侧字符串漂移。
 
 ### 5.3 标注模块 `AnnotationCanvas`（C++/Qt）
@@ -306,7 +306,7 @@ runtime\python\python.exe training\scripts\train_launcher.py ^
 
 - 工具栏：选择 / 矩形框 / OBB（5 参数：cx, cy, w, h, θ）/ 多边形 / 关键点
 - 画布：`QGraphicsView` + 自定义 `QGraphicsItem`，支持缩放、平移、控制点拖拽
-- 标签管理：标签集（颜色 / 快捷键），与 [trtexec/gui/bin/configs/labels_obb_dota_v1.json](../trtexec/gui/bin/configs/labels_obb_dota_v1.json) 同款 JSON 复用
+- 标签管理：标签集（颜色 / 快捷键），与 [4-qt-studio/bin/configs/labels_obb_dota_v1.json](../4-qt-studio/bin/configs/labels_obb_dota_v1.json) 同款 JSON 复用
 - 导出格式：YOLO Detect / YOLO-OBB / COCO（OBB 用 8 点格式适配 Ultralytics）
 - 持久化：每张图一份 sidecar JSON（含原始坐标 + 修订历史）+ 导出时再转 YOLO txt
 - 半自动加速（可选 v2）：调 Python `predict_launcher.py` 拿现有模型预标注，复用 TrainController 的子进程模式
@@ -362,9 +362,9 @@ signals:
 
 ## 七、与现有工程的衔接点
 
-- 训练产出的 `.pt → .onnx → .transd.onnx` 直接喂给现有 [trtexec/gui](../trtexec/gui) 的 trtexec 转换链路与 [trtexec/gui/inference/yolo_infer/src/yolo.hpp](../trtexec/gui/inference/yolo_infer/src/yolo.hpp) 推理 SDK，**无需改动推理侧**。
-- Python 转 transd 的逻辑已在 [ultralytics-main/yolo_obb.py](../ultralytics-main/yolo_obb.py)、[ultralytics-main/yolo_pose_export_transd.py](../ultralytics-main/yolo_pose_export_transd.py) 中验证，本方案直接抽取为 `training/scripts/export_onnx.py` 复用。
-- 标注模块导出的 `labels_*.json` 与现有 [trtexec/gui/bin/configs/labels_obb_dota_v1.json](../trtexec/gui/bin/configs/labels_obb_dota_v1.json) 同 schema，推理与训练共用一份标签。
+- 训练产出的 `.pt → .onnx → .transd.onnx` 直接喂给现有 [4-qt-studio](../4-qt-studio) 的 trtexec 转换链路与 [3-cpp-tensorrt/yolo_infer/src/yolo.hpp](../3-cpp-tensorrt/yolo_infer/src/yolo.hpp) 推理 SDK，**无需改动推理侧**。
+- Python 转 transd 的逻辑已在 [1-python-yolo/ultralytics-main/yolo_obb.py](../1-python-yolo/ultralytics-main/yolo_obb.py)、[1-python-yolo/ultralytics-main/yolo_pose_export_transd.py](../1-python-yolo/ultralytics-main/yolo_pose_export_transd.py) 中验证，本方案直接抽取为 `training/scripts/export_onnx.py` 复用。
+- 标注模块导出的 `labels_*.json` 与现有 [4-qt-studio/bin/configs/labels_obb_dota_v1.json](../4-qt-studio/bin/configs/labels_obb_dota_v1.json) 同 schema，推理与训练共用一份标签。
 
 ---
 
@@ -410,10 +410,10 @@ signals:
 Qt 侧新增 `YOLO TRAINING LAB · 训练导出` 页签，通过 `YoloTrainController` 使用 `QProcess` 启动：
 
 ```bat
-python trtexec\gui\training\scripts\tf_yolo_launcher.py --mode check-env
-python trtexec\gui\training\scripts\tf_yolo_launcher.py --mode train --task detect --data dataset.yaml --model yolov8n.pt
-python trtexec\gui\training\scripts\tf_yolo_launcher.py --mode val --task obb --weights runs\...\best.pt --data dataset.yaml
-python trtexec\gui\training\scripts\tf_yolo_launcher.py --mode export --task obb --weights runs\...\best.pt --format onnx --make-transd true
+python 1-python-yolo\launcher\tf_yolo_launcher.py --mode check-env
+python 1-python-yolo\launcher\tf_yolo_launcher.py --mode train --task detect --data dataset.yaml --model yolov8n.pt
+python 1-python-yolo\launcher\tf_yolo_launcher.py --mode val --task obb --weights runs\...\best.pt --data dataset.yaml
+python 1-python-yolo\launcher\tf_yolo_launcher.py --mode export --task obb --weights runs\...\best.pt --format onnx --make-transd true
 ```
 
 第一版支持四种任务头：
@@ -492,7 +492,7 @@ YOLO Training Lab 新增训练监控页签：
 
 ## 附录 B：参考文件
 
-- 训练侧参考：[ultralytics-main/yolo_obb.py](../ultralytics-main/yolo_obb.py)、[ultralytics-main/yolo_pose.py](../ultralytics-main/yolo_pose.py)、[ultralytics-main/yolo_pose_export_transd.py](../ultralytics-main/yolo_pose_export_transd.py)
-- 推理侧参考：[trtexec/gui/inference/yolo_infer/src/yolo.hpp](../trtexec/gui/inference/yolo_infer/src/yolo.hpp)、[YOLOv8_obb/normal/include/yolov8-obb.hpp](../YOLOv8_obb/normal/include/yolov8-obb.hpp)
-- 标签配置参考：[trtexec/gui/bin/configs/labels_obb_dota_v1.json](../trtexec/gui/bin/configs/labels_obb_dota_v1.json)
-- 既有部署文档：[docs/YOLOv8_TensorRT_部署工程总结.md](./YOLOv8_TensorRT_部署工程总结.md)、[trtexec/gui/docs/TRT_Forge_参数说明.md](../trtexec/gui/docs/TRT_Forge_参数说明.md)
+- 训练侧参考：[1-python-yolo/ultralytics-main/yolo_obb.py](../1-python-yolo/ultralytics-main/yolo_obb.py)、[1-python-yolo/ultralytics-main/yolo_pose.py](../1-python-yolo/ultralytics-main/yolo_pose.py)、[1-python-yolo/ultralytics-main/yolo_pose_export_transd.py](../1-python-yolo/ultralytics-main/yolo_pose_export_transd.py)
+- 推理侧参考：[3-cpp-tensorrt/yolo_infer/src/yolo.hpp](../3-cpp-tensorrt/yolo_infer/src/yolo.hpp)、[5-reference/YOLOv8_obb/normal/include/yolov8-obb.hpp](../5-reference/YOLOv8_obb/normal/include/yolov8-obb.hpp)
+- 标签配置参考：[4-qt-studio/bin/configs/labels_obb_dota_v1.json](../4-qt-studio/bin/configs/labels_obb_dota_v1.json)
+- 既有部署文档：[docs/YOLOv8_TensorRT_部署工程总结.md](./YOLOv8_TensorRT_部署工程总结.md)、[4-qt-studio/docs/TRT_Forge_参数说明.md](../4-qt-studio/docs/TRT_Forge_参数说明.md)

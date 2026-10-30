@@ -25,7 +25,7 @@ flowchart TB
 
 ## Goals
 
-- 使用 `ultralytics-main` 提供的 YOLO Python API 完成训练、验证、ONNX 导出。
+- 使用 `1-python-yolo/ultralytics-main` 提供的 YOLO Python API 完成训练、验证、ONNX 导出。
 - 第一批支持 `detect`、`segment`、`pose`、`obb` 四种任务头。
 - Python 训练子进程报错时，Qt 主程序不崩溃，只弹窗和写日志。
 - Python 的普通 `print`、Ultralytics 日志、stderr 都能完整回显到 Qt 日志面板。
@@ -38,7 +38,7 @@ flowchart TB
 - 第一版不让脚本自动安装缺失依赖，只检测并给出提示。
 - 第一版不把 Python 嵌入 Qt 进程。
 - 第一版不直接导出 TensorRT engine；ONNX 转 engine 继续使用现有 TRTForge 构建链路。
-- 第一版不修改 `ultralytics-main` 源码。
+- 第一版不修改 `1-python-yolo/ultralytics-main` 源码。
 
 ## Architecture Decision
 
@@ -177,7 +177,7 @@ Python 侧规则：
 }
 ```
 
-标签 JSON 命名为 `labels_<实验名称>.json`，不覆盖 `labels_coco.json`。同名时追加时间戳，分别保存到训练目录和 `trtexec/gui/bin/configs`，供后续 TRT 推理选择。
+标签 JSON 命名为 `labels_<实验名称>.json`，不覆盖 `labels_coco.json`。同名时追加时间戳，分别保存到训练目录和 `4-qt-studio/bin/configs`，供后续 TRT 推理选择。
 
 ## Parameter Exposure
 

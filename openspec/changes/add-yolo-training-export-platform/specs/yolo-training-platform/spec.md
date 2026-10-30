@@ -125,7 +125,7 @@ The system SHALL generate label JSON files compatible with the TRTForge inferenc
 - **WHEN** a training run finishes and class names can be read from the dataset or model
 - **THEN** the launcher SHALL generate `labels_<experiment>.json`
 - **AND** the JSON SHALL contain `name` and `classes` fields compatible with `labels_coco.json`
-- **AND** it SHALL save a copy in the training run directory and a copy under `trtexec/gui/bin/configs`
+- **AND** it SHALL save a copy in the training run directory and a copy under `4-qt-studio/bin/configs`
 - **AND** it SHALL emit `artifact` events with kind `labels_json`
 
 #### Scenario: Label JSON name already exists

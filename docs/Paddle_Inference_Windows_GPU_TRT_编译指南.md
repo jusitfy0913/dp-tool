@@ -1,6 +1,6 @@
 # Windows 下编译 Paddle Inference（GPU + TensorRT）
 
-本文说明如何在本机编译带 **GPU** 与 **TensorRT 子图** 的 Paddle Inference C++ 库，并替换 TRTForge OCR 使用的 `trtexec/gui/bin/paddle_inference`，以解决界面选择 `gpu:0` 时出现 `Please use PaddlePaddle with GPU version` 的问题。
+本文说明如何在本机编译带 **GPU** 与 **TensorRT 子图** 的 Paddle Inference C++ 库，并替换 TRTForge OCR 使用的 `4-qt-studio/bin/paddle_inference`，以解决界面选择 `gpu:0` 时出现 `Please use PaddlePaddle with GPU version` 的问题。
 
 官方文档（步骤参考，分支已过时）：[Windows 下从源码编译](https://www.paddlepaddle.org.cn/inference/v3.0/guides/install/compile/source_compile_under_Windows.html)
 
@@ -29,31 +29,42 @@
 在 **「适用于 VS 2022 的 x64 本机工具命令提示符」**（管理员可选）中执行：
 
 ```powershell
-cd D:\test1\deeplearning
+cd <你的仓库根目录>
 powershell -ExecutionPolicy Bypass -File scripts\build_paddle_inference_win_gpu_trt.ps1
 ```
 
+脚本内所有路径都按自身位置推导，默认值为：
+
+| 变量 | 默认值 |
+| --- | --- |
+| 仓库根 | `scripts` 目录的上一级 |
+| Paddle 源码 | `<仓库根>\third_party\Paddle` |
+| 构建目录 | `<仓库根>\third_party\Paddle\build_infer_trt` |
+| 同步目标 | `<仓库根>\4-qt-studio\bin` |
+
+需要放到别处时用环境变量覆盖：`PADDLE_THIRD_PARTY_ROOT`、`PADDLE_SRC`、`PADDLE_BUILD`、`PYTHON_EXE`。
+
 英文脚本说明见同目录 `docs/Paddle_Inference_Windows_GPU_TRT_compile_guide.md`（内容与本文一致，便于 ASCII 环境）。
 
-一键全流程（子模块 + 配置 + 编译 + 同步）：
+一键全流程（配置 + 编译 + 同步），`%~dp0` 会自动推导仓库根：
 
 ```bat
-start "" cmd /c D:\test1\deeplearning\scripts\paddle_infer_configure_build_sync.bat
+start "" cmd /c <你的仓库根目录>\scripts\paddle_infer_configure_build_sync.bat
 ```
 
-若 **configure 已成功**（存在 `build_infer_trt\Paddle.sln`），仅后台编译并同步：
+若 **configure 已成功**（存在 `build_infer_trt\Paddle.sln`），仅后台编译并同步（`-SkipConfigure`）：
 
 ```bat
-start "" cmd /c D:\test1\deeplearning\scripts\paddle_infer_build_sync_only.bat
+start "" cmd /c <你的仓库根目录>\scripts\paddle_infer_build_sync_only.bat
 ```
 
 日志：`third_party\Paddle\build_logs\paddle_infer_build.log`  
-同步脚本：`scripts\sync_paddle_inference_to_gui_bin.ps1`（保留 `ch_PP-OCRv4_*` 模型目录）。
+同步脚本：`scripts\sync_paddle_inference_to_bin.ps1`（目标目录 `4-qt-studio\bin`，保留 `ch_PP-OCRv4_*` 模型目录）。
 
 仅做 CMake 配置：
 
-```bat
-D:\test1\deeplearning\third_party\Paddle\configure_infer_trt.bat
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\build_paddle_inference_win_gpu_trt.ps1 -ConfigureOnly
 ```
 
 自定义路径示例：
@@ -82,7 +93,7 @@ powershell -ExecutionPolicy Bypass -File scripts\build_paddle_inference_win_gpu_
 ## 5. 编译成功后替换 TRTForge 库
 
 1. 在构建目录找到：`third_party\Paddle\build_infer_trt\paddle_inference_install_dir`
-2. **备份** 现有 `trtexec/gui/bin/paddle_inference`（尤其 `ch_PP-OCRv4_*` 模型目录）
+2. **备份** 现有 `4-qt-studio/bin/paddle_inference`（尤其 `ch_PP-OCRv4_*` 模型目录）
 3. 复制 install_dir 中的：
    - `paddle/lib/paddle_inference.lib`、`paddle_inference.dll`
    - `paddle/include/**`

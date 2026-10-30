@@ -57,11 +57,11 @@ TRTForge SHALL configure PaddleOCR model directories and validate required infer
 - **THEN** the system SHALL fail loading with a clear error that names the missing file
 
 ### Requirement: Paddle Inference Dependency Configuration
-TRTForge SHALL build `ocr_infer.dll` against the Paddle Inference dependency directory under `trtexec/gui/bin/paddle_inference`.
+TRTForge SHALL build `ocr_infer.dll` against the Paddle Inference dependency directory under `4-qt-studio/bin/paddle_inference`.
 
 #### Scenario: Link Paddle Inference
 - **WHEN** CMake configures `ocr_infer`
-- **THEN** it SHALL use `trtexec/gui/bin/paddle_inference` as the default `PADDLE_LIB` and link `paddle/lib/paddle_inference.lib`
+- **THEN** it SHALL use `4-qt-studio/bin/paddle_inference` as the default `PADDLE_LIB` and link `paddle/lib/paddle_inference.lib`
 
 #### Scenario: Runtime dependency missing
 - **WHEN** Paddle runtime DLLs or third-party DLLs are missing at runtime
@@ -87,7 +87,7 @@ TRTForge SHALL use the user-provided PaddleOCR test image directory for basic OC
 
 #### Scenario: Collect test images
 - **WHEN** OCR validation runs
-- **THEN** it SHALL recursively collect common image formats from `PaddleOCR-main/docs/datasets/images`
+- **THEN** it SHALL recursively collect common image formats from `ocr/PaddleOCR-main/docs/datasets/images`
 
 #### Scenario: Validate raw data contract
 - **WHEN** validation processes a test image

@@ -4,7 +4,7 @@
 
 ## 1. 当前现状
 
-DefectVision AI Studio 当前由 `trtexec/gui` 工程承载，编译产物仍保持 `TRTForge.exe`。现有能力已经覆盖：
+DefectVision AI Studio 当前由 `4-qt-studio` 工程承载，编译产物仍保持 `TRTForge.exe`。现有能力已经覆盖：
 
 - TensorRT 引擎构建：ONNX 解析、精度配置、动态 shape、自检、构建日志和进度估算。
 - 标注与数据集：图片导入、标签管理、标注画布、train/val/test 划分、YOLO/COCO/VOC 导出。
@@ -40,7 +40,7 @@ DefectVision AI Studio 当前由 `trtexec/gui` 工程承载，编译产物仍保
 建议逐步演进为以下目录结构：
 
 ```text
-trtexec/gui/
+4-qt-studio/
   include/
     app/
     engine/
@@ -172,7 +172,7 @@ AppProgressEvent
 按日期日志落盘建议：
 
 ```text
-trtexec/gui/logs/
+4-qt-studio/logs/
   2026-05-14/
     trtforge_2026-05-14.log
 ```
@@ -202,7 +202,7 @@ trtexec/gui/logs/
 
 - 不要一次性重写全部日志，建议先新增适配层，再逐页迁移。
 - 日志文件必须使用 UTF-8，避免中文路径、中文错误信息在跨平台查看时乱码。
-- 日志目录不应放到仓库根目录的 `bin/include/lib`；建议放在 `trtexec/gui/logs`，并在打包时可选择保留或清理。
+- 日志目录不应放到仓库根目录的 `bin/include/lib`；建议放在 `4-qt-studio/logs`，并在打包时可选择保留或清理。
 
 ### 4.4 Dataset 模块独立
 
@@ -267,7 +267,7 @@ trtexec/gui/logs/
 | B | 4~6 天 | 拆出 `EngineBuilderTab`，保持 UI 和操作路径不变 | `EngineBuilderTab.h/.cpp`，`MainWindow.cpp` 明显变薄 | 中 | ONNX 构建、日志、进度、自检全部可用 |
 | C | 3~5 天 | 抽 `DatasetSplitPolicy`、`DatasetYamlWriter`、数据集路径校验 | `DatasetSplitPolicy`、`DatasetYamlWriter` | 低 | YOLO 导出目录结构和 `dataset.yaml` 与旧版本一致 |
 | D | 4~6 天 | 抽 `TrainEventParser`、`TrainConfig`、`TrainingArtifactModel` | 训练 DTO、事件解析器、产物模型 | 中 | YOLO/Anomalib 环境检测、训练、导出日志和产物显示正常 |
-| E | 4~6 天 | 新增统一日志和进度事件模型，补充按日期日志落盘，先接构建与训练 | `AppLogEvent`、`AppProgressEvent`、`AppFileLogger`、日志适配层 | 中 | 构建和训练日志颜色、错误弹窗、进度刷新不退化；`trtexec/gui/logs` 生成当天日志 |
+| E | 4~6 天 | 新增统一日志和进度事件模型，补充按日期日志落盘，先接构建与训练 | `AppLogEvent`、`AppProgressEvent`、`AppFileLogger`、日志适配层 | 中 | 构建和训练日志颜色、错误弹窗、进度刷新不退化；`4-qt-studio/logs` 生成当天日志 |
 | F | 3~5 天 | 整理推理 GUI 适配层，区分 UI、worker、结果展示 | YOLO/Anomalib adapter、结果 presenter | 中 | 图片/视频推理、异常热力图、阈值调整正常 |
 
 ### 5.3 详细里程碑
@@ -278,7 +278,7 @@ trtexec/gui/logs/
 
 任务：
 
-- 确认当前 `trtexec/gui` 能在目标机器用 MSVC/CMake 编译。
+- 确认当前 `4-qt-studio` 能在目标机器用 MSVC/CMake 编译。
 - 固定一组回归用例：
   - 一个可构建的 ONNX 模型。
   - 一个可导出的 YOLO 标注项目。
@@ -394,7 +394,7 @@ trtexec/gui/logs/
 - 先接入 TensorRT 构建和 Python 训练，不急于改完所有页面。
 - 统一日志级别：`info/warn/error/success/stage/debug`。
 - 保留旧 UI 日志显示，避免用户体验变化过大。
-- 新增 `AppFileLogger`，将 `AppLogEvent` 以 UTF-8 追加写入 `trtexec/gui/logs/YYYY-MM-DD/trtforge_YYYY-MM-DD.log`。
+- 新增 `AppFileLogger`，将 `AppLogEvent` 以 UTF-8 追加写入 `4-qt-studio/logs/YYYY-MM-DD/trtforge_YYYY-MM-DD.log`。
 - 每行日志带完整时间、来源、级别和原始消息；Python stdout/stderr 原样保存。
 - 第一阶段至少覆盖 ENGINE、TRAINING；第二阶段补 INFERENCE、ANNOTATION 关键状态。
 
@@ -544,7 +544,7 @@ flowchart TB
 - 保持旧配置键 `AnnotationDataset/splitTrainPct`、`splitValPct`、`splitTestPct` 不变，避免用户已有默认比例丢失。
 - 将标注页项目文件、图片导入、类别导入、COCO/VOC/YOLO 标注导入、YOLO/COCO/VOC 导出的最近目录收敛到 `AppSettings`。
 - 保持最近目录配置仍位于 `AnnotationDataset` 分组下，便于后续继续集中管理标注工作台配置。
-- 更新 `trtexec/gui/CMakeLists.txt`，只加入新增 `AppSettings` 源文件和头文件，不修改 `project(TRTForge)`、`add_executable(TRTForge)`、DLL 名称或输出目录。
+- 更新 `4-qt-studio/CMakeLists.txt`，只加入新增 `AppSettings` 源文件和头文件，不修改 `project(TRTForge)`、`add_executable(TRTForge)`、DLL 名称或输出目录。
 
 未修改范围：
 
@@ -567,12 +567,12 @@ flowchart TB
 - 将 TensorRT 引擎构建页的 UI 卡片、按钮槽函数、`BuildOptions` 收集、实时日志、构建进度、耗时/显存刷新、自检报告从 `MainWindow` 迁移到 `EngineBuilderTab`。
 - 将 `BuilderWorker`、构建线程、`TRTProgressMonitor`、构建计时器归属迁移到 `EngineBuilderTab`。
 - `MainWindow` 仅保留顶部栏、GPU 状态和四个主功能页签创建，应用外壳职责更清楚。
-- 更新 `trtexec/gui/CMakeLists.txt`，加入 `EngineBuilderTab` 源文件和头文件，不修改 `project(TRTForge)`、`add_executable(TRTForge)`、DLL 名称或输出目录。
+- 更新 `4-qt-studio/CMakeLists.txt`，加入 `EngineBuilderTab` 源文件和头文件，不修改 `project(TRTForge)`、`add_executable(TRTForge)`、DLL 名称或输出目录。
 
 验证结果：
 
 - 已使用 `C:\Program Files\CMake\bin\cmake.exe --preset vs2022-x64` 完成 CMake 配置。
-- 已使用 `C:\Program Files\CMake\bin\cmake.exe --build --preset vs2022-x64` 完成 Release 编译，生成 `trtexec/gui/bin/TRTForge.exe`。
+- 已使用 `C:\Program Files\CMake\bin\cmake.exe --build --preset vs2022-x64` 完成 Release 编译，生成 `4-qt-studio/bin/TRTForge.exe`。
 - 编译过程中 `yolo_infer.dll` 与 `anomalib_infer.dll` 均正常生成；本批次未修改两个推理 DLL 的源码和 C API。
 
 未修改范围：
@@ -628,7 +628,7 @@ flowchart TB
 - 构建页将 `TRTLogger` 日志先映射为 `AppLogEvent`，再复用原彩色日志 UI 和 `TRTProgressMonitor`。
 - 训练页将普通日志、进程启动/结束、Python `progress` 事件映射为 `AppLogEvent` / `AppProgressEvent`，再复用原 QTextBrowser 显示。
 - 保留旧 UI 展示方式，不改变用户看到的日志内容、错误弹窗和进度刷新路径。
-- 新增 `include/common/AppFileLogger.h` 和 `src/common/AppFileLogger.cpp`，将日志以 UTF-8 追加写入 `trtexec/gui/logs/YYYY-MM-DD/trtforge_YYYY-MM-DD.log`。
+- 新增 `include/common/AppFileLogger.h` 和 `src/common/AppFileLogger.cpp`，将日志以 UTF-8 追加写入 `4-qt-studio/logs/YYYY-MM-DD/trtforge_YYYY-MM-DD.log`。
 - 构建页 `EngineBuilderTab` 通过 `appendColored()` 同步写入 ENGINE 日志，覆盖 ONNX 识别、TensorRT 构建、自检和构建结果。
 - 训练页 `TrainingTab` 通过 `appendLog()` 同步写入 TRAINING 日志，覆盖 Python stdout/stderr、结构化进度、进程启动/结束和错误。
 - 推理页 `InferenceTab` 写入 INFERENCE 关键状态，覆盖模型加载、加载失败、采集错误、推理错误和停止。
@@ -640,14 +640,14 @@ flowchart TB
 
 E2 已完成范围：
 
-- 默认写入 `trtexec/gui/logs/YYYY-MM-DD/trtforge_YYYY-MM-DD.log`，使用 UTF-8 文本。
+- 默认写入 `4-qt-studio/logs/YYYY-MM-DD/trtforge_YYYY-MM-DD.log`，使用 UTF-8 文本。
 - 日志格式统一为 `时间 [来源] [级别] 消息`。
 - 已接入 `EngineBuilderTab`、`TrainingTab` 和 `InferenceTab`。
-- `trtexec/gui/CMakeLists.txt` 已加入新增日志文件类。
+- `4-qt-studio/CMakeLists.txt` 已加入新增日志文件类。
 
 验证结果：
 
-- 已通过 `C:\Program Files\CMake\bin\cmake.exe --build --preset vs2022-x64 --target TRTForge` 编译验证，生成 `trtexec/gui/bin/TRTForge.exe`。
+- 已通过 `C:\Program Files\CMake\bin\cmake.exe --build --preset vs2022-x64 --target TRTForge` 编译验证，生成 `4-qt-studio/bin/TRTForge.exe`。
 - 编译过程中 `yolo_infer.dll` 与 `anomalib_infer.dll` 正常生成；本批次未修改两个推理 DLL 的源码和 C API。
 
 未修改范围：
@@ -687,11 +687,11 @@ E2 已完成范围：
 - 新增 `include/inference/AnomalyInferenceAdapter.h` 和 `src/inference/AnomalyInferenceAdapter.cpp`，封装 GUI 对 `AnomalyInferWorker::loadEngine()` 的 queued connection 调用。
 - 新增 `include/inference/InferenceResultPresenter.h` 和 `src/inference/InferenceResultPresenter.cpp`，集中处理推理耗时文本、检测数量文本和异常 OK/NG 状态颜色。
 - `InferenceTab` 继续负责 UI 布局、线程生命周期和信号连接；模型加载调用与部分结果展示格式已从页面代码中抽离。
-- 更新 `trtexec/gui/CMakeLists.txt`，加入新增 inference 适配层和 presenter 文件。
+- 更新 `4-qt-studio/CMakeLists.txt`，加入新增 inference 适配层和 presenter 文件。
 
 验证结果：
 
-- 已通过 `C:\Program Files\CMake\bin\cmake.exe --build "d:\test1\deeplearning\trtexec\gui\build" --config Release --target TRTForge` 编译验证，生成 `trtexec/gui/bin/TRTForge.exe`。
+- 已通过 `C:\Program Files\CMake\bin\cmake.exe --build "d:\test1\deeplearning\4-qt-studio\build" --config Release --target TRTForge` 编译验证，生成 `4-qt-studio/bin/TRTForge.exe`。
 - 编译过程中 `yolo_infer.dll` 与 `anomalib_infer.dll` 正常生成；本批次未修改两个推理 DLL 的源码和 C API。
 
 未修改范围：

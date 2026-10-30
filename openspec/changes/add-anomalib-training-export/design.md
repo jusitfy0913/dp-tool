@@ -259,6 +259,6 @@ Anomalib 模式必须在训练页保留一个面向用户的 `QTextBrowser` 日�
 
 ## Open Questions
 
-- 默认 `project` 是否继续放在 `results`，还是统一放到 `trtexec/gui/runs/anomalib`。
+- 默认 `project` 是否继续放在 `results`，还是统一放到 `4-qt-studio/runs/anomalib`。
 - `normal_dir`、`abnormal_dir`、`normal_test_dir` 第一版是否允许绝对路径与相对路径同时存在。
 - EfficientAd 的 `imagenet_dir` 若不存在时，是阻止训练还是只给 warning 并让用户选择。

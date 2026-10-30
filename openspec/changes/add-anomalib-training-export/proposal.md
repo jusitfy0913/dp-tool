@@ -2,7 +2,7 @@
 
 ## Why
 
-TRTForge 已经具备 YOLO 训练导出、ONNX 转 TensorRT 和 Anomalib TensorRT 推理能力，但异常检测模型仍需要用户手工运行 `anomalib/anomalib-main/train.py`、整理 `model.onnx` 与 `metadata.json`。这会让 PatchCore、PaDiM、EfficientAd 的训练导出链路分散，且容易再次出现 metadata 阈值契约不一致的问题。
+TRTForge 已经具备 YOLO 训练导出、ONNX 转 TensorRT 和 Anomalib TensorRT 推理能力，但异常检测模型仍需要用户手工运行 `2-python-anomaly/anomalib-main/train.py`、整理 `model.onnx` 与 `metadata.json`。这会让 PatchCore、PaDiM、EfficientAd 的训练导出链路分散，且容易再次出现 metadata 阈值契约不一致的问题。
 
 本变更在现有训练导出页新增 `Anomalib 异常检测` 模式，沿用 `QProcess + Python launcher + TRTFORGE_JSON`，让用户在 Qt 界面里完成环境检测、Folder 数据集配置、训练、ONNX 导出和 metadata 生成。
 
@@ -20,14 +20,14 @@ TRTForge 已经具备 YOLO 训练导出、ONNX 转 TensorRT 和 Anomalib TensorR
 - Affected specs: `anomalib-training-export`
 - Affected design files: `pencil-new.pen`
 - Affected future code:
-  - `trtexec/gui/training/scripts/tf_anomalib_launcher.py`
-  - `trtexec/gui/include/TrainingTab.h`
-  - `trtexec/gui/src/training/TrainingTab.cpp`
-  - `trtexec/gui/include/YoloTrainController.h`
-  - `trtexec/gui/src/training/YoloTrainController.cpp`
-  - `anomalib/anomalib-main/trtforge_metadata.py`
+  - `2-python-anomaly/launcher/tf_anomalib_launcher.py`
+  - `4-qt-studio/include/TrainingTab.h`
+  - `4-qt-studio/src/training/TrainingTab.cpp`
+  - `4-qt-studio/include/YoloTrainController.h`
+  - `4-qt-studio/src/training/YoloTrainController.cpp`
+  - `2-python-anomaly/anomalib-main/trtforge_metadata.py`
 - Affected docs:
-  - `trtexec/gui/README.md`
+  - `4-qt-studio/README.md`
   - `readme.md`
 - Constraints:
   - 不修改仓库根目录 `bin/`、`include/`、`lib/`。

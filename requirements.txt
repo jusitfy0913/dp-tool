@@ -5,7 +5,7 @@ albucore==0.0.24
 albumentations==2.0.8
 annotated-doc==0.0.4
 annotated-types==0.7.0
--e git+https://github.com/jusitfy0913/dp-tool.git@67c5879873b051200012a678ab1ce1c7738f23f2#egg=anomalib&subdirectory=anomalib\anomalib-main
+-e git+https://github.com/jusitfy0913/dp-tool.git@67c5879873b051200012a678ab1ce1c7738f23f2#egg=anomalib&subdirectory=2-python-anomaly\anomalib-main
 antlr4-python3-runtime==4.9.3
 anyio==4.12.1
 async-timeout==5.0.1

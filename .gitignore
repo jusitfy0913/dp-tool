@@ -4,8 +4,10 @@
 build/
 **/build/
 # TRTForge：本地 VS/CMake 生成目录（勿提交）
-trtexec/gui/build/
-trtexec/gui/dist/
+4-qt-studio/build/
+4-qt-studio/dist/
+# Paddle Inference 源码与构建工作区（体积大，勿提交；见 scripts/build_paddle_inference_win_gpu_trt.ps1）
+third_party/
 # 二次开发包输出（体积大，勿提交）
 dist/
 cmake-build-*/
@@ -39,7 +41,7 @@ env/
 # Training / inference temporary outputs
 runs/
 **/runs/
-trtexec/gui/logs/
+4-qt-studio/logs/
 *.log
 *.tmp
 *.temp
@@ -57,7 +59,7 @@ Thumbs.db
 *.pem
 
 # Compiled binaries and runtime output (do not push)
-trtexec/gui/bin/
+4-qt-studio/bin/
 **/bin/Debug/
 **/bin/Release/
 *.dll
@@ -87,17 +89,25 @@ trtexec/gui/bin/
 *.mov
 数据集合/
 PCB缺陷检测数据集/
+# 现场采集的 PCB 原始数据集（约 914MB，勿入库）
+/PCB data/
 pre_trained/
 trtmodel/
 results/
 **/results/
 **/datasets/
 
+# 根目录 bin 下的训练冒烟测试残留产物
+/bin/configs/labels_yolo_smoke.json
+
 # Local / broken copies, not the training source of truth
-ultralytics/
-anomalib/anomalib-master/
-anomalib/anomalib-tensorrt-cpp-main/
-anomalib/bottle/
+# 只忽略「仓库根目录」下的旧副本；不要写成 ultralytics/、anomalib/，
+# 否则会连 1-python-yolo/ultralytics-main/ultralytics、2-python-anomaly/anomalib-main/src/anomalib
+# 这些真正的训练源码一起忽略掉（源码进不了 git，换机器就丢）。
+/ultralytics/
+/anomalib/
+2-python-anomaly/anomalib-master/
+2-python-anomaly/anomalib-tensorrt-cpp-main/
 
 # Editor / agent local folders
 .cursor/
@@ -109,4 +119,14 @@ anomalib/bottle/
 **/*.egg-info/
 
 # Anomalib example notebooks are Git LFS pointers without local objects
-anomalib/anomalib-main/examples/notebooks/
+2-python-anomaly/anomalib-main/examples/notebooks/
+
+# Web Studio（6-web）运行产物
+# 上传的临时图片、任务日志、Python 缓存都不入库
+6-web/runtime/
+6-web/backend/__pycache__/
+**/__pycache__/
+*.pyc
+
+# 推理 DLL 的 CMake 构建目录
+build/infer_dlls/

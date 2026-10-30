@@ -10,4 +10,4 @@ TRTForge annotation workbench currently auto-splits images with a fixed 8/1/1 ra
 
 ## Impact
 - Affected specs: annotation-dataset-workbench
-- Affected code: `trtexec/gui/src/annotation/AnnotationTab.cpp`, `trtexec/gui/include/AnnotationTab.h`
+- Affected code: `4-qt-studio/src/annotation/AnnotationTab.cpp`, `4-qt-studio/include/AnnotationTab.h`

@@ -31,11 +31,11 @@ TRTForge 当前已经具备 ONNX 到 TensorRT 引擎构建、YOLO TensorRT 推�
 ## Impact
 - Affected specs: `annotation-dataset-workbench`
 - Affected code:
-  - `trtexec/gui/src/MainWindow.cpp`
-  - `trtexec/gui/include/MainWindow.h`
-  - `trtexec/gui/src/InferenceTab.cpp`
-  - `trtexec/gui/include/InferenceTab.h`
-  - 新增 `trtexec/gui/src/annotation/` 标注画布与数据模型
-  - 新增 `trtexec/gui/src/dataset/` 数据集划分与导出模块
-  - 新增或扩展 `trtexec/gui/bin/configs/` 下的项目/类别配置样例
+  - `4-qt-studio/src/MainWindow.cpp`
+  - `4-qt-studio/include/MainWindow.h`
+  - `4-qt-studio/src/InferenceTab.cpp`
+  - `4-qt-studio/include/InferenceTab.h`
+  - 新增 `4-qt-studio/src/annotation/` 标注画布与数据模型
+  - 新增 `4-qt-studio/src/dataset/` 数据集划分与导出模块
+  - 新增或扩展 `4-qt-studio/bin/configs/` 下的项目/类别配置样例
 

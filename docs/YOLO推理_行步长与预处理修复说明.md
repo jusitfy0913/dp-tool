@@ -1,12 +1,12 @@
 # YOLO 推理：行步长（stride）与 GUI 预处理修复说明
 
-本文档记录为修复 **TRT Forge 与 YOLOv8-seg 同图同模型推理结果严重不一致** 问题所做的源码级修改，包括：**新增字段、注释说明、删除/替换逻辑、行为变化** 与 **验证要点**。
+本文档记录为修复 **TRT Forge 与 5-reference/YOLOv8-seg 同图同模型推理结果严重不一致** 问题所做的源码级修改，包括：**新增字段、注释说明、删除/替换逻辑、行为变化** 与 **验证要点**。
 
 ---
 
 ## 1. 背景与根因（摘要）
 
-- **现象**：同一 `bus.jpg`、同一 `best.engine`，TRT Forge 侧检测/分割质量极差（漏检、低置信度、mask 异常），而 `D:\YOLOv8-seg` 工程正常。
+- **现象**：同一 `bus.jpg`、同一 `best.engine`，TRT Forge 侧检测/分割质量极差（漏检、低置信度、mask 异常），而 `D:\5-reference/YOLOv8-seg` 工程正常。
 - **结论**：**不是模型或 TensorRT 引擎问题**，主要是 **CPU 侧图像缓冲的「每行字节数」（stride / line_size）与推理预处理假设不一致**。
 - **机制**：
   - `QImage::Format_RGB888` 下，每行常按 **4 字节对齐**，当 `width × 3` 不能被 4 整除时，每行末尾存在 **padding**（例如宽 810：`810×3=2430`，对齐后 `bytesPerLine()=2432`）。
@@ -18,10 +18,10 @@
 
 | 文件 | 变更类型 |
 |------|----------|
-| `inference/yolo_infer/src/yolo.hpp` | 结构体扩展 + Doxygen 注释 |
-| `inference/yolo_infer/src/yolo.cu` | 预处理逻辑 + **英文**行内注释（见 §6） |
-| `inference/yolo_infer/src/yolo_infer_c.cpp` | 去掉中间 `cv::Mat` 包装，stride 透传 + 中文注释 |
-| `src/InferWorker.cpp` | 头文件引入 + RGB→BGR 路径改为 `cv::cvtColor` + 中文块注释 |
+| `3-cpp-tensorrt/yolo_infer/src/yolo.hpp` | 结构体扩展 + Doxygen 注释 |
+| `3-cpp-tensorrt/yolo_infer/src/yolo.cu` | 预处理逻辑 + **英文**行内注释（见 §6） |
+| `3-cpp-tensorrt/yolo_infer/src/yolo_infer_c.cpp` | 去掉中间 `cv::Mat` 包装，stride 透传 + 中文注释 |
+| `4-qt-studio/src/InferWorker.cpp` | 头文件引入 + RGB→BGR 路径改为 `cv::cvtColor` + 中文块注释 |
 
 **未改动的对外 C API**：`yolo_infer_c.h` 中 `yi_infer_bgr(..., int stride, ...)` 签名未变，仅实现与下游 `yolo::Image` 语义对齐。
 
@@ -198,7 +198,7 @@ yi_infer_bgr(m_handle, bgr.data, w, h, static_cast<int>(bgr.step), ...);
 ## 8. 验证建议
 
 1. 使用 **宽度满足 `width×3 % 4 != 0`** 的图（如 810 宽）复测；修复前后差异应最明显。
-2. 同图同 `engine` 对比 `D:\YOLOv8-seg` 与 TRT Forge：框数量、类别、置信度、mask 轮廓应收敛。
+2. 同图同 `engine` 对比 `D:\5-reference/YOLOv8-seg` 与 TRT Forge：框数量、类别、置信度、mask 轮廓应收敛。
 3. 编译前若 **`yolo_infer.dll` 被占用**（`TRTForge.exe` 正在运行），链接器可能报 `LNK1104`；需先关闭进程再生成。
 
 ---
@@ -209,10 +209,10 @@ yi_infer_bgr(m_handle, bgr.data, w, h, static_cast<int>(bgr.step), ...);
 
 | 文件 | 内容摘要 |
 |------|----------|
-| `gui/CMakeLists.txt` | `QT_DIR_HINT`、`OPENCV_DIR` 默认路径；CUDA 11.8 + 新 MSVC 的 `STL1002` 旁路（`NVCC_PREPEND_FLAGS` / `NVCC_APPEND_FLAGS`、`CUDAFLAGS`、`add_compile_definitions(_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH)` 等） |
-| `gui/CMakePresets.json` | 与上一致的缓存变量与环境变量 |
-| `gui/README.md` | 环境路径与示例命令同步 |
-| `gui/inference/yolo_infer/CMakeLists.txt` | `OPENCV_DIR` 默认路径；子工程 CUDA flag 与父工程协调 |
+| `4-qt-studio/CMakeLists.txt` | `QT_DIR_HINT`、`OPENCV_DIR` 默认路径；CUDA 11.8 + 新 MSVC 的 `STL1002` 旁路（`NVCC_PREPEND_FLAGS` / `NVCC_APPEND_FLAGS`、`CUDAFLAGS`、`add_compile_definitions(_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH)` 等） |
+| `4-qt-studio/CMakePresets.json` | 与上一致的缓存变量与环境变量 |
+| `4-qt-studio/README.md` | 环境路径与示例命令同步 |
+| `3-cpp-tensorrt/yolo_infer/CMakeLists.txt` | `OPENCV_DIR` 默认路径；子工程 CUDA flag 与父工程协调 |
 
 **stride 修复的核心交付**仍以 **§2 表中四个文件** 为准。
 
@@ -221,5 +221,5 @@ yi_infer_bgr(m_handle, bgr.data, w, h, static_cast<int>(bgr.step), ...);
 ## 10. 文档版本信息
 
 - **主题**：YOLO 推理输入行步长（`line_size` / stride）与 TRT Forge GUI 预处理。
-- **适用目录**：`trtexec/gui/` 下 `yolo_infer` 动态库与 Qt 推理工作线程。
+- **适用目录**：`4-qt-studio/` 下 `yolo_infer` 动态库与 Qt 推理工作线程。
 - **维护建议**：若未来在 `.cu` 中增加注释，**优先 ASCII**，或为 CUDA 目标单独启用 `/utf-8` 后再写中文注释。

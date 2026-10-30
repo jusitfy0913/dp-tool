@@ -7,7 +7,7 @@
 - [x] 1.5 经用户确认后再进入代码实现。
 
 ## 2. Python 统一入口
-- [x] 2.1 新增 `trtexec/gui/training/scripts/tf_yolo_launcher.py`，作为 C++/Qt 唯一调用入口。
+- [x] 2.1 新增 `1-python-yolo/launcher/tf_yolo_launcher.py`，作为 C++/Qt 唯一调用入口。
 - [x] 2.2 支持 `--mode check-env`，检测 Python、torch、CUDA、ultralytics、onnx、onnxruntime。
 - [x] 2.3 支持 `--mode probe-model`，读取模型路径、任务头、类别与基础信息。
 - [x] 2.4 支持 `--mode train`，调用 Ultralytics `YOLO(...).train(...)`。
@@ -54,5 +54,5 @@
 - [ ] 6.3 使用已有标注工作台导出的 `dataset.yaml` 验证 Ultralytics 可识别。
 - [x] 6.3.1 使用短训练验证指标表、图表刷新、GPU 状态和 `labels_*.json` 生成。
 - [x] 6.4 更新 `docs/Qt_Cpp_Python训练平台_架构设计.md`。
-- [x] 6.5 更新 `trtexec/gui/README.md`。
+- [x] 6.5 更新 `4-qt-studio/README.md`。
 - [x] 6.6 如根目录仍无 `readme.md`，补充项目总说明。

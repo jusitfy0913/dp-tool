@@ -12,7 +12,7 @@
 | Anomalib TensorRT 异常检测 | `anomalib_infer.dll` | PatchCore / PaDiM / EfficientAd 等 | **RGB888** |
 | PaddleOCR C++ OCR 推理 | `ocr_infer.dll` | 文本检测 / 文本识别 / 文本行原始数据输出 | **BGR888** |
 
-与 TRTForge 主程序一起构建时，DLL 通常输出到工程 **`trtexec/gui/bin`**，与 `TRTForge.exe` 同目录，运行时需能加载到 TensorRT、CUDA、OpenCV、Paddle Inference 等依赖 DLL。
+与 TRTForge 主程序一起构建时，DLL 通常输出到工程 **`4-qt-studio/bin`**，与 `TRTForge.exe` 同目录，运行时需能加载到 TensorRT、CUDA、OpenCV、Paddle Inference 等依赖 DLL。
 
 公开接口均为 **C ABI**（`extern "C"`），可从 C++、C# P/Invoke、Python `ctypes` 等调用。
 
@@ -22,7 +22,7 @@
 
 ### 2.1 头文件与符号
 
-- 头文件路径：`trtexec/gui/inference/yolo_infer/include/yolo_infer_c.h`
+- 头文件路径：`3-cpp-tensorrt/yolo_infer/include/yolo_infer_c.h`
 - 导出宏：编译 DLL 时定义 `YOLO_INFER_EXPORTS`，外部工程 **不要** 定义该宏（使用 `__declspec(dllimport)`）。
 
 ### 2.2 核心 API
@@ -59,9 +59,9 @@ yi_create → （循环）yi_infer_bgr → yi_destroy
 
 ### 2.6 源码与构建
 
-- 目录：`trtexec/gui/inference/yolo_infer/`
-- 入口 CMake：`trtexec/gui/inference/yolo_infer/CMakeLists.txt`
-- 主程序通过 `trtexec/gui/CMakeLists.txt` 中 `add_subdirectory(inference/yolo_infer)` 链入。
+- 目录：`3-cpp-tensorrt/yolo_infer/`
+- 入口 CMake：`3-cpp-tensorrt/yolo_infer/CMakeLists.txt`
+- 主程序通过 `4-qt-studio/CMakeLists.txt` 中 `add_subdirectory(${TRTFORGE_REPO_ROOT}/3-cpp-tensorrt/yolo_infer)` 链入。
 
 ---
 
@@ -69,7 +69,7 @@ yi_create → （循环）yi_infer_bgr → yi_destroy
 
 ### 3.1 头文件与符号
 
-- 头文件路径：`trtexec/gui/inference/anomalib_infer/include/anomalib_infer_c.h`
+- 头文件路径：`3-cpp-tensorrt/anomalib_infer/include/anomalib_infer_c.h`
 - 导出宏：编译 DLL 时定义 `ANOMALIB_INFER_EXPORTS`。
 
 ### 3.2 核心 API
@@ -112,14 +112,14 @@ const char* ai_last_error(void);
 
 ### 3.6 示例与说明
 
-- 文字说明：`trtexec/gui/inference/anomalib_infer/README.md`
-- C++：`trtexec/gui/inference/anomalib_infer/examples/cpp_basic/`
-- Python：`trtexec/gui/inference/anomalib_infer/examples/python_ctypes/infer_image.py`
+- 文字说明：`3-cpp-tensorrt/anomalib_infer/README.md`
+- C++：`3-cpp-tensorrt/anomalib_infer/examples/cpp_basic/`
+- Python：`3-cpp-tensorrt/anomalib_infer/examples/python_ctypes/infer_image.py`
 
 ### 3.7 源码与构建
 
-- 目录：`trtexec/gui/inference/anomalib_infer/`
-- CMake：`trtexec/gui/inference/anomalib_infer/CMakeLists.txt`
+- 目录：`3-cpp-tensorrt/anomalib_infer/`
+- CMake：`3-cpp-tensorrt/anomalib_infer/CMakeLists.txt`
 
 ---
 
@@ -127,7 +127,7 @@ const char* ai_last_error(void);
 
 ### 4.1 头文件与符号
 
-- 头文件路径：`trtexec/gui/inference/ocr_infer/include/ocr_infer_c.h`
+- 头文件路径：`ocr/ocr_infer/include/ocr_infer_c.h`
 - 导出宏：编译 DLL 时定义 `OCR_INFER_EXPORTS`。
 
 ### 4.2 核心 API
@@ -171,19 +171,19 @@ const char* oi_last_error(void);
 
 ### 4.5 源码与构建
 
-- 目录：`trtexec/gui/inference/ocr_infer/`
-- CMake：`trtexec/gui/inference/ocr_infer/CMakeLists.txt`
-- 示例：`trtexec/gui/inference/ocr_infer/examples/cpp_basic/`
-- 独立编译：`cd trtexec/gui/inference/ocr_infer; cmake --preset vs2022-x64; cmake --build --preset vs2022-x64`
-- TRTForge 主工程默认不再直接 `add_subdirectory` 编译 OCR；主工程默认导入 `trtexec/gui/bin/ocr_infer.dll` 与 `trtexec/gui/bin/ocr_infer.lib`，避免 OCR 第三方目标进入主解决方案。
+- 目录：`ocr/ocr_infer/`
+- CMake：`ocr/ocr_infer/CMakeLists.txt`
+- 示例：`ocr/ocr_infer/examples/cpp_basic/`
+- 独立编译：`cd ocr/ocr_infer; cmake --preset vs2022-x64; cmake --build --preset vs2022-x64`
+- TRTForge 主工程默认不再直接 `add_subdirectory` 编译 OCR；主工程默认导入 `4-qt-studio/bin/ocr_infer.dll` 与 `4-qt-studio/bin/ocr_infer.lib`，避免 OCR 第三方目标进入主解决方案。
 
 ---
 
 ## 5. TRTForge GUI 中的使用位置（参考）
 
-- YOLO：`trtexec/gui/inference/yolo_infer/` 由推理页通过 **C API** 加载引擎与推理。
-- Anomalib：`trtexec/gui/src/AnomalyInferWorker.cpp` 等对 **`ai_*`** 的薄封装，任务类型选择 **异常检测 ANOMALY** 时使用。
-- OCR：`trtexec/gui/src/OcrInferWorker.cpp` 等对 **`oi_*`** 的薄封装，任务类型选择 **OCR 文本识别 OCR** 时使用；GUI 结果列表点击某一行时，会用 `oi_result.lines[i].xs/ys` 对应的多边形在画布中高亮该文本框。
+- YOLO：`3-cpp-tensorrt/yolo_infer/` 由推理页通过 **C API** 加载引擎与推理。
+- Anomalib：`4-qt-studio/src/AnomalyInferWorker.cpp` 等对 **`ai_*`** 的薄封装，任务类型选择 **异常检测 ANOMALY** 时使用。
+- OCR：`4-qt-studio/src/OcrInferWorker.cpp` 等对 **`oi_*`** 的薄封装，任务类型选择 **OCR 文本识别 OCR** 时使用；GUI 结果列表点击某一行时，会用 `oi_result.lines[i].xs/ys` 对应的多边形在画布中高亮该文本框。
 
 更完整的 YOLO 推理流水线（binding、解码、NMS 等）见：
 
@@ -206,9 +206,9 @@ const char* oi_last_error(void);
 
 仓库提供脚本（UTF-8），在生成 zip 时会包含：
 
-- `trtexec/gui/inference/yolo_infer/`（头文件、`src`、`CMakeLists.txt`）
-- `trtexec/gui/inference/anomalib_infer/`（含 `examples`）
-- `trtexec/gui/inference/ocr_infer/`（头文件、`src`、`CMakeLists.txt`、`examples`）
+- `3-cpp-tensorrt/yolo_infer/`（头文件、`src`、`CMakeLists.txt`）
+- `3-cpp-tensorrt/anomalib_infer/`（含 `examples`）
+- `ocr/ocr_infer/`（头文件、`src`、`CMakeLists.txt`、`examples`）
 - 本说明（zip 内文件名）：`TRTForge_inference_dll_SDK_zh-CN.md`（由脚本从 `docs/TRTForge_yolo_infer*.md` 复制）
 
 **不**内含：已编译的 `.dll`、TensorRT/CUDA SDK（体量大且受许可约束）；分发运行时请单独拷贝 `bin` 下 DLL 及 NVIDIA/OpenCV 运行时。
@@ -216,29 +216,29 @@ const char* oi_last_error(void);
 在仓库根目录执行：
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\trtexec\gui\inference\package_inference_sdk.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File .\4-qt-studio\inference\package_inference_sdk.ps1
 ```
 
 可选参数：
 
 ```powershell
-.\trtexec\gui\inference\package_inference_sdk.ps1 -OutDir D:\dist -ZipName my_inference_sdk
+.\4-qt-studio\inference\package_inference_sdk.ps1 -OutDir D:\dist -ZipName my_inference_sdk
 ```
 
 生成的 zip 默认类似：`trtforge_inference_dll_sdk_YYYYMMDD_HHmmss.zip`，解压后可直接用 CMake 将 `yolo_infer` / `anomalib_infer` / `ocr_infer` 子目录并入你的工程，或对照包内 `TRTForge_inference_dll_SDK_zh-CN.md` 做二次封装。
 
 ### 7.1 打包整个 `inference` 目录（三个工程 + 脚本 + 说明）
 
-若需要 **`trtexec/gui/inference` 下全部内容**（含 `yolo_infer`、`anomalib_infer`、`ocr_infer`、`package_inference_sdk.ps1`、`package_gui_inference_full.ps1` 等），并附带仓库中的 **DLL 综合说明** 与 **YOLO 推理详解**（若存在），使用：
+若需要 **`4-qt-studio/inference` 下全部内容**（含 `yolo_infer`、`anomalib_infer`、`ocr_infer`、`package_inference_sdk.ps1`、`package_gui_inference_full.ps1` 等），并附带仓库中的 **DLL 综合说明** 与 **YOLO 推理详解**（若存在），使用：
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\trtexec\gui\inference\package_gui_inference_full.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File .\4-qt-studio\inference\package_gui_inference_full.ps1
 ```
 
 可选：
 
 ```powershell
-.\trtexec\gui\inference\package_gui_inference_full.ps1 -OutDir D:\dist -ZipName trtforge_gui_inference_full
+.\4-qt-studio\inference\package_gui_inference_full.ps1 -OutDir D:\dist -ZipName trtforge_gui_inference_full
 ```
 
 解压后典型结构：`README_PACKAGE.txt`、`inference/`（完整源码树）、`docs/`（说明文档副本）。
@@ -248,16 +248,16 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\trtexec\gui\inference\pack
 给其他开发同事、但**不提供**封装后推理实现源码时，使用：
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\trtexec\package_devkit.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File .\3-cpp-tensorrt\trtexec\package_devkit.ps1
 ```
 
 | 会打进去 | 不会打进去 |
 | --- | --- |
-| GUI 源码、`gui/training` 启动脚本 | `yolo_infer` / `anomalib_infer` / `ocr_infer` 的 `src` |
-| `ultralytics-main`、`anomalib/anomalib-main` | Anomalib 历史 `datasets` / `results` |
-| 预编译 `*_infer.dll`、`*_infer.lib`、C API 头文件 | `gui/build`、日志、`.pdb` |
+| `4-qt-studio` Qt 源码、`4-qt-studio/bin/training/scripts` 启动脚本 | `yolo_infer` / `anomalib_infer` / `ocr_infer` 的 `src` |
+| `1-python-yolo/ultralytics-main`、`2-python-anomaly/anomalib-main` | Anomalib 历史 `datasets` / `results` |
+| 预编译 `*_infer.dll`、`*_infer.lib`、C API 头文件 | `4-qt-studio/build`、日志、`.pdb` |
 
-默认输出到仓库根目录 `dist/trtforge_devkit_时间戳/`。解压后必须保持 `trtexec`、`ultralytics-main`、`anomalib` 在同一级。开发包内 `CMakeLists.txt` 已改为导入预编译推理 DLL。说明见包内 `README_DEVKIT.md`。
+默认输出到仓库根目录 `dist/trtforge_devkit_时间戳/`。解压后必须保持 `4-qt-studio`、`1-python-yolo`、`2-python-anomaly` 在同一级。开发包内 `CMakeLists.txt` 已改为导入预编译推理 DLL。说明见包内 `README_DEVKIT.md`。
 
 这与上面的「推理 SDK 源码 zip」相反：开发包给 DLL、不给推理源码；SDK zip 给源码、不给 DLL。
 
@@ -266,4 +266,4 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\trtexec\package_devkit.ps1
 ## 8. 版本与维护
 
 - 若 C API 有变更，以各目录下 **`include/*_infer_c.h`** 为唯一权威；本文描述与头文件冲突时，**以头文件为准**。
-- Anomalib 部署侧 `metadata.json` 字段含义与 `output_contract` 约定，以 `anomalib/anomalib-main/trtforge_metadata.py` 及 TRTForge README 为准。
+- Anomalib 部署侧 `metadata.json` 字段含义与 `output_contract` 约定，以 `2-python-anomaly/anomalib-main/trtforge_metadata.py` 及 TRTForge README 为准。

@@ -17,14 +17,14 @@ TRTForge 当前推理演示只面向 YOLO 检测、分割、姿态和旋转框�
 ## Impact
 - Affected specs: `anomalib-trt-inference`
 - Affected code:
-  - `trtexec/gui/include/InferenceTab.h`
-  - `trtexec/gui/src/InferenceTab.cpp`
-  - `trtexec/gui/CMakeLists.txt`
-  - `anomalib/anomalib-main/train.py`
-  - `anomalib/anomalib-main/trtforge_metadata.py`
-  - `anomalib/anomalib-main/compare_ckpt_onnx_inference.py`
+  - `4-qt-studio/include/InferenceTab.h`
+  - `4-qt-studio/src/InferenceTab.cpp`
+  - `4-qt-studio/CMakeLists.txt`
+  - `2-python-anomaly/anomalib-main/train.py`
+  - `2-python-anomaly/anomalib-main/trtforge_metadata.py`
+  - `2-python-anomaly/anomalib-main/compare_ckpt_onnx_inference.py`
   - 新增 Anomalib TRT 推理 worker 和 metadata loader
 - Affected docs:
   - `readme.md`
-  - `trtexec/gui/README.md`
+  - `4-qt-studio/README.md`
   - `docs/trtexec_gui_YOLO_TRT推理流程说明.md`

@@ -1,18 +1,18 @@
-# trtexec/gui/inference：YOLO TensorRT 推理流程说明（详尽版）
+# 3-cpp-tensorrt/yolo_infer：YOLO TensorRT 推理流程说明（详尽版）
 
-本文档完整说明 `trtexec/gui/inference/yolo_infer` 中的推理库实现，覆盖 **TensorRT 引擎加载与执行、CUDA 显存/锁页内存/流/事件、各类型输出头（DET/SEG/POSE/OBB）的张量布局与解码、letterbox 仿射、NMS、实例分割 mask 合成、原图坐标还原、C API 与常见坑**。所有引用均给出代码位置（`startLine:endLine:相对路径`）。文内英文/缩写可查阅 **§0.1 英文名词与缩写释义**；对外可调用的 C/C++ 接口见 **§11 API 参考**。
+本文档完整说明 `3-cpp-tensorrt/yolo_infer` 中的推理库实现，覆盖 **TensorRT 引擎加载与执行、CUDA 显存/锁页内存/流/事件、各类型输出头（DET/SEG/POSE/OBB）的张量布局与解码、letterbox 仿射、NMS、实例分割 mask 合成、原图坐标还原、C API 与常见坑**。所有引用均给出代码位置（`startLine:endLine:相对路径`）。文内英文/缩写可查阅 **§0.1 英文名词与缩写释义**；对外可调用的 C/C++ 接口见 **§11 API 参考**。
 
 ---
 
 ## 0. 源码索引
 
-- `trtexec/gui/inference/yolo_infer/src/yolo.cu` — YOLO 前处理 / 多版本 decode / NMS / 分割 mask / 业务侧 `InferImpl`
-- `trtexec/gui/inference/yolo_infer/src/yolo.hpp` — `Type` / `Box` / `Image` / `InstanceSegmentMap` / `Infer`
-- `trtexec/gui/inference/yolo_infer/src/infer.cu` — TRT `Runtime/Engine/Context` 封装、`enqueueV2`、`BaseMemory` / `Memory` 实现、`Timer`
-- `trtexec/gui/inference/yolo_infer/src/infer.hpp` — `trt::Infer` 抽象接口与 RAII 内存
-- `trtexec/gui/inference/yolo_infer/src/yolo_infer_c.cpp` / `include/yolo_infer_c.h` — 给 Qt/GUI 用的 C API（`yi_*`）
-- `trtexec/gui/inference/anomalib_infer/src/anomalib_infer_c.cpp` / `include/anomalib_infer_c.h` — Anomalib TensorRT 异常检测推理 DLL，读取 `metadata.json` 并输出热力图、Mask 和 OK/NG 状态
-- `trtexec/gui/src/AnomalyInferWorker.cpp` / `include/AnomalyInferWorker.h` — 给 Qt/GUI 用的 Anomalib DLL 薄适配 worker，负责 QImage 与 C API 结果转换
+- `3-cpp-tensorrt/yolo_infer/src/yolo.cu` — YOLO 前处理 / 多版本 decode / NMS / 分割 mask / 业务侧 `InferImpl`
+- `3-cpp-tensorrt/yolo_infer/src/yolo.hpp` — `Type` / `Box` / `Image` / `InstanceSegmentMap` / `Infer`
+- `3-cpp-tensorrt/yolo_infer/src/infer.cu` — TRT `Runtime/Engine/Context` 封装、`enqueueV2`、`BaseMemory` / `Memory` 实现、`Timer`
+- `3-cpp-tensorrt/yolo_infer/src/infer.hpp` — `trt::Infer` 抽象接口与 RAII 内存
+- `3-cpp-tensorrt/yolo_infer/src/yolo_infer_c.cpp` / `include/yolo_infer_c.h` — 给 Qt/GUI 用的 C API（`yi_*`）
+- `3-cpp-tensorrt/anomalib_infer/src/anomalib_infer_c.cpp` / `include/anomalib_infer_c.h` — Anomalib TensorRT 异常检测推理 DLL，读取 `metadata.json` 并输出热力图、Mask 和 OK/NG 状态
+- `4-qt-studio/src/AnomalyInferWorker.cpp` / `include/AnomalyInferWorker.h` — 给 Qt/GUI 用的 Anomalib DLL 薄适配 worker，负责 QImage 与 C API 结果转换
 
 ### 0.0.1 Windows 中文路径兼容
 
@@ -35,7 +35,7 @@ TRTForge GUI 的推理演示需要同时加载 `.trt` 引擎、图片/视频和 
 
 ### 0.0.3 Anomalib TRT 异常检测模式
 
-TRTForge 推理演示新增 `异常检测 ANOMALY` 模式，用于加载 Anomalib 已生成的 TensorRT engine 和部署用 `metadata.json`。该模式只做推理，不在 GUI 内负责 Anomalib 训练、ONNX 导出或 engine 构建。Anomalib 推理核心已封装为独立 `anomalib_infer.dll`，TRTForge GUI、外部 C++ 和 Python ctypes 都通过同一套 `ai_*` C API 调用。Anomalib 2.x 训练默认只保存 Lightning `model.ckpt`，因此本工程在 `anomalib/anomalib-main/train.py` 导出 `model.onnx` 后，额外生成 C++ 可读取的 `metadata.json`。
+TRTForge 推理演示新增 `异常检测 ANOMALY` 模式，用于加载 Anomalib 已生成的 TensorRT engine 和部署用 `metadata.json`。该模式只做推理，不在 GUI 内负责 Anomalib 训练、ONNX 导出或 engine 构建。Anomalib 推理核心已封装为独立 `anomalib_infer.dll`，TRTForge GUI、外部 C++ 和 Python ctypes 都通过同一套 `ai_*` C API 调用。Anomalib 2.x 训练默认只保存 Lightning `model.ckpt`，因此本工程在 `2-python-anomaly/anomalib-main/train.py` 导出 `model.onnx` 后，额外生成 C++ 可读取的 `metadata.json`。
 
 运行链路为：
 
@@ -64,22 +64,22 @@ flowchart LR
 
 UI 输出为原图、热力图叠加图、红色异常轮廓预测图三个子窗口，双击任一子窗口可全屏，再次双击恢复三窗口，同时显示 normalized score、raw score、阈值和 OK/NG 状态。
 
-外部调用入口为 `trtexec/gui/inference/anomalib_infer/include/anomalib_infer_c.h`。调用顺序为 `ai_create` → `ai_get_metadata` → `ai_infer_rgb` → `ai_destroy`。`ai_infer_rgb` 返回的 `ai_result` 指针和其中图像/map 内存由 DLL 句柄持有，只保证到下一次 `ai_infer_rgb` 或 `ai_destroy` 前有效，外部 C++/Python 程序必须立即深拷贝。示例见 `trtexec/gui/inference/anomalib_infer/examples/cpp_basic` 和 `trtexec/gui/inference/anomalib_infer/examples/python_ctypes/infer_image.py`。
+外部调用入口为 `3-cpp-tensorrt/anomalib_infer/include/anomalib_infer_c.h`。调用顺序为 `ai_create` → `ai_get_metadata` → `ai_infer_rgb` → `ai_destroy`。`ai_infer_rgb` 返回的 `ai_result` 指针和其中图像/map 内存由 DLL 句柄持有，只保证到下一次 `ai_infer_rgb` 或 `ai_destroy` 前有效，外部 C++/Python 程序必须立即深拷贝。示例见 `3-cpp-tensorrt/anomalib_infer/examples/cpp_basic` 和 `3-cpp-tensorrt/anomalib_infer/examples/python_ctypes/infer_image.py`。
 
 训练/导出侧新增两个 Python 文件：
 
 | 文件 | 作用 |
 | --- | --- |
-| `anomalib/anomalib-main/train.py` | 训练并导出 Anomalib 模型，支持 `--model patchcore|padim|efficientad` 选择 PatchCore、PaDiM、EfficientAd |
-| `anomalib/anomalib-main/trtforge_metadata.py` | 生成 TRTForge metadata 契约，并复用 ONNX 预处理、输出解析、归一化公式 |
-| `anomalib/anomalib-main/compare_ckpt_onnx_inference.py` | 对同一输入比较 `model.ckpt` 与 `model.onnx` 的耗时、score、OK/NG 和 anomaly map 差异 |
+| `2-python-anomaly/anomalib-main/train.py` | 训练并导出 Anomalib 模型，支持 `--model patchcore|padim|efficientad` 选择 PatchCore、PaDiM、EfficientAd |
+| `2-python-anomaly/anomalib-main/trtforge_metadata.py` | 生成 TRTForge metadata 契约，并复用 ONNX 预处理、输出解析、归一化公式 |
+| `2-python-anomaly/anomalib-main/compare_ckpt_onnx_inference.py` | 对同一输入比较 `model.ckpt` 与 `model.onnx` 的耗时、score、OK/NG 和 anomaly map 差异 |
 
 典型验证顺序：
 
 ```powershell
-cd anomalib\anomalib-main
+cd 2-python-anomaly\anomalib-main
 python train.py --model patchcore
-python compare_ckpt_onnx_inference.py --model patchcore --ckpt weights\lightning\model.ckpt --onnx weights\lightning\model.onnx --metadata weights\lightning\metadata.json --input D:\test1\deeplearning\anomalib\bottle\test\good
+python compare_ckpt_onnx_inference.py --model patchcore --ckpt weights\lightning\model.ckpt --onnx weights\lightning\model.onnx --metadata weights\lightning\metadata.json --input <仓库根>\2-python-anomaly\anomalib-main\datasets\bottle\test\good
 ```
 
 ---
@@ -246,7 +246,7 @@ flowchart LR
 
 构造时一次完成 **反序列化 → 创建上下文**，析构按相反顺序释放，避免 nvinfer 句柄泄漏。
 
-```267:300:trtexec/gui/inference/yolo_infer/src/infer.cu
+```267:300:3-cpp-tensorrt/yolo_infer/src/infer.cu
 class __native_engine_context {
  public:
   virtual ~__native_engine_context() { destroy(); }
@@ -277,7 +277,7 @@ class __native_engine_context {
 
 ### 2.2 加载 `.engine` 文件
 
-```249:265:trtexec/gui/inference/yolo_infer/src/infer.cu
+```249:265:3-cpp-tensorrt/yolo_infer/src/infer.cu
 static std::vector<uint8_t> load_file(const string &file) {
   ifstream in(file, ios::in | ios::binary);
   if (!in.is_open()) return {};
@@ -297,7 +297,7 @@ static std::vector<uint8_t> load_file(const string &file) {
 }
 ```
 
-```318:325:trtexec/gui/inference/yolo_infer/src/infer.cu
+```318:325:3-cpp-tensorrt/yolo_infer/src/infer.cu
   bool load(const string &file) {
     auto data = load_file(file);
     if (data.empty()) {
@@ -312,7 +312,7 @@ static std::vector<uint8_t> load_file(const string &file) {
 
 ### 2.3 Binding 索引表：`name → index`
 
-```327:336:trtexec/gui/inference/yolo_infer/src/infer.cu
+```327:336:3-cpp-tensorrt/yolo_infer/src/infer.cu
   void setup() {
     auto engine = this->context_->engine_;
     int nbBindings = engine->getNbBindings();
@@ -330,7 +330,7 @@ static std::vector<uint8_t> load_file(const string &file) {
 
 ### 2.4 形状信息与动态 shape
 
-```351:368:trtexec/gui/inference/yolo_infer/src/infer.cu
+```351:368:3-cpp-tensorrt/yolo_infer/src/infer.cu
   virtual std::vector<int> run_dims(const std::string &name) override {
     return run_dims(index(name));
   }
@@ -354,7 +354,7 @@ static std::vector<uint8_t> load_file(const string &file) {
 - `run_dims`：从 **context** 取「当前实际形状」，需先 `set_run_dims` 才会更新。
 - `has_dynamic_dim()`（第 399–409 行）逐 binding 扫描，遇到 `-1` 则视为动态模型。
 
-```379:384:trtexec/gui/inference/yolo_infer/src/infer.cu
+```379:384:3-cpp-tensorrt/yolo_infer/src/infer.cu
   virtual bool set_run_dims(int ibinding, const std::vector<int> &dims) override {
     Dims d;
     memcpy(d.d, dims.data(), sizeof(int) * dims.size());
@@ -365,7 +365,7 @@ static std::vector<uint8_t> load_file(const string &file) {
 
 业务层在 batch 变化时调用：
 
-```815:831:trtexec/gui/inference/yolo_infer/src/yolo.cu
+```815:831:3-cpp-tensorrt/yolo_infer/src/yolo.cu
     auto input_dims = trt_->static_dims(0);
     int infer_batch_size = input_dims[0];
     if (infer_batch_size != num_image) {
@@ -390,7 +390,7 @@ static std::vector<uint8_t> load_file(const string &file) {
 
 ### 2.5 真正的推理：`enqueueV2`
 
-```345:349:trtexec/gui/inference/yolo_infer/src/infer.cu
+```345:349:3-cpp-tensorrt/yolo_infer/src/infer.cu
   virtual bool forward(const std::vector<void *> &bindings, void *stream,
                        void *input_consum_event) override {
     return this->context_->context_->enqueueV2((void**)bindings.data(), (cudaStream_t)stream,
@@ -404,7 +404,7 @@ static std::vector<uint8_t> load_file(const string &file) {
 
 ### 2.6 业务层组织 bindings
 
-```839:844:trtexec/gui/inference/yolo_infer/src/yolo.cu
+```839:844:3-cpp-tensorrt/yolo_infer/src/yolo.cu
     float *bbox_output_device = bbox_predict_.gpu();
     vector<void *> bindings{input_buffer_.gpu(), bbox_output_device};
 
@@ -430,7 +430,7 @@ YOLO 高频推理对内存分配极为敏感（`cudaMalloc/cudaFree` 走驱动�
 
 `BaseMemory`：以 **字节** 为单位，同时管理 **pinned host + device** 两块内存；`Memory<_DT>`：以 **元素个数** 为单位的模板化包装，便于 `gpu(N)` 直接得到 `_DT *`。
 
-```46:79:trtexec/gui/inference/yolo_infer/src/infer.hpp
+```46:79:3-cpp-tensorrt/yolo_infer/src/infer.hpp
 class BaseMemory {
  public:
   BaseMemory() = default;
@@ -460,7 +460,7 @@ class BaseMemory {
 };
 ```
 
-```86:101:trtexec/gui/inference/yolo_infer/src/infer.hpp
+```86:101:3-cpp-tensorrt/yolo_infer/src/infer.hpp
 template <typename _DT>
 class Memory : public BaseMemory {
  public:
@@ -480,7 +480,7 @@ class Memory : public BaseMemory {
 
 ### 3.2 按需扩容（关键性能点）
 
-```170:194:trtexec/gui/inference/yolo_infer/src/infer.cu
+```170:194:3-cpp-tensorrt/yolo_infer/src/infer.cu
 void *BaseMemory::gpu_realloc(size_t bytes) {
   if (gpu_capacity_ < bytes) {
     release_gpu();
@@ -514,7 +514,7 @@ void *BaseMemory::cpu_realloc(size_t bytes) {
 
 `yolo::InferImpl` 持有以下 `Memory<>`：
 
-```615:628:trtexec/gui/inference/yolo_infer/src/yolo.cu
+```615:628:3-cpp-tensorrt/yolo_infer/src/yolo.cu
   vector<shared_ptr<trt::Memory<unsigned char>>> preprocess_buffers_;
   trt::Memory<float> input_buffer_, bbox_predict_, output_boxarray_;
   trt::Memory<float> segment_predict_;
@@ -525,7 +525,7 @@ void *BaseMemory::cpu_realloc(size_t bytes) {
 
 容量根据 **batch 与 head 形状** 计算（`adjust_memory`）：
 
-```632:648:trtexec/gui/inference/yolo_infer/src/yolo.cu
+```632:648:3-cpp-tensorrt/yolo_infer/src/yolo.cu
   void adjust_memory(int batch_size) {
     size_t input_numel = network_input_width_ * network_input_height_ * 3;
     input_buffer_.gpu(batch_size * input_numel);
@@ -553,7 +553,7 @@ void *BaseMemory::cpu_realloc(size_t bytes) {
 
 ### 3.4 `InstanceSegmentMap`：pinned host 上的实例 mask
 
-```593:606:trtexec/gui/inference/yolo_infer/src/yolo.cu
+```593:606:3-cpp-tensorrt/yolo_infer/src/yolo.cu
 InstanceSegmentMap::InstanceSegmentMap(int width, int height) {
   this->width = width;
   this->height = height;
@@ -582,7 +582,7 @@ InstanceSegmentMap::~InstanceSegmentMap() {
 
 `yolo::InferImpl::forwards`：
 
-```833:865:trtexec/gui/inference/yolo_infer/src/yolo.cu
+```833:865:3-cpp-tensorrt/yolo_infer/src/yolo.cu
     adjust_memory(infer_batch_size);
 
     vector<AffineMatrix> affine_matrixs(num_image);
@@ -606,7 +606,7 @@ InstanceSegmentMap::~InstanceSegmentMap() {
 
 ### 4.2 Event 计时：`Timer`
 
-```112:138:trtexec/gui/inference/yolo_infer/src/infer.cu
+```112:138:3-cpp-tensorrt/yolo_infer/src/infer.cu
 Timer::Timer() {
   checkRuntime(cudaEventCreate((cudaEvent_t *)&start_));
   checkRuntime(cudaEventCreate((cudaEvent_t *)&stop_));
@@ -635,7 +635,7 @@ float Timer::stop(const char *prefix, bool print) {
 
 业务侧的 `yi_frame_stat` 用 `chrono` 划分 **前处理 / 推理 / 后处理 / 总耗时**：
 
-```164:175:trtexec/gui/inference/yolo_infer/src/yolo_infer_c.cpp
+```164:175:3-cpp-tensorrt/yolo_infer/src/yolo_infer_c.cpp
         if (out_stat) {
             auto ms = [](auto a, auto b) {
                 return std::chrono::duration<double, std::milli>(b - a).count();
@@ -658,7 +658,7 @@ float Timer::stop(const char *prefix, bool print) {
 
 `yolo.cu` 与 `infer.cu` 均定义如下宏（推荐在所有 CUDA / kernel 调用处使用）：
 
-```32:47:trtexec/gui/inference/yolo_infer/src/yolo.cu
+```32:47:3-cpp-tensorrt/yolo_infer/src/yolo.cu
 #define checkRuntime(call)                                                                 \
   do {                                                                                     \
     auto ___call__ret_code__ = (call);                                                     \
@@ -686,7 +686,7 @@ float Timer::stop(const char *prefix, bool print) {
 
 ### 6.1 输入抽象 `yolo::Image`：行步长 `line_size`
 
-```72:95:trtexec/gui/inference/yolo_infer/src/yolo.hpp
+```72:95:3-cpp-tensorrt/yolo_infer/src/yolo.hpp
  * - line_size: 每行字节数（与 OpenCV Mat::step、Qt QImage::bytesPerLine() 等价的概念）。
  *              紧凑缓冲：传 width * 3 或 0；
  *              带 padding：例如 QImage::Format_RGB888 通常按 4 字节对齐，
@@ -703,7 +703,7 @@ struct Image {
 
 ### 6.2 letterbox 仿射 `i2d` / `d2i`
 
-```563:591:trtexec/gui/inference/yolo_infer/src/yolo.cu
+```563:591:3-cpp-tensorrt/yolo_infer/src/yolo.cu
 struct AffineMatrix {
   float i2d[6];
   float d2i[6];
@@ -735,7 +735,7 @@ struct AffineMatrix {
 
 ### 6.3 拷贝与启动 kernel
 
-```650:689:trtexec/gui/inference/yolo_infer/src/yolo.cu
+```650:689:3-cpp-tensorrt/yolo_infer/src/yolo.cu
   void preprocess(int ibatch, const Image &image,
                   shared_ptr<trt::Memory<unsigned char>> preprocess_buffer, AffineMatrix &affine,
                   void *stream = nullptr) {
@@ -776,7 +776,7 @@ struct AffineMatrix {
 
 ### 6.4 关键 kernel：letterbox + 归一化合一
 
-```405:485:trtexec/gui/inference/yolo_infer/src/yolo.cu
+```405:485:3-cpp-tensorrt/yolo_infer/src/yolo.cu
 static __global__ void warp_affine_bilinear_and_normalize_plane_kernel(
     uint8_t *src, int src_line_size, int src_width, int src_height, float *dst, int dst_width,
     int dst_height, uint8_t const_value_st, float *warp_affine_matrix_2_3, Norm norm) {
@@ -792,7 +792,7 @@ static __global__ void warp_affine_bilinear_and_normalize_plane_kernel(
 
 启动配置：
 
-```487:498:trtexec/gui/inference/yolo_infer/src/yolo.cu
+```487:498:3-cpp-tensorrt/yolo_infer/src/yolo.cu
 static void warp_affine_bilinear_and_normalize_plane(...) {
   dim3 grid((dst_width + 31) / 32, (dst_height + 31) / 32);
   dim3 block(32, 32);
@@ -806,7 +806,7 @@ static void warp_affine_bilinear_and_normalize_plane(...) {
 
 ### 6.5 归一化策略 `Norm`
 
-```49:91:trtexec/gui/inference/yolo_infer/src/yolo.cu
+```49:91:3-cpp-tensorrt/yolo_infer/src/yolo.cu
 enum class NormType : int { None = 0, MeanStd = 1, AlphaBeta = 2 };
 enum class ChannelType : int { None = 0, SwapRB = 1 };
 
@@ -864,7 +864,7 @@ struct Norm {
 
 ### 8.1 公共：`affine_project` 与 `box_iou`
 
-```103:107:trtexec/gui/inference/yolo_infer/src/yolo.cu
+```103:107:3-cpp-tensorrt/yolo_infer/src/yolo.cu
 static __host__ __device__ void affine_project(float *matrix, float x, float y, float *ox,
                                                float *oy) {
   *ox = matrix[0] * x + matrix[1] * y + matrix[2];
@@ -880,7 +880,7 @@ static __host__ __device__ void affine_project(float *matrix, float x, float y, 
 
 ### 8.3 YOLOv8 检测 — `decode_kernel_v8`
 
-```157:199:trtexec/gui/inference/yolo_infer/src/yolo.cu
+```157:199:3-cpp-tensorrt/yolo_infer/src/yolo.cu
 static __global__ void decode_kernel_v8(float *predict, int num_bboxes, int num_classes,
                                         int output_cdim, float confidence_threshold,
                                         float *invert_affine_matrix, float *parray,
@@ -903,7 +903,7 @@ a) decode 部分与 v8 检测一致，但 `output_cdim = 4 + nc + 32`，每行�
 
 b) NMS 后，每个保留实例做 mask 合成（**网络输入空间 → proto 空间** 的等比缩放）：
 
-```500:526:trtexec/gui/inference/yolo_infer/src/yolo.cu
+```500:526:3-cpp-tensorrt/yolo_infer/src/yolo.cu
 static __global__ void decode_single_mask_kernel(int left, int top, float *mask_weights,
                                                  float *mask_predict, int mask_width,
                                                  int mask_height, unsigned char *mask_out,
@@ -925,7 +925,7 @@ static __global__ void decode_single_mask_kernel(int left, int top, float *mask_
 
 c) 业务侧把每实例 mask 限定在 **检测框对应 ROI**：
 
-```940:990:trtexec/gui/inference/yolo_infer/src/yolo.cu
+```940:990:3-cpp-tensorrt/yolo_infer/src/yolo.cu
           if (has_segment_) {
             int row_index = pbox[7];
             int mask_dim = segment_head_dims_[1];
@@ -959,7 +959,7 @@ c) 业务侧把每实例 mask 限定在 **检测框对应 ROI**：
 
 d) C 层把 `InstanceSegmentMap`（**框尺度**）按 **可见 ROI** 裁剪、缩放到 **原图像素尺寸**，便于 GUI 直接叠图：
 
-```116:155:trtexec/gui/inference/yolo_infer/src/yolo_infer_c.cpp
+```116:155:3-cpp-tensorrt/yolo_infer/src/yolo_infer_c.cpp
             if (box.seg && box.seg->data && box.seg->width > 0 && box.seg->height > 0) {
                 // 可见 ROI（裁到画面内）
                 // 把 ROI 换算到 segMask 坐标（按比例 "先裁后缩"）
@@ -973,7 +973,7 @@ d) C 层把 `InstanceSegmentMap`（**框尺度**）按 **可见 ROI** 裁剪、�
 
 ### 8.5 YOLOv8 姿态 — `decode_kernel_v8_pose`
 
-```201:251:trtexec/gui/inference/yolo_infer/src/yolo.cu
+```201:251:3-cpp-tensorrt/yolo_infer/src/yolo.cu
 // per anchor = [cx,cy,w,h, score, k1x,k1y,k1v,..., k17x,k17y,k17v]
 // ...
   for (int k = 0; k < NUM_KPT; ++k) {
@@ -990,7 +990,7 @@ d) C 层把 `InstanceSegmentMap`（**框尺度**）按 **可见 ROI** 裁剪、�
 
 ### 8.6 YOLOv8 旋转框 — `decode_kernel_v8_obb`
 
-```253:316:trtexec/gui/inference/yolo_infer/src/yolo.cu
+```253:316:3-cpp-tensorrt/yolo_infer/src/yolo.cu
 // per anchor = [cx,cy,w,h, c0..c{nc-1}, angle]
   float cx_in = pitem[0], cy_in = pitem[1];
   float w_in  = pitem[2], h_in  = pitem[3];
@@ -1012,7 +1012,7 @@ d) C 层把 `InstanceSegmentMap`（**框尺度**）按 **可见 ROI** 裁剪、�
 - `(cx, cy)` 用 `d2i` 还原到原图；`(ow, oh)` 用 `d2i[0]`（均匀缩放）放大；
 - `keepflag` 暂置 1，**真正的 NMS 在 host**：
 
-```866:909:trtexec/gui/inference/yolo_infer/src/yolo.cu
+```866:909:3-cpp-tensorrt/yolo_infer/src/yolo.cu
     if (is_obb_) {
       for (int ib = 0; ib < num_image; ++ib) {
         // 按 label 分组 -> RotatedRect + scores
@@ -1026,7 +1026,7 @@ d) C 层把 `InstanceSegmentMap`（**框尺度**）按 **可见 ROI** 裁剪、�
 
 ## 9. NMS：GPU `fast_nms_kernel`
 
-```333:357:trtexec/gui/inference/yolo_infer/src/yolo.cu
+```333:357:3-cpp-tensorrt/yolo_infer/src/yolo.cu
 static __global__ void fast_nms_kernel(float *bboxes, int MAX_IMAGE_BOXES, float threshold,
                                        int box_stride) {
   int position = (blockDim.x * blockIdx.x + threadIdx.x);
@@ -1069,7 +1069,7 @@ static __global__ void fast_nms_kernel(float *bboxes, int MAX_IMAGE_BOXES, float
 
 颜色生成：
 
-```1054:1059:trtexec/gui/inference/yolo_infer/src/yolo.cu
+```1054:1059:3-cpp-tensorrt/yolo_infer/src/yolo.cu
 std::tuple<uint8_t, uint8_t, uint8_t> random_color(int id) {
   float h_plane = ((((unsigned int)id << 2) ^ 0x937151) % 100) / 100.0f;
   float s_plane = ((((unsigned int)id << 3) ^ 0x315793) % 100) / 100.0f;
@@ -1187,7 +1187,7 @@ const char* yi_last_error(void);
 
 `yi_create` 内映射代码：
 
-```32:35:trtexec/gui/inference/yolo_infer/src/yolo_infer_c.cpp
+```32:35:3-cpp-tensorrt/yolo_infer/src/yolo_infer_c.cpp
         yolo::Type type = yolo::Type::V8;
         if (task == YI_SEGMENT) type = yolo::Type::V8Seg;
         else if (task == YI_POSE) type = yolo::Type::V8Pose;

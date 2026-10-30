@@ -316,8 +316,8 @@ A：同一个产品。界面显示 **AI 缺陷检测视觉工作站**，程序�
 | [`trtexec_gui_YOLO_TRT推理流程说明.md`](trtexec_gui_YOLO_TRT推理流程说明.md) | YOLO 推理技术细节 |
 | [`TRTForge_yolo_infer与anomalib_infer_DLL调用与源码打包说明.md`](TRTForge_yolo_infer与anomalib_infer_DLL调用与源码打包说明.md) | 对外集成 API |
 | [`工业缺陷检测公开数据集_推荐清单.md`](工业缺陷检测公开数据集_推荐清单.md) | 练手、演示用公开数据集 |
-| [`trtexec/gui/README.md`](../trtexec/gui/README.md) | 开发编译与模块说明 |
+| [`4-qt-studio/README.md`](../4-qt-studio/README.md) | 开发编译与模块说明 |
 
 ---
 
-*文档版本：与仓库 `trtexec/gui` 当前功能同步；涵盖 YOLO（detect/segment/pose/obb）、Anomalib（PatchCore/PaDiM/EfficientAd）、PaddleOCR 三类算法及典型应用场景。*
+*文档版本：与仓库 `4-qt-studio` 当前功能同步；涵盖 YOLO（detect/segment/pose/obb）、Anomalib（PatchCore/PaDiM/EfficientAd）、PaddleOCR 三类算法及典型应用场景。*
