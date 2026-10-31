@@ -253,7 +253,7 @@ anomalib 把后处理归一化也编进了导出的 ONNX 图里，而这个归�
 | `--project` | `results` | 输出根目录 |
 | `--name` | `latest` | 本次运行名称 |
 | `--input-size` | `256` | 输入边长（宽=高） |
-| `--max-epochs` | `auto` | `auto` 时：patchcore/padim 为 1，efficientad 为 20 |
+| `--max-epochs` | `auto` | `auto` 时：patchcore/padim 为 1，efficientad 为 20（注意与 `train.py` 的 50/1/5 不同，详见 6.2） |
 | `--train-batch-size` | `4` | 训练 batch（efficientad 强制为 1） |
 | `--eval-batch-size` | `4` | 评估 batch |
 | `--num-workers` | `0` | DataLoader 进程数（Windows 建议 0） |
@@ -301,6 +301,11 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run_web_studio.ps1
 # 2) 浏览器打开 http://127.0.0.1:8060
 # 3) 训练页选「异常检测」→ 选模型 → 填数据集 → 开始
 ```
+
+> 启动脚本会先检查端口。若提示「端口已被占用」并给出 PID，说明上次的进程没退干净，
+> 按提示 `Stop-Process -Id <PID> -Force` 后再启动。**改动后端代码后务必确认 PID 变了**：
+> 页面是静态文件（每次读盘，立刻是新版），后端是进程内代码（不重启仍是旧版），
+> 这种不一致会让新参数被静默忽略，却看不出任何报错。
 
 界面上需要注意：
 
