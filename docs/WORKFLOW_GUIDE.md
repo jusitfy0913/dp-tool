@@ -421,6 +421,83 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\build_infer_dlls.p
 - 不依赖 Qt，只需 OpenCV + CUDA
 - **编译前必须先停掉 Web 服务**，否则 DLL 被占用会报 `LNK1104`
 
+#### OpenCV 路径怎么找（v1.8 起不再写死）
+
+所有 `CMakeLists.txt` 和 `CMakePresets.json` 里的 `D:/thirdparty/opencv` 已全部移除，
+统一按下面顺序查找：
+
+1. 命令行 `-DOPENCV_DIR=<路径>`
+2. 环境变量 `OPENCV_DIR`
+3. CMake 常规搜索（系统安装目录、`CMAKE_PREFIX_PATH` 等），找不到就报标准 `Could NOT find OpenCV`
+
+```powershell
+# 只做一次；之后所有 CMake 工程（含 ocr_infer）都读这个
+$env:OPENCV_DIR = "E:\thirdparty\opencv"
+```
+
+> 注意 preset 曾经自己带了 `"OPENCV_DIR": "D:/thirdparty/opencv"`，它会**盖掉**环境变量。
+> 已删掉，所以如果你本地 `.vs` 或 build 目录里还缓存着旧值，删掉 `build/` 重新 configure 一次。
+
+### 6.1 编译 Qt 桌面版 `TRTForge.exe`（2026-10-31 起可用）
+
+主工程的 `TRTForge.vcxproj` 要链接 `ocr_infer.lib`，所以**必须先编译 OCR 子工程**。
+顺序不能反。
+
+```powershell
+$env:OPENCV_DIR = "E:\thirdparty\opencv"
+
+# 第 1 步：OCR 子工程
+cd ocr\ocr_infer
+cmake --preset vs2022-x64 "-DCMAKE_POLICY_VERSION_MINIMUM=3.5" `
+      "-DPADDLE_LIB=<仓库根>/ocr/ocr_infer/third_party/paddle_inference"
+cmake --build --preset vs2022-x64
+# 产出：4-qt-studio/bin/{ocr_infer.dll, ocr_infer.lib, ocr_basic.exe}
+
+# 第 2 步：主工程
+cd ..\..\4-qt-studio
+cmake --preset vs2022-x64
+cmake --build --preset vs2022-x64
+# 产出：4-qt-studio/bin/{TRTForge.exe, yolo_infer.dll, anomalib_infer.dll}
+```
+
+**两个参数为什么要这么写**
+
+| 参数 | 作用 | 不写会怎样 |
+| --- | --- | --- |
+| `"-DCMAKE_POLICY_VERSION_MINIMUM=3.5"` | 让 CMake 4.x 接受 clipper 的老式 `cmake_minimum_required(VERSION 2.6.0)` | 报 `Compatibility with CMake < 3.5 has been removed` |
+| `"-DPADDLE_LIB=<...>"` | 指向 Paddle Inference 包根目录 | 默认路径是 `4-qt-studio/bin/paddle_inference`，那里的布局通常不对 |
+
+> PowerShell 里这两个参数**必须用双引号包住**。不加引号时 `=3.5` 会被当成独立参数，
+> CMake 会把它误读成 preset 名，报 `Could not read presets from ...\.5`。
+
+**Paddle 包布局要求**
+
+`PADDLE_LIB` 指向的目录需要：
+
+```
+paddle/include/paddle_inference_api.h
+paddle/lib/paddle_inference.lib
+paddle/lib/paddle_inference.dll
+third_party/install/{protobuf,glog,gflags,xxhash,mkldnn,mklml}/...
+```
+
+本机验证过的版本：**Paddle 2.6.2 / GPU / CUDA 11.8 / cuDNN 8.6 / TensorRT 8.5.1.7**。
+
+> 注意是 `mkldnn` 不是 `onednn`。`ocr_infer/CMakeLists.txt` 原先只配了 `onednn/lib`，
+> 导致链接期报 `LNK1181: 无法打开输入文件 mkldnn.lib`。现已两条都保留。
+
+**运行时依赖自动复制**
+
+`ocr_infer` 的 POST_BUILD 会把下面 6 个 DLL 自动拷到 `4-qt-studio/bin`：
+
+```
+paddle_inference.dll   common.dll   mkldnn.dll
+libiomp5md.dll         yaml-cpp.dll polyclipping.dll
+```
+
+少任何一个，`TRTForge.exe` 启动即报 `0xC0000135`（找不到依赖）。
+所以**不要手工复制**，清空 `build/` 重编即可。
+
 ---
 
 ## 7. 推理验证
@@ -455,6 +532,27 @@ Stop-Process -Id <提示里的 PID> -Force
 3. **Anomalib 必须再选 `metadata.json`**
 4. 上传图片 → 查看分数、判定、叠加图、热力图
 
+#### DLL 不可用时会自动降级（v1.8）
+
+如果 `yolo_infer.dll` / `anomalib_infer.dll` 加载失败（没编译、缺 OpenCV/CUDA 运行库），
+后端**不再直接返回 503**，而是自动切到 `onnxruntime` 跑同一份 ONNX，页面照常出结果。
+
+怎么判断这次走的是哪条路：
+
+| 观察点 | DLL 路径 | 降级路径 |
+| --- | --- | --- |
+| 结果里的 `backend` | `yolo_infer.dll` / `anomalib_infer.dll` | `onnxruntime-fallback` |
+| 结果里的 `warning` | 无 | 有，说明 DLL 为什么不可用 |
+| 页面「后端」指标 | 显示 DLL 名 | 显示 `onnxruntime-fallback`，并多一行「降级提示」 |
+| `timing` | 四阶段齐全 | 只有 `inference_ms` 有意义，前/后处理记 0 |
+
+降级的边界（别指望它替代 DLL）：
+
+- YOLO 只支持 `detect` / `obb`；`segment` / `pose` 会明确报错，提示改用 DLL。
+- Anomalib 只吃 `.onnx`；`.engine` 必须由 DLL 加载。选的是 `.engine` 时，会按
+  「同目录同名 `.onnx` → `metadata.json` 的 `onnx_path`」自动找替代模型。
+- 性能不作数：降级用 onnxruntime（CUDA provider 需 CUDA 12 + cuDNN 9，本机 CUDA 11.8 会退到 CPU）。
+
 ### 7.3 接口自检
 
 ```powershell
@@ -462,7 +560,7 @@ Stop-Process -Id <提示里的 PID> -Force
 Invoke-WebRequest http://127.0.0.1:8060/api/health
 # 期望：{"ok":true}
 
-# 能力检查
+# 能力检查（infer_fallback 为 true 表示 DLL 挂了也能降级跑）
 Invoke-WebRequest http://127.0.0.1:8060/api/capabilities
 ```
 
@@ -488,6 +586,14 @@ Invoke-WebRequest http://127.0.0.1:8060/api/capabilities
 | ONNX 导出 `TypeError: dynamo` | torch < 2.5 | 已修（`export_mixin.py` 能力探测） |
 | DLL 加载失败 | 缺 `os.add_dll_directory` | 确认 OpenCV / CUDA `bin` 已加入 |
 | `LNK1104` | DLL 被运行中的进程占用 | 先停 Web 服务 |
+| `LNK1181: 无法打开输入文件 bin\Release\ocr_infer.lib` | 主工程需要预编译的 OCR 库 | 先单独编 `ocr_infer`（见下一条） |
+| `ocr_infer` 配置报 `yaml-cpp ... does not contain a CMakeLists.txt` | `ocr/ocr_infer/third_party/yaml-cpp` 是空目录，缺源码 | 补 yaml-cpp 源码后重新 configure |
+| `ocr_infer` 配置报 `Compatibility with CMake < 3.5 has been removed` | clipper 里写的是 `cmake_minimum_required(VERSION 2.6.0)`，CMake 4.x 不再兼容 | 配置时加 `"-DCMAKE_POLICY_VERSION_MINIMUM=3.5"`（PowerShell 里必须带引号） |
+| `Could NOT find OpenCV` | 既没传 `-DOPENCV_DIR` 也没设环境变量 | `$env:OPENCV_DIR = "E:\thirdparty\opencv"` |
+| `LNK1181: 无法打开输入文件 mkldnn.lib` | 链接搜索目录只有 `onednn/lib`，包实际用 `mkldnn` | 已修（两条路径都保留）；若用别的 Paddle 包，确认 `third_party/install` 下是哪个名字 |
+| `TRTForge.exe` 启动即退，退出码 `-1073741515`（`0xC0000135`） | 缺运行时依赖 DLL | 确认 `bin/` 里 6 个 Paddle 依赖齐全；重编 OCR 会由 POST_BUILD 自动复制 |
+| `Could not read presets from ...\.5` | PowerShell 把 `-DCMAKE_POLICY_VERSION_MINIMUM=3.5` 拆开了 | 整个参数用双引号包住 |
+| 推理页出现 `onnxruntime-fallback` | DLL 没加载成功，走了降级 | 看 `warning` 字段的原因；要真实性能必须修好 DLL |
 | 异常图判成 OK | 阈值过高 | 确认 `--calibrate-metadata true`，或重跑校准 |
 | `imagenet_dir 不存在` | EfficientAd 目录缺失（`DATA_NOT_FOUND`），launcher 不会自动下载 | 先 `New-Item -ItemType Directory` 建空目录（见 2.4） |
 | 正常图分数全为 0 | PatchCore 分数饱和 | 属预期；要趋势监控请换 EfficientAd |

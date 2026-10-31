@@ -102,10 +102,15 @@ message(STATUS "[TRTForge] cuDNN version    : ${CUDNN_VERSION_STR}")
 # ---------------------------------------------------------------------------
 # OpenCV
 # ---------------------------------------------------------------------------
-if(NOT DEFINED OPENCV_DIR)
-    set(OPENCV_DIR "D:/thirdparty/opencv" CACHE PATH "OpenCV build root")
+# 不写死本机路径。查找顺序：-DOPENCV_DIR > 环境变量 OPENCV_DIR > CMake 常规搜索
+if(NOT DEFINED OPENCV_DIR AND DEFINED ENV{OPENCV_DIR})
+    set(OPENCV_DIR "$ENV{OPENCV_DIR}" CACHE PATH "OpenCV build root")
 endif()
-find_package(OpenCV REQUIRED PATHS "${OPENCV_DIR}" NO_DEFAULT_PATH)
+if(DEFINED OPENCV_DIR)
+    find_package(OpenCV REQUIRED PATHS "${OPENCV_DIR}" NO_DEFAULT_PATH)
+else()
+    find_package(OpenCV REQUIRED)
+endif()
 message(STATUS "[TRTForge] OpenCV ${OpenCV_VERSION} found at ${OpenCV_DIR}")
 
 # ---------------------------------------------------------------------------

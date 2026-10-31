@@ -10,7 +10,6 @@
       "binaryDir": "${sourceDir}/../../build/ocr-vs2022-x64",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
-        "OPENCV_DIR": "D:/thirdparty/opencv",
         "OCR_INFER_BUILD_EXAMPLES": "ON"
       }
     }

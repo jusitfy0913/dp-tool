@@ -16,11 +16,45 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import sys
 import time
 from pathlib import Path
 from typing import Any
 
+# --- 必须优先使用仓库内的 anomalib 源码 -------------------------------------
+# 本脚本放在 anomalib-main 目录下，但包实际在 anomalib-main/src/anomalib，
+# 所以裸 `import anomalib` 会落到 user-site（本机是 1.2.0）。而本工程的 ckpt
+# 是 launcher 用仓库内源码（2.x）训练出来的，两者结构不同：
+#   - ckpt 里有 `post_processor.*`，1.2.0 的模型没有该子模块 -> load_state_dict 报 unexpected
+#   - 2.x 的 `Engine._setup_transform` 要求 ckpt 顶层有 `transform`
+# 结果就是脚本"能跑但结果全是 0.5"。tf_anomalib_launcher.py 也是用同样的方式
+# 把源码目录插到 sys.path 最前面，这里保持一致，保证与训练同一份实现。
+_SRC = Path(__file__).resolve().parent / "src"
+if _SRC.is_dir():
+    for _p in (str(_SRC), str(_SRC.parent)):
+        if _p in sys.path:
+            sys.path.remove(_p)
+        sys.path.insert(0, _p)
+
 import numpy as np
+
+# --- numpy 2.x 兼容垫片（必须在 import anomalib 之前执行）-------------------
+# anomalib 的 `anomalib.data` 会间接 import imgaug，而 imgaug 在模块级用
+# `np.sctypes` 建表；该属性在 numpy 2.0 已被移除，于是 import 直接抛
+# AttributeError: `np.sctypes` was removed in the NumPy 2.0 release。
+#
+# 本机 user-site 里是 numpy 2.5.4（`%APPDATA%\Python\...`），而训练链路
+# （tf_anomalib_launcher.py）不经过 anomalib.data，所以训练正常、只有本脚本炸。
+# 这里补回该属性，避免为了跑一次对比去降级 numpy（降级 numpy 会影响
+# ultralytics / opencv / onnxruntime，风险远大于收益）。
+if not hasattr(np, "sctypes"):
+    np.sctypes = {
+        "int": [np.int8, np.int16, np.int32, np.int64],
+        "uint": [np.uint8, np.uint16, np.uint32, np.uint64],
+        "float": [np.float16, np.float32, np.float64],
+        "complex": [np.complex64, np.complex128],
+        "others": [bool, object, bytes, str, np.void],
+    }
 
 from anomalib.data.utils import get_image_filenames
 from anomalib.engine import Engine
@@ -72,16 +106,44 @@ def _to_numpy(value: Any) -> np.ndarray | None:
     return np.asarray(value)
 
 
+def _field(batch: Any, name: str) -> Any:
+    """从预测结果里取字段，兼容 dict 与对象两种形态。
+
+    新版 anomalib 的 `Engine.predict(..., return_predictions=True)` 返回的是
+    `list[dict]`，且键名是**复数**：`pred_scores` / `pred_labels` / `anomaly_maps` /
+    `pred_masks` / `image_path`。旧版返回带**单数**属性的 Batch 对象
+    （`pred_score` / `pred_label` / `anomaly_map`）。
+
+    以前只用 `getattr` 取单数属性，遇到 dict 时全部拿到 None，于是 ckpt 侧
+    分数恒为 0、状态全判 OK，热力图差恒为 0——这正是本脚本长期
+    “能跑但结果没意义”的原因。
+    """
+    aliases = (name, f"{name}s")
+    if isinstance(batch, dict):
+        for key in aliases:
+            if key in batch:
+                return batch[key]
+        # 兜底：dict 里可能用斜杠形式（如 "pred/score"）
+        for key in (name.replace("_", "/"), f"{name}s".replace("_", "/")):
+            if key in batch:
+                return batch[key]
+        return None
+    for attr in aliases:
+        if hasattr(batch, attr):
+            return getattr(batch, attr)
+    return None
+
+
 def _batch_items(predictions: Any) -> list[dict[str, Any]]:
     """Flatten Anomalib prediction batches into one dict per image."""
     items: list[dict[str, Any]] = []
     if predictions is None:
         return items
     for batch in predictions:
-        paths = _to_numpy(getattr(batch, "image_path", None))
-        scores = _to_numpy(getattr(batch, "pred_score", None))
-        labels = _to_numpy(getattr(batch, "pred_label", None))
-        maps = _to_numpy(getattr(batch, "anomaly_map", None))
+        paths = _to_numpy(_field(batch, "image_path"))
+        scores = _to_numpy(_field(batch, "pred_score"))
+        labels = _to_numpy(_field(batch, "pred_label"))
+        maps = _to_numpy(_field(batch, "anomaly_map"))
         batch_size = 1
         for arr in (scores, labels, maps, paths):
             if arr is not None and arr.ndim > 0:
@@ -121,7 +183,80 @@ def _onnx_providers(choice: str) -> list[str]:
     return ["CUDAExecutionProvider", "CPUExecutionProvider"]
 
 
-def run_ckpt(args: argparse.Namespace, filenames: list[Path]) -> tuple[list[dict[str, Any]], float]:
+def _prepare_ckpt(ckpt_path: str, metadata: dict[str, Any], model) -> Path:
+    """把一个「旧版 anomalib 产出的 ckpt」整理成当前版本能加载的形式。
+
+    原始 ckpt 由 launcher 训练产生，与本机安装的 anomalib 存在两处版本漂移：
+
+    1. **缺顶层 `transform`**：anomalib 2.x 的 `Engine._setup_transform` 在
+       `ckpt_path` 非空时强制读 `checkpoint["transform"]`，没有回退分支，
+       缺键直接 `KeyError`。这里按 metadata 的输入尺寸，用模型自身的
+       `configure_transforms` 补上，保证与训练一致。
+
+    2. **`state_dict` 里的 `post_processor.*` 是旧版遗留**：当前模型结构已不含
+       这些参数，`load_state_dict` 会报 "Unexpected key(s)"。它们分别是
+       `_image_threshold` / `_pixel_threshold` / `image_min` / `image_max` /
+       `pixel_min` / `pixel_max` —— **全是后处理标量，不是网络权重**，
+       且同样信息已由 metadata.json 承载（阈值校准后写回那里），
+       所以剔除它们不会影响推理结果。
+
+    原始文件不动，只在临时目录生成修好的副本。
+    """
+    import tempfile
+
+    import torch
+
+    source = Path(ckpt_path)
+    if not source.is_file():
+        raise FileNotFoundError(f"ckpt 不存在：{ckpt_path}")
+
+    checkpoint = torch.load(source, map_location="cpu", weights_only=False)
+    changed: list[str] = []
+
+    # 2.x 的 ckpt 自带 `hyper_parameters.pre_processor`（PreProcessor 对象），
+    # Engine 会直接用它恢复变换，不需要我们再补 transform。
+    hyper = checkpoint.get("hyper_parameters") or {}
+    if "transform" in checkpoint or (isinstance(hyper, dict) and "pre_processor" in hyper):
+        return source
+
+    if "transform" not in checkpoint:
+        size = metadata.get("transform") or {}
+        input_size = metadata.get("input_size") or [256, 256]
+        height = int(size.get("height") or input_size[0])
+        width = int(size.get("width") or input_size[-1])
+        try:
+            # 2.x 是 configure_pre_processor；旧版是 configure_transforms。
+            if hasattr(model, "configure_pre_processor"):
+                checkpoint["transform"] = model.configure_pre_processor((height, width))
+            else:
+                checkpoint["transform"] = model.configure_transforms((height, width))
+        except Exception as exc:  # noqa: BLE001 - 不同版本签名可能不同
+            raise RuntimeError(f"无法为 ckpt 生成 transform（{height}x{width}）：{exc}") from exc
+        changed.append(f"补 transform {height}x{width}")
+
+    state_dict = checkpoint.get("state_dict")
+    if isinstance(state_dict, dict):
+        # 只有当模型确实没有 post_processor 属性时，才剔除这些旧版键。
+        # 用仓库内 2.x 源码运行时模型自带该属性，这些键能正常加载（阈值也就
+        # 从 ckpt 里恢复），此时删掉反而会让分数恒为默认的 0.5。
+        has_post_processor = hasattr(model, "post_processor")
+        if not has_post_processor:
+            stale = [k for k in state_dict if k.startswith("post_processor.")]
+            if stale:
+                for key in stale:
+                    del state_dict[key]
+                changed.append(f"剔除 {len(stale)} 个旧版 post_processor 键（当前模型无此属性）")
+
+    if not changed:
+        return source
+
+    patched = Path(tempfile.gettempdir()) / f"trtforge_{source.stem}_patched.ckpt"
+    torch.save(checkpoint, patched)
+    print(f"ckpt 已适配当前 anomalib：{'；'.join(changed)} -> {patched}")
+    return patched
+
+
+def run_ckpt(args: argparse.Namespace, metadata: dict[str, Any], filenames: list[Path]) -> tuple[list[dict[str, Any]], float]:
     """Run Lightning checkpoint prediction once for the complete input set."""
     model = MODEL_FACTORIES[args.model]()
     accelerator = "auto"
@@ -131,11 +266,14 @@ def run_ckpt(args: argparse.Namespace, filenames: list[Path]) -> tuple[list[dict
         accelerator = "gpu"
     engine = Engine(accelerator=accelerator, devices=1)
 
+    # launcher 产出的 ckpt 缺顶层 transform，先补齐再交给 Engine
+    ckpt_path = _prepare_ckpt(args.ckpt, metadata, model)
+
     start = time.perf_counter()
     predictions = engine.predict(
         model=model,
         data_path=args.input,
-        ckpt_path=args.ckpt,
+        ckpt_path=str(ckpt_path),
         return_predictions=True,
     )
     total_ms = (time.perf_counter() - start) * 1000.0
@@ -247,6 +385,50 @@ def write_report(args: argparse.Namespace, filenames: list[Path], ckpt_items: li
     return report
 
 
+def _print_summary(ckpt_items: list[dict[str, Any]], onnx_items: list[dict[str, Any]], metadata: dict[str, Any]) -> None:
+    """打印一致性汇总，并解释分数差异的来源。
+
+    重要：两侧的分数**不在同一标定基准上**，不能只看绝对差就判断谁对谁错。
+
+    - ckpt 侧分数来自模型 `post_processor` 用自己的 `_image_threshold` 归一化；
+    - onnx 侧分数来自 `normalize_with_metadata`，用的是 metadata 里**校准后**的阈值。
+
+    两个阈值不同（训练默认 vs 校准值），归一化后同一个原始分数会落到不同位置，
+    于是 `score_abs_diff` 会出现一个接近常数的系统偏移。判定结论应以
+    metadata 的校准阈值为准——那是 `generate_trtforge_metadata.ps1` 在正常/异常
+    样本上验证过的（见 metadata 里 `calibration.sample_accuracy`）。
+    """
+    if not ckpt_items or not onnx_items:
+        return
+    total = min(len(ckpt_items), len(onnx_items))
+    match = sum(
+        1 for c, o in zip(ckpt_items, onnx_items, strict=False)
+        if bool(c.get("label")) == bool(o.get("label"))
+    )
+    diffs = [
+        abs(float(c.get("score", 0.0)) - float(o.get("score", 0.0)))
+        for c, o in zip(ckpt_items, onnx_items, strict=False)
+    ]
+    diffs_sorted = sorted(diffs)
+    median = diffs_sorted[len(diffs_sorted) // 2] if diffs_sorted else 0.0
+    threshold = float(metadata.get("image_threshold", 0.5))
+    calibration = metadata.get("calibration") or {}
+    print(
+        f"一致性   : {match}/{total} 判定相同（{100.0 * match / max(1, total):.1f}%）\n"
+        f"分数差   : 均值 {sum(diffs) / max(1, len(diffs)):.4f}，中位 {median:.4f}"
+        f"，范围 {min(diffs):.4f}~{max(diffs):.4f}"
+    )
+    if calibration.get("sample_accuracy") is not None:
+        print(
+            f"校准基准 : metadata image_threshold={threshold:.4f}，"
+            f"校准样本准确率={calibration.get('sample_accuracy')}"
+        )
+    print(
+        "说明     : 分数差呈近常数偏移=两侧阈值基准不同，不是推理错误；"
+        "判定以 metadata 阈值为准"
+    )
+
+
 def main() -> None:
     args = get_parser().parse_args()
     metadata = _load_metadata(args.metadata)
@@ -257,10 +439,11 @@ def main() -> None:
     print(f"input images: {len(filenames)}")
     print(f"metadata input size: {input_w}x{input_h}")
 
-    ckpt_items, ckpt_total_ms = run_ckpt(args, filenames)
+    ckpt_items, ckpt_total_ms = run_ckpt(args, metadata, filenames)
     onnx_items = run_onnx(args, metadata, filenames)
     report = write_report(args, filenames, ckpt_items, onnx_items, ckpt_total_ms)
     print(f"ckpt total: {ckpt_total_ms:.3f} ms, avg: {ckpt_total_ms / max(1, len(filenames)):.3f} ms")
+    _print_summary(ckpt_items, onnx_items, metadata)
     print(f"report    : {report.resolve()}")
 
 

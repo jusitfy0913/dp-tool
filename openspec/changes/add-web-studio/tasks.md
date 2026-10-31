@@ -36,7 +36,7 @@
 - [x] 4.4 前端上传图片 → 展示框选结果与异常热力图/轮廓图
 - [x] 4.5 验证 ctypes 结构体 ABI 与 C 侧逐字节一致（`tools/abi_probe.cpp`）
 - [x] 4.6 句柄按参数缓存复用，服务退出时统一 `*_destroy`
-- [ ] 4.7 `onnxruntime` 降级回退（当前 DLL 不可用时返回 503 并说明原因，未实现自动降级）
+- [x] 4.7 `onnxruntime` 降级回退：新增 `6-web/backend/onnx_fallback.py`，DLL 不可用时自动用 onnxruntime 跑同源 ONNX，返回结构与 DLL 路径完全一致（`backend` 字段标注真实后端、`warning` 说明降级原因）；`/api/capabilities` 暴露 `infer_fallback`；回归测试 `6-web/backend/tools/test_onnx_fallback.py` 36 项全通过
 
 ## 5. 引擎构建页（已完成）
 
@@ -88,12 +88,12 @@
 - [x] 7.2 脚本自动探测 CMake 与 VS，OpenCV 路径不写死（环境变量 > 常见位置 > 报错）
 - [x] 7.3 脚本预检 DLL 占用，给出「Web 服务还开着」的可读提示（替代 LNK1104）
 - [x] 7.4 `.gitignore` 增加 `6-web/runtime/`、`__pycache__`、`build/infer_dlls/`
-- [ ] 7.5 两个推理子工程的 `CMakeLists.txt` 仍默认 `D:/thirdparty/opencv`，待改为纯环境变量驱动
+- [x] 7.5 清除 OpenCV 硬编码：实际影响 **5 个 `CMakeLists.txt`**（任务原写"两个"，已过时）+ **2 个 `CMakePresets.json`**。统一为「`-DOPENCV_DIR` > 环境变量 `OPENCV_DIR` > CMake 常规搜索」，移除 `D:/thirdparty/opencv` 死路径；实测本机 `OPENCV_DIR=E:\thirdparty\opencv`（4.12.0）被正确识别，`4-qt-studio` 与 `ocr_infer` 均 `Configuring done`
 
 ## 8. 归档与文档
 
-- [ ] 8.1 `git mv 4-qt-studio 5-reference/4-qt-studio`
-- [ ] 8.2 全仓确认无脚本引用旧 `4-qt-studio` 路径
+- [x] 8.1 ~~`git mv 4-qt-studio 5-reference/4-qt-studio`~~ —— **已评估：不做（2026-10-31 用户决策）**。理由见下方「8.1 不做迁移的原因」。
+- [x] 8.2 全仓确认无脚本引用旧 `4-qt-studio` 路径 —— **随 8.1 一并作废**：路径本就要保留，无需清理。
 - [x] 8.3 更新 `readme.md`：Web 启动方式、四页功能、环境变量、Qt 改为仅供查阅
 - [ ] 8.4 更新 `docs/` 中涉及界面位置的说明（`WORKFLOW_GUIDE.md` 与模型对比文档已按 Web 链路重写，历史文档未逐份校对）
 - [x] 8.5 写 `6-web/README.md`：安装、启动、端口、常见问题
@@ -128,3 +128,54 @@
 | 真实训练 / 真实推理 | 通过 | PCB 数据集 30 epoch（mAP50=0.945）+ ctypes 推理验证；Anomalib 三模型均跑通 |
 | 引擎构建（Web UI） | 通过 | 浏览器实测：探测 → 构建 → 日志流 → 完成徽标；960×960 FP16 用时 474.1 s |
 | 引擎构建防护 | 通过 | 未转置 ONNX 前端标红 + 后端 400；退出码 0 但产物缺失判为失败 |
+
+---
+
+## 8.1 不做迁移的原因（2026-10-31 决策记录）
+
+原任务要求 `git mv 4-qt-studio 5-reference/4-qt-studio`。**经核查后决定不执行**，原因有四，按严重程度排列。
+
+### 一、与本变更自己的规范冲突
+
+`openspec/changes/refactor-five-tier-layout/specs/project-layout/spec.md` 明确规定：
+
+> Qt 程序 **SHALL 位于 `4-qt-studio`**，对照工程 SHALL 位于 `5-reference` **且不被任何 CMake 目标引用**。
+
+迁移后两条同时不成立：Qt 程序不在 `4-qt-studio`，而 `5-reference` 会被 CMake 引用。
+
+### 二、`4-qt-studio/bin` 是全仓唯一编译产物出口
+
+| 依赖方 | 位置 | 依赖形式 |
+| --- | --- | --- |
+| Web 后端加载 DLL | `6-web/backend/config.py:60` | `REPO_ROOT / "4-qt-studio" / "bin"` |
+| 两个推理子工程输出 | `3-cpp-tensorrt/{yolo,anomalib}_infer/CMakeLists.txt` | `TRTFORGE_BIN_DIR = ../../4-qt-studio/bin` |
+| OCR 子工程 | `ocr/ocr_infer/CMakeLists.txt:33` | `TRTFORGE_GUI_DIR = ${REPO_ROOT}/4-qt-studio` |
+| devkit 打包 | `3-cpp-tensorrt/trtexec/package_devkit.ps1:71` | 靠「存在 `4-qt-studio` 与 `1-python-yolo` 兄弟目录」判定仓库根 |
+| Paddle 同步脚本 | `scripts/sync_paddle_inference_to_bin.ps1:27` | 目标 `4-qt-studio\bin` |
+
+合计 **12 个文件、约 24 处**引用（不含文档与 `build/` 生成物）。迁移会使 Web 推理、OCR 链接、devkit 打包同时中断。
+
+### 三、迁移对象是活代码，不是参考代码
+
+`4-qt-studio` 已于 2026-10-31 通过 `cmake --preset vs2022-x64` 完整编译：
+
+```
+-- Configuring done (8.4s)
+-- Generating done (0.5s)
+yolo_infer.vcxproj     -> 4-qt-studio/bin/yolo_infer.dll
+anomalib_infer.vcxproj -> 4-qt-studio/bin/anomalib_infer.dll
+ocr_infer.vcxproj      -> 4-qt-studio/bin/ocr_infer.dll
+TRTForge.vcxproj       -> 4-qt-studio/bin/TRTForge.exe   （实测可启动）
+```
+
+把一个能正常构建的工程移入「不参与构建」的参考区，等于主动制造返工。
+
+### 四、`5-reference` 的定位是历史对照
+
+`5-reference` 现存内容为 `YOLOv8-det`、`YOLOv8-seg`、`YOLOv8_obb`、`YOLOv8-TensorRT-main` 等早期对照工程，全部不参与构建。`4-qt-studio` 与它们的性质完全不同。
+
+### 替代结论
+
+- `4-qt-studio` **保留原位**，定位为「Qt 桌面程序 + 全仓编译产物宿主」。
+- 「已被 `6-web` 取代」这一事实由 `readme.md` 的目录表标注，不以目录位置表达。
+- 若未来确实要降级 Qt 版，正确做法是先解耦产物输出目录（引入独立的 `out/bin`），再谈归档，不能反过来。

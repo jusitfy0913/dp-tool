@@ -17,10 +17,15 @@ if(MSVC)
     add_definitions(-D_CRT_SECURE_NO_WARNINGS -DNOMINMAX -DGOOGLE_GLOG_DLL_DECL=)
 endif()
 
-if(NOT DEFINED OPENCV_DIR)
-    set(OPENCV_DIR "D:/thirdparty/opencv" CACHE PATH "OpenCV build root")
+# 不写死本机路径。查找顺序：-DOPENCV_DIR > 环境变量 OPENCV_DIR > CMake 常规搜索
+if(NOT DEFINED OPENCV_DIR AND DEFINED ENV{OPENCV_DIR})
+    set(OPENCV_DIR "$ENV{OPENCV_DIR}" CACHE PATH "OpenCV build root")
 endif()
-find_package(OpenCV REQUIRED PATHS "${OPENCV_DIR}" NO_DEFAULT_PATH)
+if(DEFINED OPENCV_DIR)
+    find_package(OpenCV REQUIRED PATHS "${OPENCV_DIR}" NO_DEFAULT_PATH)
+else()
+    find_package(OpenCV REQUIRED)
+endif()
 message(STATUS "[ocr_infer] OpenCV ${OpenCV_VERSION} found at ${OPENCV_DIR}")
 
 set(OCR_INFER_DIR "${CMAKE_CURRENT_LIST_DIR}")
@@ -115,6 +120,7 @@ target_include_directories(ocr_infer
         "${PADDLE_LIB}/third_party/install/tbb/include"
         "${PADDLE_LIB}/third_party/install/mklml/include"
         "${PADDLE_LIB}/third_party/install/onednn/include"
+    "${PADDLE_LIB}/third_party/install/mkldnn/include"
         "${PADDLE_LIB}/third_party/boost"
         "${PADDLE_LIB}/third_party/eigen3"
         "${OpenCV_INCLUDE_DIRS}"
@@ -130,6 +136,7 @@ target_link_directories(ocr_infer PRIVATE
     "${PADDLE_LIB}/third_party/install/xxhash/lib"
     "${PADDLE_LIB}/third_party/install/mklml/lib"
     "${PADDLE_LIB}/third_party/install/onednn/lib"
+    "${PADDLE_LIB}/third_party/install/mkldnn/lib"
 )
 
 set(PADDLE_INFERENCE_LIB "${PADDLE_LIB}/paddle/lib/paddle_inference.lib")
@@ -165,6 +172,41 @@ set_target_properties(ocr_infer PROPERTIES
     ARCHIVE_OUTPUT_DIRECTORY_DEBUG "${TRTFORGE_BIN_DIR}"
     ARCHIVE_OUTPUT_DIRECTORY_RELEASE "${TRTFORGE_BIN_DIR}"
 )
+
+# --- 把 ocr_infer 的运行时依赖一并拷到同一输出目录 -------------------------
+# ocr_infer.dll 在运行时需要 Paddle 及其第三方库。这些 DLL 分散在
+# <PADDLE_LIB>/paddle/lib 和 <PADDLE_LIB>/third_party/install/*/lib 下，
+# 不拷过来的话 TRTForge.exe 启动会直接 0xC0000135（缺依赖）。
+# 用 POST_BUILD 而不是手工复制，保证清空 build/ 后重新编译依然完整。
+if(EXISTS "${PADDLE_LIB}")
+    set(_OCR_RUNTIME_DEPS
+        "${PADDLE_LIB}/paddle/lib/paddle_inference.dll"
+        "${PADDLE_LIB}/paddle/lib/common.dll"
+        "${PADDLE_LIB}/third_party/install/mkldnn/lib/mkldnn.dll"
+        "${PADDLE_LIB}/third_party/install/mklml/lib/libiomp5md.dll"
+    )
+    foreach(_dep IN LISTS _OCR_RUNTIME_DEPS)
+        if(EXISTS "${_dep}")
+            add_custom_command(TARGET ocr_infer POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different "${_dep}" "${TRTFORGE_BIN_DIR}"
+                COMMENT "[ocr_infer] 复制运行时依赖 ${_dep}"
+            )
+        else()
+            message(WARNING "[ocr_infer] 运行时依赖不存在，跳过：${_dep}")
+        endif()
+    endforeach()
+    # 构建产物的依赖（yaml-cpp / clipper）用生成器表达式取实际路径
+    foreach(_tgt yaml-cpp::yaml-cpp polyclipping)
+        if(TARGET ${_tgt})
+            add_custom_command(TARGET ocr_infer POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_FILE:${_tgt}>" "${TRTFORGE_BIN_DIR}"
+                COMMENT "[ocr_infer] 复制 ${_tgt} 到输出目录"
+            )
+        endif()
+    endforeach()
+    unset(_OCR_RUNTIME_DEPS)
+    unset(_OCR_BUILD_DEPS)
+endif()
 
 option(OCR_INFER_BUILD_EXAMPLES "Build ocr_basic example executable" OFF)
 if(OCR_INFER_BUILD_EXAMPLES)

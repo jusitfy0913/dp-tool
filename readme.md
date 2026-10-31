@@ -88,6 +88,7 @@ Qt 界面内部仍按四个功能分目录：`src/annotation` 标注，`src/trai
 | `PYTHON_EXE` | 构建 Paddle 时使用的 Python |
 | `TRTFORGE_ANOMALIB_DATASET_ROOT` | Anomalib 数据集根目录 |
 | `TRTFORGE_OBB_IMAGE`、`TRTFORGE_POSE_IMAGE` | 两个导出脚本的测试图 |
+| `OPENCV_DIR` | OpenCV 根目录，CMake 构建（`4-qt-studio`、`ocr_infer`、两个推理子工程）与推理 DLL 运行时共用；`-DOPENCV_DIR` 可临时覆盖 |
 
 `third_party/` 已加入 `.gitignore`，Paddle 源码与构建产物不会进入版本库。
 
@@ -131,6 +132,88 @@ python tf_anomalib_launcher.py --mode check-env
 引擎构建页选择 ONNX 后会在后台线程自动识别第一个输入 tensor 的名称和维度，并弹出“ONNX 加载中”进度提示；识别完成后提供统一 `H/W` 输入，修改一次高度和宽度即可同步覆盖 `min / opt / max` 三组动态 shape。
 
 ## 版本更新记录
+
+### v1.9 — 2026-10-31（Qt 版首次完整编译成功：TRTForge.exe 可启动）
+
+这条不是重构，是**把长期挂着的「本机没有 Qt，界面一直不可用」彻底解决了**。
+
+| 项目 | 老版本 | 新版本 | 影响 |
+| --- | --- | --- | --- |
+| `TRTForge.exe` | 从未编译成功 | **编译成功并实测可启动**（361 MB 常驻） | Qt 桌面版恢复可用 |
+| CMake 配置 | 失败 | `Configuring done` / `Generating done` | 四个目标全部产出 |
+| `ocr_infer` | 从未编译（缺依赖） | `ocr_infer.dll` + `.lib` + `ocr_basic.exe` | OCR 链路解锁 |
+| `yaml-cpp` | 空目录（坏的 gitlink） | 源码就位，随工程正常编译 | 见下方"为什么它一直是空目录" |
+| 运行时依赖 | 需手工复制，漏一个就 `0xC0000135` | POST_BUILD 自动复制 6 个依赖 | 清空 `build/` 重编也不会缺文件 |
+| 编译阻塞记录 | 记为"本机工具链阻塞" | 实为 OpenCV 死路径 + 三处真实缺陷 | 误判已纠正 |
+
+**完整构建命令**
+
+```powershell
+$env:OPENCV_DIR = "E:\thirdparty\opencv"
+
+# 1) OCR 子工程（必须先编，主工程要链接它的 .lib）
+cd ocr\ocr_infer
+cmake --preset vs2022-x64 "-DCMAKE_POLICY_VERSION_MINIMUM=3.5" `
+      "-DPADDLE_LIB=<仓库>/ocr/ocr_infer/third_party/paddle_inference"
+cmake --build --preset vs2022-x64
+
+# 2) 主工程
+cd ..\..\4-qt-studio
+cmake --preset vs2022-x64
+cmake --build --preset vs2022-x64
+```
+
+**本次修掉的四个真实缺陷**
+
+1. **OpenCV 死路径**：5 个 `CMakeLists.txt` + 2 个 `CMakePresets.json` 写死 `D:/thirdparty/opencv`，本机实际在 `E:\thirdparty\opencv`。见 v1.8。
+2. **`mkldnn/lib` 漏配**：`ocr_infer/CMakeLists.txt` 的链接搜索目录只列了 `onednn/lib`，而官方 GPU 包用的是 `mkldnn`。链接期报 `LNK1181: 无法打开输入文件 mkldnn.lib`。
+3. **CMake 4.2 与 clipper 不兼容**：clipper 写的是 `cmake_minimum_required(VERSION 2.6.0)`，CMake 4.x 已移除 <3.5 兼容。用 `-DCMAKE_POLICY_VERSION_MINIMUM=3.5` 绕过。**PowerShell 里必须加双引号**，否则 `=3.5` 会被拆成独立参数，报 `Could not read presets from ...\.5`。
+4. **运行时依赖不落地**：`ocr_infer.dll` 依赖 `paddle_inference.dll`、`common.dll`、`mkldnn.dll`、`libiomp5md.dll`、`yaml-cpp.dll`、`polyclipping.dll`，分散在 Paddle 包与 build 目录里。已加 POST_BUILD 自动复制到 `4-qt-studio/bin`。
+
+**为什么 `yaml-cpp` 一直是空目录**
+
+它在 git 索引里登记成 **gitlink（模式 `160000`，指向提交 `0579ae3`）**，但仓库**缺少 `.gitmodules`**。这是一种损坏的子模块登记：克隆下来就是个空目录，构建必然失败。
+
+对比同目录另三个第三方库，全部是普通文件管理：
+
+| 库 | git 形态 | 文件数 |
+| --- | --- | --- |
+| `abseil-cpp` | 普通文件 | 1365 |
+| `clipper_ver6.4.2` | 普通文件 | 262 |
+| `nlohmann` | 普通文件 | 3 |
+| `yaml-cpp` | **gitlink（坏）** | — |
+
+补齐源码后确认其 HEAD 恰为 `0579ae3`（tag `yaml-cpp-0.7.0`，远端 `jbeder/yaml-cpp`），版本正确。
+
+### v1.8 — 2026-10-31（推理降级保底 + OpenCV 路径去硬编码 + ckpt/ONNX 对比打通）
+
+三件事凑到一起，都是"环境一换就不工作"的老毛病，这次从根上拆掉。
+
+| 项目 | 老版本 | 新版本 | 影响 |
+| --- | --- | --- | --- |
+| DLL 不可用时的推理 | 直接 503，推理页整页不可用 | 自动降级到 `onnxruntime` 跑同源 ONNX | 没编译 DLL 也能验证模型链路 |
+| 降级结果可辨识 | — | 返回 `backend="onnxruntime-fallback"` + `warning` 说明原因 | 不会把降级结果误当成 TensorRT 性能 |
+| 能力探测 | 只有 `infer_yolo`/`infer_anomalib` | 增加 `infer_fallback`/`infer_fallback_detail` | 前端可提前提示"仍可跑通" |
+| OpenCV 路径 | `CMakeLists.txt` 写死 `D:/thirdparty/opencv` | `-DOPENCV_DIR` > 环境变量 > CMake 常规搜索 | 换机器/换盘符不再需要改源码 |
+| 受影响文件 | 2 处（任务原记录） | **5 个 `CMakeLists.txt` + 2 个 `CMakePresets.json`** | preset 里的 `OPENCV_DIR` 会盖掉环境变量，必须一起清 |
+| TRTForge 配置 | 本机失败，记录为"工具链阻塞" | **`Configuring done` / `Generating done`（exit 0）** | 真因是 OpenCV 死路径，不是工具链 |
+| 推理 DLL 编译 | — | `yolo_infer.dll`、`anomalib_infer.dll` 均编译成功 | 产物 `4-qt-studio/bin/*.dll` |
+| ckpt vs ONNX 对比 | 脚本能跑但分数恒 0.5，结论无意义 | 三模型验证通过（PatchCore 81.1%、PaDiM 89.0%、EfficientAd 82.7% 判定一致） | 见下方"对比脚本修了什么" |
+
+**降级推理的行为边界**
+
+- YOLO 只支持 `detect` / `obb`。`segment` / `pose` 需要解析额外输出张量，Python 复刻容易与 C++ 产生细微差异，遇到时明确报错并提示走 DLL。
+- Anomalib 只能加载 `.onnx`。TensorRT 引擎（`.engine`）由 DLL 专用，onnxruntime 不识该格式。
+- 引擎选的是 `.engine` 时，会按「同目录同名 `.onnx` → `metadata.json` 里的 `onnx_path`」顺序自动找替代模型。
+- 降级路径不做 C++ 侧的分阶段计时，`preprocess_ms`/`postprocess_ms` 记 0，只有 `inference_ms` 有效。
+
+**对比脚本修了什么**（`compare_ckpt_onnx_inference.py`，三个都是"能跑但结果错"的隐形缺陷）
+
+1. `import anomalib` 落到了 user-site 的 **1.2.0**，而 ckpt 是仓库内 **2.0.0b3** 训练的。版本反了导致 `state_dict` 报 unexpected keys，实际跑出来分数恒为 `0.5`。修法：优先把 `anomalib-main/src` 注入 `sys.path`，与 `tf_anomalib_launcher.py` 保持一致。
+2. 新版 `Engine.predict` 返回 `list[dict]`，键是**复数**（`pred_scores` / `anomaly_maps` / `pred_labels`）；旧代码用 `getattr` 取单数属性，全部得到 `None`，于是判定永远"OK"。
+3. `numpy 2.x` 下 `imgaug` 因 `np.sctypes` 被移除而 import 失败。加运行时垫片，不必降级 numpy（降级会波及 ultralytics / opencv / onnxruntime）。
+
+**关于"两侧分数差 ~0.33 是不是 bug"**：不是。ckpt 侧分数由模型 `post_processor` 用自己的阈值归一化，ONNX 侧用 `metadata.json` 里**校准后**的阈值归一化。两个基准不同，同一原始分数会落到不同位置，于是差异呈近常数偏移。判定结论以 metadata 阈值为准——那是 `generate_trtforge_metadata.ps1` 在正常/异常样本上验证过的。
 
 ### v1.7 — 2026-10-31（YOLO 数据增强参数开放：15 项全链路可调）
 
@@ -369,7 +452,7 @@ Web 版负责「拿到已有标注 → 重新划分 → 导出成训练可直接
 | 变量 | 作用 |
 | --- | --- |
 | `TRTFORGE_PYTHON` | 训练用 `python.exe`，不设则自动探测 |
-| `OPENCV_DIR` | OpenCV 根目录，推理 DLL 运行时必需，如 `E:\thirdparty\opencv` |
+| `OPENCV_DIR` | OpenCV 根目录，如 `E:\thirdparty\opencv`。**推理 DLL 运行时必需，CMake 构建时也读它**（`-DOPENCV_DIR` 优先，其次本环境变量，都没有才交给 CMake 常规搜索） |
 | `CUDA_PATH` | CUDA 根目录，推理 DLL 运行时必需 |
 | `TRTFORGE_TRTEXEC` | `trtexec.exe` 路径，不设则从 `CUDA_PATH\bin` / CUDA 根 / PATH 自动找 |
 | `TRTFORGE_BROWSE_ROOTS` | 额外允许浏览的目录（分号分隔），默认只允许仓库内 |

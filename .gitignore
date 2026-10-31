@@ -96,6 +96,8 @@ trtmodel/
 results/
 **/results/
 **/datasets/
+# ckpt 与 ONNX 对比脚本的报告产物（compare_ckpt_onnx_inference.py）
+**/compare_outputs/
 
 # 根目录 bin 下的训练冒烟测试残留产物（每次训练都会生成 labels_<name>.json）
 /bin/configs/labels_*.json

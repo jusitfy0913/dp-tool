@@ -103,6 +103,11 @@ async function onSubmit(event) {
 }
 
 function renderResult(result, isYolo) {
+  // 降级提示：DLL 不可用时后端会自动用 onnxruntime 跑同一份 ONNX，
+  // 结果可用但不是最终性能路径，必须让用户明确知道。
+  if (result.warning) {
+    setMetric("降级提示", result.warning);
+  }
   if (isYolo) {
     dom.imgResult.src = `data:image/png;base64,${result.annotated_png}`;
     setMetric("目标数", result.count);

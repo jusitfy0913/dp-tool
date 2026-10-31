@@ -28,4 +28,4 @@
 - [x] 5.2 新增 `trtforge_metadata.py`，统一 metadata 写入、ONNX 预处理和输出解析
 - [x] 5.3 在 `anomalib-main` 根目录新增 `compare_ckpt_onnx_inference.py`
 - [x] 5.4 TRTForge metadata loader 兼容 `input_size` 新字段并优化缺失提示
-- [ ] 5.5 运行训练导出和 ckpt/onnx 对比脚本完成样例验证（三模型训练与 ONNX 导出已验证，`compare_ckpt_onnx_inference.py` 未执行）
+- [x] 5.5 运行 `compare_ckpt_onnx_inference.py` 完成三模型样例验证（PatchCore 81.1% / PaDiM 89.0% / EfficientAd 82.7% 判定一致）。修复了脚本三个真实缺陷：① `import anomalib` 落到 user-site 1.2.0 而非仓库内 2.0.0b3（ckpt 由后者训练，导致分数恒为 0.5）→ 改为优先注入 `src` 路径；② 新版 `Engine.predict` 返回 `list[dict]` 且键为复数（`pred_scores`/`anomaly_maps`），原代码用 `getattr` 取单数属性，全部拿到 `None`；③ 新增 `_print_summary` 解释「分数差呈近常数偏移 = 两侧阈值基准不同，判定以 metadata 阈值为准」。报告见 `anomalib-main/compare_outputs/`

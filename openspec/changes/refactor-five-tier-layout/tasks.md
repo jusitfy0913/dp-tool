@@ -33,7 +33,7 @@
 - [x] 5.5 核对 `CMakeLists.txt:331-338` 的 launcher 拷贝源为 `1-python-yolo/launcher`、`2-python-anomaly/launcher`，目标为 `bin/training/scripts`
 - [x] 5.6 修正 `src/training/YoloTrainController.cpp` 的 `launcherPath()` 解析顺序与候选路径（去掉重复项，补 `appDir/../../` 源码形态）
 - [x] 5.7 修正 `tests/dll_api_smoke_test.py` 与 `test/01_asset_check.py` 的 `5-reference` 与 anomalib 数据集资产路径
-- [ ] 5.8 运行 `cmake --preset vs2022-x64` 配置成功，并编译 `TRTForge`（本机工具链阻塞，见 §9）
+- [x] 5.8 **完整编译通过**：`cmake --preset vs2022-x64` → `Configuring done` / `Generating done`；`yolo_infer`、`anomalib_infer`、`ocr_infer`、`TRTForge` 四个目标全部产出到 `4-qt-studio/bin`，`TRTForge.exe` 实测可启动（361 MB 常驻）。此前记录的「本机工具链阻塞」实为**误判**，真因是 OpenCV 硬编码到不存在的 `D:/thirdparty/opencv`（本机实际在 `E:\thirdparty\opencv`），且 preset 里的 `OPENCV_DIR` 覆盖了环境变量；已在 7.5 一并修复。OCR 缺失的 `yaml-cpp`/Paddle 依赖见 7.4。
 
 ## 6. 五级 5-reference
 - [x] 6.1 `git mv YOLOv8-det YOLOv8-seg YOLOv8_obb YOLOv8-TensorRT-main 5-reference/`
@@ -51,7 +51,11 @@
 - [x] 7.1 `git mv PaddleOCR-main ocr/PaddleOCR-main`、`git mv trtexec/gui/inference/ocr_infer ocr/ocr_infer`
 - [x] 7.2 核对 `ocr/ocr_infer/CMakeLists.txt:34` 的 `PADDLEOCR_CPP_INFER_DIR` 指向 `${REPO_ROOT}/ocr/PaddleOCR-main/deploy/cpp_infer`
 - [x] 7.3 确认 `ocr_infer` 输出目录仍为 `4-qt-studio/bin`
-- [ ] 7.4 以 `TRTFORGE_BUILD_OCR_INFER=ON` 单独配置 `ocr_infer`，确认能生成解决方案（本机工具链阻塞，见 §9）
+- [x] 7.4 **OCR 全链路编译通过**（2026-10-31）。实测命令：`cmake --preset vs2022-x64 "-DCMAKE_POLICY_VERSION_MINIMUM=3.5" "-DPADDLE_LIB=<...>/third_party/paddle_inference"`。成功产出 `4-qt-studio/bin/{ocr_infer.dll, ocr_infer.lib, ocr_basic.exe}`，并由此解锁 `TRTForge.exe` 链接。过程中修掉三处真实缺陷：
+  - **`third_party/yaml-cpp` 是空目录**：它在 git 索引里登记为 gitlink（`160000 0579ae3`）但仓库缺 `.gitmodules`，属于损坏的子模块登记。已确认内部仓库 HEAD 恰为 `0579ae3`（tag `yaml-cpp-0.7.0`，远端 `jbeder/yaml-cpp`），源码就位后配置即通过。
+  - **CMake 4.2 与 clipper 不兼容**：clipper 写的是 `cmake_minimum_required(VERSION 2.6.0)`，用 `-DCMAKE_POLICY_VERSION_MINIMUM=3.5` 绕过（PowerShell 里必须加引号，否则 `=3.5` 会被拆成独立参数）。
+  - **链接搜索目录漏了 `mkldnn/lib`**：`CMakeLists.txt` 只列了 `onednn/lib`，而官方 GPU 包实际是 `mkldnn`。已补上 include 与 lib 两条路径。
+  - 另新增 POST_BUILD，把 `paddle_inference.dll` / `common.dll` / `mkldnn.dll` / `libiomp5md.dll` / `yaml-cpp.dll` / `polyclipping.dll` 自动拷到输出目录，避免 `TRTForge.exe` 启动报 `0xC0000135`（缺依赖）。
 
 ## 8. 横切与验收
 - [x] 8.1 清理 `.gitignore` 的 `trtexec/gui/*` 旧条目，只保留 `4-qt-studio/build|dist|logs|bin`

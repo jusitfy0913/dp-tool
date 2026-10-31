@@ -17,7 +17,6 @@
         "CMAKE_BUILD_TYPE": "Release",
         "QT_DIR_HINT": "D:/QT/6.8.3/msvc2022_64",
         "CUDA_TOOLKIT_ROOT_DIR": "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v11.8",
-        "OPENCV_DIR": "D:/thirdparty/opencv",
         "TRTFORGE_BUILD_OCR_INFER": "OFF"
       }
     },
@@ -30,7 +29,6 @@
         "CMAKE_BUILD_TYPE": "Release",
         "QT_DIR_HINT": "D:/QT/6.8.3/msvc2022_64",
         "CUDA_TOOLKIT_ROOT_DIR": "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v11.8",
-        "OPENCV_DIR": "D:/thirdparty/opencv",
         "TRTFORGE_BUILD_OCR_INFER": "OFF"
       }
     }

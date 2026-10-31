@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import os
 import shlex
 import tempfile
@@ -31,6 +32,7 @@ from pydantic import BaseModel, Field
 import config
 import dataset
 import infer
+import onnx_fallback
 from runners import manager
 
 # ---------------------------------------------------------------------------
@@ -70,6 +72,10 @@ def capabilities() -> dict:
     data["infer_yolo"] = backend.yolo_ok
     data["infer_anomalib"] = backend.anomalib_ok
     data["infer_detail"] = backend.detail
+    # 降级能力：DLL 不可用时，前端可提示「仍可用 ONNX 跑通链路」
+    fallback_ok, fallback_detail = onnx_fallback.available()
+    data["infer_fallback"] = fallback_ok
+    data["infer_fallback_detail"] = fallback_detail
     return data
 
 
@@ -735,7 +741,51 @@ def _check_yolo_output_sane(result: dict, img_w: int, img_h: int) -> None:
         )
 
 
+# ---------------------------------------------------------------------------
+# 推理（DLL 优先，DLL 不可用时降级到 onnxruntime）
+# ---------------------------------------------------------------------------
+def _resolve_fallback_onnx(engine_path: str, metadata_path: str) -> tuple[str | None, str]:
+    """为降级路径找出可用的 .onnx 模型，返回 (路径, 说明)。
+
+    用户选的是 TensorRT 引擎（.engine/.trt），onnxruntime 读不了它，
+    所以必须找回同源的 ONNX。按可信度依次尝试：
+
+    1. 用户直接选的就是 .onnx —— 直接用；
+    2. 同目录同名 .onnx（`best.engine` -> `best.onnx`，`best.transd.engine` -> `best.transd.onnx`）；
+    3. metadata.json 里记录的 `onnx_path`（训练时写下的原始 ONNX 位置。
+
+    第 2 条优先于第 3 条：metadata 里的 onnx_path 往往是训练机上的绝对路径，
+    模型拷到别的机器后就失效了，而同目录同名文件通常跟着一起拷过来。
+    """
+    path = Path(engine_path)
+    if path.suffix.lower() == ".onnx":
+        return (str(path), "") if path.is_file() else (None, f"ONNX 文件不存在：{engine_path}")
+
+    sibling = path.with_suffix(".onnx")
+    if sibling.is_file():
+        return str(sibling), ""
+
+    if metadata_path and Path(metadata_path).is_file():
+        try:
+            meta = json.loads(Path(metadata_path).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            meta = {}
+        recorded = str(meta.get("onnx_path", "") or "").strip()
+        if recorded and Path(recorded).is_file():
+            return recorded, ""
+
+    return None, (
+        f"降级推理需要 .onnx，但没找到与 {path.name} 对应的 ONNX。"
+        f"请把同名的 {path.stem}.onnx 放到同一目录，或直接选择 .onnx 模型。"
+    )
+
+
+def _fallback_reason(primary: str, detail: str) -> str:
+    return f"{primary} 不可用（{detail}），已自动降级为 onnxruntime"
+
+
 @app.post("/api/infer/yolo")
+
 def infer_yolo(
     image: UploadFile = File(...),
     engine: str = Form(...),
@@ -743,21 +793,35 @@ def infer_yolo(
     conf: float = Form(0.25),
     nms: float = Form(0.45),
 ) -> JSONResponse:
-    """YOLO 推理：返回检测框与标注后的结果图（base64）。"""
+    """YOLO 推理：返回检测框与标注后的结果图（base64）。
+
+    DLL 优先；DLL 不可用时自动降级到 onnxruntime，返回结构完全一致。
+    """
     backend = infer.status()
+    warning: str | None = None
     if not backend.yolo_ok:
-        raise HTTPException(
-            status_code=503,
-            detail=(
-                "yolo_infer.dll 不可用："
-                f"{backend.detail}。请确认已编译 DLL，并设置 OPENCV_DIR / CUDA_PATH。"
-            ),
-        )
+        onnx_path, reason = _resolve_fallback_onnx(engine, "")
+        if onnx_path is None:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "yolo_infer.dll 不可用："
+                    f"{backend.detail}。请确认已编译 DLL，并设置 OPENCV_DIR / CUDA_PATH。"
+                    f"（也可改用 ONNX 降级，但{reason}）"
+                ),
+            )
+        warning = _fallback_reason("yolo_infer.dll", backend.detail or "未知原因")
 
     data, temp_path = _save_upload(image)
     try:
         array = infer.decode_image(data)
-        result = infer.run_yolo(engine, task, array, conf=conf, nms=nms)
+        if backend.yolo_ok:
+            result = infer.run_yolo(engine, task, array, conf=conf, nms=nms)
+        else:
+            try:
+                result = onnx_fallback.run_yolo(onnx_path, task, array, conf=conf, nms=nms)
+            except onnx_fallback.FallbackError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
         _check_yolo_output_sane(result, array.shape[1], array.shape[0])
         annotated = infer.draw_yolo(array, result["boxes"])
     except infer.InferError as exc:
@@ -769,6 +833,8 @@ def infer_yolo(
     import base64
 
     result["annotated_png"] = base64.b64encode(annotated).decode("ascii")
+    if warning:
+        result["warning"] = warning
     return JSONResponse(result)
 
 
@@ -779,21 +845,37 @@ def infer_anomalib(
     metadata: str = Form(...),
     model_type: str = Form("Auto"),
 ) -> JSONResponse:
-    """Anomalib 推理：返回分数、判定、叠加图与异常轮廓图（base64）。"""
+    """Anomalib 推理：返回分数、判定、叠加图与异常轮廓图（base64）。
+
+    DLL 优先；DLL 不可用时用 onnxruntime 加载同源 ONNX 降级。
+    """
     backend = infer.status()
+    warning: str | None = None
     if not backend.anomalib_ok:
-        raise HTTPException(
-            status_code=503,
-            detail=(
-                "anomalib_infer.dll 不可用："
-                f"{backend.detail}。请确认已编译 DLL，并设置 OPENCV_DIR / CUDA_PATH。"
-            ),
-        )
+        onnx_path, reason = _resolve_fallback_onnx(engine, metadata)
+        if onnx_path is None:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "anomalib_infer.dll 不可用："
+                    f"{backend.detail}。请确认已编译 DLL，并设置 OPENCV_DIR / CUDA_PATH。"
+                    f"（也可改用 ONNX 降级，但{reason}）"
+                ),
+            )
+        warning = _fallback_reason("anomalib_infer.dll", backend.detail or "未知原因")
 
     data, temp_path = _save_upload(image)
     try:
         array = infer.decode_image(data)
-        result = infer.run_anomalib(engine, metadata, array, model_type=model_type)
+        if backend.anomalib_ok:
+            result = infer.run_anomalib(engine, metadata, array, model_type=model_type)
+        else:
+            try:
+                result = onnx_fallback.run_anomalib(
+                    onnx_path, metadata, array, model_type=model_type
+                )
+            except onnx_fallback.FallbackError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
     except infer.InferError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     finally:
@@ -805,6 +887,8 @@ def infer_anomalib(
     for key in ("overlay_png", "mask_png"):
         value = result.get(key)
         result[key] = base64.b64encode(value).decode("ascii") if value else None
+    if warning:
+        result["warning"] = warning
     return JSONResponse(result)
 
 
