@@ -73,7 +73,7 @@
 - [x] 8.8 更新 `readme.md` 的新旧路径对照表，覆盖五级目录、`ocr`、`trtexec`、`scripts`、`docs`
 - [x] 8.9 全仓校验：旧路径仅剩 `readme.md` 中明确标注为「原来的路径」的历史对照
 - [x] 8.10 运行 `openspec validate refactor-five-tier-layout --strict` 通过
-- [ ] 8.11 用 `git add -A` 与 `git status` 确认重命名被识别，提交信息说明为目录结构重构（提交前需用户确认）
+- [x] 8.11 提交已完成（commit `f9aa158`，2026-10-31 经用户确认）。用 `git add -A` 确认暂存无构建产物误入，418 个文件（18 个业务改动 + 399 个 yaml-cpp 源码），提交信息说明了构建打通与目录关系。**顺带把 `yaml-cpp` 从坏的 gitlink 转为普通文件**：原登记为模式 `160000` 指向 `0579ae3`（tag `yaml-cpp-0.7.0`）却缺 `.gitmodules`，新克隆时目录为空导致构建必失败，现已与 `abseil-cpp`、`clipper` 统一为 `100644`。
 
 ## 9. 验证记录（2026-10-28）
 

@@ -6,6 +6,12 @@
 
 **阅读提示**：下文含多张 **Mermaid 流程图与结构图**，请使用支持 Mermaid 的 Markdown 预览（如 VS Code + Markdown Preview Mermaid、Typora 等）查看。文中「界面截图」可在本地软件截取后，按 `docs/images/trtforge_manual/截图说明.txt` 命名放入同目录，即可与占位说明一一对应。
 
+> **本文档描述的是 Qt 桌面版界面。**
+> 自 2026-10-31 起，日常使用推荐 [Web 工作站 `6-web`](../6-web/)（免编译，浏览器打开即用），
+> 功能覆盖训练与推理；Qt 版仍可完整编译运行（见 [WORKFLOW_GUIDE 第 6.1 节](WORKFLOW_GUIDE.md)），
+> 适合离线单机环境。**本文的页签名称、按钮位置均为 Qt 版，与 Web 版布局不同，请勿混用。**
+> 两版差异对照见 [readme 的「Web 版工作站」章节](../readme.md)。
+
 ---
 
 ## 1. 总览配图与闭环流程
