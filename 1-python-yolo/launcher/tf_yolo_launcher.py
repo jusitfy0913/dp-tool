@@ -511,6 +511,22 @@ def build_train_kwargs(args: argparse.Namespace) -> Dict[str, Any]:
         "resume": args.resume,
         "plots": args.plots,
         "verbose": True,
+        # 增强参数：默认值与 Ultralytics 默认一致，只有用户显式指定才会改变行为
+        "hsv_h": args.hsv_h,
+        "hsv_s": args.hsv_s,
+        "hsv_v": args.hsv_v,
+        "degrees": args.degrees,
+        "translate": args.translate,
+        "scale": args.scale,
+        "shear": args.shear,
+        "perspective": args.perspective,
+        "flipud": args.flipud,
+        "fliplr": args.fliplr,
+        "bgr": args.bgr,
+        "mosaic": args.mosaic,
+        "mixup": args.mixup,
+        "copy_paste": args.copy_paste,
+        "close_mosaic": args.close_mosaic,
     }
 
     pretrained = bool_or_path(args.pretrained)
@@ -774,6 +790,32 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--momentum", type=float, default=0.937)
     parser.add_argument("--weight-decay", type=float, default=0.0005)
     parser.add_argument("--freeze", type=int, default=None)
+    # ------------------------------------------------------------------
+    # 数据增强（默认值逐项对齐 Ultralytics 8.4 的 DEFAULT_CFG）：
+    # 不填时与改动前行为完全一致，避免「升级后模型表现变了却不知道为什么」。
+    # 小缺陷场景（如 PCB 70px 缺陷）最该调的是 mosaic 与 close_mosaic：
+    # mosaic 会把 4 张图拼成 1 张，等于再缩小一半，缺陷可能小到看不见。
+    # ------------------------------------------------------------------
+    parser.add_argument("--hsv-h", type=float, default=0.015, help="色调抖动幅度（0~1）")
+    parser.add_argument("--hsv-s", type=float, default=0.7, help="饱和度抖动幅度（0~1）")
+    parser.add_argument("--hsv-v", type=float, default=0.4, help="亮度抖动幅度（0~1）")
+    parser.add_argument("--degrees", type=float, default=0.0, help="随机旋转角度范围（±度）")
+    parser.add_argument("--translate", type=float, default=0.1, help="随机平移比例（0~1）")
+    parser.add_argument("--scale", type=float, default=0.5, help="随机缩放增益（0~1）")
+    parser.add_argument("--shear", type=float, default=0.0, help="随机错切角度（±度）")
+    parser.add_argument("--perspective", type=float, default=0.0, help="随机透视变换（0~0.001）")
+    parser.add_argument("--flipud", type=float, default=0.0, help="上下翻转概率（0~1）")
+    parser.add_argument("--fliplr", type=float, default=0.5, help="左右翻转概率（0~1）")
+    parser.add_argument("--bgr", type=float, default=0.0, help="RGB/BGR 通道互换概率（0~1）")
+    parser.add_argument("--mosaic", type=float, default=1.0, help="马赛克拼接概率（0~1），小缺陷建议降到 0~0.3")
+    parser.add_argument("--mixup", type=float, default=0.0, help="MixUp 概率（0~1）")
+    parser.add_argument("--copy-paste", type=float, default=0.0, help="Copy-Paste 概率（0~1，仅分割任务生效）")
+    parser.add_argument(
+        "--close-mosaic",
+        type=int,
+        default=10,
+        help="最后 N 个 epoch 关闭 mosaic，默认 10；小缺陷场景建议加大",
+    )
     parser.add_argument("--plots", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--overlap-mask", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--mask-ratio", type=int, default=4)

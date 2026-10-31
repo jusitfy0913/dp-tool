@@ -189,6 +189,19 @@ button.mini { padding: 5px 10px; font-size: 12px; }
 table.env { width: 100%; border-collapse: collapse; font-size: 12.5px; }
 table.env td { padding: 7px 10px; border-bottom: 1px solid var(--line); color: var(--muted); }
 table.env td:first-child { width: 250px; color: var(--text); }
+/* 数据增强折叠区：字段多，默认收起，避免训练表单过长 */
+.augbox { margin-top: 8px; padding-top: 10px; border-top: 1px dashed var(--line); }
+.augbox summary {
+  cursor: pointer;
+  color: var(--accent-2);
+  font-size: 12.5px;
+  padding: 4px 0;
+  outline: none;
+}
+.augbox summary:hover { color: var(--accent); }
+.augbox[open] summary { margin-bottom: 6px; }
+.augbox .actions { margin-top: 8px; }
+
 /* 数据集预览列表：图片多时只滚动容器，不把整页撑长 */
 .scrollbox { max-height: 420px; overflow: auto; border: 1px solid var(--line); border-radius: 8px; }
 .scrollbox table.env td { padding: 5px 10px; }

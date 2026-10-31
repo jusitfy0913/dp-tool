@@ -208,6 +208,31 @@ python tf_yolo_launcher.py --mode train `
 
 产物：`runs/trtforge/my_yolo/weights/{best.pt, last.pt}` + `results.csv` + 各类曲线图。
 
+#### 3.2.1 数据增强参数（v1.7 起可调）
+
+launcher 支持 15 项增强参数，**默认值与 Ultralytics `DEFAULT_CFG` 逐项一致，不填即行为不变**。
+
+```powershell
+# 小缺陷场景（PCB 70px 划痕）：降 mosaic、延长 close_mosaic、减弱几何抖动
+python tf_yolo_launcher.py --mode train `
+  --model yolov8n.pt --data configs\pcb_detect.yaml `
+  --epochs 100 --imgsz 640 --batch 16 `
+  --mosaic 0.1 --close-mosaic 20 --scale 0.3
+```
+
+| 参数 | 默认 | 建议场景 |
+| --- | --- | --- |
+| `--mosaic` | 1.0 | **小缺陷降到 0~0.3**：四图拼接会把缺陷再缩小一半 |
+| `--close-mosaic` | 10 | 小缺陷加大到 15~20，让最后几轮看完整图 |
+| `--scale` | 0.5 | 缺陷很小可降到 0.2~0.3，避免缩到看不见 |
+| `--fliplr` | 0.5 | 有丝印/文字/方向性图案时设 0 |
+| `--degrees` | 0 | 拍摄位姿固定就保持 0 |
+| `--hsv_v` / `--hsv_s` | 0.4 / 0.7 | 打光不稳、多工位时适度加大 |
+
+> 完整 15 项清单见 `readme.md` 的 v1.7 版本记录，或直接在 Web「模型训练」页展开「数据增强」。
+> 回归测试：`python 6-web/backend/tools/test_augment_params.py`（26 项）。
+
+
 ### 3.3 Anomalib 训练（三选一）
 
 ```powershell

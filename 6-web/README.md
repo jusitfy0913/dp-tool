@@ -83,6 +83,20 @@ powershell -File scripts\run_web_studio.ps1 -HostName 0.0.0.0
 
 日志是流式的，不是训练完才一次性吐出来。中间关掉浏览器训练**不会停**，重新进来点任务还能继续看。
 
+#### 数据增强（v1.7）
+
+表单里有「数据增强（留空则用默认值，共 15 项）」折叠区，包含
+`hsv_h/s/v`、`degrees`、`translate`、`scale`、`shear`、`perspective`、
+`flipud`、`fliplr`、`bgr`、`mosaic`、`mixup`、`copy_paste`、`close_mosaic`。
+
+- **留空 = 不传 = 用 Ultralytics 默认**，行为与升级前完全一致，历史实验仍可对比。
+- **填 `0` = 显式传 0**，不会被当成「没填」而忽略。
+- 两个快捷按钮：
+  - 「小缺陷预设」→ `mosaic=0.1, close_mosaic=20, scale=0.3, translate=0.05`
+  - 「清空（用默认）」→ 所有增强字段恢复留空
+- 概率类字段超出 `0~1` 或 `close_mosaic` 为负时，后端**启动前**直接返回 400，不会白等几十秒才报错。
+
+
 ### 推理演示
 
 1. 选 YOLO 或 Anomalib。
@@ -213,6 +227,11 @@ YOLO 返回画好框的图与每个目标的类别/置信度；Anomalib 返回�
 | POST | `/api/engine/build` | 用 trtexec 把 ONNX 编译成引擎 |
 | POST | `/api/dataset/scan` | 扫描数据集并按比例返回划分预览（不落盘） |
 | POST | `/api/dataset/export` | 按比例导出 YOLO / COCO / VOC |
+
+`POST /api/train/yolo` 的增强字段（全部可选，留空即用 Ultralytics 默认）：
+`hsv_h` `hsv_s` `hsv_v` `degrees` `translate` `scale` `shear` `perspective`
+`flipud` `fliplr` `bgr` `mosaic` `mixup` `copy_paste` `close_mosaic`。
+
 
 ## 代码结构
 

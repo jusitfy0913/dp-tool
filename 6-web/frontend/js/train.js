@@ -38,6 +38,33 @@ export function initTrain() {
   // 切换任务类型时自动改写权重名，与 Qt 版一致：
   // detect -> yolov8n.pt / segment -> yolov8n-seg.pt / pose -> yolov8n-pose.pt / obb -> yolov8n-obb.pt
   document.getElementById("yoloTask").addEventListener("change", syncYoloModel);
+
+  // 增强预设：只写「与默认不同」的项，其余留空，便于用户看出到底改了什么。
+  // 小缺陷预设针对 PCB 这类 70px 缺陷：关掉 mosaic（拼图会让缺陷再缩小一半）、
+  // 减弱几何抖动（避免把缺陷变形到认不出）、保留颜色抖动（应对打光差异）。
+  document.getElementById("augSmallDefect").addEventListener("click", () => {
+    const preset = {
+      augMosaic: "0.1",
+      augCloseMosaic: "20",
+      augScale: "0.3",
+      augTranslate: "0.05",
+      augDegrees: "0",
+      augMixup: "0",
+    };
+    for (const [id, value] of Object.entries(preset)) {
+      const el = document.getElementById(id);
+      if (el) el.value = value;
+    }
+    appendLog("已套用小缺陷预设：mosaic=0.1, close_mosaic=20, scale=0.3, translate=0.05", "ok");
+  });
+
+  document.getElementById("augReset").addEventListener("click", () => {
+    document.querySelectorAll(".augbox input").forEach((el) => {
+      el.value = "";
+    });
+    appendLog("已清空增强参数，将使用 Ultralytics 默认值", "ok");
+  });
+
   syncKind();
   setDefaultRunName();
 }
@@ -84,7 +111,7 @@ function formValue(id) {
 }
 
 function buildYoloPayload() {
-  return {
+  const payload = {
     task: formValue("yoloTask"),
     model: formValue("yoloModel"),
     data: formValue("yoloData"),
@@ -96,6 +123,36 @@ function buildYoloPayload() {
     name: formValue("runName") || "exp",
     python: formValue("pythonPath") || null,
   };
+
+  // 增强参数：留空就不传，后端也不会拼进命令行，最终用 Ultralytics 默认值。
+  // 这样「不填」与「升级前」行为完全一致，不会因为表单多了一堆字段而悄悄改变训练结果。
+  const augmentFields = {
+    hsv_h: "augHsvH",
+    hsv_s: "augHsvS",
+    hsv_v: "augHsvV",
+    degrees: "augDegrees",
+    translate: "augTranslate",
+    scale: "augScale",
+    shear: "augShear",
+    perspective: "augPerspective",
+    flipud: "augFlipud",
+    fliplr: "augFliplr",
+    bgr: "augBgr",
+    mosaic: "augMosaic",
+    mixup: "augMixup",
+    copy_paste: "augCopyPaste",
+    close_mosaic: "augCloseMosaic",
+  };
+  for (const [key, id] of Object.entries(augmentFields)) {
+    const raw = formValue(id).trim();
+    if (raw === "") continue;
+    const value = Number(raw);
+    if (Number.isNaN(value)) {
+      throw new Error(`增强参数 ${key} 不是合法数字：${raw}`);
+    }
+    payload[key] = value;
+  }
+  return payload;
 }
 
 function buildAnomalibPayload() {

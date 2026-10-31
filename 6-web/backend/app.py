@@ -93,6 +93,24 @@ class YoloTrainRequest(BaseModel):
     pretrained: str = "true"
     resume: bool = False
     python: str | None = Field(default=None, description="覆盖训练解释器")
+    # 数据增强：默认值与 Ultralytics 8.4 默认逐项一致，不填即行为不变。
+    # 用 None 表示「用户没填」，这样拼命令行时可以整体跳过，避免把默认值
+    # 重复写进命令行、也方便以后改 Ultralytics 默认值时不被这里钉死。
+    hsv_h: float | None = Field(default=None, description="色调抖动，默认 0.015")
+    hsv_s: float | None = Field(default=None, description="饱和度抖动，默认 0.7")
+    hsv_v: float | None = Field(default=None, description="亮度抖动，默认 0.4")
+    degrees: float | None = Field(default=None, description="随机旋转 ±度，默认 0")
+    translate: float | None = Field(default=None, description="平移比例，默认 0.1")
+    scale: float | None = Field(default=None, description="缩放增益，默认 0.5")
+    shear: float | None = Field(default=None, description="错切 ±度，默认 0")
+    perspective: float | None = Field(default=None, description="透视变换，默认 0")
+    flipud: float | None = Field(default=None, description="上下翻转概率，默认 0")
+    fliplr: float | None = Field(default=None, description="左右翻转概率，默认 0.5")
+    bgr: float | None = Field(default=None, description="RGB/BGR 互换概率，默认 0")
+    mosaic: float | None = Field(default=None, description="马赛克拼接概率，默认 1.0")
+    mixup: float | None = Field(default=None, description="MixUp 概率，默认 0")
+    copy_paste: float | None = Field(default=None, description="Copy-Paste 概率，默认 0")
+    close_mosaic: int | None = Field(default=None, description="最后 N 个 epoch 关 mosaic，默认 10")
 
 
 class AnomalibTrainRequest(BaseModel):
@@ -152,6 +170,20 @@ def train_yolo(request: YoloTrainRequest) -> dict:
         raise HTTPException(status_code=400, detail=f"dataset.yaml 不存在：{request.data}")
 
     python = _resolve_python(request.python)
+
+    # 概率类增强值必须在 [0,1]，超范围 Ultralytics 会在训练启动后才报错，
+    # 这里提前拦住，省得等几十秒才看到 ValueError。
+    for field_name in ("hsv_h", "hsv_s", "hsv_v", "translate", "scale",
+                       "perspective", "flipud", "fliplr", "mosaic", "mixup", "copy_paste"):
+        value = getattr(request, field_name)
+        if value is not None and not 0.0 <= value <= 1.0:
+            raise HTTPException(
+                status_code=400,
+                detail=f"{field_name} 必须在 0~1 之间，当前为 {value}",
+            )
+    if request.close_mosaic is not None and request.close_mosaic < 0:
+        raise HTTPException(status_code=400, detail="close_mosaic 不能为负数")
+
     command = [
         python, str(config.YOLO_LAUNCHER),
         "--mode", "train",
@@ -170,6 +202,29 @@ def train_yolo(request: YoloTrainRequest) -> dict:
     ]
     if request.resume:
         command.append("--resume")
+
+    # 增强参数只在用户填了才拼进命令行：留空 = 用 launcher 默认 = 用 Ultralytics 默认
+    augment_fields = (
+        ("hsv_h", "--hsv-h"),
+        ("hsv_s", "--hsv-s"),
+        ("hsv_v", "--hsv-v"),
+        ("degrees", "--degrees"),
+        ("translate", "--translate"),
+        ("scale", "--scale"),
+        ("shear", "--shear"),
+        ("perspective", "--perspective"),
+        ("flipud", "--flipud"),
+        ("fliplr", "--fliplr"),
+        ("bgr", "--bgr"),
+        ("mosaic", "--mosaic"),
+        ("mixup", "--mixup"),
+        ("copy_paste", "--copy-paste"),
+        ("close_mosaic", "--close-mosaic"),
+    )
+    for field_name, flag in augment_fields:
+        value = getattr(request, field_name)
+        if value is not None:
+            command += [flag, str(value)]
 
     try:
         run = manager.create("yolo-train", command, str(config.YOLO_LAUNCHER_DIR))

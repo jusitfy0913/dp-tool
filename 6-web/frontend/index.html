@@ -74,6 +74,39 @@
             <label>batch <input type="text" id="yoloBatch" value="16"></label>
             <label>device <input type="text" id="yoloDevice" value="0"></label>
           </div>
+
+          <!-- 数据增强：留空 = 用 Ultralytics 默认，行为与升级前完全一致 -->
+          <details class="augbox">
+            <summary>数据增强（留空则用默认值，共 15 项）</summary>
+            <p class="hint">
+              占位符里显示的就是 Ultralytics 默认值。小缺陷（如 PCB 70px）建议把
+              <b>mosaic 降到 0~0.3</b>：马赛克会把 4 张图拼成 1 张，缺陷再缩小一半容易消失。
+              <b>close_mosaic</b> 建议加大到 15~20，让模型最后多跑几个 epoch 的完整图。
+            </p>
+
+            <div class="grid2">
+              <label>hsv_h 色调 <input type="text" id="augHsvH" placeholder="0.015"></label>
+              <label>hsv_s 饱和度 <input type="text" id="augHsvS" placeholder="0.7"></label>
+              <label>hsv_v 亮度 <input type="text" id="augHsvV" placeholder="0.4"></label>
+              <label>degrees 旋转 ±度 <input type="text" id="augDegrees" placeholder="0"></label>
+              <label>translate 平移 <input type="text" id="augTranslate" placeholder="0.1"></label>
+              <label>scale 缩放 <input type="text" id="augScale" placeholder="0.5"></label>
+              <label>shear 错切 ±度 <input type="text" id="augShear" placeholder="0"></label>
+              <label>perspective 透视 <input type="text" id="augPerspective" placeholder="0"></label>
+              <label>flipud 上下翻转 <input type="text" id="augFlipud" placeholder="0"></label>
+              <label>fliplr 左右翻转 <input type="text" id="augFliplr" placeholder="0.5"></label>
+              <label>bgr 通道互换 <input type="text" id="augBgr" placeholder="0"></label>
+              <label>mosaic 马赛克 <input type="text" id="augMosaic" placeholder="1.0"></label>
+              <label>mixup 混类 <input type="text" id="augMixup" placeholder="0"></label>
+              <label>copy_paste 复制粘贴 <input type="text" id="augCopyPaste" placeholder="0"></label>
+              <label>close_mosaic 最后 N 轮关闭 <input type="number" id="augCloseMosaic" placeholder="10" min="0"></label>
+            </div>
+
+            <div class="actions">
+              <button type="button" class="mini" id="augSmallDefect">小缺陷预设</button>
+              <button type="button" class="mini" id="augReset">清空（用默认）</button>
+            </div>
+          </details>
         </div>
 
         <!-- Anomalib 专用 -->

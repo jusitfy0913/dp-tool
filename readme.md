@@ -132,6 +132,75 @@ python tf_anomalib_launcher.py --mode check-env
 
 ## 版本更新记录
 
+### v1.7 — 2026-10-31（YOLO 数据增强参数开放：15 项全链路可调）
+
+以前 launcher 只有 `lr0/lrf/momentum/weight_decay/freeze/imgsz/batch` 这几个旋钮，
+**数据增强一项都调不了**——想降 mosaic 只能改 Ultralytics 源码，改完下次升级就丢。
+本次把 15 项增强参数开到命令行与 Web 表单，默认值与 Ultralytics 逐项对齐。
+
+| 项目 | 老版本 | 新版本 | 影响 |
+| --- | --- | --- | --- |
+| 增强可调项 | 0 项（只能用 Ultralytics 默认） | 15 项（见下表） | 小缺陷场景终于能关掉 mosaic |
+| 默认值一致性 | 直接吃 Ultralytics 默认 | launcher 默认值逐项等于 `DEFAULT_CFG`，并加测试守住 | 不填参数 = 行为与升级前完全相同，历史实验可对比 |
+| Web 表单 | 无增强字段 | 「数据增强」折叠区，留空即用默认 | 表单不会因为多 15 个字段而过长 |
+| 参数传递语义 | — | 留空 = 不拼进命令行；填 `0` = 显式传 0 | 0 不会被误判成「没填」而丢掉 |
+| 越界防护 | 训练启动后由 Ultralytics 报错 | 后端在启动前返回 400（概率类 0~1、`close_mosaic` ≥ 0） | 不用等几十秒才知道填错了 |
+| 预设 | 无 | Web 提供「小缺陷预设」「清空」两个按钮 | PCB 这类 70px 缺陷一键套用合理值 |
+
+**新增的 15 个参数**（默认值 = Ultralytics 8.4 `DEFAULT_CFG`，命令行用短横线命名）
+
+| 参数 | 命令行 | 默认 | 范围 | 作用 |
+| --- | --- | --- | --- | --- |
+| `hsv_h` | `--hsv-h` | 0.015 | 0~1 | 色调抖动 |
+| `hsv_s` | `--hsv-s` | 0.7 | 0~1 | 饱和度抖动 |
+| `hsv_v` | `--hsv-v` | 0.4 | 0~1 | 亮度抖动（应对打光差异） |
+| `degrees` | `--degrees` | 0 | ±度 | 随机旋转 |
+| `translate` | `--translate` | 0.1 | 0~1 | 随机平移 |
+| `scale` | `--scale` | 0.5 | 0~1 | 随机缩放增益 |
+| `shear` | `--shear` | 0 | ±度 | 随机错切 |
+| `perspective` | `--perspective` | 0 | 0~0.001 | 透视变换 |
+| `flipud` | `--flipud` | 0 | 0~1 | 上下翻转 |
+| `fliplr` | `--fliplr` | 0.5 | 0~1 | 左右翻转 |
+| `bgr` | `--bgr` | 0 | 0~1 | RGB/BGR 通道互换 |
+| `mosaic` | `--mosaic` | 1.0 | 0~1 | 马赛克四图拼接 |
+| `mixup` | `--mixup` | 0 | 0~1 | 混类叠加 |
+| `copy_paste` | `--copy-paste` | 0 | 0~1 | 复制粘贴（仅分割生效） |
+| `close_mosaic` | `--close-mosaic` | 10 | ≥0 | 最后 N 个 epoch 关闭 mosaic |
+
+**使用方式**
+
+```bash
+# 命令行：只写出想改的项，其余自动用默认值
+python tf_yolo_launcher.py --mode train --task detect --model yolov8n.pt \
+  --data configs/pcb_detect.yaml --epochs 100 --imgsz 640 --batch 16 \
+  --mosaic 0.1 --close-mosaic 20 --scale 0.3
+```
+
+Web 端：「模型训练」页 → 展开「数据增强」→ 填想改的项（留空即默认）
+→ 或直接点「小缺陷预设」。
+
+**应用场景**
+
+| 场景 | 建议 | 原因 |
+| --- | --- | --- |
+| 小目标缺陷（PCB 划痕约 70px） | `mosaic 0~0.3`、`close_mosaic 15~20` | mosaic 把 4 张图拼成 1 张，缺陷再缩小一半容易消失 |
+| 拍摄角度固定、正对工件 | `degrees 0`、`perspective 0` | 引入不真实视角反而拖慢收敛 |
+| 打光不稳定、多工位 | `hsv_v 0.4~0.6`、`hsv_s 0.7` | 提升对亮度/色彩变化的鲁棒性 |
+| 有丝印/文字/方向性图案 | `fliplr 0`、`flipud 0` | 镜像后文字反了，属于不真实样本 |
+| 样本极少（< 500 张） | `mixup 0.1~0.2`、`copy_paste 0.1` | 增加样本组合多样性 |
+
+**验证记录**
+
+| 项 | 结果 |
+| --- | --- |
+| 参数透传 | 15 项逐个验证 → `build_train_kwargs()` 全部正确 |
+| 默认值零漂移 | 逐项对比 `ultralytics.cfg.DEFAULT_CFG` → 无一项不一致 |
+| 后端命令拼装 | 不填 → 命令行零增强 flag；填 `0.0` → 仍然拼入 |
+| 越界拦截 | `mosaic=1.5`、`close_mosaic=-1` → 400 且不启动进程 |
+| 真实短训练 | 2 epoch @320px，`mosaic=0.1/close_mosaic=1/scale=0.3/fliplr=0` |
+| `args.yaml` 核对 | 四项全部为传入值，未传项保持默认，exit 0 |
+| 测试脚本 | `6-web/backend/tools/test_augment_params.py` → 26 项全通过 |
+
 ### v1.6 — 2026-10-31（Web 数据集工作台：划分与导出进浏览器）
 
 以前要给已有图片重新划分 train/val、生成 `dataset.yaml`、或把数据转成 COCO/VOC，
@@ -380,6 +449,21 @@ OCR 推理页的画面区与右侧结果列表支持拖动分隔条调整比例�
 | `export` | 导出 ONNX，并可生成 `.transd.onnx` |
 
 支持任务头：`detect`、`segment`、`pose`、`obb`。
+
+### 训练超参速查（v1.7 起增强参数可调）
+
+| 类别 | 参数 | 默认 | 说明 |
+| --- | --- | --- | --- |
+| 基础 | `--epochs` / `--imgsz` / `--batch` / `--device` | 100 / 640 / 16 / 自动 | 训练规模 |
+| 优化器 | `--optimizer` `--lr0` `--lrf` `--momentum` `--weight-decay` | auto / 0.01 / 0.01 / 0.937 / 0.0005 | 学习率与正则 |
+| 冻结 | `--freeze` | 不冻结 | 冻结前 N 层，小数据集常用 |
+| 颜色增强 | `--hsv-h` `--hsv-s` `--hsv-v` | 0.015 / 0.7 / 0.4 | 对应打光与色温差异 |
+| 几何增强 | `--degrees` `--translate` `--scale` `--shear` `--perspective` | 0 / 0.1 / 0.5 / 0 / 0 | 对应拍摄位姿变化 |
+| 翻转 | `--flipud` `--fliplr` `--bgr` | 0 / 0.5 / 0 | 左右翻转默认开启，有丝印时建议关掉 |
+| 组合增强 | `--mosaic` `--mixup` `--copy-paste` `--close-mosaic` | 1.0 / 0 / 0 / 10 | **小缺陷必须降 mosaic** |
+
+> 15 项增强参数的默认值与 Ultralytics `DEFAULT_CFG` 逐项一致；不填即行为不变。
+> 小缺陷（如 PCB 70px）推荐组合：`--mosaic 0.1 --close-mosaic 20 --scale 0.3`。
 
 ## Anomalib 训练导出设计
 
