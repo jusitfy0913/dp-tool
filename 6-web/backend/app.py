@@ -29,6 +29,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 import config
+import dataset
 import infer
 from runners import manager
 
@@ -435,6 +436,76 @@ def build_engine(request: EngineBuildRequest) -> dict:
         raise HTTPException(status_code=500, detail=f"启动 trtexec 失败：{exc}") from exc
 
     return {**run.snapshot(), "engine": str(engine_path), "onnx_probe": probe}
+
+
+# ---------------------------------------------------------------------------
+# 数据集工作台：扫描 / 划分预览 / 导出
+# ---------------------------------------------------------------------------
+class DatasetScanRequest(BaseModel):
+    """扫描请求。ratios 只影响预览，不落盘。"""
+
+    source: str = Field(..., description="YOLO 数据集目录、data.yaml 或 .tfanno 文件")
+    task: str = Field(default="auto", description="auto / detect / segment / pose / obb")
+    train: int = Field(default=80, ge=0, le=100)
+    val: int = Field(default=20, ge=0, le=100)
+    limit: int = Field(default=200, ge=1, le=2000, description="预览列表最多返回多少张")
+
+
+class DatasetExportRequest(DatasetScanRequest):
+    """导出请求。额外带上格式、输出目录与覆盖开关。"""
+
+    format: str = Field(default="yolo", description="yolo / coco / voc")
+    output: str = Field(..., description="导出目标目录")
+    overwrite: bool = Field(default=False, description="目标目录非空时是否允许覆盖")
+
+
+def _ensure_dataset_path(path: str) -> None:
+    """数据集路径沿用目录浏览的白名单，避免接口被用来读任意磁盘。"""
+    allowed_roots = [config.REPO_ROOT]
+    for extra in os.environ.get("TRTFORGE_BROWSE_ROOTS", "").split(os.pathsep):
+        if extra.strip():
+            allowed_roots.append(Path(extra.strip()).resolve())
+
+    target = Path(path).expanduser().resolve()
+    if not any(target == root or root in target.parents for root in allowed_roots):
+        raise HTTPException(
+            status_code=403,
+            detail=f"路径不在允许范围内：{target}。可设置 TRTFORGE_BROWSE_ROOTS 追加允许的根目录。",
+        )
+
+
+@app.post("/api/dataset/scan")
+def dataset_scan(request: DatasetScanRequest) -> dict:
+    """扫描数据集并返回按比例划分后的预览，不写任何文件。"""
+    _ensure_dataset_path(request.source)
+    try:
+        project = dataset.load_project(request.source, request.task)
+        return dataset.preview(project, request.train, request.val, request.limit)
+    except dataset.DatasetError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except OSError as exc:
+        raise HTTPException(status_code=400, detail=f"读取数据集失败：{exc}") from exc
+
+
+@app.post("/api/dataset/export")
+def dataset_export(request: DatasetExportRequest) -> dict:
+    """扫描 → 划分 → 导出，一次请求完成，不需要前端保存划分状态。"""
+    _ensure_dataset_path(request.source)
+    _ensure_dataset_path(request.output)
+    try:
+        return dataset.run_export(
+            source=request.source,
+            task=request.task,
+            train=request.train,
+            val=request.val,
+            fmt=request.format,
+            output=request.output,
+            overwrite=request.overwrite,
+        )
+    except dataset.DatasetError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except OSError as exc:
+        raise HTTPException(status_code=400, detail=f"导出失败：{exc}") from exc
 
 
 # ---------------------------------------------------------------------------

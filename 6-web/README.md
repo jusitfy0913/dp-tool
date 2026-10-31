@@ -133,6 +133,44 @@ YOLO 返回画好框的图与每个目标的类别/置信度；Anomalib 返回�
 > trtexec 在 960×960 这类大分辨率上做 tactic 搜索可能长达数分钟，期间日志可能长时间不刷新，
 > 这是正常的，不是卡死。GPU 占用率持续接近 100% 即为仍在编译。
 
+### 数据集
+
+把已有的标注重新划分、并导出成训练可直接用的格式。
+
+1. 选数据源：YOLO 数据集目录（含 `images/`、`labels/`、`data.yaml`），或 Qt 的 `.tfanno` 工程文件。
+2. 任务类型默认「自动识别」（按标签每行字段数猜 detect / segment / pose / obb），猜错可手动指定。
+3. 填 train / val 比例，右侧会实时显示 `test = 100 - train - val`。
+4. 点「扫描预览」：显示总图片、各集张数、空标注数、类别数，以及每张图的「现有划分 → 新划分」。
+5. 选导出格式与输出目录，点「开始导出」。
+
+**划分规则（与 Qt 版对齐，务必注意）**
+
+- 比例是**向下取整**：`train = 总数 × train% ÷ 100` 取整、`val` 同理；
+- **剩下的全部归 test**，所以 80/20 时 test 是余数（692 张 → 553 / 138 / 1），
+  填 70/20/10 才能得到 70 / 20 / 剩余 10；
+- 排序用 **FNV-1a 64 位 + `_2026` 盐值**，保证同一份数据在任何机器、任何进程上
+  结果逐项一致。Qt 用的是 `qHash`，哈希函数不同，因此与 Qt 历史划分**不逐张一致**，
+  这是为了让划分可复现而做的取舍。
+
+**导出格式**
+
+| 格式 | 产物 | 限制 |
+| --- | --- | --- |
+| YOLO | `images/{train,val,test}` + `labels/{split}/*.txt` + `dataset.yaml` | 全任务支持；`dataset.yaml` 已实测能被 Ultralytics 直接识别 |
+| COCO | `annotations.json`（images / annotations / categories） | 不复制图片，图片以 `file_name` 记录；不支持 OBB |
+| VOC | `Annotations/*.xml` + `JPEGImages/` | **仅 detect**（水平矩形），其余任务直接拒绝 |
+
+**误操作防护**
+
+- 输出目录不能放在数据源内部（会自我复制）；
+- 目标目录非空时必须勾「允许覆盖」；
+- `train + val > 100` 直接拒绝；
+- 比例向下取整导致某集为 0 张时，导出摘要会明确告警，不会静默产出空训练集。
+
+实测参考（PCB 6 类 / 692 张 / 3034×1586）：扫描 692 张、2950 个对象、0 空标注；
+70/20/10 → 484/138/70；YOLO 标签往返逐值无损；COCO 2950 条标注；VOC 692 个 XML。
+验收脚本：`python 6-web/backend/tools/test_dataset_workbench.py`（20 项）。
+
 ### 环境说明
 
 显示后端探测到的全部路径、Python 解释器、DLL 加载状态，以及可用的环境变量清单。
@@ -173,6 +211,8 @@ YOLO 返回画好框的图与每个目标的类别/置信度；Anomalib 返回�
 | POST | `/api/infer/anomalib` | Anomalib 推理 |
 | GET | `/api/engine/probe?onnx=` | 探测 ONNX 输入/输出形状，判断是否可用 |
 | POST | `/api/engine/build` | 用 trtexec 把 ONNX 编译成引擎 |
+| POST | `/api/dataset/scan` | 扫描数据集并按比例返回划分预览（不落盘） |
+| POST | `/api/dataset/export` | 按比例导出 YOLO / COCO / VOC |
 
 ## 代码结构
 
@@ -183,18 +223,21 @@ YOLO 返回画好框的图与每个目标的类别/置信度；Anomalib 返回�
 │   ├── config.py         路径推导与环境变量
 │   ├── runners.py        子进程管理 + TRTFORGE_JSON 事件解析 + 广播
 │   ├── infer.py          ctypes 调 DLL（结构体定义与深拷贝）
+│   ├── dataset.py        数据集扫描 / 固定哈希划分 / YOLO·COCO·VOC 导出
 │   └── tools/
 │       ├── abi_probe.cpp       打印 C 侧结构体布局，用于和 Python 对齐比对
 │       ├── smoke_test.py       端到端冒烟测试（HTTP + WebSocket + 真实子进程）
+│       ├── test_dataset_workbench.py  数据集工作台验收（划分 / 导出 / 错误路径）
 │       └── test_exit_codes.py  退出码语义化测试（exit 2/130 的补事件逻辑）
 ├── frontend/
-│   ├── index.html        单页，四个页签
+│   ├── index.html        单页，五个页签
 │   ├── css/style.css
 │   └── js/
 │       ├── api.js        HTTP 封装
 │       ├── ws.js         WebSocket（含断线重连）
 │       ├── train.js      训练页
 │       ├── engine.js     引擎构建页（日志流 + 探测预警）
+│       ├── dataset.js    数据集页（扫描预览 + 导出）
 │       ├── infer.js      推理页
 │       └── main.js       页签 / 环境状态 / 目录浏览
 └── runtime/              上传临时文件与任务日志（已 gitignore）

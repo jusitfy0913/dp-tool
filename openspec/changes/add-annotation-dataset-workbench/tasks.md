@@ -36,8 +36,12 @@
 - [x] 5.11 明确不支持导入 X-AnyLabeling 自有 JSON 标注格式。
 
 ## 6. 验证与文档
-- [ ] 6.1 使用小样例验证 COCO、VOC、YOLO 导入导出结果。
-- [ ] 6.2 验证导出的 YOLO 数据集目录能被 Ultralytics 识别。
+- [x] 6.1 使用小样例验证 COCO、VOC、YOLO 导入导出结果。
+    - 通过 Web 数据集工作台验证：YOLO 标签往返逐值无损、COCO 结构完整、VOC XML 数量一致
+    - 脚本 `6-web/backend/tools/test_dataset_workbench.py`，20 项通过
+    - 说明：本次验证的是「YOLO/.tfanno 导入 → 划分 → 导出」，标注绘制与 COCO/VOC **反向导入**仍属 Qt 版能力
+- [x] 6.2 验证导出的 YOLO 数据集目录能被 Ultralytics 识别。
+    - `check_det_dataset(dataset.yaml)` → nc=6、6 个类名、train/val/test 三个路径全部解析成功
 - [x] 6.3 更新 TRTForge 相关 README 或 docs，说明标注 UI、项目文件、格式导出和数据集划分用法。
 - [x] 6.4 记录 VOC 仅支持检测水平框的限制。
 

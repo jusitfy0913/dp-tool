@@ -132,7 +132,38 @@ python tf_anomalib_launcher.py --mode check-env
 
 ## 版本更新记录
 
-### v1.4 — 2026-10-31（Web 引擎构建页上线，补齐「训练 → 引擎」最后一环）
+### v1.6 — 2026-10-31（Web 数据集工作台：划分与导出进浏览器）
+
+以前要给已有图片重新划分 train/val、生成 `dataset.yaml`、或把数据转成 COCO/VOC，
+只能在 Qt 版里点，或手工写脚本。本次把这套能力搬进 Web，第 5 个页签「数据集」。
+
+| 项目 | 老版本 | 新版本 | 影响 |
+| --- | --- | --- | --- |
+| 划分入口 | 只在 Qt 标注页 | Web「数据集」页：填比例 → 扫描预览 → 导出 | 无 Qt 环境也能划分 |
+| 划分可复现性 | `qHash(i + "_2026")`，依赖 Qt 哈希实现 | FNV-1a 64 位 + 同盐值 `_2026` | 同数据同比例，任何机器结果逐项一致 |
+| 比例语义 | train/val 向下取整，余数归 test | 完全照搬（`n*ratio//100`） | 与历史实验口径一致，不会悄悄改变含义 |
+| `dataset.yaml` | 仅 Qt 导出时生成 | Web 同样生成，含 `path/train/val/test/nc/names`，pose 另加 `kpt_shape` 与 `flip_idx` | 导出即可直接训练 |
+| 导出格式 | 仅 YOLO | YOLO / COCO / VOC | 一份数据多种下游可用 |
+| 输入源 | Qt 项目文件 `.tfanno` | `.tfanno` 或现成 YOLO 目录（含 `data.yaml`） | 拿到别人的 YOLO 数据集也能直接重划分 |
+| 误操作防护 | 无 | 输出不得在源内、非空目录需显式覆盖、OBB 拒绝 COCO、VOC 仅 detect、比例和超 100 直接拒绝 | 不会把数据覆盖坏、不会产出非标准格式 |
+| 空集问题 | 无提示 | 比例向下取整为 0 时导出摘要明确告警 | 不会再出现「训练集 0 张」却没人发现 |
+
+**实测数据（PCB 6 类 / 692 张 / 3034×1586）**
+
+| 项 | 结果 |
+| --- | --- |
+| 扫描 | 692 张、6 类、2950 个标注对象、0 张空标注 |
+| 划分 70/20/10 | train 484 / val 138 / test 70，两次调用逐项一致 |
+| 划分 80/20 | train 553 / val 138 / test 1（余数归 test，与 Qt 一致） |
+| YOLO 导出 | 484+138+70 张，标签逐值往返无损 |
+| Ultralytics 识别 | `check_det_dataset()` → nc=6、6 个类名、三个划分路径正确 |
+| COCO 导出 | 692 images / 2950 annotations / 6 categories |
+| VOC 导出 | 692 XML（仅 detect） |
+| 验收脚本 | `tools/test_dataset_workbench.py` → 20 项全通过 |
+
+新增接口：`POST /api/dataset/scan`（预览，不落盘）、`POST /api/dataset/export`（导出）。
+
+### v1.5 — 2026-10-31（Web 引擎构建页上线，补齐「训练 → 引擎」最后一环）
 
 此前 Web Studio 只能训练导出 ONNX，再转 TensorRT 得回到命令行手工敲 `trtexec`。
 本次把这一步收进 Web，链路在浏览器内闭环。
@@ -257,10 +288,12 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_web_studio.ps1
 | --- | --- |
 | 训练导出 | 选 YOLO / Anomalib、填参数、环境自检、实时日志与进度、指标显示、一键停止 |
 | 引擎构建 | 选 ONNX 自动探测形状、fp16/fp32、动态 shape、实时编译日志、产物落盘校验 |
+| 数据集 | 扫描 YOLO 目录 / `.tfanno`、固定哈希划分预览、导出 YOLO / COCO / VOC |
 | 推理演示 | 上传图片、调 `yolo_infer.dll` / `anomalib_infer.dll`、出检测框或异常热力图 |
 | 环境说明 | 展示后端探测到的解释器、launcher、DLL、trtexec 状态与环境变量 |
 
-标注页（数据集划分与导出工作台）尚未迁移。
+标注的**绘制**（画框、改标签、保存 `.tfanno`）仍只在 Qt 版提供；
+Web 版负责「拿到已有标注 → 重新划分 → 导出成训练可直接用的格式」。
 
 ### 关键环境变量
 

@@ -10,7 +10,7 @@
 
 ```mermaid
 flowchart TD
-    A["① 原始图片"] --> B["② 标注 / 数据整理"]
+    A["① 原始图片"] --> B["② 标注 / 数据整理<br/>Web「数据集」页可重划分与导出"]
     B --> C{"③ 任务类型"}
 
     C -->|"目标检测 / 分割 / 姿态 / OBB"| D["YOLO 训练<br/>1-python-yolo"]
@@ -143,6 +143,47 @@ New-Item -ItemType Directory -Force -Path 2-python-anomaly\anomalib-main\dataset
 
 YOLO 训练页支持自动划分 `train / val / test`，默认 `80 / 10 / 10`。
 修改比例后点「自动划分」，会按比例分配图片归属。
+
+### 2.5 用 Web 数据集工作台重划分与导出（推荐）
+
+当数据已经有标注、只是需要重新划分或转格式时，用 Web 的「数据集」页，不必开 Qt：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_web_studio.ps1
+# 浏览器打开 http://127.0.0.1:8060 → 点顶部「数据集」
+```
+
+| 步骤 | 操作 | 说明 |
+| --- | --- | --- |
+| 1 | 填数据源 | YOLO 目录（含 `images/` `labels/` `data.yaml`）或 `.tfanno` |
+| 2 | 任务类型 | 默认「自动识别」，按标签字段数判断 detect / segment / pose / obb |
+| 3 | 填比例 | train、val 两个数，test 是余数，页面会实时显示 |
+| 4 | 扫描预览 | 看各集张数、空标注数、每张图的「现有 → 新划分」 |
+| 5 | 选格式与输出目录 | YOLO / COCO / VOC，输出不能放在数据源内部 |
+| 6 | 开始导出 | 摘要里会列出统计、跳过项和警告 |
+
+**划分口径（与 Qt 版一致，容易误解，务必看清）**
+
+- `train = 总数 × train% ÷ 100` **向下取整**，`val` 同理；
+- **剩余全部归 test**：692 张配 80/20 会得到 553 / 138 / **1**，不是 553 / 139 / 0；
+- 想要真正的 80/10/10，请填 `80 / 10`，或 `70 / 20` 得到约 70 / 20 / 10；
+- 哈希为 **FNV-1a 64 位 + `_2026` 盐值**，同一份数据在任何机器上结果逐项一致。
+  Qt 用的是 `qHash`，两者哈希函数不同，所以**不能与 Qt 历史划分逐张对照**。
+
+**导出格式限制**
+
+| 格式 | 产物 | 限制 |
+| --- | --- | --- |
+| YOLO | `images/{train,val,test}` + `labels/{split}` + `dataset.yaml` | 全任务支持，`dataset.yaml` 可直接被 Ultralytics 识别 |
+| COCO | `annotations.json` | 不复制图片；不支持 OBB |
+| VOC | `Annotations/*.xml` + `JPEGImages/` | **仅 detect** |
+
+验收脚本（不启动服务也能跑）：
+
+```powershell
+python 6-web\backend\tools\test_dataset_workbench.py
+# 期望：通过 20 项，失败 0 项
+```
 
 ---
 

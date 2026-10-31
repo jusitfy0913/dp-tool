@@ -1,6 +1,7 @@
 // 入口：页签切换、环境探测、目录浏览弹窗。
 
 import { browse, getCapabilities } from "./api.js";
+import { initDataset } from "./dataset.js";
 import { initEngine } from "./engine.js";
 import { initInfer } from "./infer.js";
 import { initTrain } from "./train.js";
@@ -89,7 +90,7 @@ function initBrowse() {
 
       if (browseState.mode === "file") {
         data.entries
-          .filter((e) => !e.is_dir && /\.(trt|engine|onnx|json|yaml|yml)$/i.test(e.name))
+          .filter((e) => !e.is_dir && /\.(trt|engine|onnx|json|yaml|yml|tfanno)$/i.test(e.name))
           .forEach((entry) => list.appendChild(makeItem(entry, btnPick)));
       }
 
@@ -151,6 +152,7 @@ function initBrowse() {
 initTabs();
 initTrain();
 initEngine();
+initDataset();
 initInfer();
 initBrowse();
 refreshEnvironment();

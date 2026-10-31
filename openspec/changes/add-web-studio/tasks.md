@@ -55,16 +55,32 @@
     - `runners.py` 新增 `expect_file`，任务正常退出后校验产物是否落盘，缺失则判为 failed 并发 `ARTIFACT_MISSING` 事件
 - [x] 5.5 实测：PCB 模型 960×960 FP16 构建耗时 474.1 s，产物 10.14 MB，吞吐 135.4 qps，退出码 0
 
-## 6. 标注页（延后）
+## 6. 数据集工作台（已完成，标注绘制仍未迁移）
 
-> 注意迁移陷阱 T1：Qt 版用 `qHash(i + "_2026")` 排序，受哈希种子随机化影响，
-> 跨进程结果可能不同。Web 版必须改成固定哈希（FNV-1a）并保留 `_2026` 盐值，
-> 否则与历史实验无法对齐。
+> 注意迁移陷阱 T1：Qt 版用 `qHash(i + "_2026")` 排序，受哈希实现影响，跨版本结果可能不同。
+> Web 版改为 FNV-1a 64 位并保留 `_2026` 盐值，从此「同一份数据 + 同一比例」在
+> 任何机器、任何进程上结果完全一致。代价是与 Qt 历史划分不逐张一致，
+> 这一点已在 `readme.md` 与 `6-web/README.md` 中写明。
 
-- [ ] 6.1 用固定哈希复刻划分算法（含除不尽、单类、已标注图片的边界处理）
-- [ ] 6.2 实现 `dataset.yaml` 生成
-- [ ] 6.3 实现导出 YOLO / COCO / VOC
-- [ ] 6.4 前端图片列表 + 划分比例 + 导出按钮
+- [x] 6.1 用固定哈希复刻划分算法（含除不尽、单类、已标注图片的边界处理）
+    - `FNV-1a 64` + `_2026` 盐值，盐值与 Qt 一致，哈希函数不同
+    - 比例语义完全照搬 Qt：`train = n*train//100`、`val = n*val//100`，**余数全部归 test**
+    - 空集提醒：比例填了但向下取整为 0 时，导出摘要会明确告警
+- [x] 6.2 实现 `dataset.yaml` 生成
+    - 写 `path`（正斜杠绝对路径）/ `train` / `val` / `test` / `nc` / `names`
+    - `pose` 任务额外写 `kpt_shape: [17, 3]` 与 `flip_idx`
+    - 已用 Ultralytics `check_det_dataset()` 验证可直接识别（nc=6、三个划分路径正确）
+- [x] 6.3 实现导出 YOLO / COCO / VOC
+    - YOLO：复制图片到 `images/{train,val,test}`、写 `labels/{split}/*.txt`，标签往返逐值无损
+    - COCO：`annotations.json`（images/annotations/categories），detect 写 bbox、segment 写 polygon、pose 写 17 关键点
+    - VOC：`Annotations/*.xml` + `JPEGImages/`，仅 detect；segment/pose/obb 直接 400 拒绝
+    - 安全约束：输出目录不得位于数据源内部、非空目录需显式勾选覆盖、OBB 拒绝导出 COCO
+- [x] 6.4 前端图片列表 + 划分比例 + 导出按钮
+    - 第 5 个页签「数据集」：数据源 / 任务类型 / 格式 / train-val 比例 / 输出目录 / 覆盖开关
+    - 扫描后展示总图片、各集张数、空标注、类别数，以及前 200 张的「现有划分 → 新划分」对照
+    - 导出后展示统计、附加文件、跳过项与警告；比例改动实时显示 test 余量
+- [x] 6.5 支持 `.tfanno` 输入（Qt 标注工程），保留人工划分与类别顺序
+- [x] 6.6 验收脚本 `6-web/backend/tools/test_dataset_workbench.py`：20 项通过
 
 ## 7. 构建脚本与环境
 

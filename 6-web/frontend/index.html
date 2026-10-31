@@ -24,6 +24,7 @@
 <nav class="tabs">
   <button class="tab active" data-tab="train">训练导出</button>
   <button class="tab" data-tab="engine">引擎构建</button>
+  <button class="tab" data-tab="dataset">数据集</button>
   <button class="tab" data-tab="infer">推理演示</button>
   <button class="tab" data-tab="about">环境说明</button>
 </nav>
@@ -260,6 +261,81 @@
       <div class="card grow">
         <h2>构建日志 <span class="badge" id="engineBadge">未开始</span></h2>
         <pre class="log" id="engineLog">等待构建…</pre>
+      </div>
+    </div>
+  </section>
+
+  <!-- ==================== 数据集页 ==================== -->
+  <section class="panel" id="panel-dataset">
+    <div class="layout">
+      <form class="card" id="datasetForm">
+        <h2>数据集划分与导出</h2>
+
+        <label>数据源
+          <div class="row">
+            <input type="text" id="dsSource" placeholder="YOLO 目录、data.yaml 或 .tfanno">
+            <button type="button" class="mini" data-browse="dsSource" data-mode="file">浏览</button>
+          </div>
+        </label>
+
+        <div class="grid2">
+          <label>任务类型
+            <select id="dsTask">
+              <option value="auto">自动识别</option>
+              <option value="detect">detect 检测</option>
+              <option value="segment">segment 分割</option>
+              <option value="pose">pose 姿态</option>
+              <option value="obb">obb 旋转框</option>
+            </select>
+          </label>
+          <label>导出格式
+            <select id="dsFormat">
+              <option value="yolo">YOLO（images/labels + dataset.yaml）</option>
+              <option value="coco">COCO（annotations.json）</option>
+              <option value="voc">VOC（XML + JPEGImages，仅 detect）</option>
+            </select>
+          </label>
+        </div>
+
+        <div class="grid2">
+          <label>train 比例 %
+            <input type="number" id="dsTrain" value="80" min="0" max="100" step="1">
+          </label>
+          <label>val 比例 %
+            <input type="number" id="dsVal" value="20" min="0" max="100" step="1">
+          </label>
+        </div>
+        <p class="hint" id="dsRatioHint">其余全部归 test（与 Qt 版一致：train / val 向下取整）</p>
+
+        <label>输出目录
+          <div class="row">
+            <input type="text" id="dsOutput" placeholder="导出到哪里，不能放在数据源内部">
+            <button type="button" class="mini" data-browse="dsOutput" data-mode="dir">浏览</button>
+          </div>
+        </label>
+
+        <label>
+          <input type="checkbox" id="dsOverwrite">
+          允许覆盖非空目录
+        </label>
+
+        <div class="actions">
+          <button type="button" class="primary" id="btnScan">扫描预览</button>
+          <button type="submit" id="btnExport">开始导出</button>
+        </div>
+        <p class="hint" id="dsHint"></p>
+      </form>
+
+      <div class="card grow">
+        <h2>预览与结果 <span class="badge" id="dsBadge">未扫描</span></h2>
+        <div class="metrics" id="dsMetrics"></div>
+        <p class="hint" id="dsWarnings"></p>
+        <div class="scrollbox">
+          <table class="env" id="dsTable">
+            <tbody id="dsRows"></tbody>
+          </table>
+        </div>
+        <pre class="log hidden" id="dsResult"></pre>
       </div>
     </div>
   </section>

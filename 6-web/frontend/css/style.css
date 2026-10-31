@@ -189,6 +189,16 @@ button.mini { padding: 5px 10px; font-size: 12px; }
 table.env { width: 100%; border-collapse: collapse; font-size: 12.5px; }
 table.env td { padding: 7px 10px; border-bottom: 1px solid var(--line); color: var(--muted); }
 table.env td:first-child { width: 250px; color: var(--text); }
+/* 数据集预览列表：图片多时只滚动容器，不把整页撑长 */
+.scrollbox { max-height: 420px; overflow: auto; border: 1px solid var(--line); border-radius: 8px; }
+.scrollbox table.env td { padding: 5px 10px; }
+.scrollbox table.env td:first-child { width: auto; color: var(--muted); }
+.scrollbox thead td { position: sticky; top: 0; background: var(--panel-2); color: var(--text); font-weight: 600; }
+/* 划分标签：一眼区分 train/val/test */
+.tag { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 11px; }
+.tag.train { background: #123528; color: var(--accent); }
+.tag.val { background: #143246; color: var(--accent-2); }
+.tag.test { background: #2a2a3a; color: var(--muted); }
 code { background: var(--panel-2); padding: 2px 6px; border-radius: 5px; font-size: 12px; }
 
 /* ---------- 目录浏览弹窗 ---------- */
