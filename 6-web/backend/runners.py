@@ -44,6 +44,10 @@ class Run:
     started_at: float = field(default_factory=time.time)
     finished_at: float | None = None
     process: subprocess.Popen | None = None
+    # 期望生成的产物。退出码为 0 但该文件不存在时，任务判为失败。
+    # 为什么需要它：trtexec 在 --saveEngine 路径不可写等情况下会以 0 退出
+    # 却不落盘，只看退出码会把失败当成功（规格要求 5.4）。
+    expect_file: Path | None = None
     # 最近事件，供断线重连补发
     events: list[dict] = field(default_factory=list)
     # 订阅者队列
@@ -85,10 +89,12 @@ class RunManager:
         command: list[str],
         cwd: str,
         env: dict[str, str] | None = None,
+        expect_file: Path | None = None,
     ) -> Run:
         """启动子进程并立即开始读取输出。
 
         子进程启动失败会抛异常，由调用方转成 HTTP 错误。
+        `expect_file` 用于「退出码 0 但没产出」的失败判定。
         """
         run_id = uuid.uuid4().hex[:12]
         log_file = LOG_DIR / f"{run_id}.log"
@@ -118,6 +124,7 @@ class RunManager:
             cwd=cwd,
             process=process,
             log_file=log_file,
+            expect_file=expect_file,
         )
         with self._lock:
             self._runs[run_id] = run
@@ -217,7 +224,11 @@ class RunManager:
             run.exit_code = exit_code
             run.finished_at = time.time()
             if run.status == "running":
-                run.status = "finished" if exit_code == 0 else "failed"
+                if exit_code == 0 and run.expect_file is not None and not run.expect_file.is_file():
+                    # 退出码正常但产物没落盘，不能算成功
+                    run.status = "failed"
+                else:
+                    run.status = "finished" if exit_code == 0 else "failed"
 
             # 退出码补一层语义化错误。
             # 原因：launcher 用 argparse 解析参数，参数不合法时 argparse 直接往 stderr
@@ -226,6 +237,11 @@ class RunManager:
             synthetic = self._synthetic_error(run, exit_code)
             if synthetic is not None:
                 self._publish(run, synthetic)
+
+            # 产物缺失：退出码 0 但目标文件不存在（trtexec 可能静默不落盘）
+            missing = self._missing_artifact(run, exit_code)
+            if missing is not None:
+                self._publish(run, missing)
 
             self._publish(
                 run,
@@ -269,6 +285,39 @@ class RunManager:
                 "exit": exit_code,
             }
         return None
+
+    @staticmethod
+    def _missing_artifact(run: Run, exit_code: int | None) -> dict | None:
+        """退出码为 0 但产物没落盘时，给出可读错误。
+
+        典型场景：trtexec 的 `--saveEngine` 指到不可写目录，进程正常退出却
+        没有 .engine 文件。只看退出码会误判成功，用户点「下一步推理」才发现
+        文件不存在。这里提前把失败暴露出来，并附上日志尾部方便定位。
+        """
+        if exit_code != 0 or run.expect_file is None:
+            return None
+        if run.expect_file.is_file():
+            return None
+
+        tail: list[str] = []
+        if run.log_file and run.log_file.is_file():
+            try:
+                lines = run.log_file.read_text(encoding="utf-8", errors="replace").splitlines()
+                tail = [ln for ln in lines[-15:] if ln.strip()]
+            except OSError:
+                tail = []
+        hint = "；".join(tail[-4:]) if tail else "（无日志输出）"
+
+        return {
+            "type": "error",
+            "code": "ARTIFACT_MISSING",
+            "message": (
+                f"命令退出码为 0，但没有生成目标文件：{run.expect_file}。"
+                f"常见原因是输出目录不存在或没有写权限。日志尾部：{hint}"
+            ),
+            "expect_file": str(run.expect_file),
+            "exit": exit_code,
+        }
 
     @staticmethod
     def _parse_line(line: str) -> dict:

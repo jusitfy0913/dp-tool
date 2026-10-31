@@ -126,6 +126,8 @@ button.mini { padding: 5px 10px; font-size: 12px; }
 
 .actions { display: flex; gap: 10px; margin-top: 16px; }
 .hint { color: var(--warn); font-size: 12px; min-height: 18px; margin: 10px 0 0; }
+/* 探测到危险情况（如未转置 YOLO）时用红色，和普通提醒区分开 */
+.hint.bad { color: var(--err); }
 
 /* ---------- 日志与进度 ---------- */
 .badge {

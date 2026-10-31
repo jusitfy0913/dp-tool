@@ -143,8 +143,59 @@ def _has_training_deps(python_exe: str) -> bool:
         return False
 
 
+def resolve_trtexec() -> str | None:
+    """解析 trtexec.exe 的位置，找不到返回 None。
+
+    优先级：
+    1. 环境变量 `TRTFORGE_TRTEXEC`（直接指向 trtexec.exe）
+    2. `CUDA_PATH` 下的 `bin\\trtexec.exe`（TensorRT 常与 CUDA 装在一起）
+    3. 扫描 `CUDA\\v*\\bin\\trtexec.exe`，取版本号最大的
+    4. 常见 TensorRT 独立安装目录
+    5. PATH 里的 trtexec
+
+    之所以要扫目录而不是只认环境变量：实测这台机器根本没设 CUDA_PATH，
+    trtexec 却躺在 CUDA bin 里。只认环境变量会让引擎构建页直接不可用。
+    """
+    explicit = os.environ.get("TRTFORGE_TRTEXEC", "").strip()
+    if explicit and Path(explicit).is_file():
+        return str(Path(explicit).resolve())
+
+    candidates: list[Path] = []
+
+    cuda_path = os.environ.get("CUDA_PATH", "").strip()
+    if cuda_path:
+        candidates.append(Path(cuda_path) / "bin" / "trtexec.exe")
+
+    # CUDA 默认安装根，按版本号倒序取最新
+    cuda_root = Path(r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA")
+    if cuda_root.is_dir():
+        found = sorted(cuda_root.glob("v*/bin/trtexec.exe"), reverse=True)
+        candidates.extend(found)
+
+    for extra in (
+        r"C:\TensorRT-8.5.2.2\bin\trtexec.exe",
+        r"D:\TensorRT-8.5.2.2\bin\trtexec.exe",
+        r"C:\TensorRT\bin\trtexec.exe",
+        r"D:\thirdparty\TensorRT-8.5.2.2\bin\trtexec.exe",
+    ):
+        candidates.append(Path(extra))
+
+    from shutil import which
+
+    for name in ("trtexec.exe", "trtexec"):
+        located = which(name)
+        if located:
+            candidates.append(Path(located))
+
+    for candidate in candidates:
+        if candidate.is_file():
+            return str(candidate.resolve())
+    return None
+
+
 def capabilities() -> dict:
     """汇总当前环境是否具备各项能力，供前端决定显示什么。"""
+    trtexec = resolve_trtexec()
     return {
         "repo_root": str(REPO_ROOT),
         "python": resolve_python(),
@@ -155,4 +206,6 @@ def capabilities() -> dict:
         "yolo_dll": (BIN_DIR / "yolo_infer.dll").is_file(),
         "anomalib_dll": (BIN_DIR / "anomalib_infer.dll").is_file(),
         "dll_dirs": [str(d) for d in DLL_DIRS],
+        "trtexec": trtexec,
+        "engine_build": trtexec is not None,
     }

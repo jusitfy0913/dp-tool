@@ -98,13 +98,18 @@ Qt 界面内部仍按四个功能分目录：`src/annotation` 标注，`src/trai
 | 链路 | 必需依赖 |
 | --- | --- |
 | YOLO 训练 / 导出 | `torch`、`torchvision`、`ultralytics`、`polars`、`onnx`、`onnxruntime` |
-| Anomalib 训练 / 导出 | `torch`、`anomalib`、`lightning`、`onnx`、`onnxruntime`、`Pillow`、`numpy<2` |
+| Anomalib 训练 / 导出 | `torch`、`anomalib`、`lightning`、`onnx`、`onnxruntime`、`Pillow`、`numpy<3` |
 
-一次性装齐（`numpy<2` 必须保留，torch 2.3 与 numpy 2 存在 ABI 冲突）：
+一次性装齐：
 
 ```powershell
-python -m pip install ultralytics polars "numpy<2"
+python -m pip install ultralytics polars "numpy<3"
 ```
+
+关于 `numpy` 上限（2026-10-30 修订）：早期这里写的是 `numpy<2`，理由是 torch 2.3 按 numpy 1.x 编译。
+实测 `torch 2.3.0 + numpy 2.5.4` 的 CUDA 前向与 numpy 桥接均正常，`onnxruntime 1.20.1` 也已支持 numpy 2，
+故放宽到 `<3`。锁回 `<2` 反而会让 Ultralytics AutoUpdate 每次 `export` 都把它升上去，造成环境反复漂移。
+残留告警仅 `scipy 1.14.0` 的 `UserWarning`（声明要求 numpy<2.3），不影响 anomalib 链路。
 
 验证方式：训练页点「检测环境」，或命令行
 
@@ -126,6 +131,33 @@ python tf_anomalib_launcher.py --mode check-env
 引擎构建页选择 ONNX 后会在后台线程自动识别第一个输入 tensor 的名称和维度，并弹出“ONNX 加载中”进度提示；识别完成后提供统一 `H/W` 输入，修改一次高度和宽度即可同步覆盖 `min / opt / max` 三组动态 shape。
 
 ## 版本更新记录
+
+### v1.4 — 2026-10-31（Web 引擎构建页上线，补齐「训练 → 引擎」最后一环）
+
+此前 Web Studio 只能训练导出 ONNX，再转 TensorRT 得回到命令行手工敲 `trtexec`。
+本次把这一步收进 Web，链路在浏览器内闭环。
+
+| 项目 | 老版本 | 新版本 | 影响 |
+| --- | --- | --- | --- |
+| 引擎编译入口 | 只能在终端手工执行 `trtexec` | 「引擎构建」页：选 ONNX → 填精度 → 点按钮 | 不用记 trtexec 参数 |
+| ONNX 预检 | 无，编译完跑推理才发现布局错 | `GET /api/engine/probe`：选完文件即显示输入/输出形状、体积、可用性判定 | 错误在编译前暴露 |
+| 未转置 YOLO 防护 | 后端只在「推理」时用 `_check_yolo_output_sane()` 兜底 | 构建前前端标红 + 后端直接 400 拒绝，错误信息说明为何要用 `.transd.onnx` | 不再产出静默出错的引擎 |
+| 产物校验 | 只看退出码，`trtexec` 正常退出但没落盘也算成功 | `runners.py` 新增 `expect_file`，产物缺失判为 failed 并发 `ARTIFACT_MISSING` | 避免「显示成功、点推理找不到文件」 |
+| trtexec 定位 | 依赖环境变量 | `config.resolve_trtexec()` 四级探测：`TRTFORGE_TRTEXEC` → `CUDA_PATH\bin` → CUDA 根 `v*/bin` → PATH | 装完 CUDA 即可用 |
+| 环境状态灯 | 只查 DLL 与 launcher | 增加「缺少 trtexec（引擎构建不可用）」提示 | 缺失时一眼可见 |
+
+**实测数据（PCB 6 类模型，960×960，FP16，T1000 8GB）**
+
+| 项 | 结果 |
+| --- | --- |
+| 构建耗时 | 474.1 秒（首次，无 timing cache 命中） |
+| 引擎大小 | 10.14 MB |
+| 吞吐 | 135.4 qps |
+| 退出码 | 0，产物落盘校验通过 |
+| 错误路径 | 提交 `best.onnx` 前端红字提示 + 后端 400，日志面板显示完整原因 |
+
+> 注意：960×960 这类分辨率下 trtexec 的 tactic 搜索可达数分钟，期间日志可能长时间不刷新。
+> 只要 GPU 占用率接近 100% 就是在正常编译，不是卡死。
 
 ### v1.3 — 2026-10-30（PCB 真实数据集全链路打通 + 三个阻断级 bug 修复）
 
@@ -224,10 +256,11 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_web_studio.ps1
 | 页面 | 能力 |
 | --- | --- |
 | 训练导出 | 选 YOLO / Anomalib、填参数、环境自检、实时日志与进度、指标显示、一键停止 |
+| 引擎构建 | 选 ONNX 自动探测形状、fp16/fp32、动态 shape、实时编译日志、产物落盘校验 |
 | 推理演示 | 上传图片、调 `yolo_infer.dll` / `anomalib_infer.dll`、出检测框或异常热力图 |
-| 环境说明 | 展示后端探测到的解释器、launcher、DLL 加载状态与环境变量 |
+| 环境说明 | 展示后端探测到的解释器、launcher、DLL、trtexec 状态与环境变量 |
 
-标注页与 ONNX→TensorRT 转换页尚未迁移，仍用 Qt 版或命令行 `trtexec`。
+标注页（数据集划分与导出工作台）尚未迁移。
 
 ### 关键环境变量
 
@@ -236,6 +269,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_web_studio.ps1
 | `TRTFORGE_PYTHON` | 训练用 `python.exe`，不设则自动探测 |
 | `OPENCV_DIR` | OpenCV 根目录，推理 DLL 运行时必需，如 `E:\thirdparty\opencv` |
 | `CUDA_PATH` | CUDA 根目录，推理 DLL 运行时必需 |
+| `TRTFORGE_TRTEXEC` | `trtexec.exe` 路径，不设则从 `CUDA_PATH\bin` / CUDA 根 / PATH 自动找 |
 | `TRTFORGE_BROWSE_ROOTS` | 额外允许浏览的目录（分号分隔），默认只允许仓库内 |
 
 完整说明见 `6-web/README.md`；设计决策见 `openspec/changes/add-web-studio/`。

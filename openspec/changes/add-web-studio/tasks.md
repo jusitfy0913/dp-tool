@@ -1,6 +1,6 @@
 # 任务清单：Web 界面替代 Qt
 
-> 状态说明：已确认方案，首期范围为**训练页 + 推理页**（MVP）。标注页与引擎构建页延后。
+> 状态说明：已确认方案。训练页、推理页、引擎构建页均已完成；标注页（划分/导出工作台）仍延后。
 
 ## 1. 前置环境（已完成，留作记录）
 
@@ -38,16 +38,22 @@
 - [x] 4.6 句柄按参数缓存复用，服务退出时统一 `*_destroy`
 - [ ] 4.7 `onnxruntime` 降级回退（当前 DLL 不可用时返回 503 并说明原因，未实现自动降级）
 
-## 5. 引擎构建页（延后）
+## 5. 引擎构建页（已完成）
 
 > 注意迁移陷阱 T2：Qt 版的 `runtime`（full/lean/dispatch）与「最大 Batch」
 > 在 `BuilderWorker.cpp` 中**无任何引用**，属未生效的占位 UI。
 > Web 版暂不提供这两项，避免做出假开关。
 
-- [ ] 5.1 实现 `POST /api/engine/build`，组装 trtexec 参数
-- [ ] 5.2 日志流复用训练事件通道
-- [ ] 5.3 前端 ONNX 选择、精度、动态 shape 三组输入
-- [ ] 5.4 构建结果校验（退出码为 0 但无输出文件要报错）
+- [x] 5.1 实现 `POST /api/engine/build`，组装 trtexec 参数
+    - 参数：`--onnx` / `--saveEngine` / `--fp16|--fp32` / `--workspace` / 动态 shape 三组 / 透传额外参数
+    - `config.resolve_trtexec()` 依次探测 `TRTFORGE_TRTEXEC` → `CUDA_PATH\bin` → CUDA 根 `v*/bin` → PATH
+- [x] 5.2 日志流复用训练事件通道（`/ws/runs/{run_id}`，未新增通道）
+- [x] 5.3 前端 ONNX 选择、精度、动态 shape 三组输入
+    - 另加 `GET /api/engine/probe` 预检：选完 ONNX 立即显示输入/输出形状与文件大小
+    - 「未转置」YOLO 输出（`[1, 4+C, N]`）在前端标红、后端直接 400 拒绝，避免编译出静默出错的引擎
+- [x] 5.4 构建结果校验（退出码为 0 但无输出文件要报错）
+    - `runners.py` 新增 `expect_file`，任务正常退出后校验产物是否落盘，缺失则判为 failed 并发 `ARTIFACT_MISSING` 事件
+- [x] 5.5 实测：PCB 模型 960×960 FP16 构建耗时 474.1 s，产物 10.14 MB，吞吐 135.4 qps，退出码 0
 
 ## 6. 标注页（延后）
 
@@ -98,9 +104,11 @@
 | DLL ctypes 加载 | 通过 | 两个均返回有效 handle，`infer_yolo/infer_anomalib` 均为 true |
 | ctypes 结构体 ABI | 通过 | MSVC 实测 sizeof/offsetof 与 ctypes 逐项一致（5 个结构体） |
 | 训练环境自检 | 通过 | 通过 Web 接口启动自检，事件流返回 `missing=[]` |
-| 前端页面 | 通过 | 三个页签渲染正常，目录浏览弹窗可用 |
+| 前端页面 | 通过 | 四个页签渲染正常，目录浏览弹窗可用 |
 | 端到端冒烟测试 | 通过 | `tools/smoke_test.py` → 13 项全通过 |
 | 退出码语义化 | 通过 | `tools/test_exit_codes.py` → 6 项全通过（exit 2/0/7 + 事件解析） |
 | launcher 参数真实校验 | 通过 | 用后端拼的命令调真实 launcher，两个都进入业务逻辑而非 exit 2 |
 | 事件字段对齐 | 通过 | 按 Qt 源码核对，修正 `epoch_summary`/`gpu_status`/`artifact` 三处字段名 |
-| 真实训练 / 真实推理 | 未执行 | 缺少数据集与 `.trt` 引擎，属环境限制 |
+| 真实训练 / 真实推理 | 通过 | PCB 数据集 30 epoch（mAP50=0.945）+ ctypes 推理验证；Anomalib 三模型均跑通 |
+| 引擎构建（Web UI） | 通过 | 浏览器实测：探测 → 构建 → 日志流 → 完成徽标；960×960 FP16 用时 474.1 s |
+| 引擎构建防护 | 通过 | 未转置 ONNX 前端标红 + 后端 400；退出码 0 但产物缺失判为失败 |

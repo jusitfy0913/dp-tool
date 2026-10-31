@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import os
+import shlex
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -250,6 +251,190 @@ def check_env(kind: str, python: str | None = None) -> dict:
     except OSError as exc:
         raise HTTPException(status_code=500, detail=f"启动自检进程失败：{exc}") from exc
     return run.snapshot()
+
+
+# ---------------------------------------------------------------------------
+# 引擎构建（ONNX -> TensorRT）
+# ---------------------------------------------------------------------------
+class EngineBuildRequest(BaseModel):
+    """trtexec 转换参数。字段刻意贴近 trtexec 官方参数，便于对照文档排查。"""
+
+    onnx: str = Field(..., description="待转换的 ONNX 绝对路径")
+    engine: str = Field(default="", description="输出引擎路径，留空按 ONNX 同名推导")
+    precision: str = Field(default="fp16", description="fp32 / fp16")
+    dynamic: bool = Field(default=False, description="是否编译动态 shape")
+    min_shape: str = Field(default="", description="如 1x3x640x640")
+    opt_shape: str = Field(default="", description="如 1x3x640x640")
+    max_shape: str = Field(default="", description="如 8x3x640x640")
+    workspace_mb: int = Field(default=4096, ge=256, le=32768)
+    extra_args: str = Field(default="", description="追加的原始 trtexec 参数")
+
+
+def _probe_onnx(onnx_path: Path) -> dict:
+    """读取 ONNX 的输入名与输出形状。
+
+    用 onnxruntime 而不是 onnx 库：requirements 里已经有 onnxruntime，
+    不必额外引入依赖。探测失败不阻断构建，只是少一层预检。
+    """
+    try:
+        import onnxruntime as ort
+
+        session = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
+        inp = session.get_inputs()[0]
+        out = session.get_outputs()[0]
+        return {
+            "input_name": inp.name,
+            "input_shape": [d if isinstance(d, int) else -1 for d in inp.shape],
+            "output_name": out.name,
+            "output_shape": [d if isinstance(d, int) else -1 for d in out.shape],
+        }
+    except Exception as exc:  # noqa: BLE001 - 预检失败不影响构建
+        return {"error": f"{type(exc).__name__}: {exc}"}
+
+
+def _looks_like_untransposed_yolo(output_shape: list) -> bool:
+    """判断输出是否为「未转置的 YOLO」布局 `[1, 4+类别数, 候选框数]`。
+
+    `yolo_infer.dll` 按 `[1, 候选框数, 4+类别数]` 解析输出。用未转置的 ONNX
+    编译引擎时，DLL 会把类别数推算成 `候选框数 - 4`，解码越界读显存，
+    **不返回错误码**却输出 `confidence=957`、`top=-725` 这类垃圾框。
+    与其让用户以为成功了，不如在构建前直接拦下。
+
+    判据：三维、第 2 维是小值（类别维度，<=100）、第 3 维很大（候选框数 >1000）。
+    对 anomalib 的 `[1, 3, 256, 256]` 不成立（256 不 >1000），不会误伤。
+    """
+    if len(output_shape) != 3:
+        return False
+    _, dim1, dim2 = output_shape
+    if not isinstance(dim1, int) or not isinstance(dim2, int):
+        return False
+    return 0 < dim1 < 100 and dim2 > 1000
+
+
+@app.get("/api/engine/probe")
+def probe_onnx(onnx: str) -> dict:
+    """探测 ONNX 的输入/输出形状，并判断布局是否适合当前推理链路。
+
+    前端选完文件即可调用，让用户在点「开始构建」之前就知道选对没有。
+    """
+    onnx_path = Path(onnx).expanduser()
+    if not onnx_path.is_file():
+        raise HTTPException(status_code=400, detail=f"ONNX 文件不存在：{onnx}")
+
+    probe = _probe_onnx(onnx_path)
+    output_shape = probe.get("output_shape") or []
+    untransposed = _looks_like_untransposed_yolo(output_shape)
+
+    if probe.get("error"):
+        verdict = f"无法解析：{probe['error']}"
+    elif untransposed:
+        verdict = (
+            f"输出 {output_shape} 是「未转置」布局，yolo_infer.dll 无法正确解析。"
+            "请改用 .transd.onnx。"
+        )
+    elif len(output_shape) == 3 and output_shape[2] < 100:
+        verdict = f"输出 {output_shape}，布局正确，可以编译。"
+    else:
+        verdict = f"输出 {output_shape}，非 YOLO 布局，按普通模型处理。"
+
+    return {
+        "path": str(onnx_path),
+        "size_mb": round(onnx_path.stat().st_size / 1024 / 1024, 2),
+        "probe": probe,
+        "untransposed_yolo": untransposed,
+        "verdict": verdict,
+    }
+
+
+@app.post("/api/engine/build")
+def build_engine(request: EngineBuildRequest) -> dict:
+    """用 trtexec 把 ONNX 转成 TensorRT 引擎，日志复用通用事件流。"""
+    trtexec = config.resolve_trtexec()
+    if not trtexec:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "找不到 trtexec.exe。请设置环境变量 TRTFORGE_TRTEXEC 指向它，"
+                "或确认 TensorRT 安装在 CUDA_PATH\\bin 下。"
+            ),
+        )
+
+    onnx_path = Path(request.onnx).expanduser()
+    if not onnx_path.is_file():
+        raise HTTPException(status_code=400, detail=f"ONNX 文件不存在：{request.onnx}")
+    if onnx_path.suffix.lower() != ".onnx":
+        raise HTTPException(status_code=400, detail="只接受 .onnx 文件")
+
+    # 输出路径：留空则按 ONNX 同名 + 精度后缀推导，减少填错
+    if request.engine.strip():
+        engine_path = Path(request.engine.strip()).expanduser()
+    else:
+        tag = "fp16" if request.precision == "fp16" else "fp32"
+        engine_path = onnx_path.with_name(f"{onnx_path.stem}_{tag}.engine")
+
+    if not engine_path.parent.is_dir():
+        raise HTTPException(status_code=400, detail=f"输出目录不存在：{engine_path.parent}")
+    if engine_path.suffix.lower() not in {".engine", ".trt", ".plan"}:
+        raise HTTPException(
+            status_code=400, detail="输出文件名需以 .engine / .trt / .plan 结尾"
+        )
+
+    # 预检：拦住「未转置」的 YOLO 输出
+    probe = _probe_onnx(onnx_path)
+    output_shape = probe.get("output_shape") or []
+    if _looks_like_untransposed_yolo(output_shape):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"该 ONNX 的输出形状是 {output_shape}，属于「未转置」布局。"
+                "用它编译出的引擎会被 yolo_infer.dll 误解析：结果全错却不报错"
+                "（置信度上千、坐标为负）。请改用 launcher 导出时生成的 "
+                ".transd.onnx（输出形如 [1, 候选框数, 4+类别数]）。"
+            ),
+        )
+
+    # 组装 trtexec 参数。fp32 是 trtexec 默认行为，它没有 --fp32 参数，不传。
+    command = [trtexec, f"--onnx={onnx_path}", f"--saveEngine={engine_path}"]
+    if request.precision == "fp16":
+        command.append("--fp16")
+    elif request.precision != "fp32":
+        raise HTTPException(
+            status_code=400, detail=f"不支持的精度：{request.precision}，可选 fp32 / fp16"
+        )
+    command.append(f"--workspace={request.workspace_mb}")
+
+    if request.dynamic:
+        shapes = (
+            request.min_shape.strip(),
+            request.opt_shape.strip(),
+            request.max_shape.strip(),
+        )
+        if not all(shapes):
+            raise HTTPException(
+                status_code=400,
+                detail="启用动态 shape 时必须同时填 min / opt / max，例如 1x3x640x640",
+            )
+        input_name = probe.get("input_name") or "images"
+        command += [
+            f"--minShapes={input_name}:{shapes[0]}",
+            f"--optShapes={input_name}:{shapes[1]}",
+            f"--maxShapes={input_name}:{shapes[2]}",
+        ]
+
+    if request.extra_args.strip():
+        command += shlex.split(request.extra_args.strip(), posix=False)
+
+    try:
+        run = manager.create(
+            "engine-build",
+            command,
+            cwd=str(config.REPO_ROOT),
+            expect_file=engine_path,
+        )
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"启动 trtexec 失败：{exc}") from exc
+
+    return {**run.snapshot(), "engine": str(engine_path), "onnx_probe": probe}
 
 
 # ---------------------------------------------------------------------------

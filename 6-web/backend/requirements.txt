@@ -1,6 +1,13 @@
 fastapi>=0.110
 uvicorn>=0.27
 python-multipart>=0.0.9
-numpy>=1.24,<2
+# numpy 上限放宽到 3.0（2026-10-30 实测）：
+# - torch 2.3.0 + numpy 2.5.4：CUDA conv2d 前向、numpy<->torch 内存桥接均正常
+# - onnxruntime 1.20.1 已官方支持 numpy 2.x
+# 注意残留告警：scipy 1.14.0 声明要求 numpy<2.3，导入时会打 UserWarning，
+# 但实测 anomalib 1.2.0 的推理与训练链路未受影响。
+# 如果把 numpy 锁回 <2，Ultralytics 的 AutoUpdate 会在下次 export 时又升上去，
+# 造成环境与约束反复漂移，所以这里选择放宽而不是降级。
+numpy>=1.24,<3
 onnxruntime>=1.16
 opencv-python>=4.8,<4.12

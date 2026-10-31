@@ -1,6 +1,7 @@
 // 入口：页签切换、环境探测、目录浏览弹窗。
 
 import { browse, getCapabilities } from "./api.js";
+import { initEngine } from "./engine.js";
 import { initInfer } from "./infer.js";
 import { initTrain } from "./train.js";
 
@@ -36,6 +37,7 @@ async function refreshEnvironment() {
     if (!caps.anomalib_launcher) problems.push("缺少 Anomalib launcher");
     if (!caps.infer_yolo) problems.push("yolo_infer.dll 不可用");
     if (!caps.infer_anomalib) problems.push("anomalib_infer.dll 不可用");
+    if (caps.engine_build === false) problems.push("缺少 trtexec（引擎构建不可用）");
 
     if (problems.length === 0) {
       dot.className = "dot ok";
@@ -148,6 +150,7 @@ function initBrowse() {
 // ---------------------------------------------------------------------------
 initTabs();
 initTrain();
+initEngine();
 initInfer();
 initBrowse();
 refreshEnvironment();

@@ -23,6 +23,7 @@
 
 <nav class="tabs">
   <button class="tab active" data-tab="train">训练导出</button>
+  <button class="tab" data-tab="engine">引擎构建</button>
   <button class="tab" data-tab="infer">推理演示</button>
   <button class="tab" data-tab="about">环境说明</button>
 </nav>
@@ -197,6 +198,68 @@
         <div class="images" id="maskRow" style="display:none">
           <figure><img id="imgMask" alt="异常轮廓"><figcaption>异常轮廓</figcaption></figure>
         </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ==================== 引擎构建页 ==================== -->
+  <section class="panel" id="panel-engine">
+    <div class="layout">
+      <form class="card" id="engineForm">
+        <h2>ONNX → TensorRT</h2>
+
+        <label>ONNX 文件
+          <div class="row">
+            <input type="text" id="engOnnx" placeholder="YOLO 选 .transd.onnx；Anomalib 选 model.onnx">
+            <button type="button" class="mini" data-browse="engOnnx" data-mode="file">浏览</button>
+          </div>
+        </label>
+        <p class="hint" id="engProbe">选好文件会自动探测输入/输出形状。</p>
+
+        <label>输出引擎
+          <div class="row">
+            <input type="text" id="engOut" placeholder="留空自动推导为 &lt;onnx名&gt;_fp16.engine">
+            <button type="button" class="mini" data-browse="engOut" data-mode="dir">浏览</button>
+          </div>
+        </label>
+
+        <div class="grid2">
+          <label>精度
+            <select id="engPrecision">
+              <option value="fp16">fp16（推荐，显存约省一半）</option>
+              <option value="fp32">fp32</option>
+            </select>
+          </label>
+          <label>workspace (MB)
+            <input type="number" id="engWorkspace" value="4096" min="256" max="32768" step="256">
+          </label>
+        </div>
+
+        <label>
+          <input type="checkbox" id="engDynamic">
+          动态 shape（需要同时填 min / opt / max）
+        </label>
+
+        <div class="grid2 hidden" id="engShapeGroup">
+          <label>min <input type="text" id="engMin" placeholder="1x3x640x640"></label>
+          <label>opt <input type="text" id="engOpt" placeholder="1x3x640x640"></label>
+          <label>max <input type="text" id="engMax" placeholder="8x3x640x640"></label>
+        </div>
+
+        <label>额外参数
+          <input type="text" id="engExtra" placeholder="可选，原样追加给 trtexec，如 --verbose">
+        </label>
+
+        <div class="actions">
+          <button type="submit" class="primary" id="btnBuild">开始构建</button>
+          <button type="button" id="btnBuildStop" disabled>停止</button>
+        </div>
+        <p class="hint" id="engineHint"></p>
+      </form>
+
+      <div class="card grow">
+        <h2>构建日志 <span class="badge" id="engineBadge">未开始</span></h2>
+        <pre class="log" id="engineLog">等待构建…</pre>
       </div>
     </div>
   </section>

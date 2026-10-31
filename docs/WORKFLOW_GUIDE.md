@@ -20,7 +20,7 @@ flowchart TD
     E --> G["model.ckpt + model.onnx<br/>+ metadata.json"]
 
     F --> H["④ 导出 ONNX"]
-    H --> I["⑤ trtexec 编译引擎"]
+    H --> I["⑤ 编译引擎<br/>Web「引擎构建」页 / trtexec"]
     G --> I
     I --> J["model_fp16.engine"]
 
@@ -54,16 +54,19 @@ flowchart TD
 
 ```powershell
 # YOLO 链路
-python -m pip install torch torchvision ultralytics polars "numpy<2" onnx onnxruntime
+python -m pip install torch torchvision ultralytics polars "numpy<3" onnx onnxruntime
 
 # Anomalib 链路
-python -m pip install anomalib lightning "numpy<2" onnx onnxruntime Pillow
+python -m pip install anomalib lightning "numpy<3" onnx onnxruntime Pillow
 
 # Web 工作站
 python -m pip install fastapi uvicorn python-multipart
 ```
 
-> `numpy<2` **必须保留**：torch 2.3 与 numpy 2 存在 ABI 冲突。
+> **numpy 上限说明（2026-10-30 修订）**：早期要求 `numpy<2`，理由是 torch 2.3 按 numpy 1.x 编译。
+> 实测 `torch 2.3.0 + numpy 2.5.4` 的 CUDA 前向、numpy↔torch 桥接均正常，`onnxruntime 1.20.1` 也支持
+> numpy 2，故放宽到 `<3`。锁 `<2` 会被 Ultralytics AutoUpdate 在每次 `export` 时升回去，造成环境反复漂移。
+> 唯一残留是 `scipy 1.14.0` 的 `UserWarning`（声明要求 numpy<2.3），不影响训练与推理。
 
 ### 1.3 环境自检（关键步骤，别跳过）
 
@@ -90,7 +93,7 @@ python -c "import torch; print(torch.__version__, torch.cuda.is_available(), tor
 | --- | --- | --- |
 | CUDA 11.8 + MSVC 14.44 | `STL1002: Unexpected compiler version, expected CUDA 12.4 or newer` | 设置 `$env:NVCC_PREPEND_FLAGS = "-D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH --allow-unsupported-compiler"` |
 | Python 3.8+ DLL 搜索 | `WinDLL` 报「找不到模块或它的依赖项」 | 必须 `os.add_dll_directory()`，`6-web/backend/infer.py` 已处理 |
-| numpy 2.x | torch 导入异常 | 降到 `numpy<2`（实测 1.26.4） |
+| numpy 2.x | 早期认为与 torch 2.3 有 ABI 冲突 | 2026-10-30 实测 `torch 2.3.0 + numpy 2.5.4` 正常，约束已放宽到 `numpy<3`；若确实遇到 torch 导入异常，再降到 `numpy<2`（实测 1.26.4） |
 
 ---
 
@@ -250,6 +253,11 @@ python tf_yolo_launcher.py --mode export --model runs\trtforge\my_yolo\weights\b
 
 ### 5.1 trtexec 命令
 
+> **也可以完全不敲命令行**：Web Studio 的「引擎构建」页已支持同一套能力
+> （选 ONNX → 自动探测形状 → 选精度/dynamic shape → 实时日志）。
+> 命令行的价值在于批量脚本和排查；日常单个模型建议直接用网页。
+> 详见本章 5.4。
+
 ```powershell
 $trt = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v11.8\bin\trtexec.exe"
 
@@ -291,9 +299,12 @@ $trt = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v11.8\bin\trtexec.exe
 | PatchCore | 约 15 分钟 |
 | PaDiM | 约 17 分钟 |
 | YOLOv8n（640） | 约 2~3 分钟 |
+| YOLOv8n（960） | 约 8 分钟（474 秒，首次无 timing cache） |
 
 > **必须串行编译**。并行会互相抢 GPU，实测明显变慢。
 > 编译期间 GPU 利用率掉到 4% 是正常的（builder 在 CPU 侧搜索 tactic）。
+> 反过来，若长时间没有日志输出但 GPU 占用接近 100%，说明仍在 tactic 搜索，
+> 不是在卡死，不要中断。
 
 ### 5.3 验收
 
@@ -304,6 +315,33 @@ $trt = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v11.8\bin\trtexec.exe
 ```
 
 并生成 `*.engine` 文件。出现 `FAILED` 通常是算子不支持或 opset 过低。
+
+### 5.4 用 Web 界面构建（推荐）
+
+启动工作站后打开「引擎构建」页：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_web_studio.ps1
+# 浏览器打开 http://127.0.0.1:8060 → 点顶部「引擎构建」
+```
+
+| 操作 | 说明 |
+| --- | --- |
+| 选 ONNX | 选完自动调 `/api/engine/probe` 显示输入/输出形状与体积；未转置的 YOLO 会标红 |
+| 输出引擎 | 留空自动推导为 `<onnx名>_fp16.engine` |
+| 精度 | `fp16` 省显存（推荐）/ `fp32` |
+| 动态 shape | 勾选后填 min/opt/max，如 `1x3x960x960` |
+| workspace | 默认 4096 MB |
+
+点「开始构建」后：
+
+- 日志通过 `/ws/runs/{run_id}` 实时滚动（与训练页同一通道）；
+- 提交未转置 ONNX 会被后端 **HTTP 400** 拒绝，日志面板写明原因，不会白等十几分钟；
+- 退出码为 0 但没有生成引擎文件时，任务判为 **failed** 并发 `ARTIFACT_MISSING`，
+  不会出现「显示成功、去推理却找不到文件」。
+
+构建产物路径可直接填进「推理演示」页的引擎文件栏。
+
 
 ---
 

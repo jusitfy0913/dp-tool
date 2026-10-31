@@ -26,7 +26,13 @@ Web 版把界面换成浏览器，换来三件事：
 D:\Anaconda3\envs\dpenv\python.exe -m pip install -r 6-web\backend\requirements.txt
 ```
 
-注意不要顺手升 `numpy`：`pip install -r` 里已锁 `numpy<2`，因为 torch 2.3.0 是拿 numpy 1.x 编的。
+关于 `numpy`：早期这里锁了 `numpy<2`，因为 torch 2.3.0 是按 numpy 1.x 编的。2026-10-30 实测
+`torch 2.3.0 + numpy 2.5.4` 的 CUDA 前向与 numpy 桥接均正常，且 `onnxruntime 1.20.1` 已支持 numpy 2，
+所以上限放宽到 `<3`。
+
+为什么不干脆锁回 `<2`：Ultralytics 的 AutoUpdate 会在 `yolo export` 时把 numpy 自动升到 2.x，
+锁 `<2` 只会让环境在每次导出后反复漂移。唯一残留告警是 `scipy 1.14.0` 声明要求 numpy<2.3，
+导入时会打一行 `UserWarning`，实测不影响 anomalib 训练与推理。
 
 ### 2. 编推理 DLL（只需一次）
 
@@ -102,6 +108,31 @@ YOLO 返回画好框的图与每个目标的类别/置信度；Anomalib 返回�
 >
 > 完整实测链路见根目录 `readme.md` 的 v1.3 记录（PCB 6 类 / mAP50 0.945 / 引擎 8.41ms）。
 
+### 引擎构建
+
+把 ONNX 编译成 TensorRT 引擎，参数与 `trtexec` 一一对应。
+
+1. 选 ONNX 文件。选完会自动探测并显示输入/输出形状与文件大小。
+2. 输出引擎留空即可，会按 `<onnx名>_<fp16|fp32>.engine` 自动推导。
+3. 选精度（fp16 省显存，推荐）、workspace，需要变分辨率时勾「动态 shape」并填 min/opt/max。
+4. 点「开始构建」，日志实时滚动，状态徽标从「构建中」变为「已完成/失败」。
+
+选错文件不会白等：输出形状是 `[1, 4+类别数, 候选框数]` 的「未转置」YOLO 模型，
+提示会变红，后端也会直接返回 400 拒绝构建。
+
+构建完成后，引擎文件路径可直接填到「推理演示」页使用。
+
+实测参考（PCB 6 类模型，960×960，FP16，RTX 3060 8G）：
+
+| 项 | 数值 |
+| --- | --- |
+| 构建耗时 | 474.1 s |
+| 引擎大小 | 10.14 MB |
+| 吞吐 | 135.4 qps |
+
+> trtexec 在 960×960 这类大分辨率上做 tactic 搜索可能长达数分钟，期间日志可能长时间不刷新，
+> 这是正常的，不是卡死。GPU 占用率持续接近 100% 即为仍在编译。
+
 ### 环境说明
 
 显示后端探测到的全部路径、Python 解释器、DLL 加载状态，以及可用的环境变量清单。
@@ -112,6 +143,7 @@ YOLO 返回画好框的图与每个目标的类别/置信度；Anomalib 返回�
 | 变量 | 作用 | 默认 |
 | --- | --- | --- |
 | `TRTFORGE_PYTHON` | 训练用解释器 | 自动探测（当前解释器 / dpenv / pytorch） |
+| `TRTFORGE_TRTEXEC` | `trtexec.exe` 绝对路径 | 自动探测（`CUDA_PATH\bin` → CUDA 根 `v*/bin` → PATH） |
 | `OPENCV_DIR` | OpenCV 根目录 | 未设则推理 DLL 加载失败 |
 | `CUDA_PATH` | CUDA 根目录 | 未设则推理 DLL 加载失败 |
 | `TRTFORGE_REPO_ROOT` | 仓库根 | 从 `config.py` 位置向上推导 |
@@ -139,6 +171,8 @@ YOLO 返回画好框的图与每个目标的类别/置信度；Anomalib 返回�
 | GET | `/api/browse?path=` | 目录浏览（Web 无法弹系统选择框） |
 | POST | `/api/infer/yolo` | YOLO 推理 |
 | POST | `/api/infer/anomalib` | Anomalib 推理 |
+| GET | `/api/engine/probe?onnx=` | 探测 ONNX 输入/输出形状，判断是否可用 |
+| POST | `/api/engine/build` | 用 trtexec 把 ONNX 编译成引擎 |
 
 ## 代码结构
 
@@ -154,12 +188,13 @@ YOLO 返回画好框的图与每个目标的类别/置信度；Anomalib 返回�
 │       ├── smoke_test.py       端到端冒烟测试（HTTP + WebSocket + 真实子进程）
 │       └── test_exit_codes.py  退出码语义化测试（exit 2/130 的补事件逻辑）
 ├── frontend/
-│   ├── index.html        单页，三个页签
+│   ├── index.html        单页，四个页签
 │   ├── css/style.css
 │   └── js/
 │       ├── api.js        HTTP 封装
 │       ├── ws.js         WebSocket（含断线重连）
 │       ├── train.js      训练页
+│       ├── engine.js     引擎构建页（日志流 + 探测预警）
 │       ├── infer.js      推理页
 │       └── main.js       页签 / 环境状态 / 目录浏览
 └── runtime/              上传临时文件与任务日志（已 gitignore）
