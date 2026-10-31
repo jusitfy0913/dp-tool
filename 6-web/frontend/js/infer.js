@@ -1,9 +1,36 @@
-// 推理页：上传图片 → 调后端 → 展示结果图。
-// 图片以 base64 返回，前端只负责挂到 <img>，不做像素处理。
+// 推理页：上传图片 → 调后端 → 展示结果。
+//
+// 数据流：
+//   后端返回 base64 图（原图 / 检出图 / 热能图 / 轮廓图）+ 结构化 boxes。
+//   图片直接挂到查看器；框由前端用 SVG 叠加层重绘，因此在任意倍率下都锐利。
+//
+// 关键设计：
+//   · 叠加层与后端烧录的标注图共用同一份 `class_colors`，保证"屏幕上看到的颜色"
+//     与"导出的标注图颜色"完全一致。
+//   · 参数（conf/nms/双阈值）只改 UI 状态，点"开始推理"才提交。
+//     实时推理会让拖动滑块变成卡顿，而且每次都要重建引擎句柄。
+//   · 结果表、分布图、导出三者都从同一份 `lastResult` 生成，不会出现"导出的和看到的不一样"。
 
-import { postForm } from "./api.js";
+import { getJSON, postForm } from "./api.js";
+import { applyOverlayScale, buildOverlay, setOverlayHighlight } from "./overlay.js";
+import { createViewerStrip } from "./viewer.js";
 
 let dom = {};
+let viewers = null;
+let sourceObjectUrl = "";
+
+// 模型清单与上次参数，用于"命中缓存"提示与自动填充
+let models = [];
+let lastParamKey = "";
+let lastResult = null;
+let lastKind = "yolo";
+
+// 叠加层状态
+let overlaySvg = null;
+let overlayScale = 1;
+let highlightIndex = -1;
+let sortKey = "confidence";
+let sortAsc = false;
 
 export function initInfer() {
   dom = {
@@ -13,42 +40,314 @@ export function initInfer() {
     anomGroup: document.getElementById("inferAnomGroup"),
     btnInfer: document.getElementById("btnInfer"),
     hint: document.getElementById("inferHint"),
+    rebuildHint: document.getElementById("inferRebuildHint"),
     badge: document.getElementById("inferBadge"),
     metrics: document.getElementById("inferMetrics"),
-    imgSource: document.getElementById("imgSource"),
-    imgResult: document.getElementById("imgResult"),
-    imgMask: document.getElementById("imgMask"),
-    maskRow: document.getElementById("maskRow"),
-    capResult: document.getElementById("capResult"),
+    mount: document.getElementById("inferViewers"),
     file: document.getElementById("inferImage"),
+
+    modelSelect: document.getElementById("inferModelSelect"),
+    modelHint: document.getElementById("inferModelHint"),
+    btnRefreshModels: document.getElementById("btnRefreshModels"),
+
+    timing: document.getElementById("inferTiming"),
+    timingBar: document.getElementById("timingBar"),
+    timingLegend: document.getElementById("timingLegend"),
+
+    toolbar: document.getElementById("inferToolbar"),
+    detail: document.getElementById("inferDetail"),
+    boxHead: document.getElementById("boxHead"),
+    boxRows: document.getElementById("boxRows"),
+    confHist: document.getElementById("confHist"),
+
+    useMetaThresh: document.getElementById("anomUseMetaThresh"),
+    anomThreshHint: document.getElementById("anomThreshHint"),
+    colormap: document.getElementById("anomColormap"),
+    overlayOpacity: document.getElementById("anomOverlayOpacity"),
   };
 
+  // 四个窗口：原图 / 检出图 / 热能图 / 异常轮廓。
+  // 后两个默认关闭且标记为"暂无内容"——YOLO 模式下它们永远不会有图，
+  // 一上来就占满一屏只会挤掉真正要看的东西。
+  viewers = createViewerStrip({
+    mount: dom.mount,
+    id: "infer",
+    windows: [
+      { id: "source", title: "原图", enabled: true },
+      { id: "result", title: "检出结果", enabled: true },
+      { id: "heatmap", title: "热能图", enabled: false },
+      { id: "mask", title: "异常轮廓", enabled: false },
+    ],
+    emptyText: "全部窗口已关闭，点击上方开关重新显示",
+  });
+
+  bindSliders();
   dom.kind.addEventListener("change", syncKind);
   dom.form.addEventListener("submit", onSubmit);
   dom.file.addEventListener("change", onFileChange);
+  dom.useMetaThresh.addEventListener("change", syncThresholdControls);
+  dom.modelSelect.addEventListener("change", onModelChange);
+  dom.btnRefreshModels.addEventListener("click", () => loadModels(true));
+
+  for (const id of ["optShowBoxes", "optShowLabels", "optFadeLow"]) {
+    const el = document.getElementById(id);
+    if (el) el.addEventListener("change", () => rebuildOverlay());
+  }
+  dom.overlayOpacity.addEventListener("input", () => applyOverlayOpacity());
+
+  document.getElementById("btnExportJson").addEventListener("click", exportJson);
+  document.getElementById("btnExportCsv").addEventListener("click", exportCsv);
+
+  // 标签尺寸随倍率反向缩放，保证屏幕字号恒定
+  dom.mount.addEventListener("viewer-zoom", (event) => {
+    overlayScale = event.detail.scale || 1;
+    applyOverlayScale(overlaySvg, overlayScale);
+  });
+
+  // 参数一改就点亮"会重建引擎"提示，让用户知道慢在哪
+  for (const id of ["inferConf", "inferNms", "anomImageThr", "anomPixelThr"]) {
+    const el = document.getElementById(id);
+    if (el) el.addEventListener("change", markParamsDirty);
+  }
+
   syncKind();
+  syncThresholdControls();
+  loadModels(false);
 }
+
+// ---------------------------------------------------------------------------
+// 参数控件
+// ---------------------------------------------------------------------------
+
+/** 数字框 ↔ 滑块双向联动。 */
+function bindSlider(numberId, rangeId) {
+  const number = document.getElementById(numberId);
+  const range = document.getElementById(rangeId);
+  if (!number || !range) return;
+
+  const clamp = (value) => {
+    const low = Number(range.min);
+    const high = Number(range.max);
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed)) return Number(range.value);
+    return Math.min(high, Math.max(low, parsed));
+  };
+
+  range.addEventListener("input", () => {
+    number.value = range.value;
+  });
+  number.addEventListener("input", () => {
+    // 输入框允许暂时为空（用户正在删除重输），此时不要强行写回
+    if (number.value === "") return;
+    range.value = String(clamp(number.value));
+  });
+  number.addEventListener("blur", () => {
+    const value = clamp(number.value);
+    number.value = String(value);
+    range.value = String(value);
+  });
+}
+
+function bindSliders() {
+  bindSlider("inferConf", "inferConfRange");
+  bindSlider("inferNms", "inferNmsRange");
+  bindSlider("anomImageThr", "anomImageThrRange");
+  bindSlider("anomPixelThr", "anomPixelThrRange");
+  bindSlider("anomOverlayOpacity", "anomOverlayOpacityRange");
+}
+
+/** "沿用 metadata 默认值"开关：关掉后才允许编辑两个阈值。 */
+function syncThresholdControls() {
+  const useMeta = dom.useMetaThresh.checked;
+  for (const key of ["imageThreshold", "pixelThreshold"]) {
+    const block = document.querySelector(`.param[data-param="${key}"]`);
+    if (!block) continue;
+    block.classList.toggle("is-disabled", useMeta);
+    for (const input of block.querySelectorAll("input")) {
+      input.disabled = useMeta;
+    }
+  }
+  dom.anomThreshHint.textContent = useMeta
+    ? "直接使用 metadata 里记录的阈值。取消勾选后可手动覆盖。"
+    : "手动覆盖 metadata 阈值。改阈值同样会重建引擎句柄。";
+}
+
+/** 参数改动后提示"会重建引擎"，改回原值则提示"命中缓存"。 */
+function markParamsDirty() {
+  const key = currentParamKey();
+  if (!lastParamKey) {
+    dom.rebuildHint.classList.add("hidden");
+    return;
+  }
+  const dirty = key !== lastParamKey;
+  dom.rebuildHint.classList.remove("hidden");
+  dom.rebuildHint.classList.toggle("hint-warn", dirty);
+  dom.rebuildHint.classList.toggle("hint-ok", !dirty);
+  dom.rebuildHint.classList.toggle("hint", true);
+  dom.rebuildHint.textContent = dirty
+    ? "参数已改动：下次推理会重建引擎句柄，首次约需数秒。再改回去可命中缓存、立即返回。"
+    : "当前参数与上次推理一致，将直接命中已加载的引擎，无需重建。";
+}
+
+/** 当前参数组合的指纹，用于判断是否与上次相同（同参数会命中句柄缓存）。 */
+function currentParamKey() {
+  const parts = [dom.kind.value];
+  if (dom.kind.value === "yolo") {
+    parts.push(value("yoloEngine"), value("inferTask"), value("inferConf"), value("inferNms"));
+  } else {
+    parts.push(value("anomEngine"), value("anomMetadata"), value("anomModelType"));
+    parts.push(dom.useMetaThresh.checked ? "meta" : `${value("anomImageThr")}|${value("anomPixelThr")}`);
+  }
+  return parts.join("::");
+}
+
+// ---------------------------------------------------------------------------
+// 模型下拉
+// ---------------------------------------------------------------------------
+
+async function loadModels(manual) {
+  if (manual) dom.modelHint.textContent = "正在扫描训练产物…";
+  try {
+    const data = await getJSON("/api/models");
+    models = data.entries || [];
+    renderModelOptions(data);
+  } catch (error) {
+    dom.modelHint.textContent = `扫描失败：${error.message}`;
+  }
+}
+
+function renderModelOptions(data) {
+  const select = dom.modelSelect;
+  const previous = select.value;
+  select.replaceChildren();
+
+  const placeholder = document.createElement("option");
+  placeholder.value = "";
+  placeholder.textContent = "— 手工填写下面的路径 —";
+  select.appendChild(placeholder);
+
+  // 按类型分组，避免 YOLO 与 Anomalib 混在一个长列表里
+  for (const kind of ["yolo", "anomalib"]) {
+    const group = document.createElement("optgroup");
+    group.label = kind === "yolo" ? "YOLO 目标检测" : "Anomalib 异常检测";
+    const items = models.filter((item) => item.kind === kind);
+    if (!items.length) {
+      const none = document.createElement("option");
+      none.disabled = true;
+      none.textContent = "（该目录暂无引擎）";
+      group.appendChild(none);
+    }
+    for (const item of items) {
+      const option = document.createElement("option");
+      option.value = item.path;
+      const size = (item.size / (1024 * 1024)).toFixed(1);
+      const warn = item.kind === "yolo" && !item.transposed ? " ⚠ 未转置" : "";
+      option.textContent = `${item.label} · ${size}MB${warn}`;
+      group.appendChild(option);
+    }
+    select.appendChild(group);
+  }
+
+  if (previous && models.some((item) => item.path === previous)) {
+    select.value = previous;
+  }
+
+  const broken = (data.roots || []).filter((root) => !root.ok);
+  const parts = [`共 ${data.total ?? models.length} 个引擎`];
+  if (data.truncated) parts.push(`（已截断到 ${models.length} 个）`);
+  for (const root of broken) {
+    parts.push(`· ${root.kind} 目录未扫描：${root.reason}`);
+  }
+  dom.modelHint.textContent = parts.join(" ");
+}
+
+function onModelChange() {
+  const path = dom.modelSelect.value;
+  const item = models.find((entry) => entry.path === path);
+  if (!item) return;
+
+  dom.kind.value = item.kind === "anomalib" ? "anomalib" : "yolo";
+  syncKind();
+
+  if (item.kind === "yolo") {
+    setValue("yoloEngine", item.path);
+    setValue("yoloLabels", item.labels || "");
+    if (item.task && ["detect", "segment", "pose", "obb"].includes(item.task)) {
+      setValue("inferTask", item.task);
+    }
+  } else {
+    setValue("anomEngine", item.path);
+    // 优先用校准过的 metadata：它是按现场数据重新标定过阈值的版本
+    setValue("anomMetadata", item.metadata_calibrated || item.metadata || "");
+    if (item.model_type) {
+      const mapped = normalizeModelType(item.model_type);
+      if (mapped) setValue("anomModelType", mapped);
+    }
+  }
+
+  // 未转置的引擎会让 DLL 解码越界，产出的框是垃圾值。必须提前拦。
+  if (item.kind === "yolo" && !item.transposed) {
+    dom.modelHint.textContent =
+      `⚠ ${item.name} 对应的 ONNX 是未转置的（${item.onnx ? fileName(item.onnx) : "无"}）。`
+      + "用它编译的引擎解码会越界，结果不可信。请改用 *_fp16.engine 中对应 .transd.onnx 的那个。";
+    dom.modelHint.classList.add("hint-warn");
+  } else {
+    dom.modelHint.classList.remove("hint-warn");
+    dom.modelHint.textContent = `已填入 ${item.name}${item.labels ? "（含标签文件）" : ""}`;
+  }
+  markParamsDirty();
+}
+
+/** `Patchcore` / `PATCHCORE` → 下拉里的 `PatchCore`。 */
+function normalizeModelType(raw) {
+  const lower = String(raw).toLowerCase().replace(/[\s_-]/g, "");
+  if (lower.includes("patchcore")) return "PatchCore";
+  if (lower.includes("padim")) return "PaDiM";
+  if (lower.includes("efficientad")) return "EfficientAd";
+  return "";
+}
+
+// ---------------------------------------------------------------------------
+// 推理类型切换
+// ---------------------------------------------------------------------------
 
 function syncKind() {
   const isYolo = dom.kind.value === "yolo";
   dom.yoloGroup.classList.toggle("hidden", !isYolo);
   dom.anomGroup.classList.toggle("hidden", isYolo);
-  dom.capResult.textContent = isYolo ? "检测结果" : "异常叠加图";
-}
-
-function formValue(id) {
-  const el = document.getElementById(id);
-  return el ? el.value.trim() : "";
+  lastKind = isYolo ? "yolo" : "anomalib";
+  viewers.viewer("result").setTitle(isYolo ? "检出结果" : "异常叠加");
+  if (isYolo) {
+    // YOLO 永远不产出热能图与轮廓图，直接标记为"无内容"并关掉，
+    // 免得用户点开一个永远空着的窗口
+    viewers.setAvailable("heatmap", false);
+    viewers.setAvailable("mask", false);
+    viewers.setEnabled("heatmap", false);
+    viewers.setEnabled("mask", false);
+  }
+  // 切到 Anomalib 时不预先开放这两个窗口：等真有图了再开放，
+  // 由 renderAnomalib 决定，避免"点开了却是空的"
+  markParamsDirty();
 }
 
 function onFileChange() {
   const file = dom.file.files?.[0];
   if (!file) return;
-  dom.imgSource.src = URL.createObjectURL(file);
-  dom.imgResult.removeAttribute("src");
-  dom.imgMask.removeAttribute("src");
-  dom.maskRow.style.display = "none";
+  // 上一张图的 object URL 必须显式释放，否则大图会一直占着内存
+  if (sourceObjectUrl) URL.revokeObjectURL(sourceObjectUrl);
+  sourceObjectUrl = URL.createObjectURL(file);
+
+  // 本地预览用 object URL，比等后端回传快得多；
+  // 推理完成后如果后端回了 source_png，会换成它（两者像素一致）
+  viewers.viewer("source").setImage(sourceObjectUrl);
+  viewers.viewer("result").clear();
+  viewers.viewer("heatmap").clear();
+  viewers.viewer("mask").clear();
 }
+
+// ---------------------------------------------------------------------------
+// 提交
+// ---------------------------------------------------------------------------
 
 async function onSubmit(event) {
   event.preventDefault();
@@ -59,19 +358,22 @@ async function onSubmit(event) {
     setHint("请先选择一张图片");
     return;
   }
-  if (isYolo && !formValue("yoloEngine")) {
+  if (isYolo && !value("yoloEngine")) {
     setHint("请填写 YOLO 引擎路径");
     return;
   }
-  if (!isYolo && (!formValue("anomEngine") || !formValue("anomMetadata"))) {
+  if (!isYolo && (!value("anomEngine") || !value("anomMetadata"))) {
     setHint("请填写引擎与 metadata.json 路径");
     return;
   }
 
+  const paramKey = currentParamKey();
+  const cached = paramKey === lastParamKey;
+
   setHint("");
   dom.btnInfer.disabled = true;
-  setBadge("推理中…", "run");
-  dom.metrics.innerHTML = "";
+  setBadge(cached ? "推理中（命中缓存）…" : "推理中（重建引擎）…", "run");
+  dom.metrics.replaceChildren();
 
   const form = new FormData();
   form.append("image", file);
@@ -79,20 +381,36 @@ async function onSubmit(event) {
   let url;
   if (isYolo) {
     url = "/api/infer/yolo";
-    form.append("engine", formValue("yoloEngine"));
-    form.append("task", formValue("inferTask"));
-    form.append("conf", formValue("inferConf"));
-    form.append("nms", formValue("inferNms"));
+    form.append("engine", value("yoloEngine"));
+    form.append("task", value("inferTask"));
+    form.append("conf", value("inferConf"));
+    form.append("nms", value("inferNms"));
+    const labels = value("yoloLabels");
+    if (labels) form.append("labels", labels);
   } else {
     url = "/api/infer/anomalib";
-    form.append("engine", formValue("anomEngine"));
-    form.append("metadata", formValue("anomMetadata"));
-    form.append("model_type", formValue("anomModelType"));
+    form.append("engine", value("anomEngine"));
+    form.append("metadata", value("anomMetadata"));
+    form.append("model_type", value("anomModelType"));
+    form.append("heatmap_colormap", value("anomColormap"));
+    // 勾了"沿用 metadata"就不提交阈值字段，让后端用 -1 走默认分支
+    if (!dom.useMetaThresh.checked) {
+      form.append("image_threshold", value("anomImageThr"));
+      form.append("pixel_threshold", value("anomPixelThr"));
+    }
   }
 
+  const started = performance.now();
   try {
     const result = await postForm(url, form);
-    renderResult(result, isYolo);
+    lastResult = result;
+    lastKind = isYolo ? "yolo" : "anomalib";
+    lastParamKey = paramKey;
+    // 完成后按"当前参数 vs 上次参数"重算提示，而不是简单地隐藏。
+    // 不能只 hide：点按钮会让数字框失焦并触发一次 change，事件顺序不同就会把提示重新点亮，
+    // 这里统一收敛到 markParamsDirty 里的同一套判断，结果与事件顺序无关。
+    markParamsDirty();
+    renderResult(result, isYolo, performance.now() - started);
     setBadge("完成", "done");
   } catch (error) {
     setHint(error.message);
@@ -102,43 +420,495 @@ async function onSubmit(event) {
   }
 }
 
-function renderResult(result, isYolo) {
-  // 降级提示：DLL 不可用时后端会自动用 onnxruntime 跑同一份 ONNX，
-  // 结果可用但不是最终性能路径，必须让用户明确知道。
-  if (result.warning) {
-    setMetric("降级提示", result.warning);
-  }
+// ---------------------------------------------------------------------------
+// 结果渲染
+// ---------------------------------------------------------------------------
+
+function renderResult(result, isYolo, roundTripMs) {
+  if (result.warning) setMetric("降级提示", result.warning);
+
+  if (isYolo) renderYolo(result);
+  else renderAnomalib(result);
+
+  renderTiming(result.timing, roundTripMs);
+  dom.toolbar.classList.remove("hidden");
+
   if (isYolo) {
-    dom.imgResult.src = `data:image/png;base64,${result.annotated_png}`;
-    setMetric("目标数", result.count);
-    setMetric("后端", result.backend);
-    if (result.timing) {
-      setMetric("推理耗时", `${result.timing.inference_ms.toFixed(1)} ms`);
-      setMetric("总耗时", `${result.timing.total_ms.toFixed(1)} ms`);
-    }
-    const summary = (result.boxes || [])
-      .slice(0, 10)
-      .map((b) => `cls${b.class_label} ${b.confidence.toFixed(3)}`)
-      .join("  ");
-    if (summary) setMetric("检出", summary);
+    renderTable(result.boxes || []);
+    renderHistogram(result.boxes || []);
+    dom.detail.classList.remove("hidden");
   } else {
-    if (result.overlay_png) {
-      dom.imgResult.src = `data:image/png;base64,${result.overlay_png}`;
-    }
-    if (result.mask_png) {
-      dom.imgMask.src = `data:image/png;base64,${result.mask_png}`;
-      dom.maskRow.style.display = "grid";
-    }
-    setMetric("判定", result.is_anomaly ? "异常 NG" : "正常 OK");
-    setMetric("原始分数", Number(result.raw_score).toFixed(4));
-    setMetric("归一化分数", Number(result.normalized_score).toFixed(4));
-    if (result.metadata?.image_threshold != null) {
-      setMetric("图像阈值", Number(result.metadata.image_threshold).toFixed(4));
-    }
-    if (result.timing) {
-      setMetric("推理耗时", `${result.timing.inference_ms.toFixed(1)} ms`);
-    }
+    // 异常检测没有"检出框"，明细表换成阈值与分数说明，避免留一张空表
+    dom.detail.classList.add("hidden");
   }
+
+  rebuildOverlay();
+  applyOverlayOpacity();
+}
+
+function renderYolo(result) {
+  const boxes = result.boxes || [];
+
+  // 结果窗口显示"原图 + SVG 叠加层"，而不是后端烧录好框的 annotated_png。
+  // 原因：两份画框会叠在一起（双重描边、标签互相盖住），而且烧录图放大后必然模糊。
+  // annotated_png 仍然保留在 lastResult 里，只用于导出。
+  if (sourceObjectUrl) {
+    viewers.viewer("result").setImage(sourceObjectUrl);
+  }
+  viewers.setAvailable("result", true);
+  viewers.setAvailable("heatmap", false);
+  viewers.setAvailable("mask", false);
+  document.getElementById("anomLegend")?.classList.add("hidden");
+
+  setMetric("目标数", boxes.length);
+  setMetric("后端", result.backend);
+  if (result.timing) {
+    setMetric("推理耗时", `${result.timing.inference_ms.toFixed(1)} ms`);
+    setMetric("总耗时", `${result.timing.total_ms.toFixed(1)} ms`);
+  }
+  const labelInfo = result.labels || {};
+  if (labelInfo.ok) {
+    setMetric("标签文件", `${labelInfo.name || fileName(labelInfo.path)} · ${labelInfo.count} 类`);
+  } else if (labelInfo.error) {
+    setMetric("标签文件", labelInfo.error);
+  }
+  if (!boxes.length) setMetric("提示", "未检出目标，可尝试降低 conf");
+}
+
+function renderAnomalib(result) {
+  if (result.source_png) {
+    viewers.viewer("source").setImage(`data:image/png;base64,${result.source_png}`);
+  }
+  if (result.overlay_png) {
+    viewers.viewer("result").setImage(`data:image/png;base64,${result.overlay_png}`);
+    viewers.setAvailable("result", true);
+  }
+  if (result.heatmap_png) {
+    viewers.viewer("heatmap").setImage(`data:image/png;base64,${result.heatmap_png}`);
+    // 有内容再开放并默认打开：没有内容的窗口开着只会占地方
+    viewers.setAvailable("heatmap", true);
+    viewers.setEnabled("heatmap", true);
+  } else {
+    viewers.setAvailable("heatmap", false);
+  }
+  if (result.mask_png) {
+    viewers.viewer("mask").setImage(`data:image/png;base64,${result.mask_png}`);
+    viewers.setAvailable("mask", true);
+    viewers.setEnabled("mask", true);
+  } else {
+    viewers.setAvailable("mask", false);
+  }
+
+  const verdict = result.is_anomaly ? "异常 NG" : "正常 OK";
+  const badge = document.createElement("div");
+  badge.className = `metric metric-verdict ${result.is_anomaly ? "is-ng" : "is-ok"}`;
+  badge.innerHTML = `判定 <b>${escapeHtml(verdict)}</b>`;
+  dom.metrics.appendChild(badge);
+
+  setMetric("归一化分数", Number(result.normalized_score).toFixed(4));
+  setMetric("原始分数", Number(result.raw_score).toFixed(4));
+
+  // 生效阈值与 metadata 原值并列显示：覆盖之后如果只显示生效值，
+  // 用户过几天回来会分不清"这个 0.6 是我设的还是文件里的"
+  const thresholds = result.thresholds || {};
+  const imageThr = thresholds.image || {};
+  const pixelThr = thresholds.pixel || {};
+  setMetric(
+    "图像阈值",
+    `${fmtThreshold(imageThr.effective)}${imageThr.overridden ? `（覆盖，原 ${fmtThreshold(imageThr.metadata)}）` : "（metadata）"}`,
+  );
+  setMetric(
+    "像素阈值",
+    `${fmtThreshold(pixelThr.effective)}${pixelThr.overridden ? `（覆盖，原 ${fmtThreshold(pixelThr.metadata)}）` : "（metadata）"}`,
+  );
+  if (result.heatmap_colormap) setMetric("色带", result.heatmap_colormap);
+  renderPixelThresholdLegend(pixelThr.effective);
+  if (result.timing) {
+    setMetric("推理耗时", `${result.timing.inference_ms.toFixed(1)} ms`);
+    setMetric("总耗时", `${result.timing.total_ms.toFixed(1)} ms`);
+  }
+}
+
+function fmtThreshold(value) {
+  return value === null || value === undefined ? "—" : Number(value).toFixed(4);
+}
+
+/** 把像素阈值画到 0~1 色阶刻度上。 */
+function renderPixelThresholdLegend(threshold) {
+  const legend = document.getElementById("anomLegend");
+  const mark = document.getElementById("pixelThrMark");
+  const note = document.getElementById("pixelThrNote");
+  if (!legend || !mark || !note) return;
+
+  if (threshold === null || threshold === undefined || !Number.isFinite(Number(threshold))) {
+    legend.classList.add("hidden");
+    return;
+  }
+  const ratio = Math.min(1, Math.max(0, Number(threshold)));
+  mark.style.left = `${ratio * 100}%`;
+  note.textContent = `像素阈值 ${ratio.toFixed(4)}`;
+  legend.classList.remove("hidden");
+}
+
+/** 三级耗时分解条。 */
+function renderTiming(timing, roundTripMs) {
+  if (!timing) {
+    dom.timing.classList.add("hidden");
+    return;
+  }
+  const pre = Number(timing.preprocess_ms) || 0;
+  const infer = Number(timing.inference_ms) || 0;
+  const post = Number(timing.postprocess_ms) || 0;
+  const total = pre + infer + post || 1;
+
+  const segments = [
+    { key: "pre", label: "预处理", ms: pre, cls: "seg-pre" },
+    { key: "infer", label: "推理", ms: infer, cls: "seg-infer" },
+    { key: "post", label: "后处理", ms: post, cls: "seg-post" },
+  ];
+
+  dom.timingBar.replaceChildren();
+  dom.timingLegend.replaceChildren();
+  for (const seg of segments) {
+    const bar = document.createElement("div");
+    bar.className = `timing-seg ${seg.cls}`;
+    bar.style.width = `${(seg.ms / total) * 100}%`;
+    bar.title = `${seg.label} ${seg.ms.toFixed(2)} ms`;
+    dom.timingBar.appendChild(bar);
+
+    const item = document.createElement("div");
+    item.className = "timing-item";
+    item.innerHTML =
+      `<span class="timing-dot ${seg.cls}"></span>`
+      + `${escapeHtml(seg.label)} <b>${seg.ms.toFixed(2)} ms</b>`;
+    dom.timingLegend.appendChild(item);
+  }
+
+  const totalItem = document.createElement("div");
+  totalItem.className = "timing-item timing-total";
+  totalItem.innerHTML = `合计 <b>${total.toFixed(2)} ms</b>`;
+  dom.timingLegend.appendChild(totalItem);
+
+  if (Number.isFinite(roundTripMs)) {
+    const net = document.createElement("div");
+    net.className = "timing-item timing-net";
+    // 往返耗时与后端计时之差 = 上传 + 编码 + 传输，用来解释"为什么感觉比 40ms 慢"
+    net.innerHTML = `含往返 <b>${roundTripMs.toFixed(0)} ms</b>`;
+    dom.timingLegend.appendChild(net);
+  }
+
+  dom.timing.classList.remove("hidden");
+}
+
+// ---------------------------------------------------------------------------
+// 明细表
+// ---------------------------------------------------------------------------
+
+const COLUMNS = [
+  { key: "index", label: "#", align: "num", width: 4 },
+  { key: "label_name", label: "类别", align: "" },
+  { key: "confidence", label: "置信度", align: "num" },
+  { key: "left", label: "left", align: "num" },
+  { key: "top", label: "top", align: "num" },
+  { key: "width", label: "宽", align: "num" },
+  { key: "height", label: "高", align: "num" },
+  { key: "area", label: "面积", align: "num" },
+];
+
+function renderTable(boxes) {
+  dom.boxHead.replaceChildren();
+  dom.boxRows.replaceChildren();
+
+  const row = document.createElement("tr");
+  for (const col of COLUMNS) {
+    const th = document.createElement("th");
+    th.textContent = col.label + (sortKey === col.key ? (sortAsc ? " ▲" : " ▼") : "");
+    th.className = col.align;
+    th.addEventListener("click", () => {
+      if (sortKey === col.key) sortAsc = !sortAsc;
+      else {
+        sortKey = col.key;
+        sortAsc = col.key === "index" || col.key === "label_name";
+      }
+      renderTable(lastResult?.boxes || []);
+    });
+    row.appendChild(th);
+  }
+  dom.boxHead.appendChild(row);
+
+  if (!boxes.length) {
+    const empty = document.createElement("tr");
+    const cell = document.createElement("td");
+    cell.colSpan = COLUMNS.length;
+    cell.className = "num";
+    cell.textContent = "没有检出目标";
+    empty.appendChild(cell);
+    dom.boxRows.appendChild(empty);
+    return;
+  }
+
+  const rows = boxes.map((box, index) => ({
+    ...box,
+    index,
+    width: box.right - box.left,
+    height: box.bottom - box.top,
+    area: Math.max(0, (box.right - box.left) * (box.bottom - box.top)),
+  }));
+
+  const sortable = sortKey === "label_name"
+    ? (a, b) => String(a[sortKey]).localeCompare(String(b[sortKey]), "zh")
+    : (a, b) => Number(a[sortKey]) - Number(b[sortKey]);
+  rows.sort((a, b) => (sortAsc ? sortable(a, b) : -sortable(a, b)));
+
+  const median = medianConfidence(boxes);
+  for (const item of rows) {
+    const tr = document.createElement("tr");
+    if (item.index === highlightIndex) tr.classList.add("is-active");
+    if (boxes.length > 2 && item.confidence < median) tr.classList.add("is-low");
+
+    for (const col of COLUMNS) {
+      const td = document.createElement("td");
+      td.className = col.align;
+      if (col.key === "index") td.textContent = String(item.index + 1);
+      else if (col.key === "label_name") {
+        const swatch = document.createElement("span");
+        swatch.className = "swatch";
+        swatch.style.background = colorCss(colorOf(lastResult?.class_colors, item.class_label));
+        td.appendChild(swatch);
+        td.appendChild(document.createTextNode(item.label_name || `cls${item.class_label}`));
+      } else if (col.key === "confidence") td.textContent = item.confidence.toFixed(4);
+      else if (col.key === "area") td.textContent = Math.round(item.area).toLocaleString();
+      else td.textContent = Number(item[col.key]).toFixed(1);
+      tr.appendChild(td);
+    }
+
+    // 行与框联动：点行高亮对应框，再点一次取消
+    tr.addEventListener("click", () => {
+      highlightIndex = highlightIndex === item.index ? -1 : item.index;
+      for (const other of dom.boxRows.children) other.classList.remove("is-active");
+      if (highlightIndex >= 0) tr.classList.add("is-active");
+      highlightBoxes(highlightIndex);
+    });
+
+    dom.boxRows.appendChild(tr);
+  }
+}
+
+function medianConfidence(boxes) {
+  if (!boxes.length) return 0;
+  const sorted = [...boxes].map((b) => b.confidence).sort((a, b) => a - b);
+  return (sorted[Math.floor((sorted.length - 1) / 2)] + sorted[Math.ceil((sorted.length - 1) / 2)]) / 2;
+}
+
+function highlightBoxes(index) {
+  setOverlayHighlight(overlaySvg, index);
+}
+
+// ---------------------------------------------------------------------------
+// 置信度分布
+// ---------------------------------------------------------------------------
+
+function renderHistogram(boxes) {
+  dom.confHist.replaceChildren();
+  if (!boxes.length) {
+    const empty = document.createElement("p");
+    empty.className = "hint";
+    empty.textContent = "没有检出目标";
+    dom.confHist.appendChild(empty);
+    return;
+  }
+
+  // 10 档、每档 0.1。用固定边界而不是自适应：不同次推理之间形状可比。
+  const bins = new Array(10).fill(0);
+  for (const box of boxes) {
+    const idx = Math.min(9, Math.max(0, Math.floor(box.confidence * 10)));
+    bins[idx] += 1;
+  }
+  const peak = Math.max(...bins, 1);
+
+  bins.forEach((count, index) => {
+    const row = document.createElement("div");
+    row.className = "hist-row";
+
+    const label = document.createElement("span");
+    label.className = "hist-label";
+    label.textContent = (index / 10).toFixed(1);
+
+    const track = document.createElement("div");
+    track.className = "hist-track";
+    const bar = document.createElement("div");
+    bar.className = "hist-bar";
+    bar.style.width = `${(count / peak) * 100}%`;
+    // 低分段用警示色，一眼看出"是不是靠低分框凑数"
+    if (index < 3) bar.classList.add("is-low");
+    track.appendChild(bar);
+
+    const value = document.createElement("span");
+    value.className = "hist-value";
+    value.textContent = String(count);
+
+    row.appendChild(label);
+    row.appendChild(track);
+    row.appendChild(value);
+    dom.confHist.appendChild(row);
+  });
+
+  const note = document.createElement("p");
+  note.className = "hint";
+  note.textContent = `共 ${boxes.length} 个框，中位置信度 ${medianConfidence(boxes).toFixed(3)}`;
+  dom.confHist.appendChild(note);
+}
+
+// ---------------------------------------------------------------------------
+// 叠加层
+// ---------------------------------------------------------------------------
+
+function rebuildOverlay() {
+  if (lastKind !== "yolo" || !lastResult) {
+    const viewer = viewers.viewer("result");
+    if (viewer) viewer.setOverlay(null);
+    overlaySvg = null;
+    return;
+  }
+  const boxes = lastResult.boxes || [];
+  const viewer = viewers.viewer("result");
+  if (!viewer) return;
+
+  overlaySvg = buildOverlay({
+    boxes,
+    width: lastResult.image_width,
+    height: lastResult.image_height,
+    classColors: lastResult.class_colors,
+    showBoxes: document.getElementById("optShowBoxes").checked,
+    showLabels: document.getElementById("optShowLabels").checked,
+    fadeLowConf: document.getElementById("optFadeLow").checked,
+    highlight: highlightIndex,
+  });
+  applyOverlayScale(overlaySvg, overlayScale);
+  viewer.setOverlay(overlaySvg);
+}
+
+function applyOverlayOpacity() {
+  const percent = Number(dom.overlayOpacity.value);
+  if (lastKind !== "anomalib") {
+    // YOLO 的"检出结果"是后端烧录的标注图，压淡它只会让框变糊；
+    // 这个控件只服务于异常叠加图
+    viewers.viewer("result").setImageOpacity?.(1);
+    return;
+  }
+  const viewer = viewers.viewer("result");
+  if (!viewer || !viewer.setImageOpacity) return;
+  viewer.setImageOpacity(Number.isFinite(percent) ? percent / 100 : 1);
+}
+
+// ---------------------------------------------------------------------------
+// 导出
+// ---------------------------------------------------------------------------
+
+function exportJson() {
+  if (!lastResult) {
+    setHint("还没有结果可导出");
+    return;
+  }
+  // 导出与屏幕一致：图内联为 base64，明细直接取 boxes，不做任何裁剪
+  const payload = {
+    exported_at: new Date().toISOString(),
+    kind: lastKind,
+    backend: lastResult.backend,
+    image: {
+      width: lastResult.image_width,
+      height: lastResult.image_height,
+    },
+    timing: lastResult.timing,
+    count: lastResult.count ?? (lastResult.boxes || []).length,
+    class_names: lastResult.class_names || [],
+    boxes: lastResult.boxes || [],
+    thresholds: lastResult.thresholds || null,
+    annotated_png: lastResult.annotated_png || null,
+    heatmap_png: lastResult.heatmap_png || null,
+  };
+  download(`infer_${stamp()}.json`, JSON.stringify(payload, null, 2), "application/json");
+}
+
+function exportCsv() {
+  if (!lastResult || lastKind !== "yolo") {
+    setHint("CSV 导出仅适用于检出结果");
+    return;
+  }
+  const boxes = lastResult.boxes || [];
+  const header = ["index", "class_label", "label_name", "confidence", "left", "top", "right", "bottom", "width", "height", "area"];
+  const lines = [header.join(",")];
+  boxes.forEach((box, index) => {
+    const width = box.right - box.left;
+    const height = box.bottom - box.top;
+    const cells = [
+      index + 1,
+      box.class_label,
+      csvCell(box.label_name || `cls${box.class_label}`),
+      box.confidence.toFixed(6),
+      box.left.toFixed(2),
+      box.top.toFixed(2),
+      box.right.toFixed(2),
+      box.bottom.toFixed(2),
+      width.toFixed(2),
+      height.toFixed(2),
+      Math.round(Math.max(0, width * height)),
+    ];
+    lines.push(cells.join(","));
+  });
+  // 前缀 BOM：Excel 打开中文 CSV 不加 BOM 会乱码
+  download(`infer_${stamp()}.csv`, `\ufeff${lines.join("\r\n")}`, "text/csv");
+}
+
+function csvCell(value) {
+  const text = String(value);
+  return /[",\r\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+}
+
+function download(filename, content, mime) {
+  const blob = new Blob([content], { type: `${mime};charset=utf-8` });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  // 立刻释放会让部分浏览器来不及下载，延后一拍即可
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+function stamp() {
+  const now = new Date();
+  const pad = (v) => String(v).padStart(2, "0");
+  return `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}_${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
+}
+
+// ---------------------------------------------------------------------------
+// 小工具
+// ---------------------------------------------------------------------------
+
+function value(id) {
+  const el = document.getElementById(id);
+  return el ? String(el.value).trim() : "";
+}
+
+function setValue(id, next) {
+  const el = document.getElementById(id);
+  if (el) el.value = next;
+}
+
+function fileName(path) {
+  return String(path || "").split(/[\\/]/).pop();
+}
+
+function colorOf(classColors, classLabel) {
+  if (!classColors) return null;
+  return classColors[String(classLabel)] || classColors[classLabel] || null;
+}
+
+function colorCss(rgb) {
+  return rgb ? `rgb(${rgb[0]}, ${rgb[1]}, ${rgb[2]})` : "var(--text-dim)";
 }
 
 function setMetric(name, value) {
@@ -149,7 +919,7 @@ function setMetric(name, value) {
 }
 
 function escapeHtml(text) {
-  return text.replace(/[&<>"']/g, (ch) => ({
+  return String(text).replace(/[&<>"']/g, (ch) => ({
     "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
   }[ch]));
 }

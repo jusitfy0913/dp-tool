@@ -185,6 +185,25 @@ python 6-web\backend\tools\test_dataset_workbench.py
 # 期望：通过 20 项，失败 0 项
 ```
 
+### 2.6 前端单测（零依赖，只需 node）
+
+前端是零构建的，所以单测也不装任何框架，直接 `node` 跑。这两项不需要启动服务：
+
+```powershell
+node 6-web\frontend\tests\test_viewer_math.mjs
+# 期望：✓ 全部通过：37 条断言
+
+node 6-web\frontend\tests\test_contrast.mjs
+# 期望：✓ 全部通过：23 项
+```
+
+| 脚本 | 守住什么 |
+| --- | --- |
+| `test_viewer_math.mjs` | 滚轮缩放必须锚定光标（连续缩放 8 次后漂移 ≤ 0.5px）、屏幕与图像坐标互逆、滚轮增量按 `deltaMode` 归一化 |
+| `test_contrast.mjs` | 从 `style.css` 读设计令牌按 WCAG 公式核算，正文与面板底色不低于 4.5:1，网格/扫描线不透明度 ≤ 0.05 |
+
+改配色的正确流程：改令牌 → 跑 `test_contrast` → 不达标就再调，别靠眼睛判断。
+
 ---
 
 ## 3. 训练
@@ -598,6 +617,9 @@ Invoke-WebRequest http://127.0.0.1:8060/api/capabilities
 | `imagenet_dir 不存在` | EfficientAd 目录缺失（`DATA_NOT_FOUND`），launcher 不会自动下载 | 先 `New-Item -ItemType Directory` 建空目录（见 2.4） |
 | 正常图分数全为 0 | PatchCore 分数饱和 | 属预期；要趋势监控请换 EfficientAd |
 | 引擎编译卡住不动 | builder 在 CPU 侧搜索 tactic | 看 GPU 显存仍在占用即正常，耐心等 |
+| 推理页图像看不清缺陷 | 窗口未放大 | 滚轮以光标为锚点缩放，或点 `1:1` 看原始像素；多个窗口可独立开关 |
+| 前端改了样式但浏览器没变 | 静态资源被缓存 | 硬刷新（`Ctrl+F5`）；后端已带 `Last-Modified`/`ETag`，正常刷新即可拿到新文件 |
+| 前端配色改完对比度不达标 | 只看了「好看」没看可读性 | 跑 `node 6-web\frontend\tests\test_contrast.mjs`，它会按 WCAG 公式逐对核算 |
 
 ---
 
@@ -606,7 +628,7 @@ Invoke-WebRequest http://127.0.0.1:8060/api/capabilities
 | 想了解 | 看这个 |
 | --- | --- |
 | 三个异常检测模型怎么选 | `docs/异常检测模型对比与选型_PatchCore_PaDiM_EfficientAd.md` |
-| Web 工作站怎么用 | `6-web/README.md` |
+| Web 工作站怎么用 | `6-web/README.md`（含「前端视觉体系」：设计令牌、可读性护栏、查看器） |
 | 项目整体结构与层级 | `readme.md` |
 | DLL C API 调用与打包 | `docs/TRTForge_yolo_infer与anomalib_infer_DLL调用与源码打包说明.md` |
 | YOLO TRT 推理细节 | `docs/trtexec_gui_YOLO_TRT推理流程说明.md` |

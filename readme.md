@@ -6,7 +6,7 @@
 
 | 路径 | 说明 |
 | --- | --- |
-| `6-web` | **浏览器版工作站（推荐）**：FastAPI 后端 + 零构建前端，功能覆盖训练导出与推理演示，不需要 Qt。详见 `6-web/README.md` |
+| `6-web` | **浏览器版工作站（推荐）**：FastAPI 后端 + 零构建前端，功能覆盖训练导出、引擎构建、数据集划分导出、标注工作台与推理演示，不需要 Qt。详见 `6-web/README.md` |
 | `4-qt-studio` | DefectVision AI Studio Qt 桌面程序；当前编译产物仍为 `TRTForge.exe`，包含 ONNX 转 TensorRT、标注数据集、YOLO/Anomalib 训练页和推理演示页。**已被 `6-web` 取代，保留作迁移参考** |
 | `4-qt-studio/installer` | Windows 安装包脚本（Inno Setup）：递归打包 `4-qt-studio/bin` 内已编译的 exe 与全部运行库，详见 `4-qt-studio/README.md` 中「制作 Windows 安装包」 |
 | `3-cpp-tensorrt/trtexec` | 命令行版 `trtexec` 封装（TensorRT C++ 采样工具、profiler/tracer 脚本） |
@@ -132,6 +132,72 @@ python tf_anomalib_launcher.py --mode check-env
 引擎构建页选择 ONNX 后会在后台线程自动识别第一个输入 tensor 的名称和维度，并弹出“ONNX 加载中”进度提示；识别完成后提供统一 `H/W` 输入，修改一次高度和宽度即可同步覆盖 `min / opt / max` 三组动态 shape。
 
 ## 版本更新记录
+
+### v1.11 — 2026-10-31（Web 标注工作台：不用装 Qt 也能画框、存盘、导出）
+
+以前「标注」这件事只能在 `4-qt-studio` 里做，而 Qt 版长期编不出来，等于整条数据链路
+（采集 → 标注 → 训练）在标注这一环断着。本次把标注搬到浏览器，格式与 Qt 版**双向互通**。
+
+| 项目 | 老版本 | 新版本 | 影响 |
+| --- | --- | --- | --- |
+| 标注入口 | 只有 Qt 桌面程序 | 浏览器「标注」页签 | 局域网任意机器可标注，不用装 Qt / 不用编译 |
+| `.tfanno` 读写 | 仅 Qt | `annotation.py` 逐字段对齐 `AnnotationProject.cpp` | Web 存的 Qt 能开，Qt 存的 Web 能开 |
+| 形状 | — | 矩形 / 旋转矩形 / 多边形 / 线 / 点 / 关键点组，六种全支持 | 检测、分割、姿态、OBB 四类任务都能标 |
+| 撤销 | — | 双栈各 50 步，拖动未位移不入栈 | 手滑不会把撤销记录塞满 |
+| 并发保存 | — | `rev` 乐观锁 + `mtime_ns` 文件指纹 | 两个人改同一个工程，后保存的人看到冲突弹窗，不会静默覆盖 |
+| 保存 | — | 停止编辑 3 秒自动保存 + `Ctrl+S` | 忘了存也不会丢 |
+| 自动标注 | — | 本地引擎出草稿（可选外部 HTTP 服务） | 先机器粗标再人修，效率翻倍 |
+| 草稿处理 | — | 单条 / 全部接受与拒绝，全部接受算一次撤销 | 不满意一键扔掉 |
+| 导出 | 数据集页只能导已有文件 | 标注页把**内存中**工程直接导出 YOLO/COCO/VOC | 标完立刻能训，不用先存再切页 |
+| 版本可见性 | 无版本概念 | 顶栏徽标 + `/api/health` 返回 `version` | 一眼看出页面连的是不是最新后端，不再被旧进程骗 |
+
+三个必须知道的坑（都已修，记下来免得再踩）：
+
+1. **`st_mtime_ns` 不能当 JSON 数字传给浏览器**。它约 `1.79e18`，超过 JS 的
+   `Number.MAX_SAFE_INTEGER`（`9e15`），`JSON.parse` 会把低位舍入，
+   于是"刚打开就报文件被外部修改"。改成字符串传输 + `4096ns` 容差比较。
+2. **`snapPoint()` 的返回契约必须统一成 `[x, y]` 数组**。有一个分支返回了 `{x, y}` 对象，
+   调用方按数组取 `point[0]` 就拿到 `undefined`，表现是"画出来的框没有坐标"并且拖拽收不了尾。
+3. **引擎输出维度和 `yolo_infer.dll` 不匹配时 DLL 不报错**，只返回 `confidence=957` 这类垃圾框。
+   自动标注侧加了 `sanitize_drafts()`：置信度不在 `[0,1]`、宽高非正、出图的草稿直接丢掉并给出警告，
+   不至于把垃圾框灌进标注文件。
+
+验收：`python 6-web/backend/tools/test_annotation_project.py` → **131 / 131 通过**；
+回归 `test_infer_params.py`(71)、`test_augment_params.py`(26)、`test_dataset_workbench.py`(20)、
+`test_exit_codes.py`(6)、`test_onnx_fallback.py`(36) 全通过。
+浏览器实测：六种形状各画一次并重载后几何与类别一致、撤销 50 步后重做 50 步回到初态、
+外部改文件触发冲突弹窗的两个选项都生效、真实 `best.transd_fp16.engine` 生成草稿并接受、
+中文与含空格路径的图片正常显示、三种格式导出产物与界面一致。细节见 `6-web/README.md`。
+
+**同版本附带的一处小修**：排查过程中发现 8060 端口被几小时前的旧进程占着，
+导致「改了代码没效果」白查很久。因此加了版本号可见性——`app.py` 定义 `APP_VERSION`，
+`/api/health` 返回 `{"ok":true,"version":"1.11.0"}`，前端顶栏显示 `v1.11.0` 徽标。
+以后徽标不涨就说明连的是旧进程。版本号规则：**改后端就改 `APP_VERSION`**。
+
+### v1.10 — 2026-10-31（Web 推理控制台：阈值可覆盖、框改矢量叠加、显存不再涨）
+
+以前的推理页只能"填路径 → 看图"，参数是死的，图上的框是后端烧死的。本次把它做成真正的控制台。
+
+| 项目 | 老版本 | 新版本 | 影响 |
+| --- | --- | --- | --- |
+| 类别名 | 只有 `cls0`/`cls1` | 解析 `labels_*.json` 显示 `missing_hole` 等真实名 | 现场排错不用再对着类别号查表 |
+| 检出框来源 | 后端画死在 PNG 上 | 后端出干净原图，前端 SVG 画框 | 缩放不糊、可单独关框、标签字号恒定 |
+| Anomalib 阈值 | 只能吃 `metadata.json` | 可覆盖图像/像素阈值，也可一键沿用默认 | 同一个引擎能现场试不同灵敏度 |
+| 阈值展示 | 无 | 同时显示「生效值 / 原值 / 是否覆盖」 | 不会被 `ai_get_metadata` 的原地改写骗到 |
+| 热能图 | 无 | `cv2.applyColorMap` 可选色带，独立窗口 | 异常区域比红色轮廓更直观 |
+| 引擎句柄 | 无上限累积 | LRU 上限 4，淘汰立即 destroy | 连续换 8 组参数，常驻句柄恒为 4 |
+| 模型发现 | 手工敲路径 | `GET /api/models` 扫 `runs/`、`results/` | 选完自动带出 ONNX / 标签 / metadata |
+| 结果明细 | 一段文字 | 可排序表格 + 点行高亮 + 置信度直方图 + 计时分解 | 能直接看出是哪一类、哪一步慢 |
+| 导出 | 右键存图 | JSON / CSV 一键导出，数值与屏幕一致 | 出报告不用手抄 |
+
+**必须知道的一个坑**：`ai_create` 的阈值参数是**原地写进**内部 `meta_` 的，
+所以之后 `ai_get_metadata` 返回的已经是覆盖后的值。想拿文件原值只能自己读 `metadata.json`。
+`infer.read_metadata_thresholds()` 就是为此单独加的，响应里 `effective` / `metadata` 两个字段分得很清。
+
+验收：`python 6-web/backend/tools/test_infer_params.py` → **71 / 71 通过**；
+另跑 `test_augment_params.py`(26)、`test_dataset_workbench.py`(20)、`test_exit_codes.py`(6)、
+`test_onnx_fallback.py`(36) 全通过。真实产物在浏览器里联调过 PCB 与 `bottle.png`，
+细节见 `6-web/README.md`。
 
 ### v1.9 — 2026-10-31（Qt 版首次完整编译成功：TRTForge.exe 可启动）
 
@@ -444,11 +510,12 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_web_studio.ps1
 | 训练导出 | 选 YOLO / Anomalib、填参数、环境自检、实时日志与进度、指标显示、一键停止 |
 | 引擎构建 | 选 ONNX 自动探测形状、fp16/fp32、动态 shape、实时编译日志、产物落盘校验 |
 | 数据集 | 扫描 YOLO 目录 / `.tfanno`、固定哈希划分预览、导出 YOLO / COCO / VOC |
-| 推理演示 | 上传图片、调 `yolo_infer.dll` / `anomalib_infer.dll`、出检测框或异常热力图 |
+| 标注 | 打开 / 新建 `.tfanno`、六种形状绘制（矩形/旋转矩形/多边形/线/点/关键点组）、缩放平移吸附、撤销重做、3 秒自动保存、修订号冲突弹窗、类别与属性面板、自动标注草稿层、导出 YOLO / COCO / VOC |
+| 推理演示 | 模型下拉自动发现产物、`conf`/`nms` 与 Anomalib 双阈值滑块、SVG 矢量框叠加、热能图色带、结果明细表（可排序/点行高亮）、置信度直方图、计时分解、JSON/CSV 导出 |
 | 环境说明 | 展示后端探测到的解释器、launcher、DLL、trtexec 状态与环境变量 |
 
-标注的**绘制**（画框、改标签、保存 `.tfanno`）仍只在 Qt 版提供；
-Web 版负责「拿到已有标注 → 重新划分 → 导出成训练可直接用的格式」。
+从 v1.11 起，**标注全流程都可以在浏览器完成**（画、改、存、导出），不再需要 Qt 版；
+`.tfanno` 格式与 Qt 双向互通，历史工程可以直接打开继续标。
 
 ### 关键环境变量
 

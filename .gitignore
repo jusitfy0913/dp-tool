@@ -135,3 +135,8 @@ build/infer_dlls/
 
 # 本地参考资料 / 研究草稿，不属于交付链路，不入库
 /7-autoresearch-master/
+
+# AnyLabeling 外部标注服务源码（GPL-3.0）
+# 只作为「外部 HTTP 服务」的候选实现，本项目只调用其 HTTP 接口、不分发其代码。
+# 目录约 64MB，且 GPL-3.0 与仓库许可不同，因此不入库。
+/8-X-AnyLabeling-main/

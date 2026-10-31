@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import mimetypes
 import os
 import shlex
 import tempfile
@@ -29,11 +30,19 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+import annotation
+import autolabel
 import config
 import dataset
 import infer
+import labels as labels_mod
+import models as models_mod
 import onnx_fallback
 from runners import manager
+
+#: 应用版本号。前端顶栏与 /api/health 都读它，方便一眼看出「页面连的是哪个后端」。
+#: 起因：改了代码但 8060 上跑的是几小时前的旧进程，排查很久才发现。
+APP_VERSION = "1.11.0"
 
 # ---------------------------------------------------------------------------
 # 应用与生命周期
@@ -52,16 +61,19 @@ async def lifespan(app: FastAPI):
         infer.release_handles()
 
 
-app = FastAPI(title="TRTForge Web Studio", version="0.1.0", lifespan=lifespan)
-
+app = FastAPI(title="TRTForge Web Studio", version=APP_VERSION, lifespan=lifespan)
 
 # ---------------------------------------------------------------------------
 # 环境探测
 # ---------------------------------------------------------------------------
 @app.get("/api/health")
 def health() -> dict:
-    """存活探针。"""
-    return {"ok": True}
+    """存活探针，同时回报版本号。
+
+    ``version`` 是判断「页面连的后端是不是最新的」的唯一可靠依据：
+    端口被旧进程占着时，页面一切正常，只是版本号停在旧值。
+    """
+    return {"ok": True, "version": APP_VERSION}
 
 
 @app.get("/api/capabilities")
@@ -522,13 +534,8 @@ class DatasetExportRequest(DatasetScanRequest):
 
 def _ensure_dataset_path(path: str) -> None:
     """数据集路径沿用目录浏览的白名单，避免接口被用来读任意磁盘。"""
-    allowed_roots = [config.REPO_ROOT]
-    for extra in os.environ.get("TRTFORGE_BROWSE_ROOTS", "").split(os.pathsep):
-        if extra.strip():
-            allowed_roots.append(Path(extra.strip()).resolve())
-
     target = Path(path).expanduser().resolve()
-    if not any(target == root or root in target.parents for root in allowed_roots):
+    if not config.is_path_allowed(target):
         raise HTTPException(
             status_code=403,
             detail=f"路径不在允许范围内：{target}。可设置 TRTFORGE_BROWSE_ROOTS 追加允许的根目录。",
@@ -641,13 +648,8 @@ def browse(path: str = "") -> dict:
 
     出于安全考虑，只允许浏览仓库根目录以及显式配置的额外根。
     """
-    allowed_roots = [config.REPO_ROOT]
-    for extra in os.environ.get("TRTFORGE_BROWSE_ROOTS", "").split(os.pathsep):
-        if extra.strip():
-            allowed_roots.append(Path(extra.strip()).resolve())
-
     target = Path(path).resolve() if path.strip() else config.REPO_ROOT
-    if not any(target == root or root in target.parents for root in allowed_roots):
+    if not config.is_path_allowed(target):
         raise HTTPException(status_code=403, detail="该目录不在允许浏览的范围内")
 
     if not target.is_dir():
@@ -785,17 +787,18 @@ def _fallback_reason(primary: str, detail: str) -> str:
 
 
 @app.post("/api/infer/yolo")
-
 def infer_yolo(
     image: UploadFile = File(...),
     engine: str = Form(...),
     task: str = Form("detect"),
     conf: float = Form(0.25),
     nms: float = Form(0.45),
+    labels: str = Form(""),
 ) -> JSONResponse:
-    """YOLO 推理：返回检测框与标注后的结果图（base64）。
+    """YOLO 推理：返回检测框、类别名与标注后的结果图（base64）。
 
     DLL 优先；DLL 不可用时自动降级到 onnxruntime，返回结构完全一致。
+    `labels` 是标签文件路径，缺失时框上只有 `cls{id}`，不报错。
     """
     backend = infer.status()
     warning: str | None = None
@@ -823,7 +826,19 @@ def infer_yolo(
             except onnx_fallback.FallbackError as exc:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
         _check_yolo_output_sane(result, array.shape[1], array.shape[0])
-        annotated = infer.draw_yolo(array, result["boxes"])
+
+        # 类别名与配色在这里补齐，两条后端路径共用同一份逻辑
+        label_info = labels_mod.load_labels(labels)
+        infer.attach_labels(result, label_info["classes"])
+        result["labels"] = {
+            "path": labels or None,
+            "ok": label_info["ok"],
+            "name": label_info["name"],
+            "count": len(label_info["classes"]),
+            "error": label_info["error"],
+        }
+        # 先补标签再画图：draw_yolo 要读 label_name 才能把类别名烧进去
+        annotated = infer.draw_yolo(array, result["boxes"], result["class_colors"])
     except infer.InferError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     finally:
@@ -844,10 +859,15 @@ def infer_anomalib(
     engine: str = Form(...),
     metadata: str = Form(...),
     model_type: str = Form("Auto"),
+    image_threshold: float = Form(-1.0),
+    pixel_threshold: float = Form(-1.0),
+    heatmap_colormap: str = Form("TURBO"),
 ) -> JSONResponse:
-    """Anomalib 推理：返回分数、判定、叠加图与异常轮廓图（base64）。
+    """Anomalib 推理：返回分数、判定、叠加图、轮廓图、热能图与原图（base64）。
 
-    DLL 优先；DLL 不可用时用 onnxruntime 加载同源 ONNX 降级。
+    阈值语义与 DLL 一致：`>= 0` 覆盖 metadata，`< 0` 沿用 metadata。
+    响应里 `thresholds` 同时给出"本次生效值"与"metadata 文件原值"，
+    因为 `ai_get_metadata` 拿到的已经是覆盖后的值，原值只能自己读文件。
     """
     backend = infer.status()
     warning: str | None = None
@@ -868,7 +888,13 @@ def infer_anomalib(
     try:
         array = infer.decode_image(data)
         if backend.anomalib_ok:
-            result = infer.run_anomalib(engine, metadata, array, model_type=model_type)
+            result = infer.run_anomalib(
+                engine, metadata, array,
+                model_type=model_type,
+                image_threshold=image_threshold,
+                pixel_threshold=pixel_threshold,
+                colormap=heatmap_colormap,
+            )
         else:
             try:
                 result = onnx_fallback.run_anomalib(
@@ -876,6 +902,14 @@ def infer_anomalib(
                 )
             except onnx_fallback.FallbackError as exc:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
+            # 降级路径没有 C++ 侧的热能图渲染，这里补齐字段，保证前端只有一条渲染逻辑
+            result.setdefault("heatmap_png", None)
+            result.setdefault("source_png", None)
+            result.setdefault("heatmap_colormap", None)
+            result.setdefault("thresholds", {
+                "image": {"effective": None, "metadata": None, "overridden": False},
+                "pixel": {"effective": None, "metadata": None, "overridden": False},
+            })
     except infer.InferError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     finally:
@@ -884,12 +918,310 @@ def infer_anomalib(
 
     import base64
 
-    for key in ("overlay_png", "mask_png"):
+    for key in ("overlay_png", "mask_png", "heatmap_png", "source_png"):
         value = result.get(key)
         result[key] = base64.b64encode(value).decode("ascii") if value else None
     if warning:
         result["warning"] = warning
     return JSONResponse(result)
+
+
+@app.get("/api/models")
+def list_models(limit: int = models_mod.MAX_ENTRIES) -> dict:
+    """枚举训练产物目录里的可用引擎，供推理页的模型下拉使用。
+
+    只读目录、只取文件属性，不读取引擎或 ONNX 内容——
+    一个 PatchCore 目录就有 275MB 的引擎加 300MB 的 ONNX，读一遍会很慢。
+    """
+    try:
+        return models_mod.scan_models(limit=max(1, min(int(limit), models_mod.MAX_ENTRIES)))
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"扫描训练产物失败：{exc}") from exc
+
+
+@app.get("/api/infer/cache")
+def infer_cache() -> dict:
+    """查看当前推理句柄缓存（只读诊断）。
+
+    存在的理由：句柄常驻显存，用户改阈值改到显存告急时需要能看见"现在到底留了几个"。
+    没有这个窗口，用户只能靠猜。
+    """
+    return {"ok": True, **infer.cache_stats()}
+
+
+# ---------------------------------------------------------------------------
+# 标注工作台
+# ---------------------------------------------------------------------------
+class AnnotationProjectRequest(BaseModel):
+    """保存标注工程的请求。
+
+    ``rev`` 是客户端读到的修订号，服务端拿它做乐观锁；
+    ``stamp`` 是文件指纹（mtime + size），用来发现"有人用 Qt 或记事本改过文件"。
+    两者都为 ``None`` 且 ``force=False`` 时按"新建或强制写"处理。
+    """
+
+    path: str = Field(..., description=".tfanno 工程文件路径")
+    project: dict = Field(..., description="完整工程内容")
+    rev: int | None = Field(default=None, description="客户端读到的修订号")
+    stamp: dict | None = Field(default=None, description="客户端读到的文件指纹")
+    force: bool = Field(default=False, description="跳过修订号校验，强制覆盖")
+
+
+class AnnotationExportRequest(BaseModel):
+    """从标注工程导出训练数据集。"""
+
+    project: dict = Field(..., description="内存中的完整工程内容")
+    source: str = Field(default="", description="工程文件路径，用于输出目录防呆")
+    format: str = Field(default="yolo", description="yolo / coco / voc")
+    output: str = Field(..., description="导出目标目录")
+    overwrite: bool = Field(default=False, description="目标目录非空时是否允许覆盖")
+
+
+class AnnotationAutoLabelRequest(BaseModel):
+    """预标注请求。``service`` 留空则只走自有推理通道。"""
+
+    image: str = Field(..., description="当前图片的绝对路径")
+    task: str = Field(default="detect")
+    engine: str = Field(..., description=".engine 路径")
+    labels: str = Field(default="", description="labels_*.json 路径")
+    conf: float = Field(default=0.25, ge=0.0, le=1.0)
+    nms: float = Field(default=0.45, ge=0.0, le=1.0)
+    service: str = Field(default="", description="外部标注服务基址，如 http://127.0.0.1:8500")
+    prompts: dict | None = Field(default=None, description="外部服务的提示（文本/点/框）")
+    timeout: float = Field(default=20.0, ge=1.0, le=300.0)
+
+
+def _ensure_annotation_path(path: str) -> Path:
+    """标注相关路径的白名单校验。
+
+    与目录浏览、数据集扫描共用同一份白名单（`config.is_path_allowed`）。
+    单独包一层是为了把错误信息说清楚：标注页最常见的困惑是
+    "工程能打开，但图片全是裂的"，根因就是图片所在盘不在白名单里。
+    """
+    target = Path(path).expanduser()
+    try:
+        resolved = target.resolve()
+    except OSError as exc:
+        raise HTTPException(status_code=400, detail=f"路径无法解析：{path}（{exc}）") from exc
+    if not config.is_path_allowed(resolved):
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                f"路径不在允许范围内：{resolved}。"
+                "如需访问仓库外的目录，请设置 TRTFORGE_BROWSE_ROOTS 并重启服务。"
+            ),
+        )
+    return resolved
+
+
+@app.get("/api/annotation/project")
+def annotation_load(path: str) -> dict:
+    """读取 `.tfanno` 工程。
+
+    返回三块内容：规范化后的工程、文件指纹（供保存时回传）、图片列表统计。
+    ``exists=False`` 时工程字段是一份可直接用的空白骨架，前端据此进入"新建"流程。
+    """
+    target = _ensure_annotation_path(path)
+    if not target.is_file():
+        return {
+            "ok": True,
+            "exists": False,
+            "path": str(target),
+            "project": annotation.new_project(),
+            "meta": {"rev": -1, "mtime_ns": "0", "size": 0, "warnings": []},
+            "stats": annotation.stats(annotation.new_project()),
+        }
+
+    try:
+        project, meta = annotation.load(target)
+    except annotation.AnnotationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return {
+        "ok": True,
+        "exists": True,
+        "path": str(target),
+        "project": project,
+        "meta": meta,
+        "stats": annotation.stats(project),
+    }
+
+
+@app.post("/api/annotation/project")
+def annotation_save(request: AnnotationProjectRequest) -> dict:
+    """保存工程。修订号不一致返回 **409** 并附上磁盘真实状态。
+
+    409 而不是 400：前端要据此弹"冲突"对话框，而不是显示一条普通错误。
+    """
+    target = _ensure_annotation_path(request.path)
+    if target.suffix.lower() != ".tfanno":
+        raise HTTPException(status_code=400, detail="标注工程文件扩展名必须是 .tfanno")
+
+    try:
+        meta = annotation.save(
+            target,
+            request.project,
+            expected_rev=request.rev,
+            expected_stamp=request.stamp,
+            force=request.force,
+        )
+    except annotation.RevisionConflict as exc:
+        return JSONResponse(
+            status_code=409,
+            content={
+                "ok": False,
+                "error": "revision-conflict",
+                "reason": exc.reason,
+                "message": str(exc),
+                "disk": exc.disk,
+                "expected": exc.expected,
+            },
+        )
+    except annotation.AnnotationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"写入工程失败：{exc}") from exc
+
+    project, _ = annotation.load(target)
+    return {
+        "ok": True,
+        "path": str(target),
+        "rev": meta["rev"],
+        "meta": meta,
+        "stats": annotation.stats(project),
+        "warnings": meta.get("warnings", []),
+    }
+
+
+@app.get("/api/annotation/image")
+def annotation_image(path: str) -> FileResponse:
+    """图片流。
+
+    单独开接口而不是挂 `/static`：数据集在仓库任意位置，挂载点无法覆盖，
+    而且挂载目录等于把整个目录树暴露成静态资源。
+    """
+    target = _ensure_annotation_path(path)
+    if not target.is_file():
+        raise HTTPException(status_code=404, detail=f"图片不存在：{target}")
+
+    media_type = mimetypes.guess_type(str(target))[0] or "application/octet-stream"
+    if not media_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail=f"不是图片文件：{target}")
+    return FileResponse(target, media_type=media_type)
+
+
+@app.get("/api/annotation/image-meta")
+def annotation_image_meta(path: str) -> dict:
+    """探测单张图片的尺寸，供"添加图片到工程"时填 width/height。"""
+    target = _ensure_annotation_path(path)
+    if not target.is_file():
+        raise HTTPException(status_code=404, detail=f"图片不存在：{target}")
+    width, height = dataset._image_size(target)
+    return {"ok": True, "path": str(target), "width": width, "height": height}
+
+
+@app.post("/api/annotation/scan-images")
+def annotation_scan_images(root: str, recursive: bool = True, limit: int = 5000) -> dict:
+    """扫描目录里的图片，返回路径与尺寸，供前端批量加入工程。
+
+    只认常见图片后缀，且跳过 `.tfanno` 的临时文件，避免把导出产物也收进来。
+    """
+    base = _ensure_annotation_path(root)
+    if not base.is_dir():
+        raise HTTPException(status_code=400, detail=f"不是目录：{base}")
+
+    suffixes = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
+    pattern = "**/*" if recursive else "*"
+    found: list[dict] = []
+    for item in base.glob(pattern):
+        if len(found) >= limit:
+            break
+        if not item.is_file() or item.suffix.lower() not in suffixes:
+            continue
+        width, height = dataset._image_size(item)
+        found.append({"path": str(item), "width": width, "height": height})
+
+    found.sort(key=lambda entry: entry["path"].lower())
+    return {"ok": True, "root": str(base), "count": len(found), "images": found, "truncated": len(found) >= limit}
+
+
+@app.post("/api/annotation/export")
+def annotation_export(request: AnnotationExportRequest) -> dict:
+    """把内存中的工程导出成 YOLO / COCO / VOC。
+
+    走 `annotation.to_dataset_project` + `dataset.export_*`，
+    既不另写一套导出，也不需要先把工程落盘再读回来（那样会丢掉未保存的编辑）。
+    """
+    target = _ensure_annotation_path(request.output)
+    if request.format not in dataset.FORMATS:
+        raise HTTPException(status_code=400, detail=f"未知导出格式：{request.format}")
+
+    issues = annotation.validate(request.project)
+    project = annotation.to_dataset_project(request.project, source=request.source or None)
+    # 导出沿用工程里已经标好的集合划分，不重新按比例分配——
+    # 标注页的划分是用户逐个设过的，重算等于把他的选择抹掉。
+    splits = [image.current_split for image in project.images]
+
+    try:
+        if request.format == "yolo":
+            result = dataset.export_yolo(project, target, splits, request.overwrite)
+        elif request.format == "coco":
+            result = dataset.export_coco(project, target, splits, request.overwrite)
+        else:
+            result = dataset.export_voc(project, target, splits, request.overwrite)
+    except dataset.DatasetError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except OSError as exc:
+        raise HTTPException(status_code=400, detail=f"导出失败：{exc}") from exc
+
+    result.update(
+        {
+            "task": project.task,
+            "source_kind": "tfanno",
+            "split_counts": dataset.split_counts(splits),
+            "issues": issues,
+            "warnings": project.warnings,
+        }
+    )
+    return result
+
+
+@app.post("/api/annotation/autolabel")
+def annotation_autolabel(request: AnnotationAutoLabelRequest) -> dict:
+    """用自有引擎（必要时加外部服务）为当前图片生成预标注草稿。
+
+    草稿只存在会话内，绝不自动写盘——误检直接落盘等于把错误固化进工程。
+    """
+    image = _ensure_annotation_path(request.image)
+    engine = _ensure_annotation_path(request.engine)
+    if not image.is_file():
+        raise HTTPException(status_code=404, detail=f"图片不存在：{image}")
+    if not engine.is_file():
+        raise HTTPException(status_code=404, detail=f"引擎不存在：{engine}")
+
+    labels_path = ""
+    if request.labels.strip():
+        labels_path = str(_ensure_annotation_path(request.labels))
+
+    try:
+        return autolabel.run(
+            image_path=str(image),
+            task=request.task,
+            engine=str(engine),
+            labels_path=labels_path,
+            conf=request.conf,
+            nms=request.nms,
+            service=request.service,
+            prompts=request.prompts,
+            timeout=request.timeout,
+        )
+    except autolabel.AutoLabelError as exc:
+        return JSONResponse(status_code=400, content={"ok": False, "error": exc.kind, "message": str(exc)})
+    except infer.InferError as exc:
+        raise HTTPException(status_code=503, detail=f"推理失败：{exc}") from exc
+    except OSError as exc:
+        raise HTTPException(status_code=400, detail=f"预标注失败：{exc}") from exc
+
 
 
 # ---------------------------------------------------------------------------

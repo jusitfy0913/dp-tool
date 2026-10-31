@@ -1,6 +1,7 @@
 // 入口：页签切换、环境探测、目录浏览弹窗。
 
-import { browse, getCapabilities } from "./api.js";
+import { browse, getCapabilities, getHealth } from "./api.js";
+import { initAnnotate } from "./annotate.js";
 import { initDataset } from "./dataset.js";
 import { initEngine } from "./engine.js";
 import { initInfer } from "./infer.js";
@@ -18,6 +19,9 @@ function initTabs() {
       tabs.forEach((t) => t.classList.toggle("active", t === tab));
       const name = tab.dataset.tab;
       panels.forEach((p) => p.classList.toggle("active", p.id === `panel-${name}`));
+      // 通知各模块"我这一页现在可见了"。
+      // 标注画布必须先可见才能量到真实尺寸，否则会按 0 宽高初始化成 1×1。
+      document.dispatchEvent(new CustomEvent("tab-change", { detail: { name } }));
     });
   });
 }
@@ -25,6 +29,21 @@ function initTabs() {
 // ---------------------------------------------------------------------------
 // 环境状态
 // ---------------------------------------------------------------------------
+async function refreshVersion() {
+  const badge = document.getElementById("appVersion");
+  if (!badge) return;
+  try {
+    const health = await getHealth();
+    if (health.version) {
+      badge.textContent = `v${health.version}`;
+      badge.title = `后端版本 v${health.version}（来自 /api/health）`;
+    }
+  } catch {
+    // 版本号拿不到不影响使用，顶栏状态灯会另外报「后端未连接」。
+    badge.title = "未能获取后端版本";
+  }
+}
+
 async function refreshEnvironment() {
   const dot = document.getElementById("envDot");
   const text = document.getElementById("envText");
@@ -149,10 +168,20 @@ function initBrowse() {
 // ---------------------------------------------------------------------------
 // 启动
 // ---------------------------------------------------------------------------
+
+// ?reduced-motion=1 手动关闭发光、扫描线与过渡效果。
+// 用途：验收可读性护栏，以及在核显机器上排除合成层开销。与系统偏好
+// prefers-reduced-motion 走同一套令牌归零规则（见 style.css 第 1.9 节）。
+if (new URLSearchParams(location.search).has("reduced-motion")) {
+  document.documentElement.classList.add("reduced-motion");
+}
+
 initTabs();
 initTrain();
 initEngine();
 initDataset();
+initAnnotate();
 initInfer();
 initBrowse();
+refreshVersion();
 refreshEnvironment();

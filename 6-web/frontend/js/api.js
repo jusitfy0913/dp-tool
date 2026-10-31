@@ -1,5 +1,20 @@
 // 统一的 HTTP 封装：把后端返回的错误转成可读文案，避免到处写 try/catch。
 
+/**
+ * 带状态码与原始响应的错误。
+ *
+ * 只有 message 的话，调用方无法区分「409 修订号冲突」和「403 路径越界」——
+ * 前者要弹冲突对话框，后者只要一行提示。标注页的乐观锁依赖这个区分。
+ */
+export class ApiError extends Error {
+  constructor(message, status, payload) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+    this.payload = payload;
+  }
+}
+
 async function request(url, options = {}) {
   const response = await fetch(url, options);
   const contentType = response.headers.get("content-type") || "";
@@ -13,7 +28,7 @@ async function request(url, options = {}) {
 
   if (!response.ok) {
     const detail = (payload && (payload.detail || payload.message)) || payload || response.statusText;
-    throw new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
+    throw new ApiError(typeof detail === "string" ? detail : JSON.stringify(detail), response.status, payload);
   }
   return payload;
 }
@@ -39,6 +54,11 @@ export function getCapabilities() {
   return getJSON("/api/capabilities");
 }
 
+/** 存活探针，同时带回后端版本号（用来识别「连到了旧进程」）。 */
+export function getHealth() {
+  return getJSON("/api/health");
+}
+
 export function listRuns() {
   return getJSON("/api/runs");
 }
@@ -50,4 +70,43 @@ export function stopRun(runId) {
 export function browse(path) {
   const query = path ? `?path=${encodeURIComponent(path)}` : "";
   return getJSON(`/api/browse${query}`);
+}
+
+// ---------------------------------------------------------------------------
+// 标注工程
+// ---------------------------------------------------------------------------
+function query(params) {
+  const search = new URLSearchParams();
+  Object.entries(params).forEach(([key, value]) => {
+    if (value !== undefined && value !== null && value !== "") search.set(key, String(value));
+  });
+  return search.toString();
+}
+
+export function loadAnnotationProject(path) {
+  return getJSON(`/api/annotation/project?${query({ path })}`);
+}
+
+export function saveAnnotationProject(payload) {
+  return postJSON("/api/annotation/project", payload);
+}
+
+export function annotationImageUrl(path) {
+  return `/api/annotation/image?${query({ path })}`;
+}
+
+export function annotationImageMeta(path) {
+  return getJSON(`/api/annotation/image-meta?${query({ path })}`);
+}
+
+export function scanAnnotationImages(root, recursive = true) {
+  return getJSON(`/api/annotation/scan-images?${query({ root, recursive })}`);
+}
+
+export function exportAnnotationProject(payload) {
+  return postJSON("/api/annotation/export", payload);
+}
+
+export function autoLabel(payload) {
+  return postJSON("/api/annotation/autolabel", payload);
 }

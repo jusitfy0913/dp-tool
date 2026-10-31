@@ -18,11 +18,13 @@ from __future__ import annotations
 import ctypes
 import os
 import threading
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 
+import labels as labels_mod
 from config import BIN_DIR, DLL_DIRS
 
 # ---------------------------------------------------------------------------
@@ -297,6 +299,76 @@ def status() -> BackendStatus:
 
 
 # ---------------------------------------------------------------------------
+# 句柄缓存（LRU）
+# ---------------------------------------------------------------------------
+# 为什么要有上限：
+#   引擎句柄在创建时就把 conf / nms / 阈值**烧死**在里面，换参数必须重建。
+#   一旦前端把阈值开放成滑块，用户拖动几十下就会产生几十个句柄，
+#   而每个句柄都常驻一份显存（PatchCore 的引擎本身 275MB）。
+#   实测过没有上限时显存会一路涨到 OOM。
+#
+# 为什么是 4：
+#   典型现场并存量是「YOLO 两个任务 + Anomalib 两个模型」。超过 4 说明用户在
+#   反复试参，此时旧句柄留着也没有命中收益，不如立刻腾出显存。
+#
+# 为什么不用 TTL：
+#   显存压力来自"同时存在多少个"，不是"存在多久"。空转的句柄不会自己释放，
+#   TTL 只是把 OOM 推迟到定时器触发那一刻。
+HANDLE_CACHE_LIMIT = 4
+
+
+class _HandleCache:
+    """带上限的句柄缓存；超限时销毁最久未用项。
+
+    淘汰时**立即**调用 destroy，而不是等进程退出：显存是有限资源，
+    靠析构函数兜底在实际使用中根本等不到。
+    """
+
+    def __init__(self, limit: int, destroy) -> None:
+        self._limit = max(1, int(limit))
+        self._destroy = destroy
+        self._items: OrderedDict[tuple, ctypes.c_void_p] = OrderedDict()
+        # 供测试观察：记录被淘汰的键，用于断言"淘汰的是最久未用的那个"
+        self.evicted: list[tuple] = []
+
+    def get(self, key: tuple) -> ctypes.c_void_p | None:
+        """命中则移到队尾（标记为最近使用）并返回句柄。"""
+        handle = self._items.get(key)
+        if handle:
+            self._items.move_to_end(key)
+            return handle
+        return None
+
+    def put(self, key: tuple, handle: ctypes.c_void_p) -> None:
+        """写入新句柄；超过上限先淘汰最久未用项。"""
+        self._items[key] = handle
+        self._items.move_to_end(key)
+        while len(self._items) > self._limit:
+            old_key, old_handle = self._items.popitem(last=False)
+            self.evicted.append(old_key)
+            self._safe_destroy(old_handle)
+
+    def _safe_destroy(self, handle: ctypes.c_void_p) -> None:
+        try:
+            self._destroy(handle)
+        except Exception:  # noqa: BLE001 - 销毁失败不能让推理流程崩掉
+            pass
+
+    def clear(self) -> None:
+        while self._items:
+            _, handle = self._items.popitem(last=True)
+            self._safe_destroy(handle)
+
+    def keys(self) -> list[tuple]:
+        """当前缓存键，按最近使用到最久未用排列。"""
+        return list(self._items.keys())
+
+    def __len__(self) -> int:
+        return len(self._items)
+
+
+
+# ---------------------------------------------------------------------------
 # 图像编解码
 # ---------------------------------------------------------------------------
 def decode_image(raw: bytes) -> np.ndarray:
@@ -327,7 +399,16 @@ def _encode_png(image: np.ndarray) -> bytes:
 # YOLO 推理
 # ---------------------------------------------------------------------------
 _yolo_lock = threading.Lock()
-_yolo_handles: dict[tuple[str, str, float, float], ctypes.c_void_p] = {}
+
+
+def _destroy_yolo(handle: ctypes.c_void_p) -> None:
+    """销毁一个 YOLO 句柄。库没加载时静默跳过（服务退出路径会走到）。"""
+    lib = _yolo_lib
+    if lib is not None and handle:
+        lib.yi_destroy(handle)
+
+
+_yolo_handles = _HandleCache(HANDLE_CACHE_LIMIT, _destroy_yolo)
 
 
 def _yolo_handle(engine_path: str, task: str, conf: float, nms: float) -> ctypes.c_void_p:
@@ -353,7 +434,7 @@ def _yolo_handle(engine_path: str, task: str, conf: float, nms: float) -> ctypes
     if not handle:
         raise InferError(_lib_error(lib, "yi_create"))
 
-    _yolo_handles[key] = handle
+    _yolo_handles.put(key, handle)
     return handle
 
 
@@ -374,7 +455,11 @@ def run_yolo(
     conf: float = 0.25,
     nms: float = 0.45,
 ) -> dict:
-    """执行一次 YOLO 推理，返回可 JSON 序列化的结果。"""
+    """执行一次 YOLO 推理，返回可 JSON 序列化的结果。
+
+    这里只产出整数类别号；类别名与配色统一由 `attach_labels()` 补上，
+    这样 DLL 路径与 onnxruntime 降级路径的结构天然一致。
+    """
     lib = _yolo_lib
     if lib is None:
         raise InferError(f"yolo_infer.dll 未加载：{_load_error or '未知原因'}")
@@ -443,28 +528,70 @@ def run_yolo(
     }
 
 
-def draw_yolo(image: np.ndarray, boxes: list[dict]) -> bytes:
-    """把检测框画到图上，返回 PNG 字节。"""
+def attach_labels(result: dict, classes: list[str] | None) -> dict:
+    """给推理结果补上类别名与统一配色，返回同一个 dict。
+
+    单独成函数的原因：DLL 路径与 onnxruntime 降级路径都要用，
+    放在各自实现里迟早会漂移（一边有 label_name 一边没有），
+    前端的绘制与表格就得写两套兜底逻辑。
+    """
+    boxes = result.get("boxes") or []
+    for item in boxes:
+        item["label_name"] = labels_mod.name_for(int(item.get("class_label", 0)), classes)
+
+    class_count = len(classes) if classes else 0
+    highest = max((int(b.get("class_label", 0)) for b in boxes), default=-1)
+    # 没有标签文件时也要给配色：颜色数按实际出现的最大类别号 + 1，
+    # 否则前端取不到颜色会全部退化成同一种。
+    color_count = max(class_count, highest + 1, 1)
+
+    result["class_names"] = list(classes) if classes else []
+    result["class_colors"] = labels_mod.class_colors(color_count)
+    return result
+
+
+def draw_yolo(image: np.ndarray, boxes: list[dict], class_colors: dict | None = None) -> bytes:
+    """把检测框画到图上，返回 PNG 字节。
+
+    颜色取 `class_colors`（接口下发的同一份），据此保证"导出的图和屏幕上看到的一致"。
+    没传配色时退回按类别号现算，结果与下发的一致（同一个纯函数）。
+    """
     import cv2
 
     canvas = image.copy()
-    thickness = max(2, int(round(min(canvas.shape[:2]) / 320)))
-    font_scale = max(0.5, min(canvas.shape[:2]) / 900)
+    height, width = canvas.shape[:2]
+    thickness = max(2, int(round(min(height, width) / 320)))
+    font_scale = max(0.5, min(height, width) / 900)
+
+    def bgr_for(class_label: int) -> tuple[int, int, int]:
+        """OpenCV 要 BGR，配色表存的是 RGB。"""
+        rgb = None
+        if class_colors:
+            rgb = class_colors.get(str(class_label))
+        if rgb is None:
+            rgb = labels_mod.color_for(class_label)
+        return (int(rgb[2]), int(rgb[1]), int(rgb[0]))
 
     for item in boxes:
+        color = bgr_for(int(item.get("class_label", 0)))
         if item.get("is_obb"):
             obb = item["obb"]
             rect = ((obb["cx"], obb["cy"]), (obb["w"], obb["h"]), obb["angle"] * 180.0 / 3.141592653589793)
             points = cv2.boxPoints(rect).astype(int)
-            cv2.polylines(canvas, [points], True, (0, 220, 120), thickness)
+            cv2.polylines(canvas, [points], True, color, thickness)
             origin = tuple(points[0])
         else:
             x1, y1 = int(item["left"]), int(item["top"])
             x2, y2 = int(item["right"]), int(item["bottom"])
-            cv2.rectangle(canvas, (x1, y1), (x2, y2), (60, 200, 255), thickness)
+            cv2.rectangle(canvas, (x1, y1), (x2, y2), color, thickness)
             origin = (x1, max(0, y1 - 6))
 
-        label = f"cls{item['class_label']} {item['confidence']:.2f}"
+        label = f"{item.get('label_name') or 'cls' + str(item.get('class_label', 0))} {item['confidence']:.2f}"
+        # 先画一圈深色描边再画亮色字：PCB 这类背景本身就很花，单色字容易糊进去
+        cv2.putText(
+            canvas, label, origin, cv2.FONT_HERSHEY_SIMPLEX, font_scale,
+            (16, 18, 22), max(1, thickness + 1), cv2.LINE_AA,
+        )
         cv2.putText(
             canvas, label, origin, cv2.FONT_HERSHEY_SIMPLEX, font_scale,
             (255, 255, 255), max(1, thickness - 1), cv2.LINE_AA,
@@ -481,12 +608,95 @@ def draw_yolo(image: np.ndarray, boxes: list[dict]) -> bytes:
 # Anomalib 推理
 # ---------------------------------------------------------------------------
 _anom_lock = threading.Lock()
-_anom_handles: dict[tuple[str, str, str], ctypes.c_void_p] = {}
 
 
-def _anom_handle(engine_path: str, metadata_path: str, model_type: str) -> ctypes.c_void_p:
-    """取（或创建）Anomalib 句柄。"""
-    key = (os.path.abspath(engine_path), os.path.abspath(metadata_path), model_type)
+def _destroy_anom(handle: ctypes.c_void_p) -> None:
+    """销毁一个 Anomalib 句柄。"""
+    lib = _anomalib_lib
+    if lib is not None and handle:
+        lib.ai_destroy(handle)
+
+
+_anom_handles = _HandleCache(HANDLE_CACHE_LIMIT, _destroy_anom)
+
+# 默认色带：TURBO 的色差感知比 JET 均匀，异常强度的层次不会在黄绿段挤成一片。
+DEFAULT_COLORMAP = "TURBO"
+_FALLBACK_COLORMAPS = ("TURBO", "JET", "INFERNO", "VIRIDIS")
+
+
+def resolve_colormap(name: str | None):
+    """把色带名解析成 cv2 常量；非法名称回退默认，不抛错。
+
+    cv2 的版本差异不小（COLORMAP_TURBO 是 4.1.1 之后才有的），
+    所以逐个候选往下试，而不是直接 getattr 一次了事。
+    """
+    import cv2
+
+    wanted = (name or DEFAULT_COLORMAP).strip().upper().replace("COLORMAP_", "")
+    for candidate in (wanted, *_FALLBACK_COLORMAPS):
+        value = getattr(cv2, f"COLORMAP_{candidate}", None)
+        if value is not None:
+            return value, candidate
+    # 极端情况下连 JET 都没有，用 0（AUTUMN）兜底，保证接口永远能出图
+    return 0, "AUTUMN"
+
+
+def read_metadata_thresholds(metadata_path: str) -> dict:
+    """从 metadata.json 里读出**文件原值**阈值。
+
+    为什么不直接用 ai_get_metadata：
+        ai_create 的 override 是**原地改写**内部 meta_（见 anomalib_infer_c.cpp
+        `load()` 里的 `if (imageThresholdOverride >= 0) meta_.imageThreshold = ...`），
+        所以句柄建立之后再查 metadata，拿到的已经是"生效值"，原值就此丢失。
+        要在界面上并列显示"用户设定"与"metadata 原值"，只能自己读文件。
+
+    读失败不抛错：原值只用于展示，不影响推理。
+    """
+    info = {"image_threshold": None, "pixel_threshold": None,
+            "pred_scores": None, "anomaly_maps": None, "error": ""}
+    try:
+        import json
+
+        raw = json.loads(Path(metadata_path).read_text(encoding="utf-8-sig"))
+    except (OSError, UnicodeDecodeError, ValueError) as exc:
+        info["error"] = f"metadata 读取失败：{exc}"
+        return info
+
+    for key in ("image_threshold", "pixel_threshold"):
+        value = raw.get(key)
+        # bool 是 int 的子类，显式排除，免得 true 被当成 1.0
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            info[key] = float(value)
+
+    for key in ("pred_scores", "anomaly_maps"):
+        block = raw.get(key)
+        if isinstance(block, dict):
+            low, high = block.get("min"), block.get("max")
+            if isinstance(low, (int, float)) and isinstance(high, (int, float)):
+                info[key] = [float(low), float(high)]
+    return info
+
+
+def _anom_handle(
+    engine_path: str,
+    metadata_path: str,
+    model_type: str,
+    image_threshold: float = -1.0,
+    pixel_threshold: float = -1.0,
+) -> ctypes.c_void_p:
+    """取（或创建）Anomalib 句柄。
+
+    阈值进入缓存键是必须的：句柄在创建时就把阈值烧进 meta_，
+    用同一个句柄做两次不同阈值的推理，第二次会沿用第一次的判定标准，
+    界面上看起来"改了阈值没反应"。
+    """
+    key = (
+        os.path.abspath(engine_path),
+        os.path.abspath(metadata_path),
+        model_type,
+        round(float(image_threshold), 6),
+        round(float(pixel_threshold), 6),
+    )
     handle = _anom_handles.get(key)
     if handle:
         return handle
@@ -502,18 +712,18 @@ def _anom_handle(engine_path: str, metadata_path: str, model_type: str) -> ctype
     if not metadata_file.is_file():
         raise InferError(f"metadata.json 不存在：{metadata_path}")
 
-    # 阈值 override 传负数表示沿用 metadata
+    # 阈值 override 传负数表示沿用 metadata —— 这是 DLL 自带的约定（见 anomalib_infer_c.h）
     handle = lib.ai_create(
         str(engine_file).encode("utf-8"),
         str(metadata_file).encode("utf-8"),
         model_type.encode("utf-8"),
-        ctypes.c_float(-1.0),
-        ctypes.c_float(-1.0),
+        ctypes.c_float(float(image_threshold)),
+        ctypes.c_float(float(pixel_threshold)),
     )
     if not handle:
         raise InferError(_lib_error(lib, "ai_create"))
 
-    _anom_handles[key] = handle
+    _anom_handles.put(key, handle)
     return handle
 
 
@@ -523,10 +733,16 @@ def run_anomalib(
     image: np.ndarray,
     model_type: str = "Auto",
     want_overlay: bool = True,
+    image_threshold: float = -1.0,
+    pixel_threshold: float = -1.0,
+    colormap: str | None = None,
+    want_heatmap: bool = True,
 ) -> dict:
-    """执行一次 Anomalib 推理，返回分数、判定与叠加图。
+    """执行一次 Anomalib 推理，返回分数、判定、叠加图、轮廓图与热能图。
 
     输入要求 RGB888，这里从 BGR 转换。
+
+    阈值语义：`>= 0` 覆盖 metadata，`< 0` 沿用 metadata（与 DLL 一致）。
     """
     lib = _anomalib_lib
     if lib is None:
@@ -540,8 +756,12 @@ def run_anomalib(
     stride = int(rgb.strides[0])
     buffer = rgb.ctypes.data_as(ctypes.POINTER(ctypes.c_ubyte))
 
+    originals = read_metadata_thresholds(metadata_path)
+
     with _anom_lock:
-        handle = _anom_handle(engine_path, metadata_path, model_type)
+        handle = _anom_handle(
+            engine_path, metadata_path, model_type, image_threshold, pixel_threshold
+        )
 
         metadata = AiMetadata()
         if lib.ai_get_metadata(handle, ctypes.byref(metadata)) == 0:
@@ -549,6 +769,8 @@ def run_anomalib(
                 "model_type": metadata.model_type.decode("utf-8", errors="replace"),
                 "normalization": metadata.normalization.decode("utf-8", errors="replace"),
                 "output_contract": metadata.output_contract.decode("utf-8", errors="replace"),
+                # 注意：这两个值是**生效值**（override 已经写进去了），
+                # 文件原值在下面的 thresholds.metadata 里
                 "image_threshold": float(metadata.image_threshold),
                 "pixel_threshold": float(metadata.pixel_threshold),
                 "input_h": int(metadata.input_h),
@@ -581,9 +803,22 @@ def run_anomalib(
             },
             "overlay_png": None,
             "mask_png": None,
+            "heatmap_png": None,
+            "source_png": None,
+            "image_width": width,
+            "image_height": height,
         }
 
-        # 叠加图与轮廓图都是 DLL 持有的指针，必须立刻拷贝成 PNG
+        # 叠加图 / 轮廓图 / 原图 / 热能图都是 DLL 持有的指针，
+        # 只在下一次推理前有效，所以必须在这里立刻拷贝成 PNG。
+        if result.source_rgb and result.source_w > 0 and result.source_h > 0:
+            source = _pointer_to_array(
+                result.source_rgb, result.source_h, result.source_w, result.source_stride
+            )
+            payload["source_png"] = _encode_png(cv2.cvtColor(source, cv2.COLOR_RGB2BGR))
+            payload["image_width"] = int(result.source_w)
+            payload["image_height"] = int(result.source_h)
+
         if want_overlay and result.overlay_rgb and result.overlay_w > 0 and result.overlay_h > 0:
             overlay = _pointer_to_array(
                 result.overlay_rgb, result.overlay_h, result.overlay_w, result.overlay_stride
@@ -596,6 +831,39 @@ def run_anomalib(
             )
             payload["mask_png"] = _encode_png(cv2.cvtColor(mask, cv2.COLOR_RGB2BGR))
 
+        colormap_name = DEFAULT_COLORMAP
+        if want_heatmap:
+            heatmap, colormap_name = _render_heatmap(result, metadata, colormap)
+            payload["heatmap_png"] = heatmap
+        else:
+            _, colormap_name = resolve_colormap(colormap)
+        payload["heatmap_colormap"] = colormap_name
+
+    # 生效阈值 = 覆盖值（>=0）或文件原值；两者都拿不到时退回 DLL 报的值
+    effective_image = (
+        float(image_threshold) if float(image_threshold) >= 0
+        else originals["image_threshold"]
+        if originals["image_threshold"] is not None
+        else meta_dict.get("image_threshold")
+    )
+    effective_pixel = (
+        float(pixel_threshold) if float(pixel_threshold) >= 0
+        else originals["pixel_threshold"]
+        if originals["pixel_threshold"] is not None
+        else meta_dict.get("pixel_threshold")
+    )
+    payload["thresholds"] = {
+        "image": {
+            "effective": effective_image,
+            "metadata": originals["image_threshold"],
+            "overridden": float(image_threshold) >= 0,
+        },
+        "pixel": {
+            "effective": effective_pixel,
+            "metadata": originals["pixel_threshold"],
+            "overridden": float(pixel_threshold) >= 0,
+        },
+    }
     return payload
 
 
@@ -607,22 +875,69 @@ def _pointer_to_array(pointer, height: int, width: int, stride: int) -> np.ndarr
     return np.ascontiguousarray(buffer[:, : width * 3].reshape(height, width, 3))
 
 
+def _render_heatmap(result: AiResult, metadata: AiMetadata, colormap: str | None = None):
+    """把 `normalized_map` 渲染成假彩色热能图，返回 (PNG 字节 | None, 实际色带名)。
+
+    为什么不直接用 DLL 给的叠加图：
+        叠加图是"原图 + 半透明热力"的成品，判读时无法把"原图纹理"与"异常强度"分开看。
+        热能图是把异常强度单独摊开，配合叠加图一起看才能判断"是误检还是真异常"。
+
+    归一化用 metadata 的 anomaly_maps.min/max（`AiMetadata.map_min/map_max`）：
+        同一批图用同一个范围，不同图之间的颜色才可比。若 metadata 没给范围，
+        才退回本图自身的最值（此时只能看"这张图里哪里最异常"，不能横向比）。
+
+    顺序是"先放大灰度值图，再上色"：
+        反过来先上色再放大，颜色会在线性插值下互相污染，弱异常区会出现脏色带。
+    """
+    import cv2
+
+    _, name_used = resolve_colormap(colormap)
+
+    if not result.normalized_map or result.map_w <= 0 or result.map_h <= 0:
+        return None, name_used
+
+    count = int(result.map_w) * int(result.map_h)
+    raw = ctypes.string_at(ctypes.cast(result.normalized_map, ctypes.c_void_p), count * 4)
+    values = np.frombuffer(raw, dtype=np.float32).reshape(int(result.map_h), int(result.map_w))
+    values = values.astype(np.float32, copy=True)
+
+    low, high = float(metadata.map_min), float(metadata.map_max)
+    if not (high > low):
+        low, high = float(values.min()), float(values.max())
+    if high > low:
+        scaled = (values - low) / (high - low)
+    else:
+        # 全图同值（正常图常见）：全给 0，不要除以 0 也不要伪造"有异常"
+        scaled = np.zeros_like(values)
+
+    scaled = np.clip(scaled, 0.0, 1.0)
+    gray = (scaled * 255.0).round().astype(np.uint8)
+
+    # 放大到原图尺寸；尺寸取 source 的，没有就保持 map 的原尺寸
+    target_w = int(result.source_w) if result.source_w > 0 else int(result.map_w)
+    target_h = int(result.source_h) if result.source_h > 0 else int(result.map_h)
+    if (target_w, target_h) != (int(result.map_w), int(result.map_h)):
+        gray = cv2.resize(gray, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
+
+    colormap_id, name_used = resolve_colormap(colormap)
+    colored = cv2.applyColorMap(gray, colormap_id)
+    return _encode_png(colored), name_used
+
+
 def release_handles() -> None:
     """服务退出时释放所有缓存句柄。"""
-    global _yolo_lib, _anomalib_lib
     with _yolo_lock:
-        if _yolo_lib is not None:
-            for handle in _yolo_handles.values():
-                try:
-                    _yolo_lib.yi_destroy(handle)
-                except Exception:  # noqa: BLE001
-                    pass
-            _yolo_handles.clear()
+        _yolo_handles.clear()
     with _anom_lock:
-        if _anomalib_lib is not None:
-            for handle in _anom_handles.values():
-                try:
-                    _anomalib_lib.ai_destroy(handle)
-                except Exception:  # noqa: BLE001
-                    pass
-            _anom_handles.clear()
+        _anom_handles.clear()
+
+
+def cache_stats() -> dict:
+    """当前句柄缓存状态，供测试与诊断页查看。"""
+    return {
+        "limit": HANDLE_CACHE_LIMIT,
+        "yolo": len(_yolo_handles),
+        "anomalib": len(_anom_handles),
+        "yolo_keys": [list(map(str, k)) for k in _yolo_handles.keys()],
+        "anomalib_keys": [list(map(str, k)) for k in _anom_handles.keys()],
+    }

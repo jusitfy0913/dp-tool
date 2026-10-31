@@ -99,6 +99,35 @@ def ensure_dirs() -> None:
         d.mkdir(parents=True, exist_ok=True)
 
 
+def allowed_roots() -> list[Path]:
+    """允许被接口访问的根目录列表。
+
+    Web 端没有原生文件对话框，路径全靠后端列出，因此必须有一份白名单，
+    否则接口就成了"读任意磁盘"的后门。默认只放仓库根，需要别的目录时
+    用 TRTFORGE_BROWSE_ROOTS 显式追加（分号/冒号分隔，看平台）。
+
+    收敛到这里的原因：目录浏览、数据集扫描、模型扫描三处都需要同一份判断，
+    各写一遍迟早出现"某处忘了校验"的漏洞。
+    """
+    roots = [REPO_ROOT]
+    for extra in os.environ.get("TRTFORGE_BROWSE_ROOTS", "").split(os.pathsep):
+        if extra.strip():
+            try:
+                roots.append(Path(extra.strip()).expanduser().resolve())
+            except OSError:
+                continue
+    return roots
+
+
+def is_path_allowed(path: str | Path) -> bool:
+    """判断路径是否落在白名单内（含根目录自身）。"""
+    try:
+        target = Path(path).expanduser().resolve()
+    except OSError:
+        return False
+    return any(target == root or root in target.parents for root in allowed_roots())
+
+
 def resolve_python() -> str | None:
     """解析训练用 Python 解释器。
 

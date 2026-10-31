@@ -4,6 +4,8 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>TRTForge Web Studio</title>
+<!-- 内联 SVG 图标：省一个静态文件，也避免浏览器去请求 /favicon.ico 造成控制台 404 -->
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='3' fill='%23070a0e'/%3E%3Cpath d='M3 11.5V4.5h2.6l1.4 3.2 1.4-3.2H11v7' stroke='%2322d3ee' stroke-width='1.6' fill='none' stroke-linecap='square'/%3E%3C/svg%3E">
 <link rel="stylesheet" href="/static/css/style.css">
 </head>
 <body>
@@ -12,7 +14,7 @@
     <span class="logo">TRT</span>
     <div>
       <h1>TRTForge Web Studio</h1>
-      <p class="sub">缺陷检测 · 训练与推理</p>
+      <p class="sub">缺陷检测 · 训练与推理 <span class="ver" id="appVersion" title="后端版本号（来自 /api/health）">v1.11.0</span></p>
     </div>
   </div>
   <div class="status" id="envStatus">
@@ -25,6 +27,7 @@
   <button class="tab active" data-tab="train">训练导出</button>
   <button class="tab" data-tab="engine">引擎构建</button>
   <button class="tab" data-tab="dataset">数据集</button>
+  <button class="tab" data-tab="annotate">标注</button>
   <button class="tab" data-tab="infer">推理演示</button>
   <button class="tab" data-tab="about">环境说明</button>
 </nav>
@@ -168,11 +171,32 @@
           </select>
         </label>
 
+        <!-- 训练产物下拉：扫描 runs/ 与 results/ 里的引擎。
+             选完自动填引擎、标签、metadata 与任务类型；不满意可以直接改下面的输入框，
+             手工输入始终有效，下拉只是省事，不是必经之路。 -->
+        <div class="group">
+          <label>训练产物
+            <div class="row">
+              <select id="inferModelSelect">
+                <option value="">— 手工填写下面的路径 —</option>
+              </select>
+              <button type="button" class="mini" id="btnRefreshModels" title="重新扫描训练产物目录">刷新</button>
+            </div>
+          </label>
+          <p class="hint" id="inferModelHint">从训练产物里选一个引擎可自动填好配套文件。</p>
+        </div>
+
         <div class="group" id="inferYoloGroup">
-          <label>引擎文件 .trt
+          <label>引擎文件 .trt / .engine
             <div class="row">
               <input type="text" id="yoloEngine" placeholder="yolo 引擎路径">
               <button type="button" class="mini" data-browse="yoloEngine" data-mode="file">浏览</button>
+            </div>
+          </label>
+          <label>标签文件 labels_*.json
+            <div class="row">
+              <input type="text" id="yoloLabels" placeholder="留空则框上只显示 cls0、cls1…">
+              <button type="button" class="mini" data-browse="yoloLabels" data-mode="file">浏览</button>
             </div>
           </label>
           <label>任务类型
@@ -183,14 +207,27 @@
               <option value="obb">obb</option>
             </select>
           </label>
-          <div class="grid2">
-            <label>conf <input type="number" id="inferConf" value="0.25" step="0.05" min="0" max="1"></label>
-            <label>nms <input type="number" id="inferNms" value="0.45" step="0.05" min="0" max="1"></label>
+
+          <!-- 滑块与数字框双向联动。参数改动不会立刻重跑，
+               而是等下一次点"开始推理"——实时推理会让拖动过程卡成幻灯片。 -->
+          <div class="param" data-param="conf">
+            <div class="param-head">
+              <span class="param-name">conf 置信度阈值</span>
+              <input type="number" id="inferConf" value="0.25" step="0.01" min="0.01" max="1">
+            </div>
+            <input type="range" id="inferConfRange" value="0.25" step="0.01" min="0.01" max="1">
+          </div>
+          <div class="param" data-param="nms">
+            <div class="param-head">
+              <span class="param-name">nms IoU 阈值</span>
+              <input type="number" id="inferNms" value="0.45" step="0.01" min="0.01" max="1">
+            </div>
+            <input type="range" id="inferNmsRange" value="0.45" step="0.01" min="0.01" max="1">
           </div>
         </div>
 
         <div class="group hidden" id="inferAnomGroup">
-          <label>引擎文件 .trt
+          <label>引擎文件 .trt / .engine
             <div class="row">
               <input type="text" id="anomEngine" placeholder="anomalib 引擎路径">
               <button type="button" class="mini" data-browse="anomEngine" data-mode="file">浏览</button>
@@ -210,11 +247,53 @@
               <option value="EfficientAd">EfficientAd</option>
             </select>
           </label>
+          <label>热能图色带
+            <select id="anomColormap">
+              <option value="TURBO">TURBO（推荐，色差感知均匀）</option>
+              <option value="JET">JET（传统彩虹，层次集中在绿黄段）</option>
+              <option value="INFERNO">INFERNO（暗底亮峰）</option>
+              <option value="VIRIDIS">VIRIDIS（暗底亮峰，色盲友好）</option>
+            </select>
+          </label>
+
+          <label class="check-row">
+            <input type="checkbox" id="anomUseMetaThresh" checked>
+            <span>沿用 metadata 默认阈值</span>
+          </label>
+          <p class="hint" id="anomThreshHint">默认直接使用 metadata 里记录的阈值。</p>
+
+          <div class="param" data-param="imageThreshold">
+            <div class="param-head">
+              <span class="param-name">图像阈值（判定 OK / NG）</span>
+              <input type="number" id="anomImageThr" value="0.5" step="0.01" min="0" max="1">
+            </div>
+            <input type="range" id="anomImageThrRange" value="0.5" step="0.01" min="0" max="1">
+          </div>
+          <div class="param" data-param="pixelThreshold">
+            <div class="param-head">
+              <span class="param-name">像素阈值（圈出异常区域）</span>
+              <input type="number" id="anomPixelThr" value="0.5" step="0.01" min="0" max="1">
+            </div>
+            <input type="range" id="anomPixelThrRange" value="0.5" step="0.01" min="0" max="1">
+          </div>
+          <div class="param" data-param="overlayOpacity">
+            <div class="param-head">
+              <span class="param-name">叠加图不透明度</span>
+              <input type="number" id="anomOverlayOpacity" value="100" step="5" min="0" max="100">
+            </div>
+            <input type="range" id="anomOverlayOpacityRange" value="100" step="5" min="0" max="100">
+          </div>
         </div>
 
         <label>图片
           <input type="file" id="inferImage" accept=".jpg,.jpeg,.png,.bmp">
         </label>
+
+        <!-- 参数一改就要重建引擎（conf/nms/阈值都烧在句柄里），
+             不提示的话用户会以为"改了没反应"或"程序卡了"。 -->
+        <p class="hint hint-warn hidden" id="inferRebuildHint">
+          参数已改动：下次推理会重建引擎句柄，首次约需数秒。再改回去可命中缓存、立即返回。
+        </p>
 
         <div class="actions">
           <button type="submit" class="primary" id="btnInfer">开始推理</button>
@@ -225,12 +304,54 @@
       <div class="card grow">
         <h2>结果 <span class="badge" id="inferBadge">待推理</span></h2>
         <div class="metrics" id="inferMetrics"></div>
-        <div class="images">
-          <figure><img id="imgSource" alt="原图"><figcaption>原图</figcaption></figure>
-          <figure><img id="imgResult" alt="结果"><figcaption id="capResult">结果</figcaption></figure>
+
+        <!-- 计时分解：预处理 / 推理 / 后处理三段。单看总耗时无法判断瓶颈在哪。 -->
+        <div class="timing-panel hidden" id="inferTiming">
+          <div class="timing-bar" id="timingBar"></div>
+          <div class="timing-legend" id="timingLegend"></div>
         </div>
-        <div class="images" id="maskRow" style="display:none">
-          <figure><img id="imgMask" alt="异常轮廓"><figcaption>异常轮廓</figcaption></figure>
+
+        <!-- 叠加层开关：截图时常常要"只要框"或"只要图"。 -->
+        <div class="result-toolbar hidden" id="inferToolbar">
+          <label class="chip-check"><input type="checkbox" id="optShowBoxes" checked><span>显示框</span></label>
+          <label class="chip-check"><input type="checkbox" id="optShowLabels" checked><span>显示标签</span></label>
+          <label class="chip-check"><input type="checkbox" id="optFadeLow"><span>淡化低分框</span></label>
+          <span class="toolbar-spacer"></span>
+          <button type="button" class="mini" id="btnExportJson">导出 JSON</button>
+          <button type="button" class="mini" id="btnExportCsv">导出 CSV</button>
+        </div>
+
+        <!-- 像素阈值参考线：热能图是连续色阶，光看数字不知道"阈值落在颜色的哪个位置"。
+             这条刻度把阈值画在 0~1 的色阶上，一眼看出红线右侧才是被判为异常的区域。 -->
+        <div class="heat-legend hidden" id="anomLegend">
+          <span class="heat-legend-label">0.0</span>
+          <div class="heat-legend-track">
+            <span class="heat-legend-mark" id="pixelThrMark" title="像素阈值"></span>
+          </div>
+          <span class="heat-legend-label">1.0</span>
+          <span class="heat-legend-note" id="pixelThrNote">像素阈值 —</span>
+        </div>
+
+        <!-- 多窗口图像查看器：窗口清单与开关由 js/infer.js 通过 js/viewer.js 创建。
+             每个窗口独立可缩放（滚轮，锚定光标）与平移（左键拖动），
+             开关状态持久化在 localStorage，键名带本容器标识以防与其他页面串扰。 -->
+        <div id="inferViewers"></div>
+
+        <!-- 明细与分布：表格用来核对具体数值，分布用来看有没有"一堆 0.31 的凑数框" -->
+        <div class="detail-grid hidden" id="inferDetail">
+          <div class="detail-main">
+            <h3>检出明细 <span class="hint-inline">点行高亮对应框，点表头排序</span></h3>
+            <div class="scrollbox scrollbox-sm">
+              <table class="data-table" id="boxTable">
+                <thead id="boxHead"></thead>
+                <tbody id="boxRows"></tbody>
+              </table>
+            </div>
+          </div>
+          <div class="detail-side">
+            <h3>置信度分布</h3>
+            <div class="hist" id="confHist"></div>
+          </div>
         </div>
       </div>
     </div>
@@ -364,12 +485,151 @@
         <div class="metrics" id="dsMetrics"></div>
         <p class="hint" id="dsWarnings"></p>
         <div class="scrollbox">
-          <table class="env" id="dsTable">
+          <table class="data-table" id="dsTable">
+            <thead id="dsHead"></thead>
             <tbody id="dsRows"></tbody>
           </table>
         </div>
         <pre class="log hidden" id="dsResult"></pre>
       </div>
+    </div>
+  </section>
+
+  <!-- ==================== 标注工作台 ==================== -->
+  <section class="panel" id="panel-annotate">
+    <div class="anno-layout">
+      <!-- 左：工程与图片列表 -->
+      <aside class="card anno-side anno-left">
+        <h2>工程</h2>
+        <div class="anno-row">
+          <input type="text" id="annoPath" placeholder=".tfanno 工程文件路径" />
+          <button type="button" class="mini" data-browse="annoPath" data-mode="file" title="浏览">…</button>
+        </div>
+        <div class="anno-row">
+          <button type="button" class="primary" id="annoOpen">打开</button>
+          <button type="button" id="annoCreate">新建</button>
+          <button type="button" id="annoSaveNow" title="Ctrl+S">保存</button>
+        </div>
+        <p class="anno-hint" id="annoSaveState">未打开工程</p>
+
+        <h2>图片 <span class="anno-count" id="annoImageCount">0</span></h2>
+        <ul class="anno-imagelist" id="annoImageList"></ul>
+
+        <div class="anno-row anno-stack">
+          <input type="text" id="annoAddRoot" placeholder="图片目录" />
+          <div class="anno-row">
+            <button type="button" class="mini" data-browse="annoAddRoot" title="浏览">…</button>
+            <button type="button" class="mini" id="annoAddImages">批量加入</button>
+          </div>
+        </div>
+      </aside>
+
+      <!-- 中：画布 -->
+      <section class="anno-center">
+        <div class="anno-toolbar">
+          <div class="anno-group" role="group" aria-label="绘制工具">
+            <button type="button" class="mini tool active" data-tool="select" title="选择 (V)">选择</button>
+            <button type="button" class="mini tool" data-tool="rectangle" title="矩形 (R)">矩形</button>
+            <button type="button" class="mini tool" data-tool="rotated_rect" title="旋转矩形 (O)">旋转框</button>
+            <button type="button" class="mini tool" data-tool="polygon" title="多边形 (P)">多边形</button>
+            <button type="button" class="mini tool" data-tool="line" title="线段 (L)">线段</button>
+            <button type="button" class="mini tool" data-tool="point" title="点 (T)">点</button>
+            <button type="button" class="mini tool" data-tool="keypoints" title="关键点组 (K)">关键点</button>
+          </div>
+          <div class="anno-group">
+            <button type="button" class="mini" id="annoUndo" title="撤销 (Ctrl+Z)">撤销</button>
+            <button type="button" class="mini" id="annoRedo" title="重做 (Ctrl+Shift+Z)">重做</button>
+            <button type="button" class="mini" id="annoDelete" title="删除选中 (Delete)">删除</button>
+          </div>
+          <div class="anno-group">
+            <label class="anno-toggle"><input type="checkbox" id="annoShowShapes" checked />框</label>
+            <label class="anno-toggle"><input type="checkbox" id="annoShowLabels" checked />标签</label>
+            <label class="anno-toggle"><input type="checkbox" id="annoShowScore" />置信度</label>
+            <label class="anno-toggle"><input type="checkbox" id="annoCrosshair" />十字线</label>
+            <label class="anno-toggle"><input type="checkbox" id="annoSnap" checked />吸附</label>
+          </div>
+          <div class="anno-group">
+            <label class="anno-toggle" title="标注填充透明度">填充
+              <input type="range" id="annoFillAlpha" min="0" max="80" value="18" />
+            </label>
+          </div>
+          <div class="anno-group">
+            <button type="button" class="mini" id="annoFit" title="适应窗口 (F)">FIT</button>
+            <button type="button" class="mini" id="annoZoomReset" title="原始像素">1:1</button>
+            <span class="anno-zoom" id="annoZoom">—</span>
+          </div>
+          <div class="anno-group anno-group-last">
+            <button type="button" class="mini accent" id="annoAutoLabel" title="用自有引擎生成预标注草稿">预标注</button>
+          </div>
+        </div>
+
+        <div class="anno-stage" id="annoStage">
+          <canvas id="annoCanvas"></canvas>
+          <canvas class="anno-mini" id="annoMini" title="导航缩略图：点击或拖动定位"></canvas>
+          <div class="anno-empty" id="annoEmpty">打开或新建一个 <code>.tfanno</code> 工程后开始标注</div>
+          <div class="anno-status" id="annoStatus"></div>
+        </div>
+      </section>
+
+      <!-- 右：类别 / 属性 / 草稿 -->
+      <aside class="card anno-side anno-right">
+        <h2>类别 <span class="anno-count" id="annoClassCount">0</span></h2>
+        <ul class="anno-classlist" id="annoClassList"></ul>
+        <div class="anno-row">
+          <input type="text" id="annoClassName" placeholder="新类别名" />
+          <button type="button" class="mini" id="annoClassAdd">加</button>
+        </div>
+
+        <h2>预标注草稿 <span class="anno-count" id="annoDraftCount">0</span></h2>
+        <div class="anno-row">
+          <button type="button" class="mini" id="annoAcceptAll">全部接受</button>
+          <button type="button" class="mini" id="annoRejectAll">全部丢弃</button>
+        </div>
+        <ul class="anno-draftlist" id="annoDraftList"></ul>
+
+        <h2>属性</h2>
+        <div class="anno-props" id="annoProps">
+          <p class="anno-hint">未选中标注</p>
+        </div>
+
+        <h2>导出</h2>
+        <div class="anno-row">
+          <select id="annoExportFormat">
+            <option value="yolo">YOLO</option>
+            <option value="coco">COCO</option>
+            <option value="voc">VOC</option>
+          </select>
+          <input type="text" id="annoExportOut" placeholder="输出目录" />
+        </div>
+        <div class="anno-row">
+          <button type="button" class="mini" data-browse="annoExportOut">…</button>
+          <button type="button" class="mini primary" id="annoExport">导出</button>
+        </div>
+
+        <!-- 预标注参数（折叠）：放在右栏内部，展开时右栏自己滚动，画布高度不受影响 -->
+        <details class="anno-autolabel" id="annoAutoLabelBox">
+          <summary>预标注参数</summary>
+          <div class="anno-row">
+            <input type="text" id="annoAlEngine" placeholder=".engine 引擎路径" />
+            <button type="button" class="mini" data-browse="annoAlEngine" data-mode="file">…</button>
+          </div>
+          <div class="anno-row">
+            <input type="text" id="annoAlLabels" placeholder="labels_*.json（可空）" />
+            <button type="button" class="mini" data-browse="annoAlLabels" data-mode="file">…</button>
+          </div>
+          <div class="anno-row">
+            <label class="anno-toggle">conf <input type="number" id="annoAlConf" min="0" max="1" step="0.05" value="0.25" /></label>
+            <label class="anno-toggle">nms <input type="number" id="annoAlNms" min="0" max="1" step="0.05" value="0.45" /></label>
+          </div>
+          <div class="anno-row">
+            <input type="text" id="annoAlService" placeholder="外部标注服务地址（可空），如 http://127.0.0.1:8500" />
+          </div>
+          <p class="anno-hint">
+            主通道用自有引擎，总是可用；填了服务地址会先试外部通道（SAM / 文字提示），
+            不可达时自动回退并提示。
+          </p>
+        </details>
+      </aside>
     </div>
   </section>
 
@@ -402,6 +662,20 @@
     <footer>
       <button type="button" id="browseUp">上一级</button>
       <button type="button" class="primary" id="browsePick">选择当前目录</button>
+    </footer>
+  </div>
+</div>
+
+<!-- 修订号冲突弹窗：两个明确选项，不给"关闭了事"的后悔空间 -->
+<div class="modal hidden" id="annoConflictModal">
+  <div class="modal-box">
+    <header>
+      <h3>工程已被修改</h3>
+    </header>
+    <p class="anno-hint" id="annoConflictText"></p>
+    <footer>
+      <button type="button" id="annoConflictReload">重新加载（丢弃我的修改）</button>
+      <button type="button" class="primary" id="annoConflictForce">强制覆盖</button>
     </footer>
   </div>
 </div>

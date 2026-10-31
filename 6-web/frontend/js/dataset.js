@@ -22,6 +22,7 @@ export function initDataset() {
   const metrics = document.getElementById("dsMetrics");
   const warnings = document.getElementById("dsWarnings");
   const rows = document.getElementById("dsRows");
+  const head = document.getElementById("dsHead");
   const result = document.getElementById("dsResult");
   const btnScan = document.getElementById("btnScan");
   const btnExport = document.getElementById("btnExport");
@@ -94,13 +95,18 @@ export function initDataset() {
 
   function renderRows(data) {
     rows.innerHTML = "";
-    const head = document.createElement("tr");
-    for (const title of ["图片", "现有划分", "新划分", "标注数", "尺寸"]) {
-      const td = document.createElement("td");
-      td.textContent = title;
-      head.appendChild(td);
+    head.innerHTML = "";
+
+    // 表头用 th 而不是 td：语义正确，读屏会把列名关联到单元格。
+    // 数值列加 num 类右对齐，等宽字体让位数相同的数字纵向对齐。
+    const headRow = document.createElement("tr");
+    for (const [title, numeric] of [["图片", false], ["现有划分", false], ["新划分", false], ["标注数", true], ["尺寸", true]]) {
+      const th = document.createElement("th");
+      th.textContent = title;
+      if (numeric) th.style.textAlign = "right";
+      headRow.appendChild(th);
     }
-    rows.appendChild(head);
+    head.appendChild(headRow);
 
     for (const image of data.images) {
       const tr = document.createElement("tr");
@@ -118,10 +124,12 @@ export function initDataset() {
       tr.appendChild(assigned);
 
       const objects = document.createElement("td");
+      objects.className = "num";
       objects.textContent = image.objects;
       tr.appendChild(objects);
 
       const size = document.createElement("td");
+      size.className = "num";
       size.textContent = image.width && image.height ? `${image.width}×${image.height}` : "未知";
       tr.appendChild(size);
 
