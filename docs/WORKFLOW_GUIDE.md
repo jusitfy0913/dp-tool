@@ -430,7 +430,23 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\build_infer_dlls.p
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run_web_studio.ps1
 # 浏览器打开 http://127.0.0.1:8060
+
+# 换端口
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run_web_studio.ps1 -Port 8070
 ```
+
+**端口被占用怎么办**：脚本会在启动前检查端口，被占用时直接打印「占用进程名 + PID + 启动时间」并中止，
+不再丢一个 `10048` 后让人猜。按提示清理即可：
+
+```powershell
+Stop-Process -Id <提示里的 PID> -Force
+```
+
+> 为什么会有残留进程：脚本是前台拉起 uvicorn，父进程被关掉后子进程在 Windows 上不会自动退出，
+> 会一直占着端口。**更隐蔽的风险**是「以为重启了，其实还在跑旧后端」——
+> 页面（静态文件每次读盘）已经是新版，后端（进程内代码）还是旧版，
+> 于是新加的接口参数会被静默忽略。改动后端后务必确认 PID 变了。
+
 
 ### 7.2 推理页操作
 
