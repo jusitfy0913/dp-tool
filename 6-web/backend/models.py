@@ -21,6 +21,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 
@@ -104,6 +105,15 @@ def _find_onnx(engine: Path) -> tuple[Path | None, bool]:
     return onnx_files[0], _is_transposed_onnx(onnx_files[0])
 
 
+def _run_dir(engine: Path) -> Path:
+    """引擎所在实验目录。
+
+    YOLO 的引擎放在 `<run>/weights/best.engine`，其余产物在 `<run>/` 根；
+    统一在这里判定一次，避免每个调用点各写一遍而大小写判断不一致。
+    """
+    return engine.parent.parent if engine.parent.name.lower() == "weights" else engine.parent
+
+
 def _find_labels(engine: Path, kind: str) -> Path | None:
     """找标签文件。
 
@@ -122,7 +132,7 @@ def _find_labels(engine: Path, kind: str) -> Path | None:
         if not found:
             continue
         # 实验名 = 引擎所在 run 目录名；优先精确匹配，避免一个 run 里多份标签时选错
-        run_name = engine.parent.name if engine.parent.name != "weights" else engine.parent.parent.name
+        run_name = _run_dir(engine).name
         for candidate in found:
             if candidate.stem == f"labels_{run_name}":
                 return candidate
@@ -142,8 +152,6 @@ def _find_metadata(engine: Path) -> tuple[Path | None, Path | None]:
 
 def _read_json_quietly(path: Path) -> dict:
     """读一个 json，失败返回空字典（扫描器不能因为一个坏文件就崩）。"""
-    import json
-
     try:
         raw = json.loads(path.read_text(encoding="utf-8-sig"))
     except (OSError, UnicodeDecodeError, ValueError):
@@ -151,7 +159,7 @@ def _read_json_quietly(path: Path) -> dict:
     return raw if isinstance(raw, dict) else {}
 
 
-def _infer_task(engine: Path, kind: str, metadata: Path | None) -> str | None:
+def _infer_task(engine: Path, kind: str) -> str | None:
     """推断任务类型，供前端预填。
 
     优先级：
@@ -163,8 +171,7 @@ def _infer_task(engine: Path, kind: str, metadata: Path | None) -> str | None:
         return "anomalib"
 
     # 引擎在 weights/ 里，args.yaml 在 run 根
-    run_dir = engine.parent.parent if engine.parent.name.lower() == "weights" else engine.parent
-    args_file = run_dir / "args.yaml"
+    args_file = _run_dir(engine) / "args.yaml"
     if args_file.is_file():
         try:
             text = args_file.read_text(encoding="utf-8-sig", errors="replace")
@@ -259,7 +266,7 @@ def scan_models(limit: int = MAX_ENTRIES) -> dict:
             labels_path = _find_labels(engine, kind)
             metadata_path, calibrated_path = _find_metadata(engine)
 
-            task = _infer_task(engine, kind, metadata_path)
+            task = _infer_task(engine, kind)
 
             model_type = None
             input_size = None
@@ -279,7 +286,7 @@ def scan_models(limit: int = MAX_ENTRIES) -> dict:
                 "size": int(stat.st_size),
                 "mtime": float(stat.st_mtime),
                 "root": str(root),
-                "run_dir": str(engine.parent.parent if engine.parent.name.lower() == "weights" else engine.parent),
+                "run_dir": str(_run_dir(engine)),
                 "onnx": str(onnx_path) if onnx_path else None,
                 "transposed": bool(transposed),
                 "labels": str(labels_path) if labels_path else None,

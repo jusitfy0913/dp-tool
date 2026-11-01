@@ -112,11 +112,13 @@ def load_labels(path: str | Path | None) -> dict:
     # 逐项转字符串并丢掉空白项与 null：
     # 现场出现过 classes 里混 null 或空串的标签文件。
     # 这里必须显式排除 None——`str(None)` 是 "None"，会被当成一个合法类别名混进来。
-    cleaned = [
-        str(item).strip()
-        for item in classes
-        if item is not None and str(item).strip()
-    ]
+    cleaned = []
+    for item in classes:
+        if item is None:
+            continue
+        text = str(item).strip()
+        if text:
+            cleaned.append(text)
     if not cleaned:
         result["error"] = "标签文件 classes 为空"
         return result

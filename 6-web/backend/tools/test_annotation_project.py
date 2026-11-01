@@ -815,6 +815,70 @@ def test_palette() -> None:
     check("配色：各通道在 0~255", all(0 <= c <= 255 for s in range(12) for c in annotation.default_color(s)))
 
 
+def test_hardening(tmp: Path) -> None:
+    """回归：并发保存与校验器的两类「看起来正常却被判错/写坏」的问题。"""
+    import threading
+
+    root = tmp / "hard"
+    make_image(root / "images" / "a.png")
+    make_image(root / "images" / "b.png")
+    path = root / "hard.tfanno"
+    project = build_project(root)
+    annotation.save(path, project, force=True)
+    loaded, _ = annotation.load(path)
+
+    # 1) 标注 id 只在单图内唯一：两张图各有一个 "1" 不该报警
+    twins = json.loads(json.dumps(loaded))
+    for image in twins["images"]:
+        for index, obj in enumerate(image.get("annotations") or []):
+            obj["id"] = str(index + 1)
+    issues = annotation.validate(twins)
+    check(
+        "并发/校验：跨图同号标注不再误报重复",
+        not any("标注 id 重复" in item for item in issues),
+        str(issues),
+    )
+
+    # 2) 同一张图内重复才真的算错
+    dupes = json.loads(json.dumps(twins))
+    objects = dupes["images"][0].get("annotations") or []
+    if len(objects) >= 2:
+        objects[1]["id"] = objects[0]["id"]
+        issues_dup = annotation.validate(dupes)
+        check("并发/校验：单图内重复 id 仍被抓到", any("标注 id 重复" in item for item in issues_dup), str(issues_dup))
+
+    # 3) 同一路径并发保存：只能有一个成功（其余撞修订号），文件必须仍是完整 JSON
+    results: list[str] = []
+    errors: list[str] = []
+
+    def worker() -> None:
+        try:
+            annotation.save(path, loaded, expected_rev=loaded.get("rev"), force=False)
+            results.append("ok")
+        except annotation.RevisionConflict:
+            results.append("conflict")
+        except Exception as exc:  # noqa: BLE001 - 任何其它异常都算失败
+            errors.append(repr(exc))
+
+    threads = [threading.Thread(target=worker) for _ in range(6)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    check("并发保存：无意外异常", not errors, str(errors))
+    check("并发保存：有且仅有一个成功", results.count("ok") == 1, str(results))
+    after, _ = annotation.load(path)
+    check("并发保存：文件仍是完整工程", len(after.get("images") or []) == len(loaded.get("images") or []))
+    check(
+        "并发保存：修订号只加一",
+        int(after.get("rev") or 0) == int(loaded.get("rev") or 0) + 1,
+        f"{after.get('rev')} vs {loaded.get('rev')}",
+    )
+    leftovers = list(root.glob("*.tmp*"))
+    check("并发保存：无残留临时文件", not leftovers, str(leftovers))
+
+
 def main() -> int:
     with tempfile.TemporaryDirectory(prefix="tfanno_test_") as raw:
         tmp = Path(raw)
@@ -829,6 +893,7 @@ def main() -> int:
         test_api(tmp)
         test_unicode_paths(tmp)
         test_palette()
+        test_hardening(tmp)
 
     print()
     if FAILED:

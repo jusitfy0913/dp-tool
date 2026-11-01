@@ -81,6 +81,8 @@ const state = {
   undo: [],
   redo: [],
   image: null,
+  /** 图片解码序号：用于丢弃「后到的旧图」，见 loadCurrentImage。 */
+  imageLoadSeq: 0,
   view: { scale: 1, offset: { x: 0, y: 0 } },
   /** 是否已经成功"适应窗口"过一次。用于在面板由隐藏变可见时补算倍率。 */
   viewValid: false,
@@ -98,6 +100,18 @@ const state = {
   /** 拖动会话：{ kind, index, start, original, startScreen, startOffset } */
   drag: null,
   saveTimer: 0,
+  /** 在飞保存请求的 promise；flushSave 用它等待落地。 */
+  saveTask: null,
+  /**
+   * 编辑序号：每次 markDirty 递增。
+   *
+   * 用途是「保存期间又改了东西」的检测——保存请求发出时记下序号，
+   * 回来时若序号变了，说明这次存的是旧内容，必须保持 dirty 并重新排期，
+   * 否则那批编辑既没写盘、也没被标脏，关页面就静默丢失。
+   */
+  editSeq: 0,
+  /** 保存进行中又被请求保存：结束后补跑一次，不能直接丢掉。 */
+  saveQueued: false,
   conflict: null,
 };
 
@@ -108,6 +122,31 @@ const el = {};
 // ---------------------------------------------------------------------------
 function clone(value) {
   return typeof structuredClone === "function" ? structuredClone(value) : JSON.parse(JSON.stringify(value));
+}
+
+/**
+ * 解析「每行 键: 值」的文本，返回键值对象。
+ *
+ * 只按**第一个**冒号切分，所以值里可以继续出现冒号（URL、时间戳）。
+ * 键为空、或整行没有冒号的行直接跳过——用户多敲一个空行不该变成一条脏属性。
+ */
+function parseKeyedLines(text) {
+  const result = {};
+  for (const line of text.split("\n")) {
+    const position = line.indexOf(":");
+    if (position <= 0) continue;
+    const key = line.slice(0, position).trim();
+    if (!key) continue;
+    result[key] = line.slice(position + 1).trim();
+  }
+  return result;
+}
+
+/** 把键值对象还原成「每行 键: 值」的文本，用于回填编辑框。 */
+function formatKeyedLines(source) {
+  return Object.entries(source || {})
+    .map(([key, value]) => `${key}: ${value}`)
+    .join("\n");
 }
 
 function currentImage() {
@@ -174,15 +213,25 @@ function snapshot(full = false) {
 }
 
 function applySnapshot(entry) {
-  if (!entry) return;
+  if (!entry) return false;
+  let indexChanged = false;
   if (entry.full) {
     state.project = entry.project;
-    state.currentIndex = Math.min(Math.max(0, state.currentIndex), Math.max(0, state.project.images.length - 1));
+    const next = Math.min(Math.max(0, state.currentIndex), Math.max(0, state.project.images.length - 1));
+    indexChanged = next !== state.currentIndex;
+    state.currentIndex = next;
   } else {
+    // 撤销/重做必须切到快照所属的那张图。
+    // 只改数组不切视图的话，用户会看到"标注莫名消失"——其实改的是另一张图。
+    if (entry.index !== state.currentIndex) {
+      state.currentIndex = entry.index;
+      indexChanged = true;
+    }
     const image = state.project.images[entry.index];
     if (image) image.annotations = entry.annotations;
   }
   if (state.selectedId && !selectedObject()) state.selectedId = "";
+  return indexChanged;
 }
 
 /**
@@ -204,10 +253,11 @@ function undo() {
   if (!state.undo.length) return false;
   const entry = state.undo.pop();
   state.redo.push(snapshot(entry.full));
-  applySnapshot(entry);
+  const indexChanged = applySnapshot(entry);
   markDirty();
   renderAll();
-  renderCanvas();
+  if (indexChanged) loadCurrentImage();
+  else renderCanvas();
   updateHistoryButtons();
   setStatus("已撤销");
   return true;
@@ -217,10 +267,11 @@ function redo() {
   if (!state.redo.length) return false;
   const entry = state.redo.pop();
   state.undo.push(snapshot(entry.full));
-  applySnapshot(entry);
+  const indexChanged = applySnapshot(entry);
   markDirty();
   renderAll();
-  renderCanvas();
+  if (indexChanged) loadCurrentImage();
+  else renderCanvas();
   updateHistoryButtons();
   setStatus("已重做");
   return true;
@@ -242,6 +293,7 @@ function afterEdit() {
 
 function markDirty() {
   state.dirty = true;
+  state.editSeq += 1;
   scheduleSave();
   updateSaveState();
 }
@@ -261,7 +313,11 @@ async function flushSave() {
     clearTimeout(state.saveTimer);
     state.saveTimer = 0;
   }
-  if (state.dirty && state.project && state.path) await saveProject({ silent: true });
+  // 先等在飞的请求落地：否则下面可能拿还没更新的 rev 再存一次，白撞 409。
+  if (state.saveTask) await state.saveTask.catch(() => {});
+  if (state.dirty && state.project && state.path && !state.conflict) {
+    await saveProject({ silent: true });
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -319,31 +375,86 @@ async function createProject() {
     setStatus("请先填写要创建的 .tfanno 路径", "bad");
     return;
   }
-  state.path = path;
-  state.exists = false;
-  state.project = {
+  // 1) 先把手上的修改落盘：切工程不能顺手带走当前工程的未保存内容。
+  await flushSave();
+  if (state.dirty) {
+    setStatus("当前工程还有未保存的修改，新建已取消", "bad");
+    return;
+  }
+
+  // 2) 目标已存在就必须显式确认：新建等于用空工程覆盖磁盘上的旧内容。
+  let existed = false;
+  try {
+    existed = Boolean((await loadAnnotationProject(path)).exists);
+  } catch {
+    /* 读不到就交给保存阶段去报错 */
+  }
+  if (existed && !window.confirm(`磁盘上已存在工程：\n${path}\n\n新建会用空工程覆盖它，确定继续？`)) {
+    setStatus("已取消新建", "warn");
+    return;
+  }
+
+  const project = {
     version: 1,
     task: "detect",
     rev: 0,
     classes: [{ id: 0, name: "object", color: [31, 182, 255] }],
     images: [],
   };
-  state.meta = { rev: -1, mtime_ns: "0", size: 0 };
-  state.dirty = false;
-  state.currentIndex = -1;
-  state.selectedId = "";
-  state.undo.length = 0;
-  state.redo.length = 0;
-  updateHistoryButtons();
-  renderAll();
-  renderCanvas();
-  await saveProject({ force: true, silent: false });
+
+  // 3) 先写盘、成功后再接管内存状态。
+  // 反过来的话，写失败会留下一个「内存里是新工程、磁盘上是旧工程」的假象，
+  // 用户接着编辑并自动保存，就把旧工程悄悄覆盖掉了。
+  state.saving = true;
+  try {
+    const result = await saveAnnotationProject({ path, project, rev: null, stamp: null, force: true });
+    state.path = result.path || path;
+    state.project = project;
+    state.meta = { rev: result.rev, mtime_ns: result.meta.mtime_ns, size: result.meta.size };
+    state.exists = true;
+    state.dirty = false;
+    state.currentIndex = -1;
+    state.selectedId = "";
+    state.undo.length = 0;
+    state.redo.length = 0;
+    if (el.path) el.path.value = state.path;
+    updateHistoryButtons();
+    renderAll();
+    renderCanvas();
+    setStatus(`已新建工程 rev=${result.rev}`, "ok");
+  } catch (error) {
+    setStatus(`新建失败：${error.message}`, "bad");
+  } finally {
+    state.saving = false;
+    updateSaveState();
+  }
 }
 
-async function saveProject({ silent = false, force = false } = {}) {
-  if (!state.project || !state.path) return;
-  if (state.saving) return;
+/**
+ * 保存工程。同一时刻只允许一个请求在飞：
+ * 期间的新请求记成 `saveQueued`，等当前请求结束后补跑一次。
+ *
+ * 外层这层包装只做一件事：把在飞请求的 promise 挂到 `state.saveTask`，
+ * 让 `flushSave` 能等它落地（切图、导出、冲突重载都依赖这一点）。
+ */
+function saveProject(options = {}) {
+  if (!state.project || !state.path) return Promise.resolve();
+  if (state.saving) {
+    // 已有请求在飞：记一笔，等它结束后补存一次。
+    // 直接丢弃会让这批编辑永远等不到保存（防抖定时器已被 flushSave 清掉）。
+    state.saveQueued = true;
+    return state.saveTask || Promise.resolve();
+  }
+  const task = runSaveProject(options).finally(() => {
+    if (state.saveTask === task) state.saveTask = null;
+  });
+  state.saveTask = task;
+  return task;
+}
+
+async function runSaveProject({ silent = false, force = false } = {}) {
   state.saving = true;
+  const sentSeq = state.editSeq;
   try {
     const result = await saveAnnotationProject({
       path: state.path,
@@ -354,7 +465,9 @@ async function saveProject({ silent = false, force = false } = {}) {
     });
     state.meta = { rev: result.rev, mtime_ns: result.meta.mtime_ns, size: result.meta.size };
     state.exists = true;
-    state.dirty = false;
+    // 请求体是发出时的快照：期间若又编辑过，这批内容并没有写盘，
+    // 因此必须保持 dirty 并重新排期，不能无条件清掉。
+    state.dirty = state.editSeq !== sentSeq;
     state.path = result.path || state.path;
     if (el.path) el.path.value = state.path;
     if (result.warnings?.length) {
@@ -364,6 +477,7 @@ async function saveProject({ silent = false, force = false } = {}) {
     }
     updateSaveState();
     renderImageList();
+    if (state.dirty) scheduleSave();
   } catch (error) {
     if (error instanceof ApiError && error.status === 409) {
       showConflict(error);
@@ -372,6 +486,10 @@ async function saveProject({ silent = false, force = false } = {}) {
     }
   } finally {
     state.saving = false;
+    if (state.saveQueued) {
+      state.saveQueued = false;
+      if (state.dirty && !state.conflict) saveProject({ silent: true });
+    }
   }
 }
 
@@ -413,6 +531,12 @@ async function loadCurrentImage() {
     renderCanvas();
     return;
   }
+  // 解码是异步的：记下本次加载的序号，回调里比对。
+  // 不加这层，快速切图时旧图后到会覆盖新图，画布上就会是"
+  // 上一张的位图配这一张的标注"，坐标全错。
+  state.imageLoadSeq += 1;
+  const seq = state.imageLoadSeq;
+
   if (!image.width || !image.height) {
     try {
       const meta = await annotationImageMeta(image.path);
@@ -422,14 +546,18 @@ async function loadCurrentImage() {
       /* 尺寸探测失败不阻塞显示，画布按已有宽高处理 */
     }
   }
+  if (seq !== state.imageLoadSeq) return;  // 等元信息期间又切图了
+
   const bitmap = new Image();
   bitmap.onload = () => {
+    if (seq !== state.imageLoadSeq) return;  // 旧图后到，丢弃
     state.image = bitmap;
     fitView();
     renderCanvas();
     setStatus(`${image.id} · ${image.width}×${image.height} · ${image.annotations.length} 个标注`);
   };
   bitmap.onerror = () => {
+    if (seq !== state.imageLoadSeq) return;
     state.image = null;
     renderCanvas();
     setStatus(`图片无法显示：${image.path}（检查是否在 TRTFORGE_BROWSE_ROOTS 内）`, "bad");
@@ -1347,20 +1475,49 @@ function handleDrag(point) {
   }
 
   if (drag.kind === "edge") {
-    // 拖边：只改那条边对应的坐标，另三条边不动
-    const corners = shapeCorners(target);
-    const xs = corners.map((p) => p[0]);
-    const ys = corners.map((p) => p[1]);
-    let minX = Math.min(...xs);
-    let maxX = Math.max(...xs);
-    let minY = Math.min(...ys);
-    let maxY = Math.max(...ys);
-    // 0=上边 1=右边 2=下边 3=左边
-    const index = drag.index;
-    if (index === 0) minY = point.y;
-    else if (index === 1) maxX = point.x;
-    else if (index === 2) maxY = point.y;
-    else minX = point.x;
+    // 拖边：只改那条边，另三条边不动。
+    // 旋转框必须**在它自己的局部坐标系里**改——先按 AABB 求出四条边再写回，
+    // 等于把斜放的框摆正，角度和形状都会糊掉。
+    const angle = Number(target.rotation) || 0;
+    const rotated = target.shape_type === "rotated_rect" && angle !== 0;
+    let minX;
+    let maxX;
+    let minY;
+    let maxY;
+    if (rotated) {
+      const [a, b] = target.points;
+      minX = Math.min(a[0], b[0]);
+      maxX = Math.max(a[0], b[0]);
+      minY = Math.min(a[1], b[1]);
+      maxY = Math.max(a[1], b[1]);
+      const cx = (minX + maxX) / 2;
+      const cy = (minY + maxY) / 2;
+      // 把光标换算到未旋转的局部坐标（R(-angle)）
+      const dx = point.x - cx;
+      const dy = point.y - cy;
+      const cos = Math.cos(angle);
+      const sin = Math.sin(angle);
+      const localX = cx + dx * cos + dy * sin;
+      const localY = cy - dx * sin + dy * cos;
+      // 0=上边 1=右边 2=下边 3=左边
+      if (drag.index === 0) minY = localY;
+      else if (drag.index === 1) maxX = localX;
+      else if (drag.index === 2) maxY = localY;
+      else minX = localX;
+    } else {
+      const corners = shapeCorners(target);
+      const xs = corners.map((p) => p[0]);
+      const ys = corners.map((p) => p[1]);
+      minX = Math.min(...xs);
+      maxX = Math.max(...xs);
+      minY = Math.min(...ys);
+      maxY = Math.max(...ys);
+      // 0=上边 1=右边 2=下边 3=左边
+      if (drag.index === 0) minY = point.y;
+      else if (drag.index === 1) maxX = point.x;
+      else if (drag.index === 2) maxY = point.y;
+      else minX = point.x;
+    }
     if (Math.abs(maxX - minX) < tolerance || Math.abs(maxY - minY) < tolerance) return;
     ensureDragHistory(drag);
     target.points = [
@@ -1501,11 +1658,8 @@ function acceptDraft(id) {
 }
 
 function rejectDraft(id) {
-  const drafts = currentDrafts();
-  const index = drafts.findIndex((item) => item.id === id);
-  if (index < 0) return;
-  drafts.splice(index, 1);
-  if (state.selectedId === id) state.selectedId = "";
+  // 丢弃草稿与删除标注是同一件事，只是对象在草稿区而不是标注区。
+  if (!removeObject(id)) return;
   renderAll();
   renderCanvas();
   setStatus("已丢弃草稿");
@@ -1754,6 +1908,15 @@ function renderProps() {
     return input;
   };
 
+  const numberInput = (value, onChange, step = null) => {
+    const input = document.createElement("input");
+    input.type = "number";
+    if (step) input.step = step;
+    input.value = value ?? "";
+    input.addEventListener("change", onChange);
+    return input;
+  };
+
   field(
     "标签",
     textInput(obj.label, (event) => {
@@ -1785,18 +1948,20 @@ function renderProps() {
     textInput(obj.description, (event) => {
       pushHistory();
       obj.description = event.target.value;
+      // 必须与其它属性一致地走 afterEdit：否则描述改了不标脏、不排期自动保存，
+      // 关页面时静默丢掉。
+      afterEdit();
     }),
   );
 
-  const groupInput = document.createElement("input");
-  groupInput.type = "number";
-  groupInput.value = String(obj.group_id ?? 0);
-  groupInput.addEventListener("change", () => {
-    pushHistory();
-    obj.group_id = Number(groupInput.value) || 0;
-    afterEdit();
-  });
-  field("分组", groupInput);
+  field(
+    "分组",
+    numberInput(obj.group_id ?? 0, (event) => {
+      pushHistory();
+      obj.group_id = Number(event.target.value) || 0;
+      afterEdit();
+    }),
+  );
 
   if (obj.shape_type === "keypoints") {
     field(
@@ -1817,31 +1982,29 @@ function renderProps() {
   }
 
   if (obj.shape_type === "rotated_rect") {
-    const rotInput = document.createElement("input");
-    rotInput.type = "number";
-    rotInput.step = "0.01";
-    rotInput.value = String(obj.rotation ?? 0);
-    rotInput.addEventListener("change", () => {
-      pushHistory();
-      obj.rotation = Number(rotInput.value) || 0;
-      afterEdit();
-      renderCanvas();
-    });
-    field("旋转角", rotInput);
+    field(
+      "旋转角",
+      numberInput(obj.rotation ?? 0, (event) => {
+        pushHistory();
+        obj.rotation = Number(event.target.value) || 0;
+        afterEdit();
+        renderCanvas();
+      }, "0.01"),
+    );
   }
 
-  const scoreInput = document.createElement("input");
-  scoreInput.type = "number";
-  scoreInput.step = "0.01";
-  scoreInput.value = Number(obj.score) >= 0 ? String(Number(obj.score)) : "";
+  const scoreInput = numberInput(
+    Number(obj.score) >= 0 ? Number(obj.score) : "",
+    () => {
+      pushHistory();
+      const value = Number(scoreInput.value);
+      obj.score = scoreInput.value !== "" && Number.isFinite(value) ? value : -1;
+      afterEdit();
+      renderCanvas();
+    },
+    "0.01",
+  );
   scoreInput.placeholder = "无";
-  scoreInput.addEventListener("change", () => {
-    pushHistory();
-    const value = Number(scoreInput.value);
-    obj.score = scoreInput.value !== "" && Number.isFinite(value) ? value : -1;
-    afterEdit();
-    renderCanvas();
-  });
   field("置信度", scoreInput);
 
   const difficultRow = document.createElement("label");
@@ -1859,53 +2022,34 @@ function renderProps() {
   el.props.appendChild(difficultRow);
 
   // 属性用 "key: value" 每行一条：比 JSON 好输入，也比键值表格省空间
-  const attrLabel = document.createElement("p");
-  attrLabel.className = "anno-hint";
-  attrLabel.textContent = "属性（每行 键: 值）";
-  const attrArea = document.createElement("textarea");
-  attrArea.rows = 3;
-  attrArea.value = Object.entries(obj.attributes || {})
-    .map(([key, value]) => `${key}: ${value}`)
-    .join("\n");
-  attrArea.addEventListener("change", () => {
-    pushHistory();
-    const attributes = {};
-    for (const line of attrArea.value.split("\n")) {
-      const position = line.indexOf(":");
-      if (position <= 0) continue;
-      const key = line.slice(0, position).trim();
-      const value = line.slice(position + 1).trim();
-      if (key) attributes[key] = value;
-    }
+  const keyedArea = (title, rows, source, onChange) => {
+    const label = document.createElement("p");
+    label.className = "anno-hint";
+    label.textContent = title;
+    const area = document.createElement("textarea");
+    area.rows = rows;
+    area.value = formatKeyedLines(source);
+    area.addEventListener("change", () => {
+      pushHistory();
+      onChange(parseKeyedLines(area.value));
+      afterEdit();
+    });
+    el.props.append(label, area);
+  };
+
+  keyedArea("属性（每行 键: 值）", 3, obj.attributes, (attributes) => {
     if (Object.keys(attributes).length) obj.attributes = attributes;
     else delete obj.attributes;
-    afterEdit();
   });
-  el.props.append(attrLabel, attrArea);
 
-  const flagLabel = document.createElement("p");
-  flagLabel.className = "anno-hint";
-  flagLabel.textContent = "标记（每行 键: true/false）";
-  const flagArea = document.createElement("textarea");
-  flagArea.rows = 2;
-  flagArea.value = Object.entries(obj.flags || {})
-    .map(([key, value]) => `${key}: ${value}`)
-    .join("\n");
-  flagArea.addEventListener("change", () => {
-    pushHistory();
+  keyedArea("标记（每行 键: true/false）", 2, obj.flags, (rawFlags) => {
     const flags = {};
-    for (const line of flagArea.value.split("\n")) {
-      const position = line.indexOf(":");
-      if (position <= 0) continue;
-      const key = line.slice(0, position).trim();
-      const raw = line.slice(position + 1).trim().toLowerCase();
-      if (key) flags[key] = raw === "true" || raw === "1";
+    for (const [key, value] of Object.entries(rawFlags)) {
+      flags[key] = value.toLowerCase() === "true" || value === "1";
     }
     if (Object.keys(flags).length) obj.flags = flags;
     else delete obj.flags;
-    afterEdit();
   });
-  el.props.append(flagLabel, flagArea);
 
   const hideRow = document.createElement("label");
   hideRow.className = "anno-toggle";

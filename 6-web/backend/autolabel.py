@@ -253,14 +253,10 @@ def drafts_from_shapes(shapes: list[dict], task: str = "detect") -> list[dict]:
 
     groups: dict[int, list[dict]] = {}
     singles: list[dict] = []
-    for index, shape in enumerate(shapes):
+    for shape in shapes:
         if not isinstance(shape, dict):
             continue
-        shape_type = str(shape.get("shape_type") or shape.get("type") or "rectangle").lower()
-        group_id = int(shape.get("group_id", 0) or 0)
-        if task == "pose" and shape_type in ("point", "keypoint") and group_id:
-            groups.setdefault(group_id, []).append(shape)
-            continue
+        group_id = annotation.as_int(shape.get("group_id"), 0)
         if group_id:
             groups.setdefault(group_id, []).append(shape)
         else:
@@ -278,12 +274,12 @@ def drafts_from_shapes(shapes: list[dict], task: str = "detect") -> list[dict]:
                     pair = pair[0]
                 if isinstance(pair, (list, tuple)) and len(pair) >= 2:
                     points.append([float(pair[0]), float(pair[1])])
-                    visibility.append(int(member.get("visibility", 2)))
+                    visibility.append(annotation.as_int(member.get("visibility", 2), 2))
             if points:
                 draft = _draft(
                     shape="keypoints",
                     points=points,
-                    class_id=int(members[0].get("class_id", 0) or 0),
+                    class_id=annotation.as_int(members[0].get("class_id"), 0),
                     label=str(members[0].get("label") or ""),
                     score=-1.0,
                     group_id=group_id,
@@ -300,13 +296,14 @@ def drafts_from_shapes(shapes: list[dict], task: str = "detect") -> list[dict]:
         except annotation.AnnotationError:
             continue
         obj["id"] = obj.get("id") or _draft_id()
-        obj["class_id"] = int(shape.get("class_id", 0) or 0)
+        obj["class_id"] = annotation.as_int(shape.get("class_id"), 0)
         drafts.append(obj)
 
     for draft in drafts:
         draft.setdefault("_draft", True)
-    if warnings:
-        drafts[0].setdefault("_warnings", warnings) if drafts else None
+    # 清洗阶段的说明挂在第一条草稿上，前端接受/拒绝时会一并显示。
+    if warnings and drafts:
+        drafts[0].setdefault("_warnings", warnings)
     return drafts
 
 

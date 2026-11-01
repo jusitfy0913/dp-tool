@@ -123,12 +123,11 @@ export function buildOverlay(options) {
     let anchorY;
 
     if (box.is_obb && box.obb) {
-      const points = obbCorners(box.obb).map(([x, y]) => `${x},${y}`).join(" ");
+      const corners = obbCorners(box.obb);
       shape = document.createElementNS(SVG_NS, "polygon");
-      shape.setAttribute("points", points);
-      const first = obbCorners(box.obb)[0];
-      anchorX = first[0];
-      anchorY = Math.min(...obbCorners(box.obb).map((p) => p[1]));
+      shape.setAttribute("points", corners.map(([x, y]) => `${x},${y}`).join(" "));
+      anchorX = corners[0][0];
+      anchorY = Math.min(...corners.map((point) => point[1]));
     } else {
       shape = document.createElementNS(SVG_NS, "rect");
       shape.setAttribute("x", String(box.left));
@@ -160,7 +159,7 @@ export function buildOverlay(options) {
 
     if (showLabels) {
       const text = `${box.label_name || `cls${box.class_label}`} ${box.confidence.toFixed(2)}`;
-      group.appendChild(buildLabel({ text, color, x: anchorX, y: anchorY, height, opacity }));
+      group.appendChild(buildLabel({ text, color, x: anchorX, y: anchorY, opacity }));
     }
 
     for (const kpt of box.kpts || []) {
@@ -184,7 +183,7 @@ export function buildOverlay(options) {
 /**
  * 构建一个标签（背景块 + 文字），并放进 `g.ov-label` 里等待反向缩放。
  */
-function buildLabel({ text, color, x, y, height, opacity }) {
+function buildLabel({ text, color, x, y, opacity }) {
   const group = document.createElementNS(SVG_NS, "g");
   group.setAttribute("class", "ov-label");
   group.setAttribute("opacity", String(opacity));

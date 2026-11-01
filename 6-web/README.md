@@ -366,8 +366,22 @@ POST {service}/predict    multipart/form-data
 | 类别名 | 只在推理页 | 标注页与推理页共用 `labels.py` 的配色与命名 |
 | 导出 | 只能导出推理结果图 | 工程级导出 YOLO / COCO / VOC，与数据集页同实现 |
 
-验收脚本：`python 6-web/backend/tools/test_annotation_project.py`（131 项），
+验收脚本：`python 6-web/backend/tools/test_annotation_project.py`（138 项），
 外加浏览器实测六种形状、撤销重做、冲突弹窗、真实 `.engine` 自动标注与三种格式导出。
+
+#### v1.12 修复（代码审查发现，按严重度从高到低）
+
+| 严重度 | 问题 | 修复方式 |
+| --- | --- | --- |
+| 高 | 「批量加入图片」用 GET 调后端的 POST 扫描接口，直接 405 | 客户端改发 POST，参数仍走查询串 |
+| 高 | 自动保存期间的新编辑会被丢弃（`saving` 时直接 return）且保存成功即无条件清除脏标记 | 增加编辑序号 `editSeq` 比对 + `saveQueued` 补存；`flushSave` 先等在飞请求落地 |
+| 中 | 「描述」字段改完不标脏、不排期保存，关页面即丢 | 与其它属性一致地走 `afterEdit()` |
+| 中 | 快速切图时旧图解码后到，画布出现「上一张的位图 + 这一张的标注」 | `imageLoadSeq` 序号比对，过期回调直接丢弃 |
+| 中 | 旋转框拖边先转成 AABB 再写回，把斜放的框「摆正」 | 在框自身的局部坐标系（`R(-angle)`）里只改目标那条边 |
+| 中 | 「新建」固定 `force: true` 静默覆盖磁盘上的已有工程 | 先探测是否存在并要求确认；先写盘成功再接管内存状态 |
+| 中 | 撤销/重做只改数组不切视图，可能在别的图上「莫名少框」 | 快照带图片索引，索引变化时同步切图并重新解码 |
+| 中 | 同进程并发保存共用 pid 临时文件，且「读 rev → 写回」无锁 | 临时名加 uuid；按绝对路径加写锁，`touch()` 共用同一把锁 |
+| 低 | 校验器用同一个 `seen_ids` 混算图片 id 与标注 id，正常的 Qt 工程被误报重复 | 图片 id 全局去重、标注 id 逐图去重 |
 
 ### 环境说明
 
@@ -470,7 +484,7 @@ offset1 = cursor - p_image * scale1
 
 | 方法 | 路径 | 用途 |
 | --- | --- | --- |
-| GET | `/api/health` | 存活探针，返回 `{"ok":true,"version":"1.11.0"}`；版本号用来识别「连到了旧进程」 |
+| GET | `/api/health` | 存活探针，返回 `{"ok":true,"version":"1.12.0"}`；版本号用来识别「连到了旧进程」 |
 | GET | `/api/capabilities` | 环境探测（前端状态灯用） |
 | POST | `/api/train/yolo` | 启动 YOLO 训练 |
 | POST | `/api/train/anomalib` | 启动 Anomalib 训练 |
@@ -622,7 +636,7 @@ node 6-web\frontend\tests\test_contrast.mjs
 | 脚本 | 结果 |
 | --- | --- |
 | `test_infer_params.py` | **71 / 71 通过** |
-| `test_annotation_project.py` | **131 / 131 通过** |
+| `test_annotation_project.py` | **138 / 138 通过** |
 | `test_augment_params.py` | 26 / 26 通过 |
 | `test_dataset_workbench.py` | 20 / 20 通过 |
 | `test_exit_codes.py` | 6 / 6 通过 |
@@ -730,14 +744,14 @@ D:\Anaconda3\envs\dpenv\python.exe -m uvicorn app:app --app-dir 6-web\backend `
 判断标准只有一条：**`CreationDate` 必须晚于你最后一次改后端代码的时间。**
 `--reload` 只监听 `.py`，改了前端 HTML/CSS/JS 仍需浏览器 `Ctrl+F5`。
 
-更快的判断办法：**看顶栏标题下方的版本号徽标**（`v1.11.0` 这种，来自 `/api/health`）。
+更快的判断办法：**看顶栏标题下方的版本号徽标**（`v1.12.0` 这种，来自 `/api/health`）。
 后端代码一改，`app.py` 里的 `APP_VERSION` 就要跟着加，页面上的徽标才会变。
 徽标数字没变 = 页面连的还是旧进程，这时候改什么都不会生效。
 
 ```powershell
 # 一条命令确认后端版本
 Invoke-WebRequest http://127.0.0.1:8060/api/health -UseBasicParsing | Select-Object -ExpandProperty Content
-# 期望输出类似 {"ok":true,"version":"1.11.0"}
+# 期望输出类似 {"ok":true,"version":"1.12.0"}
 ```
 
 ## 与 Qt 版的关系

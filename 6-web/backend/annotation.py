@@ -21,7 +21,9 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import time
+import uuid
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -278,6 +280,26 @@ def _as_points(raw) -> list[list[float]]:
     return points
 
 
+def as_int(value, default: int) -> int:
+    """把外部输入转成 int，失败就用 ``default``。
+
+    `.tfanno` 可能来自 Qt、手工编辑或外部标注服务，单个字段类型不对
+    不该让整份工程读不出来，所以转换失败在这里统一吞掉。
+    """
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def as_float(value, default: float) -> float:
+    """与 :func:`as_int` 同理，用于浮点字段。"""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def _fold_rectangle(points: list[list[float]], shape: str) -> list[list[float]]:
     """把 4 个角点折叠成 Qt 的 2 点对角线表示。
 
@@ -317,10 +339,10 @@ def normalize_object(raw: dict, warnings: list[str] | None = None) -> dict:
             points = _fold_rectangle(points, shape)
         elif len(points) > arity:
             points = points[:arity]
-        elif len(points) < arity:
-            warnings and warnings.append(f"标注「{object_id}」的 {shape} 点数不足（{len(points)} < {arity}）")
-    elif shape == "polygon" and len(points) < 3:
-        warnings and warnings.append(f"多边形「{object_id}」只有 {len(points)} 个点，无法围成面积")
+        elif len(points) < arity and warnings is not None:
+            warnings.append(f"标注「{object_id}」的 {shape} 点数不足（{len(points)} < {arity}）")
+    elif shape == "polygon" and len(points) < 3 and warnings is not None:
+        warnings.append(f"多边形「{object_id}」只有 {len(points)} 个点，无法围成面积")
 
     visibility = []
     for value in raw.get("keypoint_visibility") or []:
@@ -335,37 +357,17 @@ def normalize_object(raw: dict, warnings: list[str] | None = None) -> dict:
         elif len(visibility) > len(points):
             visibility = visibility[: len(points)]
 
-    try:
-        score = float(raw.get("score", -1.0))
-    except (TypeError, ValueError):
-        score = -1.0
-
-    try:
-        rotation = float(raw.get("rotation", 0.0) or 0.0)
-    except (TypeError, ValueError):
-        rotation = 0.0
-
-    try:
-        group_id = int(raw.get("group_id", 0) or 0)
-    except (TypeError, ValueError):
-        group_id = 0
-
-    try:
-        class_id = int(raw.get("class_id", 0) or 0)
-    except (TypeError, ValueError):
-        class_id = 0
-
     obj = {
         "id": object_id,
-        "class_id": class_id,
+        "class_id": as_int(raw.get("class_id"), 0),
         "label": str(raw.get("label") or ""),
         "description": str(raw.get("description") or ""),
-        "group_id": group_id,
+        "group_id": as_int(raw.get("group_id"), 0),
         "shape_type": shape,
         "points": points,
-        "rotation": rotation,
+        "rotation": as_float(raw.get("rotation"), 0.0),
         "keypoint_visibility": visibility,
-        "score": score,
+        "score": as_float(raw.get("score", -1.0), -1.0),
     }
     # 扩展字段：只在显式出现时保留，默认值丢弃（不落盘）。
     for key in ("difficult", "flags", "attributes"):
@@ -389,12 +391,13 @@ def normalize_image(raw: dict, warnings: list[str] | None = None) -> dict:
         try:
             annotations.append(normalize_object(item, warnings))
         except AnnotationError as exc:
-            warnings and warnings.append(f"图片「{image_id}」有一条标注被跳过：{exc}")
+            if warnings is not None:
+                warnings.append(f"图片「{image_id}」有一条标注被跳过：{exc}")
     return new_image(
         image_id,
         path,
-        int(raw.get("width") or 0),
-        int(raw.get("height") or 0),
+        as_int(raw.get("width"), 0),
+        as_int(raw.get("height"), 0),
         split_from_str(str(raw.get("split") or "train"), warnings),
         annotations,
     )
@@ -412,10 +415,7 @@ def normalize_project(raw: dict) -> tuple[dict, list[str]]:
     for index, item in enumerate(raw.get("classes") or []):
         if not isinstance(item, dict):
             continue
-        try:
-            class_id = int(item.get("id", index))
-        except (TypeError, ValueError):
-            class_id = index
+        class_id = as_int(item.get("id"), index)
         color = item.get("color")
         if isinstance(color, (list, tuple)) and len(color) >= 3:
             try:
@@ -436,14 +436,8 @@ def normalize_project(raw: dict) -> tuple[dict, list[str]]:
         except AnnotationError as exc:
             warnings.append(f"一条图片记录被跳过：{exc}")
 
-    try:
-        version = int(raw.get("version", CURRENT_VERSION))
-    except (TypeError, ValueError):
-        version = CURRENT_VERSION
-    try:
-        rev = max(0, int(raw.get("rev", 0) or 0))
-    except (TypeError, ValueError):
-        rev = 0
+    version = as_int(raw.get("version", CURRENT_VERSION), CURRENT_VERSION)
+    rev = max(0, as_int(raw.get("rev"), 0))
 
     project = {
         "version": version if version > 0 else CURRENT_VERSION,
@@ -562,13 +556,14 @@ def read_stamp(path: str | Path) -> dict:
     if not target.is_file():
         return {"rev": -1, "mtime_ns": "0", "size": 0, "exists": False}
     stat = target.stat()
+    # 读不出 rev 就当 0：这个值只用于乐观锁，不该让「看看文件状态」失败。
     rev = 0
     try:
         raw = json.loads(target.read_text(encoding="utf-8-sig", errors="replace"))
-        if isinstance(raw, dict):
-            rev = max(0, int(raw.get("rev", 0) or 0))
-    except (OSError, json.JSONDecodeError, TypeError, ValueError):
-        rev = 0
+    except (OSError, json.JSONDecodeError):
+        raw = None
+    if isinstance(raw, dict):
+        rev = max(0, as_int(raw.get("rev"), 0))
     return {"rev": rev, "mtime_ns": str(stat.st_mtime_ns), "size": stat.st_size, "exists": True}
 
 
@@ -605,14 +600,37 @@ def load(path: str | Path) -> tuple[dict, dict]:
     return project, meta
 
 
+_WRITE_LOCKS: dict[str, threading.Lock] = {}
+_WRITE_LOCKS_GUARD = threading.Lock()
+
+
+def _lock_for(target: Path) -> threading.Lock:
+    """按规范化后的绝对路径取一把写锁。
+
+    uvicorn 的同步路由跑在线程池里，同一个工程可能被两次请求同时保存。
+    「读 rev → 校验 → 写回 rev+1」这段必须串行，否则两次保存都能通过校验，
+    后写的直接抹掉前一次的内容（丢更新）。
+    """
+    key = os.path.abspath(str(target))
+    with _WRITE_LOCKS_GUARD:
+        lock = _WRITE_LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _WRITE_LOCKS[key] = lock
+        return lock
+
+
 def _atomic_write(target: Path, text: str) -> None:
     """先写临时文件再替换。
 
     直接覆盖写在中途失败（磁盘满、进程被杀）时会留下半截 JSON，
     用户的工程就废了。原子替换把损失限制在「没保存成功」。
+
+    临时文件名带 uuid：只用 pid 的话，同进程内的两个请求会写同一个临时文件，
+    互相把对方的半截内容 replace 成正式文件。
     """
     target.parent.mkdir(parents=True, exist_ok=True)
-    temp = target.with_suffix(target.suffix + f".tmp{os.getpid()}")
+    temp = target.with_suffix(target.suffix + f".tmp{os.getpid()}.{uuid.uuid4().hex[:8]}")
     try:
         temp.write_text(text, encoding="utf-8", newline="\n")
         os.replace(temp, target)
@@ -640,6 +658,18 @@ def save(
     冲突时抛 :class:`RevisionConflict`，**不写盘**。
     """
     target = Path(path)
+    with _lock_for(target):
+        return _save_locked(target, project, expected_rev, expected_stamp, force)
+
+
+def _save_locked(
+    target: Path,
+    project: dict,
+    expected_rev: int | None,
+    expected_stamp: dict | None,
+    force: bool,
+) -> dict:
+    """``save`` 的实现体，调用方**必须**已持有该路径的写锁。"""
     disk = read_stamp(target)
     normalized, warnings = normalize_project(project)
 
@@ -657,7 +687,7 @@ def save(
             if same_rev and disk["exists"] and parsed is not None:
                 client_ns, exact = parsed
                 drift = abs(client_ns - int(disk["mtime_ns"]))
-                size_mismatch = int(expected_stamp.get("size") or 0) != disk["size"]
+                size_mismatch = as_int(expected_stamp.get("size"), 0) != disk["size"]
                 # 精确值必须完全一致；浮点数最多容忍 STAMP_TOLERANCE_NS 的末位舍入。
                 if size_mismatch or drift > (0 if exact else STAMP_TOLERANCE_NS):
                     # 修订号没变但文件指纹变了：说明有人绕过本接口改了文件。
@@ -684,8 +714,10 @@ def touch(path: str | Path, project: dict) -> dict:
     """按当前内容重写一次（用于导出前把内存状态落成临时文件）。不动 rev 语义。"""
     target = Path(path)
     normalized, warnings = normalize_project(project)
-    normalized["rev"] = max(0, read_stamp(target)["rev"])
-    _atomic_write(target, dumps(normalized))
+    # 与 save 共用同一把锁：导出前重写和用户手动保存撞在一起同样会写出半截文件。
+    with _lock_for(target):
+        normalized["rev"] = max(0, read_stamp(target)["rev"])
+        _atomic_write(target, dumps(normalized))
     return {"rev": normalized["rev"], "warnings": warnings}
 
 
@@ -769,22 +801,25 @@ def validate(project: dict) -> list[str]:
     issues: list[str] = []
     class_ids = {int(item.get("id", -1)) for item in project.get("classes") or []}
 
-    seen_ids: set[str] = set()
+    # 两类别 id 必须分开算：图片 id 是全局的，标注 id 只需在单张图内唯一
+    # （Qt 端和历史工程都是从 1 开始、逐图重置）。共用一个集合会把正常工程误判成重复。
+    seen_image_ids: set[str] = set()
     for image in project.get("images") or []:
         image_id = str(image.get("id") or "")
         if not image_id:
             issues.append("有图片缺少 id")
-        elif image_id in seen_ids:
+        elif image_id in seen_image_ids:
             issues.append(f"图片 id 重复：{image_id}")
-        seen_ids.add(image_id)
+        seen_image_ids.add(image_id)
 
         width = int(image.get("width") or 0)
         height = int(image.get("height") or 0)
+        seen_object_ids: set[str] = set()
         for obj in image.get("annotations") or []:
             object_id = str(obj.get("id") or "")
-            if object_id in seen_ids:
-                issues.append(f"标注 id 重复：{object_id}")
-            seen_ids.add(object_id)
+            if object_id in seen_object_ids:
+                issues.append(f"标注 id 重复：{image_id} / {object_id}")
+            seen_object_ids.add(object_id)
 
             if int(obj.get("class_id", 0)) not in class_ids:
                 issues.append(f"标注「{object_id}」引用了不存在的类别 {obj.get('class_id')}")

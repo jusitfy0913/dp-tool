@@ -100,7 +100,8 @@ export function annotationImageMeta(path) {
 }
 
 export function scanAnnotationImages(root, recursive = true) {
-  return getJSON(`/api/annotation/scan-images?${query({ root, recursive })}`);
+  // 后端是 @app.post（参数走查询串）：用 GET 会拿到 405，"批量加入图片"整条流程都失效。
+  return postJSON(`/api/annotation/scan-images?${query({ root, recursive })}`, {});
 }
 
 export function exportAnnotationProject(payload) {

@@ -42,7 +42,7 @@ from runners import manager
 
 #: 应用版本号。前端顶栏与 /api/health 都读它，方便一眼看出「页面连的是哪个后端」。
 #: 起因：改了代码但 8060 上跑的是几小时前的旧进程，排查很久才发现。
-APP_VERSION = "1.11.0"
+APP_VERSION = "1.12.0"
 
 # ---------------------------------------------------------------------------
 # 应用与生命周期
@@ -534,12 +534,7 @@ class DatasetExportRequest(DatasetScanRequest):
 
 def _ensure_dataset_path(path: str) -> None:
     """数据集路径沿用目录浏览的白名单，避免接口被用来读任意磁盘。"""
-    target = Path(path).expanduser().resolve()
-    if not config.is_path_allowed(target):
-        raise HTTPException(
-            status_code=403,
-            detail=f"路径不在允许范围内：{target}。可设置 TRTFORGE_BROWSE_ROOTS 追加允许的根目录。",
-        )
+    _ensure_allowed_path(path)
 
 
 @app.post("/api/dataset/scan")
@@ -991,12 +986,12 @@ class AnnotationAutoLabelRequest(BaseModel):
     timeout: float = Field(default=20.0, ge=1.0, le=300.0)
 
 
-def _ensure_annotation_path(path: str) -> Path:
-    """标注相关路径的白名单校验。
+def _ensure_allowed_path(path: str) -> Path:
+    """把路径解析成绝对路径并做白名单校验，返回解析结果。
 
-    与目录浏览、数据集扫描共用同一份白名单（`config.is_path_allowed`）。
-    单独包一层是为了把错误信息说清楚：标注页最常见的困惑是
-    "工程能打开，但图片全是裂的"，根因就是图片所在盘不在白名单里。
+    目录浏览、数据集、标注三条链路共用同一份白名单（`config.is_path_allowed`）。
+    集中在这里是为了错误信息只维护一份——标注页最常见的困惑是
+    「工程能打开，但图片全是裂的」，根因就是图片所在盘不在白名单里。
     """
     target = Path(path).expanduser()
     try:
@@ -1021,15 +1016,17 @@ def annotation_load(path: str) -> dict:
     返回三块内容：规范化后的工程、文件指纹（供保存时回传）、图片列表统计。
     ``exists=False`` 时工程字段是一份可直接用的空白骨架，前端据此进入"新建"流程。
     """
-    target = _ensure_annotation_path(path)
+    target = _ensure_allowed_path(path)
     if not target.is_file():
+        # 文件不存在不是错误：前端要拿到一份可直接编辑的骨架，点「新建」再落盘。
+        blank = annotation.new_project()
         return {
             "ok": True,
             "exists": False,
             "path": str(target),
-            "project": annotation.new_project(),
+            "project": blank,
             "meta": {"rev": -1, "mtime_ns": "0", "size": 0, "warnings": []},
-            "stats": annotation.stats(annotation.new_project()),
+            "stats": annotation.stats(blank),
         }
 
     try:
@@ -1053,7 +1050,7 @@ def annotation_save(request: AnnotationProjectRequest) -> dict:
 
     409 而不是 400：前端要据此弹"冲突"对话框，而不是显示一条普通错误。
     """
-    target = _ensure_annotation_path(request.path)
+    target = _ensure_allowed_path(request.path)
     if target.suffix.lower() != ".tfanno":
         raise HTTPException(status_code=400, detail="标注工程文件扩展名必须是 .tfanno")
 
@@ -1100,7 +1097,7 @@ def annotation_image(path: str) -> FileResponse:
     单独开接口而不是挂 `/static`：数据集在仓库任意位置，挂载点无法覆盖，
     而且挂载目录等于把整个目录树暴露成静态资源。
     """
-    target = _ensure_annotation_path(path)
+    target = _ensure_allowed_path(path)
     if not target.is_file():
         raise HTTPException(status_code=404, detail=f"图片不存在：{target}")
 
@@ -1113,7 +1110,7 @@ def annotation_image(path: str) -> FileResponse:
 @app.get("/api/annotation/image-meta")
 def annotation_image_meta(path: str) -> dict:
     """探测单张图片的尺寸，供"添加图片到工程"时填 width/height。"""
-    target = _ensure_annotation_path(path)
+    target = _ensure_allowed_path(path)
     if not target.is_file():
         raise HTTPException(status_code=404, detail=f"图片不存在：{target}")
     width, height = dataset._image_size(target)
@@ -1126,7 +1123,7 @@ def annotation_scan_images(root: str, recursive: bool = True, limit: int = 5000)
 
     只认常见图片后缀，且跳过 `.tfanno` 的临时文件，避免把导出产物也收进来。
     """
-    base = _ensure_annotation_path(root)
+    base = _ensure_allowed_path(root)
     if not base.is_dir():
         raise HTTPException(status_code=400, detail=f"不是目录：{base}")
 
@@ -1152,7 +1149,7 @@ def annotation_export(request: AnnotationExportRequest) -> dict:
     走 `annotation.to_dataset_project` + `dataset.export_*`，
     既不另写一套导出，也不需要先把工程落盘再读回来（那样会丢掉未保存的编辑）。
     """
-    target = _ensure_annotation_path(request.output)
+    target = _ensure_allowed_path(request.output)
     if request.format not in dataset.FORMATS:
         raise HTTPException(status_code=400, detail=f"未知导出格式：{request.format}")
 
@@ -1192,8 +1189,8 @@ def annotation_autolabel(request: AnnotationAutoLabelRequest) -> dict:
 
     草稿只存在会话内，绝不自动写盘——误检直接落盘等于把错误固化进工程。
     """
-    image = _ensure_annotation_path(request.image)
-    engine = _ensure_annotation_path(request.engine)
+    image = _ensure_allowed_path(request.image)
+    engine = _ensure_allowed_path(request.engine)
     if not image.is_file():
         raise HTTPException(status_code=404, detail=f"图片不存在：{image}")
     if not engine.is_file():
@@ -1201,7 +1198,7 @@ def annotation_autolabel(request: AnnotationAutoLabelRequest) -> dict:
 
     labels_path = ""
     if request.labels.strip():
-        labels_path = str(_ensure_annotation_path(request.labels))
+        labels_path = str(_ensure_allowed_path(request.labels))
 
     try:
         return autolabel.run(
