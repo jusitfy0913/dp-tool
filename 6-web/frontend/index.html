@@ -151,8 +151,54 @@
 
       <div class="card grow">
         <h2>训练日志 <span class="badge" id="runBadge">未开始</span></h2>
-        <div class="progress"><div class="bar" id="progressBar"></div></div>
+
+        <!-- 进度面板：
+             epoch / pct 来自后端 progress 与 epoch_summary 事件（真实值）；
+             「每轮耗时 / 预计剩余」由前端按最近 3 轮耗时的中位数推算，
+             后端不报 ETA —— 首轮要扫数据集，用平均值会被拉偏。 -->
+        <div class="run-progress">
+          <div class="run-progress-head">
+            <span class="badge" id="trainStage">待启动</span>
+            <span id="trainEpoch">epoch -/-</span>
+            <span id="trainPct">0.0%</span>
+            <span id="trainElapsed">已用 0:00</span>
+            <span id="trainEta">预计剩余 —</span>
+            <span id="trainSpeed">每轮 —</span>
+          </div>
+          <div class="progress"><div class="bar" id="progressBar"></div></div>
+        </div>
+
         <div class="metrics" id="metrics"></div>
+
+        <!-- 参数回显：以前只在日志里打一行命令，用户没法确认自己填的参数到底传进去没有 -->
+        <details class="run-fold" id="trainCommandBox" hidden>
+          <summary>实际执行的参数</summary>
+          <pre class="log log-mini" id="trainCommand"></pre>
+        </details>
+
+        <div class="chart-row" id="trainCharts" hidden>
+          <figure class="chart">
+            <figcaption id="lossChartCap">loss</figcaption>
+            <svg class="chart-svg" id="lossChart" viewBox="0 0 320 110"
+                 role="img" aria-label="loss 曲线"></svg>
+          </figure>
+          <figure class="chart">
+            <figcaption id="metricChartCap">指标</figcaption>
+            <svg class="chart-svg" id="metricChart" viewBox="0 0 320 110"
+                 role="img" aria-label="验证指标曲线"></svg>
+          </figure>
+        </div>
+
+        <details class="run-fold" id="epochTableBox" hidden>
+          <summary>每轮指标（最近 20 轮）</summary>
+          <div class="scrollbox">
+            <table class="data-table" id="epochTable">
+              <thead id="epochHead"></thead>
+              <tbody id="epochRows"></tbody>
+            </table>
+          </div>
+        </details>
+
         <pre class="log" id="logBox"></pre>
       </div>
     </div>
@@ -414,6 +460,19 @@
 
       <div class="card grow">
         <h2>构建日志 <span class="badge" id="engineBadge">未开始</span></h2>
+
+        <!-- 进度面板。百分比是**估算**：trtexec 在 tactic 选择阶段一行日志都不打
+             （实测 960×960 空白 473 秒），拿不到真实进度。口径见 backend/progress.py。 -->
+        <div class="build-steps" id="engSteps"></div>
+        <div class="progress"><div class="bar" id="engBar"></div></div>
+        <div class="build-line">
+          <span id="engPct">0%</span>
+          <span id="engStage">等待开始</span>
+          <span id="engElapsed">已用 0:00</span>
+          <span id="engEta">预计剩余 —</span>
+        </div>
+        <p class="hint" id="engEstimateNote"></p>
+
         <pre class="log" id="engineLog">等待构建…</pre>
       </div>
     </div>

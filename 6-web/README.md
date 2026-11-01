@@ -104,6 +104,40 @@ powershell -File scripts\run_web_studio.ps1 -HostName 0.0.0.0
 
 日志是流式的，不是训练完才一次性吐出来。中间关掉浏览器训练**不会停**，重新进来点任务还能继续看。
 
+#### 训练进度面板（v1.13）
+
+进度条上方那排数字不是装饰，训练开始后每秒都在动：
+
+| 位置 | 含义 | 数据来源 |
+| --- | --- | --- |
+| 阶段徽标 | 运行中 / 已完成 / 已停止 / 失败 | 任务事件 |
+| `epoch 12/100` | 当前轮次 | 后端 `progress` / `epoch_summary` 的 `epoch`、`total`（真实值） |
+| `12.0%` | 已完成轮次占比 | 同上（真实值） |
+| `已用 3:20` | 从点开始训练到现在 | 前端计时 |
+| `每轮 ≈ 18s` | 最近 3 轮耗时的**中位数** | 前端按 `epoch_summary` 到达时间算 |
+| `预计剩余 22:10` | 剩余轮数 × 每轮耗时 − 本轮已过去的时间 | 前端推算 |
+
+两处刻意的取舍：
+
+- **用中位数、不用平均值**：第 1 轮要扫数据集、建缓存，耗时常常是后面几轮的几倍，
+  平均值会让整段训练的剩余时间长期偏高。取最近 3 轮的中位数，第 2 轮之后基本就准了。
+- **「预计剩余」是推算值**，launcher 不提供 ETA。它只影响观感，不影响训练本身。
+
+另外三个折叠块（默认收起，不占地方）：
+
+| 折叠块 | 内容 |
+| --- | --- |
+| 实际执行的参数 | 完整命令行。以前只在日志里打一行，现在可以复制出来核对「我填的到底传没传」 |
+| 每轮指标（最近 20 轮） | 由 `epoch_summary` 的 `losses` / `metrics` / `lr` 动态生成列；列数上限 8，loss 在前、lr 在后 |
+| 曲线 | 两张零依赖内联 SVG：左 loss、右验证指标（优先 mAP50-95 与 mAP50），不引任何图表库 |
+
+> 训练结束后 launcher 还会补一次「最终验证」的 `epoch_summary`，其 `epoch = total + 1`。
+> 面板会把轮次夹到 `total`（不会出现「epoch 4/3」），这一行在表格里标成 **final**。
+>
+> loss 曲线优先用 `losses`；实测 8.x 的 `trainer.tloss` 在 `on_fit_epoch_end` 常为 None，
+> `losses` 是空字典，此时自动回退到验证损失之和，标题会写明「loss（总，验证）」，
+> 不会出现一条永远空着的曲线。
+
 #### 数据增强（v1.7）
 
 表单里有「数据增强（留空则用默认值，共 15 项）」折叠区，包含
@@ -211,8 +245,57 @@ YOLO 返回干净原图与每个目标的类别名/置信度，框由前端画�
 | 引擎大小 | 10.14 MB |
 | 吞吐 | 135.4 qps |
 
-> trtexec 在 960×960 这类大分辨率上做 tactic 搜索可能长达数分钟，期间日志可能长时间不刷新，
-> 这是正常的，不是卡死。GPU 占用率持续接近 100% 即为仍在编译。
+#### 构建进度与预计时间（v1.13）
+
+> **百分比是估算值，不是 trtexec 报的真实进度。**
+> trtexec 在整个 tactic 选择阶段**一行日志都不打**：真实日志
+> `runtime/logs/f066553e4df2.log` 里 `Local timing cache in use.` 到
+> `Engine built in 474.149 sec.` 之间是整整 **473 秒的空白**。没有进度可读，
+> 只能按「历史耗时 + 阶段边界」推算，界面上的口径说明也如实写明了这一点。
+
+界面元素：
+
+| 元素 | 说明 |
+| --- | --- |
+| 阶段清单 | 8 个阶段：启动 / 解析 ONNX / 解析完成 / 构建与 tactic 搜索 / 序列化 / 校验 / 推理基准 / 完成。已过为绿、当前为青 |
+| 百分比 | `已用 ÷ 估算耗时`，并夹在本阶段区间内（构建段封顶 **94%**，基准段封顶 **99%**） |
+| 已用 / 预计剩余 | 前端每秒刷新，不依赖后端事件（心跳是 2 秒一条） |
+| 估算依据 | 启动时显示「预计约 N 分 M 秒」并注明是估算 |
+
+三条设计约束（改之前先想清楚为什么）：
+
+1. **只有 `&&&& PASSED` 才到 100%。** 阶段上限刻意不衔接 100，因为估算必然有误差；
+   进度条冲满却还在跑，比停在 94% 更让人怀疑是不是卡死了。
+2. **失败/中断不补 100%。** 进度停在失败发生的位置，由 `finished` 事件说明结果。
+3. **估算会越用越准。** 每次成功的构建都从 `Engine built in X sec.` 抓真实耗时，
+   写进 `runtime/engine_stats.json`；下次相同（精度 / 动态 / 体积 ±67% / 分辨率 ±20%）
+   的构建直接用历史**中位数**，不再用公式。
+
+无历史时的外推公式（常量在 `backend/progress.py`）：
+
+```
+秒数 = 38.3 × ONNX_MB × (imgsz / 960) ^ 0.4     # FP16；FP32 再 × 0.7
+```
+
+`38.3` 与 `0.4` 都是实测反解出来的，两个数据点：
+
+| 模型 | ONNX | 输入 | 实测 `Engine built in` | 公式给出 |
+| --- | --- | --- | --- | --- |
+| PCB 6 类 | 12.39 MB | 960×960 | 474.1 s | 474.5 s |
+| PCB 6 类（3 轮微调后导出） | 12.07 MB | 320×320 | 313.6 s | 298 s |
+
+> 表中的「实测」取自日志里的 `Engine built in X sec.`，也就是估算要预测的那一段；
+> 浏览器上显示的「实际 5 分 17 秒」是进程总时长（含解析与推理基准），两者差几秒是正常的。
+
+> 为什么指数是 `0.4` 而不是 `2`：第一版按「面积」推算（`(imgsz/640)^2`），
+> 对 960 能对上但把 320 估成 **53 秒**，实测要 **5 分 17 秒**。
+> 原因是耗时主要由「层数 × 每层候选 kernel 数」决定，输入尺寸只影响每次候选的试跑成本；
+> 而且分辨率小 → 激活值小 → 显存里能塞下更多 tactic，搜索空间反而更大。
+> 按两个实测点反解得到指数 ≈ 0.37，取 0.4。
+
+> 若看到「预计剩余 0:00」但仍在构建，通常是实际比估算慢（GPU 被别人占用、
+> 模型改动）。进度会停在 94% 等真实结果，这是预期行为，不是卡死。
+> 想确认还在跑：看日志是否有新行，或 `nvidia-smi` 里 trtexec 是否占用 GPU。
 
 ### 数据集
 
@@ -390,6 +473,21 @@ POST {service}/predict    multipart/form-data
 验收脚本：`python 6-web/backend/tools/test_annotation_project.py`（138 项），
 外加浏览器实测六种形状、撤销重做、冲突弹窗、真实 `.engine` 自动标注与三种格式导出。
 
+#### v1.13 新增（训练与转换进度可视化）
+
+| 项 | v1.12 | v1.13 |
+| --- | --- | --- |
+| 训练进度条 | 只有一条宽度，没有轮次/时间信息 | 阶段徽标 + `epoch n/N` + 百分比 + 已用 + **每轮耗时** + **预计剩余**，每秒刷新 |
+| 训练指标 | 只有一排最新值的 chip | 追加「每轮指标」表（动态列，最近 20 轮）与两张内联 SVG 曲线（loss / mAP） |
+| 参数可核对 | 命令行只出现在日志里一行 | 「实际执行的参数」折叠块，可复制核对 |
+| 引擎构建进度 | 无法量化，只有「构建中/已完成」徽标；tactic 搜索期间 473 秒无任何反馈 | 8 阶段清单 + 估算百分比 + 已用/剩余；心跳线程每 2 秒推进，日志静默期进度仍在动 |
+| 构建耗时 | 无记录 | 每次成功都落盘 `runtime/engine_stats.json`，下次同类构建取历史中位数 |
+| 主动停止 | 可能被判成「失败」（读线程与 stop 抢状态，随机复现） | 先标记 `cancelled` 再 terminate，稳定显示「已停止」，进度停在中断处 |
+
+新增文件：`backend/progress.py`、`backend/tools/test_engine_progress.py`。
+改动文件：`backend/runners.py`（tracker/心跳/停止竞态）、`backend/app.py`（`estimate_seconds`）、
+`frontend/index.html`、`frontend/js/train.js`、`frontend/js/engine.js`、`frontend/css/style.css`。
+
 #### v1.12 修复（代码审查发现，按严重度从高到低）
 
 | 严重度 | 问题 | 修复方式 |
@@ -499,13 +597,14 @@ offset1 = cursor - p_image * scale1
 | `TRTFORGE_ANOMALIB_DATASET_ROOT` | Anomalib 数据集根 | `<仓库>/2-python-anomaly/anomalib-main/datasets/bottle` |
 | `TRTFORGE_BROWSE_ROOTS` | 额外允许浏览的目录，分号分隔 | 仅仓库根 |
 | `TRTFORGE_MAX_UPLOAD_MB` | 上传图片上限 | 32 |
+| `TRTFORGE_ENGINE_STATS` | 引擎构建耗时统计文件（自学习估算用） | `6-web/runtime/engine_stats.json` |
 | `TRTFORGE_WEB_PORT` / `TRTFORGE_WEB_HOST` | 监听端口 / 地址 | 8060 / 127.0.0.1 |
 
 ## 后端接口
 
 | 方法 | 路径 | 用途 |
 | --- | --- | --- |
-| GET | `/api/health` | 存活探针，返回 `{"ok":true,"version":"1.12.0"}`；版本号用来识别「连到了旧进程」 |
+| GET | `/api/health` | 存活探针，返回 `{"ok":true,"version":"1.13.0"}`；版本号用来识别「连到了旧进程」 |
 | GET | `/api/capabilities` | 环境探测（前端状态灯用） |
 | POST | `/api/train/yolo` | 启动 YOLO 训练 |
 | POST | `/api/train/anomalib` | 启动 Anomalib 训练 |
@@ -558,6 +657,30 @@ offset1 = cursor - p_image * scale1
 `hsv_h` `hsv_s` `hsv_v` `degrees` `translate` `scale` `shear` `perspective`
 `flipud` `fliplr` `bgr` `mosaic` `mixup` `copy_paste` `close_mosaic`。
 
+`POST /api/engine/build` 的额外响应字段：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `estimate_seconds` | float | 本次构建的估算耗时（秒）。有历史命中时是历史中位数，否则是公式外推 |
+| `meta` | object | 估算依据：`{onnx_mb, precision, dynamic, imgsz}`，`imgsz` 从 ONNX 输入形状或动态 shape 的 opt 解出 |
+
+引擎构建期间，`/ws/runs/{id}` 会多出一种事件（`kind="engine-build"` 才会发）：
+
+```json
+{"type":"progress","stage":"build","stage_label":"构建与 tactic 选择","stage_index":3,
+ "pct":24.6,"elapsed":117.3,"eta":357.2,"estimate":474.5}
+```
+
+| 字段 | 说明 |
+| --- | --- |
+| `stage` / `stage_label` / `stage_index` | 当前阶段，取值见 `backend/progress.py` 的 `STAGE_ORDER` |
+| `pct` | **估算**百分比，单调不减，只有 `PASSED` 才等于 100 |
+| `elapsed` / `eta` | 已用 / 剩余秒数；`estimate` 为 null 时 `eta` 也是 null |
+| `estimate` | 本次估算总耗时 |
+
+发布策略：阶段变化立刻发；同一阶段内只在**整数百分比**变化时发（心跳线程每 2 秒检查一次），
+一次 8 分钟的构建约 90 条，不会把 `EVENT_BUFFER_SIZE`（2000）的历史缓冲挤掉有用的日志。
+
 `POST /api/infer/yolo` 的额外字段：
 
 | 字段 | 类型 | 默认 | 说明 |
@@ -590,7 +713,8 @@ offset1 = cursor - p_image * scale1
 ├── backend/
 │   ├── app.py            FastAPI 路由
 │   ├── config.py         路径推导、环境变量与白名单（allowed_roots / is_path_allowed）
-│   ├── runners.py        子进程管理 + TRTFORGE_JSON 事件解析 + 广播
+│   ├── progress.py       引擎构建阶段识别 + 耗时自学习估算（trtexec 不给真实进度）
+│   ├── runners.py        子进程管理 + TRTFORGE_JSON 事件解析 + 广播 + 进度心跳
 │   ├── infer.py          ctypes 调 DLL（结构体定义、LRU 句柄缓存、热能图渲染）
 │   ├── labels.py         标签文件解析 + 统一定义类别配色（后端绘制与前端共用）
 │   ├── models.py         训练产物扫描（引擎配对 ONNX / 标签 / metadata / 任务类型）
@@ -603,6 +727,7 @@ offset1 = cursor - p_image * scale1
 │       ├── test_dataset_workbench.py  数据集工作台验收（划分 / 导出 / 错误路径）
 │       ├── test_infer_params.py       推理控制台验收（阈值 / 标签 / 配色 / LRU / 扫描 / 热能图）
 │       ├── test_annotation_project.py 标注工程验收（往返 / 冲突 / 回退 / 导出回读）
+│       ├── test_engine_progress.py    构建进度与耗时估算验收（真实日志回放 + 自学习）
 │       └── test_exit_codes.py  退出码语义化测试（exit 2/130 的补事件逻辑）
 ├── frontend/
 │   ├── index.html        单页，六个页签
@@ -612,8 +737,8 @@ offset1 = cursor - p_image * scale1
 │   │   ├── ws.js         WebSocket（含断线重连）
 │   │   ├── viewer.js     图像查看器：光标锚点缩放 / 拖动平移 / 多窗口容器 / 透明度
 │   │   ├── overlay.js    检出框 SVG 叠加层：逆缩放标签、低分淡出、行高亮联动
-│   │   ├── train.js      训练页
-│   │   ├── engine.js     引擎构建页（日志流 + 探测预警）
+│   │   ├── train.js      训练页（进度面板 + ETA + 每轮指标表 + 内联 SVG 曲线 + 参数回显）
+│   │   ├── engine.js     引擎构建页（阶段清单 + 估算进度 + 日志流 + 探测预警）
 │   │   ├── dataset.js    数据集页（扫描预览 + 导出）
 │   │   ├── annotate.js   标注工作台（Canvas 2D 六形状 / 缩放平移 / 吸附 / 撤销重做 / 自动保存 / 草稿层 / 导出）
 │   │   ├── infer.js      推理控制台（模型扫描 / 参数联动 / 表格 / 直方图 / 导出）
@@ -642,6 +767,9 @@ D:\Anaconda3\envs\dpenv\python.exe 6-web\backend\tools\test_annotation_project.p
 # 前端单测（不需要服务，有 node 就行）
 node 6-web\frontend\tests\test_viewer_math.mjs
 node 6-web\frontend\tests\test_contrast.mjs
+
+# 引擎构建进度与耗时估算（不需要服务、不需要 trtexec；有真实日志时自动回放全量）
+D:\Anaconda3\envs\dpenv\python.exe 6-web\backend\tools\test_engine_progress.py
 ```
 
 2026-10-29 实测结果：`smoke_test` **13 项全通过**（能力探测、参数校验、越权拦截、
@@ -673,6 +801,27 @@ node 6-web\frontend\tests\test_contrast.mjs
   且页面同时显示「设定 0.8 / 原值 0.5 / 已覆盖」。
 - LRU：连续 8 组不同 `conf` 推理，`GET /api/infer/cache` 显示常驻句柄恒为 4；
   回头用旧参数命中缓存，`rebuilt=false`，无引擎重建。
+
+2026-11-01 进度可视化实测结果（v1.13）：
+
+| 脚本 | 结果 |
+| --- | --- |
+| `test_engine_progress.py` | **26 / 26 通过** |
+
+`test_engine_progress.py` 做的事：把真实日志按原始时间戳回放（假时钟），断言阶段顺序、
+百分比单调不减、**473 秒静默期内心跳产出 86 条进度**、只有 `PASSED` 才到 100%、
+失败/中断不补 100%；再验证估算公式对 960（474 s）与 320（313 s）两个数据点的偏差、
+历史中位数优先、体积/精度/分辨率不匹配时回退、统计文件损坏时降级。
+
+浏览器实测（Playwright 驱动，全部真实进程）：
+
+| 场景 | 结果 |
+| --- | --- |
+| 960×960 引擎构建（T1000） | 启动 2 秒内显示「预计约 8 分 8 秒」，进度 8%→11%→25%，已用/剩余每秒刷新；**日志 473 秒无新行期间进度仍在前移** |
+| 中断构建 | 徽标「已停止」，进度停在 13%，终端 `status=cancelled`；这次中断发生在 tactic 阶段（还没打出 `Engine built in`），所以不写统计、不产引擎；若中断发生在引擎已落盘之后，那段真实耗时照样入账 |
+| 320×320 引擎构建 | 估算 53 s（当时的错误公式）→ 实际 5 分 17 秒，收尾提示「实际 5 分 17 秒，估算 53 秒」；`engine_stats.json` 记下 313.55 s，**该次实测直接推翻了「按面积平方」的假设并改成了幂律模型** |
+| 训练进度面板（3 轮 / 320px / PCB 553 张） | `epoch 3/3`、100%、已用 0:59、每轮 ≈ 0:06、剩余 0:00；最终验证那行标成 `final`（不再出现 `epoch 4/3`）；loss 与 mAP 两条曲线各 1 / 2 条折线，`stroke` 解析为 `rgb(34,211,238)`，页面无横向溢出 |
+| 参数回显 | 折叠块里的命令行与后端 `run.command` 逐字一致 |
 
 ### ctypes 结构体对齐
 
@@ -765,14 +914,14 @@ D:\Anaconda3\envs\dpenv\python.exe -m uvicorn app:app --app-dir 6-web\backend `
 判断标准只有一条：**`CreationDate` 必须晚于你最后一次改后端代码的时间。**
 `--reload` 只监听 `.py`，改了前端 HTML/CSS/JS 仍需浏览器 `Ctrl+F5`。
 
-更快的判断办法：**看顶栏标题下方的版本号徽标**（`v1.12.0` 这种，来自 `/api/health`）。
+更快的判断办法：**看顶栏标题下方的版本号徽标**（`v1.13.0` 这种，来自 `/api/health`）。
 后端代码一改，`app.py` 里的 `APP_VERSION` 就要跟着加，页面上的徽标才会变。
 徽标数字没变 = 页面连的还是旧进程，这时候改什么都不会生效。
 
 ```powershell
 # 一条命令确认后端版本
 Invoke-WebRequest http://127.0.0.1:8060/api/health -UseBasicParsing | Select-Object -ExpandProperty Content
-# 期望输出类似 {"ok":true,"version":"1.12.0"}
+# 期望输出类似 {"ok":true,"version":"1.13.0"}
 ```
 
 ## 与 Qt 版的关系
@@ -781,3 +930,4 @@ Invoke-WebRequest http://127.0.0.1:8060/api/health -UseBasicParsing | Select-Obj
 事件解析逻辑都在里面）。确认 Web 版功能覆盖后再归档到 `5-reference`。
 
 详见提案：`openspec/changes/add-web-studio/`。
+

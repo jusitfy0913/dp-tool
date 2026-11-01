@@ -383,6 +383,7 @@ $trt = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v11.8\bin\trtexec.exe
 | EfficientAd | 约 8 分钟 |
 | PatchCore | 约 15 分钟 |
 | PaDiM | 约 17 分钟 |
+| YOLOv8n（320） | 约 5 分钟（313 秒，`Engine built in` 值） |
 | YOLOv8n（640） | 约 2~3 分钟 |
 | YOLOv8n（960） | 约 8 分钟（474 秒，首次无 timing cache） |
 
@@ -390,6 +391,35 @@ $trt = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v11.8\bin\trtexec.exe
 > 编译期间 GPU 利用率掉到 4% 是正常的（builder 在 CPU 侧搜索 tactic）。
 > 反过来，若长时间没有日志输出但 GPU 占用接近 100%，说明仍在 tactic 搜索，
 > 不是在卡死，不要中断。
+
+**为什么 320 也要 5 分钟（重要，别按面积去推算）**
+
+第一版 Web 估算假设「耗时 ∝ 输入面积」，于是 960 的 474 秒推到 320 只剩 53 秒。
+实测 320 需要 **313.6 秒**，假设直接被推翻。真实规律是：
+
+- 耗时主要来自「层数 × 每层候选 kernel 数」，ONNX 体积是层数的代理，
+  输入尺寸只影响**每次候选试跑**的成本；
+- 分辨率小 → 激活值小 → 显存里能塞下更多 tactic，搜索空间反而更大，
+  两者部分抵消，所以远没有「平方」那么快。
+
+用 960（474 s）与 320（313 s）两点反解，指数 ≈ 0.37，Web 端取 0.4：
+
+```
+秒数 ≈ 38.3 × ONNX_MB × (imgsz / 960) ^ 0.4      # fp16；fp32 × 0.7
+```
+
+> 跨显卡要重算：`38.3` 是 T1000（Turing，8 GB）上的值，换 Ampere/Ada 会明显变小。
+> 不需要手调 —— Web 端每次成功构建都会把真实耗时写进
+> `runtime/engine_stats.json`，同类构建下次直接取历史中位数。
+
+**tactic 搜索期间日志是静默的，这不是卡死**
+
+真实日志里 `Local timing cache in use.` 到 `Engine built in 474.149 sec.` 之间
+是 **473 秒空白**，trtexec 一行都不打。所以：
+
+- 命令行里只能靠「等」，别以为卡住了就 Ctrl+C；
+- Web 界面会用心跳线程每 2 秒推进估算进度，即使日志不动，百分比和已用时间也在动；
+- 判断是否真的在跑：`nvidia-smi` 里 trtexec 是否占着 GPU，或看日志是否终于出现新行。
 
 ### 5.3 验收
 
@@ -424,6 +454,25 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_web_studio.ps1
 - 提交未转置 ONNX 会被后端 **HTTP 400** 拒绝，日志面板写明原因，不会白等十几分钟；
 - 退出码为 0 但没有生成引擎文件时，任务判为 **failed** 并发 `ARTIFACT_MISSING`，
   不会出现「显示成功、去推理却找不到文件」。
+
+**进度面板（v1.13）**
+
+| 元素 | 说明 |
+| --- | --- |
+| 阶段清单 | 启动 / 解析 ONNX / 解析完成 / 构建与 tactic 搜索 / 序列化 / 校验 / 推理基准 / 完成 |
+| 百分比 | `已用 ÷ 估算`，夹在本阶段区间内（构建段封顶 94%，基准段封顶 99%），只有 `PASSED` 才 100% |
+| 已用 / 预计剩余 | 前端每秒刷新；后端心跳每 2 秒推一次整数百分比 |
+| 估算来源 | 有历史 → 同精度/同 dynamic/体积 ±67%/分辨率 ±20% 的中位数；无历史 → 公式外推 |
+
+三条必须守住的行为：
+
+1. **失败或中断的构建不补 100%**，进度停在出事的位置，避免「进度满格但失败」；
+2. **统计在 `Engine built in` 出现的那一刻就落盘**：那一段是真实的构建耗时，
+   即使之后的推理基准被中断，它对下次估算依然有参考价值；而根本没跑到这一步的失败
+   （参数错误、早期 OOM、ONNX 解析失败）不会产生任何条目；
+3. **落盘的值只认 `Engine built in X sec.`**，不拿进程总时长充数（后者含解析与基准）。
+
+验证：`python 6-web\backend\tools\test_engine_progress.py`（26 项，含真实日志按时间戳回放）。
 
 构建产物路径可直接填进「推理演示」页的引擎文件栏。
 

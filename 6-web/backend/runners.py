@@ -28,6 +28,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import progress
 from config import EVENT_BUFFER_SIZE, LOG_DIR, TRAIN_EVENT_PREFIX
 
 
@@ -54,9 +55,18 @@ class Run:
     subscribers: list[asyncio.Queue] = field(default_factory=list)
     lock: threading.Lock = field(default_factory=threading.Lock)
     log_file: Path | None = None
+    # 引擎构建专用：进度推断器 + 心跳线程停止信号。其它任务保持 None。
+    # 之所以挂在 Run 上而不是 RunManager 里：进度天然属于某个任务的生命周期，
+    # 任务一结束（_reader 的 finally）就该停心跳，放在 Run 上最不容易漏。
+    tracker: Any = None
+    progress_stop: threading.Event | None = None
+    # 估算所需的信息（onnx_mb / precision / dynamic / imgsz），同时回传给前端，
+    # 让「预计剩余」在第一个事件到达前就能显示。
+    meta: dict = field(default_factory=dict)
 
     def snapshot(self) -> dict:
         """给接口返回的任务摘要。"""
+        end = self.finished_at or time.time()
         return {
             "run_id": self.run_id,
             "kind": self.kind,
@@ -64,6 +74,9 @@ class Run:
             "exit_code": self.exit_code,
             "started_at": self.started_at,
             "finished_at": self.finished_at,
+            # 已用秒数：刷新页面后前端可以直接接着显示，不必从 0 重新数
+            "elapsed": round(max(0.0, end - self.started_at), 1),
+            "meta": dict(self.meta),
             "command": self.command,
         }
 
@@ -90,11 +103,15 @@ class RunManager:
         cwd: str,
         env: dict[str, str] | None = None,
         expect_file: Path | None = None,
+        meta: dict | None = None,
+        estimate: float | None = None,
     ) -> Run:
         """启动子进程并立即开始读取输出。
 
         子进程启动失败会抛异常，由调用方转成 HTTP 错误。
         `expect_file` 用于「退出码 0 但没产出」的失败判定。
+        `meta` / `estimate` 只对 `kind == "engine-build"` 有意义：
+        前者是估算依据（同时回传给前端），后者是本轮估算耗时（秒）。
         """
         run_id = uuid.uuid4().hex[:12]
         log_file = LOG_DIR / f"{run_id}.log"
@@ -125,9 +142,27 @@ class RunManager:
             process=process,
             log_file=log_file,
             expect_file=expect_file,
+            meta=dict(meta or {}),
         )
         with self._lock:
             self._runs[run_id] = run
+
+        # 引擎构建起两个线程：读日志的（下面）+ 推进估算进度的心跳（这里）。
+        # 心跳是必需的：tactic 选择阶段 trtexec 一行都不打（实测空白 473 秒），
+        # 只靠日志驱动的话进度条会长时间冻在原处，正是要解决的问题。
+        if kind == "engine-build":
+            run.tracker = progress.EngineBuildAnalyzer(
+                estimate,
+                meta=run.meta,
+                stats=progress.default_store(),
+                started_at=run.started_at,
+            )
+            run.progress_stop = threading.Event()
+            threading.Thread(
+                target=progress.run_heartbeat,
+                args=(run.tracker, lambda payload: self._publish(run, payload), run.progress_stop),
+                daemon=True,
+            ).start()
 
         thread = threading.Thread(target=self._reader, args=(run,), daemon=True)
         thread.start()
@@ -151,14 +186,20 @@ class RunManager:
         if proc.poll() is not None:
             return False
         try:
+            # 先标记再 terminate，顺序不能反。
+            # 读线程在自己的 finally 里会 `if run.status == "running"` 才覆盖状态，
+            # 并立刻广播 finished。若等 proc.wait() 返回后再标记，读线程可能已经
+            # 把 terminate 导致的退出码 1 判成 "failed" 并广播出去，
+            # 用户主动停止就会显示成「构建失败」（实测会随机复现）。
+            run.status = "cancelled"
             proc.terminate()
             try:
                 proc.wait(timeout=3)
             except subprocess.TimeoutExpired:
                 proc.kill()
         except Exception:  # noqa: BLE001 - 停止失败也要让状态可读
+            run.status = "running"
             return False
-        run.status = "cancelled"
         return True
 
     def shutdown_all(self) -> None:
@@ -208,6 +249,12 @@ class RunManager:
                 log_handle.flush()
                 payload = self._parse_line(line)
                 self._publish(run, payload)
+                # 引擎构建：同一行再喂给进度推断器。tracker 只在阶段变化时返回事件，
+                # 普通日志行返回 None，所以不会多出事件。
+                if run.tracker is not None:
+                    tracker_event = run.tracker.feed(line)
+                    if tracker_event is not None:
+                        self._publish(run, tracker_event)
         except Exception as exc:  # noqa: BLE001 - 读线程不能静默死掉
             self._publish(
                 run,
@@ -216,6 +263,9 @@ class RunManager:
         finally:
             if log_handle is not None:
                 log_handle.close()
+            # 先停心跳：进程都结束了还继续推进度，会和下面的 finished 抢语义
+            if run.progress_stop is not None:
+                run.progress_stop.set()
             exit_code = None
             try:
                 exit_code = run.process.wait(timeout=10)
@@ -229,6 +279,12 @@ class RunManager:
                     run.status = "failed"
                 else:
                     run.status = "finished" if exit_code == 0 else "failed"
+
+            # 进度收尾：成功补 100%，失败就停在原处（不假装走满）
+            if run.tracker is not None:
+                final_progress = run.tracker.finish(run.status, exit_code)
+                if final_progress is not None:
+                    self._publish(run, final_progress)
 
             # 退出码补一层语义化错误。
             # 原因：launcher 用 argparse 解析参数，参数不合法时 argparse 直接往 stderr

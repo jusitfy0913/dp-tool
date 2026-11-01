@@ -1,8 +1,13 @@
 // 引擎构建页：ONNX -> TensorRT 引擎。
 //
 // 与训练页的区别：
-// - trtexec 只输出普通文本日志，没有 TRTFORGE_JSON 结构事件，所以不做指标解析；
-// - 进度无法量化（trtexec 不报百分比），用状态徽标表达 运行中/完成/失败 即可；
+// - trtexec 只输出普通文本日志，没有 TRTFORGE_JSON 结构事件，指标层为空；
+// - **trtexec 不提供进度**。整个 tactic 选择阶段一行日志都不打（实测 PCB 960×960
+//   从 `Local timing cache in use` 到 `Engine built in` 空白 473 秒），所以
+//   界面上的百分比是按「历史耗时 + 阶段边界」估算的，不是真实进度。
+//   估算逻辑与基线在 backend/progress.py，改口径只改那边，前端只负责呈现；
+// - 为了让它看起来「活着」，已用时间与预计剩余由本地 1s 定时器刷新，
+//   不依赖后端事件间隔（后端心跳是 2s 一条，且只推整数百分比变化）；
 // - 日志量可达上千行，用 textContent 整体替换比逐行 append 更快。
 //
 // 事件流本身复用 /ws/runs/{id}，和训练页是同一条通道。
@@ -12,6 +17,19 @@ import { connectRunEvents } from "./ws.js";
 
 // 只保留最近若干行，防止长时间构建把内存和 DOM 拖慢
 const MAX_LINES = 2000;
+
+// 阶段清单必须与 backend/progress.py 的 STAGE_ORDER 一一对应（顺序也要一致）。
+// 对不上时以事件里的 stage_label 为准，前端不会因此报错。
+const STAGES = [
+  { id: "start", label: "启动" },
+  { id: "parse", label: "解析 ONNX" },
+  { id: "parsed", label: "解析完成" },
+  { id: "build", label: "构建 / tactic 搜索" },
+  { id: "built", label: "序列化引擎" },
+  { id: "deserialize", label: "校验引擎" },
+  { id: "benchmark", label: "推理基准" },
+  { id: "done", label: "完成" },
+];
 
 export function initEngine() {
   const form = document.getElementById("engineForm");
@@ -33,9 +51,25 @@ export function initEngine() {
   const badge = document.getElementById("engineBadge");
   const btnBuild = document.getElementById("btnBuild");
   const btnStop = document.getElementById("btnBuildStop");
+  const stepsBox = document.getElementById("engSteps");
+  const bar = document.getElementById("engBar");
+  const pctText = document.getElementById("engPct");
+  const stageText = document.getElementById("engStage");
+  const elapsedText = document.getElementById("engElapsed");
+  const etaText = document.getElementById("engEta");
+  const estimateNote = document.getElementById("engEstimateNote");
 
   let active = null; // { runId, stream }
   let lines = [];
+
+  // 进度视图状态：时间基准放在本地，刷新/事件延迟都不会让数字停住
+  const view = {
+    estimate: null, // 估算总秒数；null 表示后端没给
+    startedAt: 0, // Date.now() 毫秒
+    pct: 0,
+    stageIndex: -1,
+    timer: null,
+  };
 
   // -------------------------------------------------------------------------
   // 辅助
@@ -60,10 +94,115 @@ export function initEngine() {
     return Array.isArray(shape) ? `[${shape.join(", ")}]` : "?";
   }
 
+  /** 秒 -> `m:ss`（超过一小时才带小时），用于「已用 / 剩余」 */
+  function fmtClock(seconds) {
+    const total = Math.max(0, Math.round(seconds));
+    const h = Math.floor(total / 3600);
+    const m = Math.floor((total % 3600) / 60);
+    const sec = total % 60;
+    const ss = String(sec).padStart(2, "0");
+    if (h) return `${h}:${String(m).padStart(2, "0")}:${ss}`;
+    return `${m}:${ss}`;
+  }
+
+  /** 秒 -> 中文口语时长，用于「预计约 8 分 7 秒」这类说明文字 */
+  function fmtSpoken(seconds) {
+    const total = Math.max(0, Math.round(seconds));
+    const m = Math.floor(total / 60);
+    if (m >= 1) return `${m} 分 ${total % 60} 秒`;
+    return `${total} 秒`;
+  }
+
   function render() {
     if (lines.length > MAX_LINES) lines = lines.slice(-MAX_LINES);
     logBox.textContent = lines.join("\n");
     logBox.scrollTop = logBox.scrollHeight;
+  }
+
+  // -------------------------------------------------------------------------
+  // 进度面板
+  // -------------------------------------------------------------------------
+  function renderSteps(activeIndex) {
+    stepsBox.innerHTML = "";
+    STAGES.forEach((stage, index) => {
+      const chip = document.createElement("span");
+      let cls = "build-step";
+      if (index < activeIndex) cls += " done";
+      else if (index === activeIndex) cls += " current";
+      chip.className = cls;
+      chip.textContent = stage.label;
+      stepsBox.appendChild(chip);
+    });
+  }
+
+  /** 每秒刷新一次时间：即使后端 2 秒才推一条事件，数字也在动 */
+  function tickClock() {
+    if (!view.startedAt) return;
+    const elapsed = (Date.now() - view.startedAt) / 1000;
+    elapsedText.textContent = `已用 ${fmtClock(elapsed)}`;
+    if (view.estimate) {
+      const left = Math.max(0, view.estimate - elapsed);
+      etaText.textContent = `预计剩余 ${fmtClock(left)}`;
+    }
+  }
+
+  function startTicker() {
+    stopTicker();
+    view.timer = setInterval(tickClock, 1000);
+    tickClock();
+  }
+
+  function stopTicker() {
+    if (view.timer) {
+      clearInterval(view.timer);
+      view.timer = null;
+    }
+  }
+
+  function resetProgress(estimate) {
+    view.estimate = Number.isFinite(estimate) && estimate > 0 ? estimate : null;
+    view.startedAt = Date.now();
+    view.pct = 0;
+    view.stageIndex = -1;
+    bar.style.width = "0%";
+    pctText.textContent = "0%";
+    stageText.textContent = "启动中";
+    elapsedText.textContent = "已用 0:00";
+    etaText.textContent = "预计剩余 —";
+    renderSteps(-1);
+    // 口径必须写在界面上：否则用户会以为这是 trtexec 报的真实进度
+    estimateNote.textContent = view.estimate
+      ? `预计约 ${fmtSpoken(view.estimate)}。trtexec 在 tactic 搜索阶段不输出任何日志，` +
+        `这里的百分比是按历史构建耗时推算的估算值，不是真实进度；已用时间每秒在走，说明没卡死。`
+      : "trtexec 不提供进度，也没有历史耗时可用，只能显示阶段与已用时间。";
+    estimateNote.className = "hint";
+  }
+
+  function applyProgress(payload) {
+    const pct = Number(payload.pct);
+    if (Number.isFinite(pct)) {
+      view.pct = Math.min(100, Math.max(0, pct));
+      bar.style.width = `${view.pct.toFixed(1)}%`;
+      pctText.textContent = `${view.pct.toFixed(0)}%`;
+    }
+    const index = STAGES.findIndex((stage) => stage.id === payload.stage);
+    if (index >= 0) {
+      view.stageIndex = index;
+      // 结束阶段把「完成」这一格也打勾，否则收尾时会有一格停在 current
+      renderSteps(payload.stage === "done" ? STAGES.length : index);
+    }
+    if (payload.stage_label || payload.stage) {
+      stageText.textContent = payload.stage_label || payload.stage;
+    }
+    // 后端给的 elapsed/eta 更可靠（它掌握进程真实起点），优先采用
+    if (typeof payload.elapsed === "number") {
+      elapsedText.textContent = `已用 ${fmtClock(payload.elapsed)}`;
+    }
+    if (typeof payload.eta === "number") {
+      etaText.textContent = `预计剩余 ${fmtClock(payload.eta)}`;
+    } else if (payload.estimate === null) {
+      etaText.textContent = "预计剩余 —";
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -146,6 +285,9 @@ export function initEngine() {
       btnStop.disabled = false;
       setHint(`输出目标：${run.engine}`);
 
+      resetProgress(run.estimate_seconds);
+      startTicker();
+
       lines.push(`$ ${run.command.join(" ")}`);
       lines.push("");
       render();
@@ -154,24 +296,48 @@ export function initEngine() {
         onEvent: (payload) => {
           if (payload.type === "log") {
             lines.push(payload.line);
+          } else if (payload.type === "progress") {
+            applyProgress(payload);
           } else if (payload.type === "error") {
             lines.push(`[错误] ${payload.message}`);
           }
           render();
         },
         onClose: (payload) => {
+          stopTicker();
           const ok = payload.status === "finished";
-          setBadge(ok ? "已完成" : "失败", ok ? "done" : "fail");
+          // 主动停止不是「失败」：进度停在中断处，用户在意的正是「停在哪、花了多久」
+          const cancelled = payload.status === "cancelled";
+          setBadge(cancelled ? "已停止" : ok ? "已完成" : "失败", cancelled ? "warn" : ok ? "done" : "fail");
           lines.push("");
           lines.push(`[结束] 退出码=${payload.exit} 状态=${payload.status}`);
           render();
           btnBuild.disabled = false;
           btnStop.disabled = true;
           active = null;
+
+          const spent = view.startedAt ? (Date.now() - view.startedAt) / 1000 : null;
           if (ok) {
-            setHint(`构建完成：${body.engine || autoName(body.onnx)}`);
+            if (view.pct < 100) applyProgress({ pct: 100, stage: "done", stage_label: "完成" });
+            // 把「实际 vs 估算」摆出来，用户才知道下次该不该信这个数字
+            const compare = spent != null && view.estimate
+              ? `｜实际 ${fmtSpoken(spent)}，估算 ${fmtSpoken(view.estimate)}`
+              : spent != null
+                ? `｜实际 ${fmtSpoken(spent)}`
+                : "";
+            setHint(`构建完成：${body.engine || autoName(body.onnx)}${compare}`);
+            estimateNote.textContent =
+              `构建耗时已记入 runtime/engine_stats.json，下次同类构建的估算会更准。`;            estimateNote.className = "hint ok";
+          } else if (cancelled) {
+            setHint(`已停止${spent != null ? `，已用 ${fmtSpoken(spent)}` : ""}（中断的构建不产出引擎）`, true);
+            estimateNote.textContent =
+              "进度条停在中断位置。若中断前已打出 `Engine built in`，那段真实耗时仍会计入统计。";
+            estimateNote.className = "hint";
           } else {
             setHint("构建失败，看日志尾部定位原因", true);
+            estimateNote.textContent =
+              "进度条停在失败发生的位置。若失败前已打出 `Engine built in`，那段真实耗时仍会计入统计。";
+            estimateNote.className = "hint bad";
           }
         },
         onError: (message) => {
@@ -180,6 +346,7 @@ export function initEngine() {
         },
       });
     } catch (error) {
+      stopTicker();
       setHint(error.message, true);
       setBadge("失败", "fail");
       lines.push(`[错误] ${error.message}`);
@@ -191,11 +358,17 @@ export function initEngine() {
 
   btnStop.addEventListener("click", async () => {
     if (!active) return;
+    // 先摆出「正在停止」，最终文案由 onClose 统一写（那里才知道是 cancelled 还是 failed）
+    setHint("正在停止…");
+    btnStop.disabled = true;
     try {
       await stopRun(active.runId);
-      setHint("已请求停止");
     } catch (error) {
       setHint(error.message, true);
+      btnStop.disabled = false;
     }
   });
+
+  // 首屏就把阶段清单画出来，用户一眼知道要经过哪几步
+  renderSteps(-1);
 }

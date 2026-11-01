@@ -10,6 +10,30 @@ const state = {
   artifacts: [],
 };
 
+/// 进度与曲线状态。
+///
+/// 为什么前端自己算 ETA：launcher 只在每轮结束发 `epoch_summary`，不给「还要多久」。
+/// 首轮包含数据集扫描（缓存都要重建），拿平均值算必然偏高，所以取**最近 3 轮耗时的中位数**。
+const progress = {
+  total: 0,
+  epoch: 0,
+  pct: 0,
+  startedAt: 0, // Date.now() 毫秒
+  lastEpochAt: 0, // 上一轮结束的 Date.now() 毫秒
+  epochDeltas: [], // 最近若干轮的单轮耗时（秒）
+  timer: null,
+  rows: [], // 每轮指标，供表格重绘
+  columns: [], // 动态列，顺序即显示顺序
+  losses: [], // 总 loss 序列，供曲线
+  lossSource: "", // "训练" 或 "验证"，用于曲线标题
+  metrics: {}, // {指标名: [值...]}，供曲线
+};
+
+//: 表格只留最近这么多轮，避免长时间训练把 DOM 撑大
+const MAX_TABLE_ROWS = 20;
+//: 曲线最多画这么多点（与表格解耦：曲线看趋势，多留一些更平滑）
+const MAX_CHART_POINTS = 300;
+
 let dom = {};
 
 export function initTrain() {
@@ -29,6 +53,24 @@ export function initTrain() {
     progressBar: document.getElementById("progressBar"),
     metrics: document.getElementById("metrics"),
     badge: document.getElementById("runBadge"),
+    // 进度面板
+    stage: document.getElementById("trainStage"),
+    epochText: document.getElementById("trainEpoch"),
+    pctText: document.getElementById("trainPct"),
+    elapsedText: document.getElementById("trainElapsed"),
+    etaText: document.getElementById("trainEta"),
+    speedText: document.getElementById("trainSpeed"),
+    // 参数回显 / 表格 / 曲线
+    commandBox: document.getElementById("trainCommandBox"),
+    command: document.getElementById("trainCommand"),
+    chartRow: document.getElementById("trainCharts"),
+    lossChart: document.getElementById("lossChart"),
+    lossCap: document.getElementById("lossChartCap"),
+    metricChart: document.getElementById("metricChart"),
+    metricCap: document.getElementById("metricChartCap"),
+    tableBox: document.getElementById("epochTableBox"),
+    tableHead: document.getElementById("epochHead"),
+    tableRows: document.getElementById("epochRows"),
   };
 
   dom.kind.addEventListener("change", syncKind);
@@ -199,6 +241,10 @@ async function onSubmit(event) {
     dom.btnStop.disabled = false;
     appendLog(`任务已启动：${run.run_id}`, "ok");
     appendLog(`命令：${run.command.join(" ")}`);
+    // 参数回显：折叠块里放完整命令行，用户能确认自己填的参数真的传进去了
+    dom.commandBox.hidden = false;
+    dom.command.textContent = run.command.join(" ");
+    startProgressView();
     openStream(run.run_id);
   } catch (error) {
     setHint(error.message);
@@ -216,12 +262,17 @@ function openStream(runId) {
       dom.btnTrain.disabled = false;
       dom.btnCheckEnv.disabled = false;
       dom.btnStop.disabled = true;
+      stopProgressTimer();
       const ok = (payload.exit ?? 0) === 0;
       setBadge(ok ? "已完成" : "失败", ok ? "done" : "fail");
+      setStage(ok ? "已完成" : "已结束", ok ? "done" : "fail");
+      if (ok && progress.pct < 100) setProgressBar(100);
       appendLog(
         ok ? "任务完成。" : `任务结束，退出码 ${payload.exit}`,
         ok ? "ok" : "err",
       );
+      // 结束那一刻把「已用」定格，避免定时器停掉后数字看起来停在中间
+      renderElapsed(true);
       if (state.artifacts.length) {
         appendLog(`产物：\n${state.artifacts.join("\n")}`, "ok");
       }
@@ -259,6 +310,10 @@ async function onCheckEnv() {
   try {
     const run = await postJSON(`/api/train/${kind}/check-env?python=${encodeURIComponent(python || "")}`, {});
     state.runId = run.run_id;
+    // 自检没有 epoch 概念，但「已用时间」仍然有意义（加载 torch/CUDA 可能要几十秒）
+    startProgressView();
+    setStage("环境检测", "run");
+    setProgressBar(0);
     openStream(run.run_id);
   } catch (error) {
     setHint(error.message);
@@ -283,9 +338,12 @@ function handleEvent(event) {
   switch (event.type) {
     case "progress": {
       const pct = Number(event.pct ?? 0);
-      dom.progressBar.style.width = `${Math.min(100, Math.max(0, pct)).toFixed(1)}%`;
+      setProgressBar(pct);
       const stage = event.stage ? `[${event.stage}] ` : "";
       const total = event.total ?? "-";
+      if (event.total) progress.total = Number(event.total);
+      if (event.epoch != null) progress.epoch = Number(event.epoch);
+      renderEpochText();
       appendLog(`${stage}进度：epoch ${event.epoch ?? "-"}/${total}，${pct.toFixed(1)}%`);
       break;
     }
@@ -301,9 +359,10 @@ function handleEvent(event) {
       applyMetricDict(event.metrics, 8);
       applyMetricDict(event.lr, 2);
       if (event.gpu) applyGpu(event.gpu);
+      recordEpoch(event);
       if (event.total) {
         const pct = Number(event.pct ?? (event.epoch / event.total) * 100);
-        dom.progressBar.style.width = `${Math.min(100, Math.max(0, pct)).toFixed(1)}%`;
+        setProgressBar(pct);
       }
       break;
     }
@@ -455,6 +514,323 @@ function applyGpu(gpu) {
 }
 
 // ---------------------------------------------------------------------------
+// 进度面板：epoch / 已用 / 每轮耗时 / 预计剩余
+//
+// 「预计剩余」是前端推算的，不是后端字段：
+//   单轮耗时 = 最近 3 轮耗时的中位数（首轮含数据集扫描，用平均会被拉偏）
+//   剩余     = 剩余轮数 × 单轮耗时 - 本轮已过去的秒数
+// 定时器每秒刷新一次，所以即使一轮要跑几分钟，数字也在动。
+// ---------------------------------------------------------------------------
+function setProgressBar(pct) {
+  const value = Math.min(100, Math.max(0, Number(pct) || 0));
+  progress.pct = value;
+  dom.progressBar.style.width = `${value.toFixed(1)}%`;
+  dom.pctText.textContent = `${value.toFixed(1)}%`;
+}
+
+function setStage(text, cls = "") {
+  dom.stage.textContent = text;
+  dom.stage.className = cls ? `badge ${cls}` : "badge";
+}
+
+function renderEpochText() {
+  const total = progress.total || "-";
+  const epoch = progress.epoch || "-";
+  dom.epochText.textContent = `epoch ${epoch}/${total}`;
+}
+
+function median(values) {
+  if (!values.length) return 0;
+  const ordered = [...values].sort((a, b) => a - b);
+  const mid = Math.floor(ordered.length / 2);
+  return ordered.length % 2 ? ordered[mid] : (ordered[mid - 1] + ordered[mid]) / 2;
+}
+
+/** 单轮耗时的中位数（只取最近 3 轮），拿不到返回 0 */
+function perEpochSeconds() {
+  return median(progress.epochDeltas.slice(-3));
+}
+
+function fmtClock(seconds) {
+  const total = Math.max(0, Math.round(seconds));
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const sec = total % 60;
+  const ss = String(sec).padStart(2, "0");
+  if (h) return `${h}:${String(m).padStart(2, "0")}:${ss}`;
+  return `${m}:${ss}`;
+}
+
+/** 刷新「已用 / 每轮 / 剩余」。freeze=true 时把已用定格在当前位置。 */
+function renderElapsed(freeze = false) {
+  if (!progress.startedAt) return;
+  const elapsed = (Date.now() - progress.startedAt) / 1000;
+  dom.elapsedText.textContent = `已用 ${fmtClock(elapsed)}`;
+
+  const per = perEpochSeconds();
+  dom.speedText.textContent = per ? `每轮 ≈ ${fmtClock(per)}` : "每轮 —";
+
+  if (!per || !progress.total || !progress.epoch) {
+    dom.etaText.textContent = "预计剩余 —";
+    return;
+  }
+  const left = Math.max(0, progress.total - progress.epoch);
+  // 本轮已经跑掉的时间要从剩余里扣掉，否则最后一轮的剩余时间会看着不动
+  const inEpoch = progress.lastEpochAt ? (Date.now() - progress.lastEpochAt) / 1000 : 0;
+  const remain = Math.max(0, left * per - (freeze ? 0 : inEpoch));
+  dom.etaText.textContent = `预计剩余 ${fmtClock(remain)}`;
+}
+
+function startProgressView() {
+  stopProgressTimer();
+  progress.total = 0;
+  progress.epoch = 0;
+  progress.startedAt = Date.now();
+  progress.lastEpochAt = 0;
+  progress.epochDeltas = [];
+  progress.pct = 0;
+  progress.timer = setInterval(() => renderElapsed(false), 1000);
+  setStage("运行中", "run");
+  renderEpochText();
+  renderElapsed();
+}
+
+function stopProgressTimer() {
+  if (progress.timer) {
+    clearInterval(progress.timer);
+    progress.timer = null;
+  }
+}
+
+/** 收到一轮的汇总：更新 ETA 基准、表格、曲线。 */
+function recordEpoch(event) {
+  const now = Date.now();
+  const rawEpoch = Number(event.epoch) || progress.epoch + 1;
+  if (event.total) progress.total = Number(event.total);
+  // launcher 在训练结束后还会补一次「最终验证」的 epoch_summary，其 epoch = total + 1。
+  // 直接照搬会显示成「epoch 4/3」，所以夹到 total，并在表格里标成 final。
+  const isFinal = progress.total > 0 && rawEpoch > progress.total;
+  progress.epoch = isFinal ? progress.total : rawEpoch;
+
+  if (progress.lastEpochAt && !isFinal) {
+    const delta = (now - progress.lastEpochAt) / 1000;
+    if (delta > 0) progress.epochDeltas.push(delta);
+  }
+  progress.lastEpochAt = now;
+  renderEpochText();
+  renderElapsed();
+
+  // 表格行：把 losses / metrics / lr 展平成 `group:name` 的列
+  const values = {};
+  collectNumbers(event.losses, "loss", values);
+  collectNumbers(event.metrics, "metric", values);
+  collectNumbers(event.lr, "lr", values);
+  progress.rows.push({ epoch: rawEpoch, values, isFinal });
+  if (progress.rows.length > MAX_TABLE_ROWS) {
+    progress.rows = progress.rows.slice(-MAX_TABLE_ROWS);
+  }
+  // 新列出现时插到对应分组末尾，已有列顺序不变
+  for (const key of Object.keys(values)) {
+    if (!progress.columns.includes(key)) progress.columns.push(key);
+  }
+  progress.columns.sort(compareColumn);
+  renderEpochTable();
+
+  // 曲线数据：loss 取总和（各损失项相加，趋势与总损失一致）。
+  // 训练损失优先；launcher 在 on_fit_epoch_end 里 `trainer.tloss` 常常是 None
+  // （实测 8.x 会返回空 losses），这时回退到验证损失之和，否则曲线永远是空的。
+  const trainLossValues = Object.entries(event.losses || {})
+    .filter(([, v]) => typeof v === "number")
+    .map(([, v]) => v);
+  let lossSum = null;
+  if (trainLossValues.length) {
+    lossSum = trainLossValues.reduce((a, b) => a + b, 0);
+    progress.lossSource = "训练";
+  } else {
+    const valLossValues = Object.entries(event.metrics || {})
+      .filter(([key, v]) => /loss$/i.test(key) && typeof v === "number")
+      .map(([, v]) => v);
+    if (valLossValues.length) {
+      lossSum = valLossValues.reduce((a, b) => a + b, 0);
+      progress.lossSource = "验证";
+    }
+  }
+  if (lossSum != null) {
+    progress.losses.push(lossSum);
+    if (progress.losses.length > MAX_CHART_POINTS) progress.losses.shift();
+  }
+  for (const key of preferredMetricKeys(event.metrics)) {
+    const series = progress.metrics[key] || (progress.metrics[key] = []);
+    series.push(Number(event.metrics[key]));
+    if (series.length > MAX_CHART_POINTS) series.shift();
+  }
+  dom.chartRow.hidden = progress.losses.length < 2 && Object.keys(progress.metrics).length === 0;
+  drawCharts();
+}
+
+function collectNumbers(dict, group, out) {
+  if (!dict || typeof dict !== "object") return;
+  for (const [name, value] of Object.entries(dict)) {
+    if (typeof value === "number" && Number.isFinite(value)) out[`${group}:${name}`] = value;
+  }
+}
+
+/** 列排序：loss 在前、metric 居中、lr 在后；同组内保持出现顺序（sort 稳定） */
+function compareColumn(a, b) {
+  const rank = (key) => (key.startsWith("loss:") ? 0 : key.startsWith("metric:") ? 1 : 2);
+  return rank(a) - rank(b);
+}
+
+/** 优先画 mAP 这类用户最关心的指标，最多两条，避免曲线糊成一团 */
+function preferredMetricKeys(metrics) {
+  if (!metrics || typeof metrics !== "object") return [];
+  const numeric = Object.keys(metrics).filter((key) => typeof metrics[key] === "number");
+  const preferred = ["metrics/mAP50-95(B)", "metrics/mAP50(B)", "metrics/mAP50-95", "metrics/mAP50"];
+  const picked = preferred.filter((key) => numeric.includes(key));
+  if (picked.length) return picked.slice(0, 2);
+  return numeric.slice(0, 2);
+}
+
+function fmtNum(value) {
+  const abs = Math.abs(value);
+  if (abs >= 1000) return value.toFixed(0);
+  if (abs >= 100) return value.toFixed(1);
+  if (abs >= 1) return value.toFixed(3);
+  return value.toFixed(4);
+}
+
+function renderEpochTable() {
+  if (!progress.rows.length) {
+    dom.tableBox.hidden = true;
+    return;
+  }
+  dom.tableBox.hidden = false;
+  // 列太多会把表格撑爆，只留前 8 列（loss 优先，因为排序把 loss 放前面）
+  const columns = progress.columns.slice(0, 8);
+
+  const headRow = document.createElement("tr");
+  headRow.appendChild(cellNode("th", "epoch"));
+  for (const key of columns) {
+    headRow.appendChild(cellNode("th", key, "num"));
+  }
+  dom.tableHead.innerHTML = "";
+  dom.tableHead.appendChild(headRow);
+
+  dom.tableRows.innerHTML = "";
+  for (const row of progress.rows) {
+    const tr = document.createElement("tr");
+    tr.appendChild(cellNode("td", row.isFinal ? "final" : String(row.epoch), "num"));
+    for (const key of columns) {
+      const value = row.values[key];
+      tr.appendChild(cellNode("td", typeof value === "number" ? fmtNum(value) : "—", "num"));
+    }
+    dom.tableRows.appendChild(tr);
+  }
+}
+
+function cellNode(tag, text, cls = "") {
+  const node = document.createElement(tag);
+  node.textContent = text;
+  if (cls) node.className = cls;
+  return node;
+}
+
+// ---------------------------------------------------------------------------
+// 曲线：零依赖内联 SVG（前端保持零构建，不引第三方图表库）
+// ---------------------------------------------------------------------------
+const SVG_NS = "http://www.w3.org/2000/svg";
+
+function svgEl(name, attrs) {
+  const node = document.createElementNS(SVG_NS, name);
+  for (const [key, value] of Object.entries(attrs || {})) {
+    node.setAttribute(key, String(value));
+  }
+  return node;
+}
+
+/**
+ * 把若干条序列画进一个 svg。
+ * `series` 形如 [{ name, values }]，自动根据全部数据定 Y 轴范围。
+ * 只画折线 + 3 条横向参考线 + 最大/最小值文本，够看趋势就行。
+ */
+function drawChart(svg, series) {
+  const W = 320;
+  const H = 110;
+  const PAD = 12;
+  svg.innerHTML = "";
+
+  const usable = series.filter((item) => item.values.length >= 1);
+  if (!usable.length) {
+    const empty = svgEl("text", { x: W / 2, y: H / 2, class: "chart-axis", "text-anchor": "middle" });
+    empty.textContent = "暂无数据";
+    svg.appendChild(empty);
+    return;
+  }
+
+  const all = usable.flatMap((item) => item.values);
+  let min = Math.min(...all);
+  let max = Math.max(...all);
+  if (min === max) {
+    // 一条水平线也要能看见：人为撑开一点范围
+    min -= 0.5;
+    max += 0.5;
+  }
+  const span = max - min;
+
+  for (let i = 0; i <= 2; i += 1) {
+    const y = PAD + ((H - 2 * PAD) / 2) * i;
+    svg.appendChild(
+      svgEl("line", { x1: PAD, y1: y, x2: W - PAD, y2: y, class: "chart-grid" }),
+    );
+  }
+
+  usable.forEach((item, index) => {
+    const count = item.values.length;
+    const points = item.values
+      .map((value, i) => {
+        const x = count === 1 ? W / 2 : PAD + (i / (count - 1)) * (W - 2 * PAD);
+        const y = H - PAD - ((value - min) / span) * (H - 2 * PAD);
+        return `${x.toFixed(1)},${y.toFixed(1)}`;
+      })
+      .join(" ");
+    const line = svgEl("polyline", { points, class: `chart-line chart-s${index % 3}` });
+    // 点少的时候补圆点，否则 1~2 个点时折线几乎看不见
+    if (count <= 2) {
+      for (const pair of points.split(" ")) {
+        const [cx, cy] = pair.split(",");
+        svg.appendChild(svgEl("circle", { cx, cy, r: 2, class: `chart-dot chart-f${index % 3}` }));
+      }
+    }
+    svg.appendChild(line);
+  });
+
+  const maxText = svgEl("text", { x: PAD, y: PAD - 2, class: "chart-axis" });
+  maxText.textContent = fmtNum(max);
+  svg.appendChild(maxText);
+  const minText = svgEl("text", { x: PAD, y: H - 2, class: "chart-axis" });
+  minText.textContent = fmtNum(min);
+  svg.appendChild(minText);
+}
+
+function drawCharts() {
+  const lossSeries = progress.losses.length
+    ? [{ name: "total loss", values: progress.losses }]
+    : [];
+  drawChart(dom.lossChart, lossSeries);
+  dom.lossCap.textContent = lossSeries.length
+    ? `loss（总，${progress.lossSource || "训练"}）`
+    : "loss（暂无数据）";
+
+  const metricSeries = Object.entries(progress.metrics)
+    .filter(([, values]) => values.length)
+    .map(([name, values]) => ({ name, values }));
+  drawChart(dom.metricChart, metricSeries);
+  dom.metricCap.textContent = metricSeries.length
+    ? `指标：${metricSeries.map((item) => item.name).join(" / ")}`
+    : "指标（暂无数据）";
+}
+
+// ---------------------------------------------------------------------------
 // DOM 小工具
 // ---------------------------------------------------------------------------
 function appendLog(text, cls = "") {
@@ -502,4 +878,34 @@ function resetRunView() {
   dom.logBox.innerHTML = "";
   dom.metrics.innerHTML = "";
   dom.progressBar.style.width = "0%";
+
+  // 进度面板 / 表格 / 曲线全部清空，否则上一个任务的曲线会留在新任务下面
+  stopProgressTimer();
+  progress.total = 0;
+  progress.epoch = 0;
+  progress.startedAt = 0;
+  progress.lastEpochAt = 0;
+  progress.epochDeltas = [];
+  progress.pct = 0;
+  progress.rows = [];
+  progress.columns = [];
+  progress.losses = [];
+  progress.metrics = {};
+  progress.lossSource = "";
+  setStage("待启动");
+  dom.epochText.textContent = "epoch -/-";
+  dom.pctText.textContent = "0.0%";
+  dom.elapsedText.textContent = "已用 0:00";
+  dom.etaText.textContent = "预计剩余 —";
+  dom.speedText.textContent = "每轮 —";
+  dom.commandBox.hidden = true;
+  dom.command.textContent = "";
+  dom.chartRow.hidden = true;
+  dom.tableBox.hidden = true;
+  dom.tableHead.innerHTML = "";
+  dom.tableRows.innerHTML = "";
+  dom.lossChart.innerHTML = "";
+  dom.metricChart.innerHTML = "";
+  dom.lossCap.textContent = "loss（暂无数据）";
+  dom.metricCap.textContent = "指标（暂无数据）";
 }

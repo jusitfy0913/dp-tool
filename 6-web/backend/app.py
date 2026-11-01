@@ -38,11 +38,12 @@ import infer
 import labels as labels_mod
 import models as models_mod
 import onnx_fallback
+import progress
 from runners import manager
 
 #: 应用版本号。前端顶栏与 /api/health 都读它，方便一眼看出「页面连的是哪个后端」。
 #: 起因：改了代码但 8060 上跑的是几小时前的旧进程，排查很久才发现。
-APP_VERSION = "1.12.0"
+APP_VERSION = "1.13.0"
 
 # ---------------------------------------------------------------------------
 # 应用与生命周期
@@ -385,6 +386,22 @@ def _looks_like_untransposed_yolo(output_shape: list) -> bool:
     return 0 < dim1 < 100 and dim2 > 1000
 
 
+def _shape_side(spec: str) -> int | None:
+    """从 `1x3x960x960` 这类 shape 串里取出边长（最后一维）。
+
+    构建耗时随输入面积的平方增长，所以估算只需要这一个数。解析不出来返回 None，
+    由调用方回退到默认 640。
+    """
+    parts = [p.strip() for p in spec.replace("X", "x").split("x") if p.strip()]
+    if len(parts) < 2:
+        return None
+    try:
+        side = int(parts[-1])
+    except ValueError:
+        return None
+    return side if side > 0 else None
+
+
 @app.get("/api/engine/probe")
 def probe_onnx(onnx: str) -> dict:
     """探测 ONNX 的输入/输出形状，并判断布局是否适合当前推理链路。
@@ -498,17 +515,42 @@ def build_engine(request: EngineBuildRequest) -> dict:
     if request.extra_args.strip():
         command += shlex.split(request.extra_args.strip(), posix=False)
 
+    # 进度估算的信息：trtexec 的耗时几乎全在 tactic 搜索，而它主要由
+    # 「ONNX 体积 × 输入面积」决定。把这三项交给 progress 模块，
+    # 有历史就取中位数，没历史按实测基线外推。
+    imgsz = 640
+    if request.dynamic and request.opt_shape.strip():
+        imgsz = _shape_side(request.opt_shape) or 640
+    else:
+        input_shape = probe.get("input_shape") or []
+        if len(input_shape) >= 4 and isinstance(input_shape[2], int) and input_shape[2] > 0:
+            imgsz = int(input_shape[2])
+    meta = {
+        "onnx_mb": round(onnx_path.stat().st_size / 1024 / 1024, 2),
+        "precision": request.precision,
+        "dynamic": request.dynamic,
+        "imgsz": imgsz,
+    }
+    estimate = progress.estimate_seconds(meta, progress.default_store())
+
     try:
         run = manager.create(
             "engine-build",
             command,
             cwd=str(config.REPO_ROOT),
             expect_file=engine_path,
+            meta=meta,
+            estimate=estimate,
         )
     except OSError as exc:
         raise HTTPException(status_code=500, detail=f"启动 trtexec 失败：{exc}") from exc
 
-    return {**run.snapshot(), "engine": str(engine_path), "onnx_probe": probe}
+    return {
+        **run.snapshot(),
+        "engine": str(engine_path),
+        "onnx_probe": probe,
+        "estimate_seconds": round(estimate, 1),
+    }
 
 
 # ---------------------------------------------------------------------------
