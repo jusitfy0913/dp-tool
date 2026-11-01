@@ -31,7 +31,9 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 import annotation
+import augpreview
 import autolabel
+import checkpoints
 import config
 import dataset
 import infer
@@ -39,11 +41,12 @@ import labels as labels_mod
 import models as models_mod
 import onnx_fallback
 import progress
+import traininfo
 from runners import manager
 
 #: 应用版本号。前端顶栏与 /api/health 都读它，方便一眼看出「页面连的是哪个后端」。
 #: 起因：改了代码但 8060 上跑的是几小时前的旧进程，排查很久才发现。
-APP_VERSION = "1.13.0"
+APP_VERSION = "1.14.0"
 
 # ---------------------------------------------------------------------------
 # 应用与生命周期
@@ -111,6 +114,9 @@ class YoloTrainRequest(BaseModel):
     workers: int = 8
     pretrained: str = "true"
     resume: bool = False
+    # 断点续训：显式给出 last.pt 的绝对路径。非空时后端只拼 --resume-from，
+    # 不再依赖 Ultralytics 的 get_latest_run() 去猜「最近一次 run」。
+    resume_from: str = Field(default="", description="从指定 last.pt 续训")
     python: str | None = Field(default=None, description="覆盖训练解释器")
     # 数据增强：默认值与 Ultralytics 8.4 默认逐项一致，不填即行为不变。
     # 用 None 表示「用户没填」，这样拼命令行时可以整体跳过，避免把默认值
@@ -221,6 +227,12 @@ def train_yolo(request: YoloTrainRequest) -> dict:
     ]
     if request.resume:
         command.append("--resume")
+    if request.resume_from.strip():
+        checkpoint = Path(request.resume_from).expanduser()
+        if not checkpoint.is_file():
+            raise HTTPException(status_code=400, detail=f"续训检查点不存在：{checkpoint}")
+        _ensure_allowed_path(str(checkpoint))
+        command += ["--resume-from", str(checkpoint.resolve())]
 
     # 增强参数只在用户填了才拼进命令行：留空 = 用 launcher 默认 = 用 Ultralytics 默认
     augment_fields = (
@@ -297,6 +309,93 @@ def train_anomalib(request: AnomalibTrainRequest) -> dict:
     except OSError as exc:
         raise HTTPException(status_code=500, detail=f"启动训练进程失败：{exc}") from exc
     return run.snapshot()
+
+
+# ---------------------------------------------------------------------------
+# 开训前体检：数据集概览 + 增强预览
+# ---------------------------------------------------------------------------
+class DatasetOverviewRequest(BaseModel):
+    """只读扫描 dataset.yaml，不写任何文件。"""
+
+    source: str = Field(..., description="dataset.yaml 路径")
+    refresh: bool = Field(default=False, description="跳过多秒内的缓存")
+
+
+@app.post("/api/train/dataset-overview")
+def train_dataset_overview(request: DatasetOverviewRequest) -> dict:
+    """统计数据集规模、类别分布与结构问题。
+
+    独立于 /api/dataset/scan：那个接口要把整个数据集读成对象列表用于划分导出，
+    这里只要「已经导出的 YOLO 目录健康报告」，读标签文件名与首列类别号即可。
+    """
+    _ensure_allowed_path(request.source)
+    try:
+        return traininfo.scan(request.source, use_cache=not request.refresh)
+    except traininfo.OverviewError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except OSError as exc:
+        raise HTTPException(status_code=400, detail=f"扫描数据集失败：{exc}") from exc
+
+
+class AugmentPreviewRequest(BaseModel):
+    """增强预览请求。params 由前端把 15 个表单值原样传上来，空串表示用默认值。"""
+
+    data: str = Field(..., description="dataset.yaml 路径，用于定位训练集样本")
+    params: dict[str, Any] = Field(default_factory=dict, description="增强参数字典")
+    index: int = Field(default=0, ge=0, description="取第几张训练图")
+    seed: int | None = Field(default=None, description="随机种子；相同种子结果完全一致")
+    imgsz: int = Field(default=640, ge=64, le=4096, description="与训练一致的输入尺寸")
+    split: str = Field(default="train", description="从哪个 split 取样本")
+
+
+@app.post("/api/train/augment-preview")
+def train_augment_preview(request: AugmentPreviewRequest) -> dict:
+    """用当前参数对一张真实样本做一次增强，返回原图与增强图。
+
+    返回的两张图都是 base64 JPEG，前端直接塞进 <img>，不落临时文件。
+    """
+    _ensure_allowed_path(request.data)
+    try:
+        return augpreview.render(
+            request.data,
+            request.params,
+            index=request.index,
+            seed=request.seed,
+            imgsz=request.imgsz,
+            split=request.split,
+        )
+    except traininfo.OverviewError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except augpreview.PreviewError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/runs/checkpoints")
+def list_run_checkpoints(root: str | None = None, project: str | None = None, limit: int = 50) -> dict:
+    """列出历史训练目录，供断点续训挑选。
+
+    扫描根：``root``（显式指定）> 表单里的 ``project``（按 launcher 的 cwd 解析）
+    > launcher 目录下的 ``runs`` 与仓库根下的 ``runs``。
+    只读 ``args.yaml`` / ``results.csv``，不加载 ``.pt``——后端解释器没有 torch。
+    """
+    roots: list[Path] = []
+    if root and root.strip():
+        _ensure_allowed_path(root)
+        roots.append(Path(root).expanduser().resolve())
+    if project and project.strip():
+        candidate = Path(project).expanduser()
+        if not candidate.is_absolute():
+            # launcher 的 cwd 就是 YOLO_LAUNCHER_DIR，project 相对路径按它解析
+            candidate = config.YOLO_LAUNCHER_DIR / candidate
+        if config.is_path_allowed(candidate):
+            roots.append(candidate.resolve())
+    roots.append(config.YOLO_LAUNCHER_DIR / "runs")
+    roots.append(config.REPO_ROOT / "runs")
+
+    try:
+        return checkpoints.list_checkpoints(roots, limit=max(1, min(limit, 200)))
+    except OSError as exc:
+        raise HTTPException(status_code=400, detail=f"扫描训练目录失败：{exc}") from exc
 
 
 # ---------------------------------------------------------------------------

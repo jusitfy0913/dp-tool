@@ -1,13 +1,24 @@
 // 训练页：表单 → 启动任务 → 事件流渲染。
 // 只做展示与参数收集，参数语义完全沿用 launcher，不在前端做业务判断。
 
-import { postJSON, stopRun } from "./api.js";
+import { getJSON, postJSON, stopRun } from "./api.js";
 import { connectRunEvents } from "./ws.js";
 
 const state = {
   runId: null,
   stream: null,
   artifacts: [],
+};
+
+/// 开训前体检 / 增强预览 / 断点续训的状态。
+/// 全部只活在页面里：刷新后重新扫描即可，不落 localStorage——
+/// 这些信息都依赖磁盘上的真实文件，缓存下来反而会误导。
+const precheck = {
+  overview: null,
+  previewIndex: 0,
+  previewSeed: null,
+  resumeFrom: "",
+  resumeLabel: "",
 };
 
 /// 进度与曲线状态。
@@ -71,6 +82,31 @@ export function initTrain() {
     tableBox: document.getElementById("epochTableBox"),
     tableHead: document.getElementById("epochHead"),
     tableRows: document.getElementById("epochRows"),
+    // 开训前体检
+    btnScanData: document.getElementById("btnScanData"),
+    overviewHint: document.getElementById("dsOverviewHint"),
+    overviewBody: document.getElementById("dsOverviewBody"),
+    overviewCounts: document.getElementById("dsCounts"),
+    overviewBars: document.getElementById("dsClassBars"),
+    overviewResolution: document.getElementById("dsResolution"),
+    overviewWarnings: document.getElementById("dsWarnings"),
+    // 增强预览
+    btnPreview: document.getElementById("btnPreview"),
+    btnPreviewSeed: document.getElementById("btnPreviewSeed"),
+    btnPreviewNext: document.getElementById("btnPreviewNext"),
+    previewHint: document.getElementById("previewHint"),
+    previewBody: document.getElementById("previewBody"),
+    previewOrigin: document.getElementById("previewOrigin"),
+    previewAug: document.getElementById("previewAug"),
+    previewAugCap: document.getElementById("previewAugCap"),
+    previewApplied: document.getElementById("previewApplied"),
+    // 断点续训
+    btnScanRuns: document.getElementById("btnScanRuns"),
+    btnClearResume: document.getElementById("btnClearResume"),
+    resumeHint: document.getElementById("resumeHint"),
+    resumeActive: document.getElementById("resumeActive"),
+    resumeTableBox: document.getElementById("resumeTableBox"),
+    resumeRows: document.getElementById("resumeRows"),
   };
 
   dom.kind.addEventListener("change", syncKind);
@@ -106,6 +142,17 @@ export function initTrain() {
     });
     appendLog("已清空增强参数，将使用 Ultralytics 默认值", "ok");
   });
+
+  // 开训前体检：三个面板都是「看一眼就能省一次训练」的信息，全部按需触发
+  dom.btnScanData.addEventListener("click", () => scanDataset());
+  dom.btnPreview.addEventListener("click", () => renderPreview({ reseed: true }));
+  dom.btnPreviewSeed.addEventListener("click", () => renderPreview({ reseed: true }));
+  dom.btnPreviewNext.addEventListener("click", () => {
+    precheck.previewIndex += 1;
+    renderPreview({ reseed: true });
+  });
+  dom.btnScanRuns.addEventListener("click", () => scanRuns());
+  dom.btnClearResume.addEventListener("click", () => clearResume());
 
   syncKind();
   setDefaultRunName();
@@ -234,6 +281,12 @@ async function onSubmit(event) {
 
   try {
     const payload = isYolo ? buildYoloPayload() : buildAnomalibPayload();
+    if (isYolo && precheck.resumeFrom) {
+      // 续训走独立字段：后端只拼 --resume-from <绝对路径>，
+      // 不再依赖 Ultralytics 的 get_latest_run() 去猜「最近一次 run」。
+      payload.resume_from = precheck.resumeFrom;
+      appendLog(`续训模式：从 ${precheck.resumeFrom} 继续，epochs 等参数以检查点记录为准`, "warn");
+    }
     const url = isYolo ? "/api/train/yolo" : "/api/train/anomalib";
     const run = await postJSON(url, payload);
     state.runId = run.run_id;
@@ -264,17 +317,28 @@ function openStream(runId) {
       dom.btnStop.disabled = true;
       stopProgressTimer();
       const ok = (payload.exit ?? 0) === 0;
-      setBadge(ok ? "已完成" : "失败", ok ? "done" : "fail");
-      setStage(ok ? "已完成" : "已结束", ok ? "done" : "fail");
+      // 主动停止不是失败：Windows 上 terminate() 的退出码是 1，
+      // 只能靠后端标好的 status 判断。以前这里只看退出码，
+      // 于是「自己点的停止」被显示成「失败」，误导用户以为训练崩了。
+      const cancelled = payload.status === "cancelled";
+      setBadge(cancelled ? "已停止" : ok ? "已完成" : "失败", cancelled ? "warn" : ok ? "done" : "fail");
+      setStage(cancelled ? "已停止" : ok ? "已完成" : "已结束", cancelled ? "warn" : ok ? "done" : "fail");
       if (ok && progress.pct < 100) setProgressBar(100);
       appendLog(
-        ok ? "任务完成。" : `任务结束，退出码 ${payload.exit}`,
-        ok ? "ok" : "err",
+        cancelled
+          ? "任务已停止（进度与产物保留，可从 last.pt 续训）"
+          : ok
+            ? "任务完成。"
+            : `任务结束，退出码 ${payload.exit}`,
+        cancelled ? "warn" : ok ? "ok" : "err",
       );
       // 结束那一刻把「已用」定格，避免定时器停掉后数字看起来停在中间
       renderElapsed(true);
       if (state.artifacts.length) {
-        appendLog(`产物：\n${state.artifacts.join("\n")}`, "ok");
+        // 同一个产物会被后端发多次（训练中出图、校验后再出图、收尾再列一遍），
+        // 直接 join 会打印出一堆重复路径，这里按首次出现顺序去重。
+        const unique = [...new Set(state.artifacts)];
+        appendLog(`产物：\n${unique.join("\n")}`, "ok");
       }
     },
     onError: (message) => appendLog(message, "warn"),
@@ -908,4 +972,328 @@ function resetRunView() {
   dom.metricChart.innerHTML = "";
   dom.lossCap.textContent = "loss（暂无数据）";
   dom.metricCap.textContent = "指标（暂无数据）";
+}
+
+// ---------------------------------------------------------------------------
+// 开训前体检（v1.14）：数据集概览 / 增强预览 / 断点续训
+// ---------------------------------------------------------------------------
+// 三块都是「只读看一眼」的功能：不写文件、不改训练参数，
+// 唯一的副作用是扫描时多读几次磁盘，因此全部按需触发，不做自动轮询。
+
+/** 表单里的 15 项增强参数，空串表示「用 launcher 默认值」。 */
+function augmentFormValues() {
+  const map = {
+    hsv_h: "augHsvH",
+    hsv_s: "augHsvS",
+    hsv_v: "augHsvV",
+    degrees: "augDegrees",
+    translate: "augTranslate",
+    scale: "augScale",
+    shear: "augShear",
+    perspective: "augPerspective",
+    flipud: "augFlipud",
+    fliplr: "augFliplr",
+    bgr: "augBgr",
+    mosaic: "augMosaic",
+    mixup: "augMixup",
+    copy_paste: "augCopyPaste",
+  };
+  const params = {};
+  for (const [key, id] of Object.entries(map)) {
+    // 空串也照传：后端把空串理解为「默认值」，并在响应里回显真正用了多少
+    params[key] = formValue(id);
+  }
+  return params;
+}
+
+// ---- 数据集概览 -----------------------------------------------------------
+async function scanDataset() {
+  const source = formValue("yoloData");
+  if (!source) {
+    setOverviewHint("先填 dataset.yaml 路径", "bad");
+    return;
+  }
+  dom.btnScanData.disabled = true;
+  setOverviewHint("扫描中…（几万张的目录会慢一点）");
+  try {
+    // refresh 传 false：后端按「yaml 路径 + mtime + size」缓存 60 秒。
+    // 重新导出数据集会重写 dataset.yaml，缓存自然失效；连点两次不会重扫几万张。
+    const data = await postJSON("/api/train/dataset-overview", { source, refresh: false });
+    precheck.overview = data;
+    renderOverview(data);
+    setOverviewHint(`扫描完成，用时 ${data.elapsed_ms} ms${data.cached ? "（数据集未变，命中缓存）" : ""}`, "ok");
+  } catch (error) {
+    setOverviewHint(error.message, "bad");
+  } finally {
+    dom.btnScanData.disabled = false;
+  }
+}
+
+function setOverviewHint(text, cls = "") {
+  dom.overviewHint.textContent = text;
+  dom.overviewHint.className = `hint ${cls}`.trim();
+}
+
+/** 渲染概览：计数格 + 每类实例条形 + 分辨率 + 警告清单。 */
+function renderOverview(data) {
+  dom.overviewBody.hidden = false;
+
+  const splits = data.splits || {};
+  const cells = [
+    ["图片总数", data.counts.total],
+    ["标注框总数", data.counts.instances],
+    ["类别数", (data.classes || []).length],
+  ];
+  for (const name of ["train", "val", "test"]) {
+    const stat = splits[name];
+    if (!stat) continue;
+    cells.push([
+      name,
+      stat.configured ? `${stat.images} 图 / ${stat.instances} 框` : "未配置",
+    ]);
+  }
+
+  dom.overviewCounts.innerHTML = "";
+  for (const [label, value] of cells) {
+    const box = document.createElement("div");
+    box.className = "stat";
+    const name = document.createElement("span");
+    name.className = "stat-label";
+    name.textContent = label;
+    const number = document.createElement("b");
+    number.textContent = String(value);
+    box.append(name, number);
+    dom.overviewCounts.appendChild(box);
+  }
+
+  // 每类实例数：条形长度相对最多的类，0 用红色标出来
+  const classes = data.classes || [];
+  const counts = data.class_instances || {};
+  dom.overviewBars.innerHTML = "";
+  const maxCount = Math.max(1, ...classes.map((item) => counts[String(item.id)] || 0));
+  for (const item of classes) {
+    const value = counts[String(item.id)] || 0;
+    const row = document.createElement("div");
+    row.className = "bar-row";
+    const label = document.createElement("span");
+    label.className = "bar-label";
+    label.textContent = item.name;
+    const track = document.createElement("span");
+    track.className = "bar-track";
+    const fill = document.createElement("span");
+    fill.className = value === 0 ? "bar-fill is-zero" : "bar-fill";
+    fill.style.width = `${(value / maxCount) * 100}%`;
+    track.appendChild(fill);
+    const number = document.createElement("span");
+    number.className = "bar-value";
+    number.textContent = String(value);
+    row.append(label, track, number);
+    dom.overviewBars.appendChild(row);
+  }
+
+  const res = data.resolutions || {};
+  if (res.count) {
+    const top = (res.top || [])[0];
+    dom.overviewResolution.textContent =
+      `train 分辨率：宽 ${res.width[0]}~${res.width[2]}（中位 ${res.width[1]}），` +
+      `高 ${res.height[0]}~${res.height[2]}（中位 ${res.height[1]}）` +
+      (top ? `；最常见 ${top.width}×${top.height}（${top.count} 张）` : "");
+  } else {
+    dom.overviewResolution.textContent = "分辨率：没读到可用图片尺寸";
+  }
+
+  dom.overviewWarnings.innerHTML = "";
+  const warnings = data.warnings || [];
+  dom.overviewWarnings.hidden = warnings.length === 0;
+  for (const item of warnings) {
+    const li = document.createElement("li");
+    li.className = `warn-${item.level}`;
+    li.textContent = item.text;
+    dom.overviewWarnings.appendChild(li);
+  }
+}
+
+// ---- 增强预览 -------------------------------------------------------------
+async function renderPreview({ reseed = false } = {}) {
+  const data = formValue("yoloData");
+  if (!data) {
+    setPreviewHint("先填 dataset.yaml 路径", "bad");
+    return;
+  }
+  if (reseed || precheck.previewSeed === null) {
+    // seed 由前端产生并回显：用户想复现某次预览时可以把数字记下来
+    precheck.previewSeed = Math.floor(Math.random() * 1e9);
+  }
+  dom.btnPreview.disabled = true;
+  dom.btnPreviewSeed.disabled = true;
+  dom.btnPreviewNext.disabled = true;
+  setPreviewHint("生成中…");
+  try {
+    const result = await postJSON("/api/train/augment-preview", {
+      data,
+      params: augmentFormValues(),
+      index: precheck.previewIndex,
+      seed: precheck.previewSeed,
+      imgsz: Number(formValue("yoloImgsz")) || 640,
+      split: "train",
+    });
+    dom.previewBody.hidden = false;
+    dom.previewOrigin.src = result.origin;
+    dom.previewAug.src = result.augmented;
+    dom.previewAugCap.textContent =
+      `增强后（第 ${result.index + 1}/${result.total} 张，seed ${result.seed}）`;
+    renderPreviewApplied(result);
+    setPreviewHint(`已生成，输入尺寸 ${result.imgsz}`, "ok");
+  } catch (error) {
+    setPreviewHint(error.message, "bad");
+  } finally {
+    dom.btnPreview.disabled = false;
+    dom.btnPreviewSeed.disabled = false;
+    dom.btnPreviewNext.disabled = false;
+  }
+}
+
+function setPreviewHint(text, cls = "") {
+  dom.previewHint.textContent = text;
+  dom.previewHint.className = `hint ${cls}`.trim();
+}
+
+/** 本次到底触发了什么、什么没生效、哪些参数压根不参与——全部照实列出来。 */
+function renderPreviewApplied(result) {
+  dom.previewApplied.innerHTML = "";
+  const lines = [];
+  for (const item of result.applied || []) {
+    lines.push(["warn-info", `生效：${item.name} —— ${item.detail}`]);
+  }
+  for (const item of result.skipped || []) {
+    lines.push(["warn-info", `未生效：${item.name} —— ${item.detail}`]);
+  }
+  for (const item of result.ignored || []) {
+    lines.push(["warn-warn", `不参与预览：${item.name} —— ${item.detail}`]);
+  }
+  if (result.fell_back?.length) {
+    lines.push(["warn-warn", `这些值不是数字，已按默认值渲染：${result.fell_back.join(", ")}`]);
+  }
+  dom.previewApplied.hidden = lines.length === 0;
+  for (const [cls, text] of lines) {
+    const li = document.createElement("li");
+    li.className = cls;
+    li.textContent = text;
+    dom.previewApplied.appendChild(li);
+  }
+}
+
+// ---- 断点续训 -------------------------------------------------------------
+async function scanRuns() {
+  dom.btnScanRuns.disabled = true;
+  setResumeHint("扫描中…");
+  try {
+    const project = formValue("project");
+    const query = project ? `?project=${encodeURIComponent(project)}` : "";
+    const data = await getJSON(`/api/runs/checkpoints${query}`);
+    renderRuns(data);
+    setResumeHint(`共 ${data.total} 次训练，列出 ${data.shown} 条`, "ok");
+  } catch (error) {
+    setResumeHint(error.message, "bad");
+  } finally {
+    dom.btnScanRuns.disabled = false;
+  }
+}
+
+function setResumeHint(text, cls = "") {
+  dom.resumeHint.textContent = text;
+  dom.resumeHint.className = `hint ${cls}`.trim();
+}
+
+function renderRuns(data) {
+  dom.resumeRows.innerHTML = "";
+  dom.resumeTableBox.hidden = (data.items || []).length === 0;
+  for (const item of data.items || []) {
+    const tr = document.createElement("tr");
+
+    const nameCell = document.createElement("td");
+    const name = document.createElement("div");
+    name.textContent = item.name;
+    const meta = document.createElement("div");
+    meta.className = "row-sub";
+    meta.textContent = [item.task, item.imgsz ? `${item.imgsz}px` : "", item.optimizer]
+      .filter(Boolean)
+      .join(" · ");
+    nameCell.append(name, meta);
+    nameCell.title = item.run_dir;
+    tr.appendChild(nameCell);
+
+    const doneCell = document.createElement("td");
+    doneCell.className = "num";
+    doneCell.textContent = `${item.epochs_done}/${item.epochs_planned ?? "?"}`;
+    tr.appendChild(doneCell);
+
+    const mapCell = document.createElement("td");
+    mapCell.className = "num";
+    mapCell.textContent = item.best_map === null ? "—" : fmtNum(item.best_map);
+    tr.appendChild(mapCell);
+
+    const weightCell = document.createElement("td");
+    weightCell.className = "num";
+    weightCell.textContent = item.last_pt ? `${item.last_pt_mb} MB` : "缺失";
+    tr.appendChild(weightCell);
+
+    const actionCell = document.createElement("td");
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "mini";
+    button.textContent = "继续训练";
+    button.disabled = !item.resumable;
+    if (item.blocked_reason) button.title = item.blocked_reason;
+    button.addEventListener("click", () => applyResume(item));
+    actionCell.appendChild(button);
+    if (item.blocked_reason) {
+      const why = document.createElement("div");
+      why.className = "row-sub";
+      why.textContent = item.blocked_reason;
+      actionCell.appendChild(why);
+    }
+    tr.appendChild(actionCell);
+
+    dom.resumeRows.appendChild(tr);
+  }
+}
+
+/** 选中一条历史：回填表单并把主按钮改成「继续训练」。 */
+function applyResume(item) {
+  precheck.resumeFrom = item.last_pt;
+  precheck.resumeLabel = `${item.name}（第 ${item.epochs_done} 轮后）`;
+  precheck.previewIndex = 0;
+
+  document.getElementById("yoloData").value = item.data;
+  document.getElementById("yoloModel").value = item.last_pt;
+  if (item.task) document.getElementById("yoloTask").value = item.task;
+  if (item.imgsz) document.getElementById("yoloImgsz").value = String(item.imgsz);
+  // project 取 run_dir 的父目录，name 取原实验名：这样续训写回同一个目录
+  const runDir = item.run_dir.replace(/[\\/]+$/, "");
+  const cut = Math.max(runDir.lastIndexOf("\\"), runDir.lastIndexOf("/"));
+  if (cut > 0) {
+    dom.project.value = runDir.slice(0, cut);
+    dom.runName.value = runDir.slice(cut + 1);
+  }
+
+  dom.resumeActive.hidden = false;
+  dom.resumeActive.textContent =
+    `已选择续训点：${precheck.resumeLabel} → ${item.last_pt}。` +
+    "epochs / 优化器等参数以该检查点内记录的为准，表单上改这些不会生效。";
+  dom.btnClearResume.hidden = false;
+  dom.btnTrain.textContent = `继续训练（从第 ${item.epochs_done} 轮）`;
+  setHint("已进入续训模式；只想改参数重新练的话，点「取消续训」");
+  appendLog(`已选择续训点：${item.last_pt}`, "ok");
+}
+
+function clearResume() {
+  precheck.resumeFrom = "";
+  precheck.resumeLabel = "";
+  dom.resumeActive.hidden = true;
+  dom.resumeActive.textContent = "";
+  dom.btnClearResume.hidden = true;
+  dom.btnTrain.textContent = "开始训练";
+  setHint("");
+  appendLog("已取消续训，下次提交按普通训练处理", "warn");
 }

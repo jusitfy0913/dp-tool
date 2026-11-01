@@ -251,6 +251,47 @@ python tf_yolo_launcher.py --mode train `
 > 完整 15 项清单见 `readme.md` 的 v1.7 版本记录，或直接在 Web「模型训练」页展开「数据增强」。
 > 回归测试：`python 6-web/backend/tools/test_augment_params.py`（26 项）。
 
+#### 3.2.2 训练前体检与断点续训（v1.14）
+
+**目的**：把三类「跑到一半才发现」的返工提前到 10 秒内发现——数据集配错、增强配错、白重跑。
+
+| 能力 | Web 位置 | 命令行等价物 |
+| --- | --- | --- |
+| 数据集概览 | 训练页「数据集概览」→ 扫描数据集 | 无（只读统计，不训练） |
+| 增强预览 | 训练页「增强预览」→ 生成预览 | 无（cv2 近似，不写盘） |
+| 断点续训 | 训练页「断点续训」→ 扫描历史 → 继续训练 | `--resume-from <weights\last.pt>` |
+
+断点续训的唯一新增参数：
+
+```powershell
+python tf_yolo_launcher.py --mode train `
+  --model  runs\trtforge\my_yolo\weights\last.pt `
+  --data   configs\pcb_detect.yaml `
+  --resume-from runs\trtforge\my_yolo\weights\last.pt `
+  --project runs\trtforge --name my_yolo
+```
+
+- **`--resume-from` 和 `--resume` 不同**：后者靠 `get_latest_run()` 猜「最近一次 run」，机器上并存多个项目时经常猜错；
+  前者是你显式指定的检查点，launcher 用 `model.train(resume=该路径)` 恢复，同时把该权重当初始模型加载。
+- 续训会**写回原 run 目录**（Ultralytics `check_resume` 用检查点里记录的 `project/name`），
+  `results.csv` 继续追加行。想开新实验就别用续训，直接改 `--name`。
+- `weights/last.pt` 或 `dataset.yaml` 丢失时不可续训，Web 端会直接显示 `blocked_reason`，不用点进去才发现。
+
+**体检能看到什么**
+
+- 三个 split 各自：图片数、标注文件数、空标注数、有图无标（漏标）、有标无图（孤儿标）、框总数
+- 每类框数（一眼看长尾）、抽样分辨率分布（不解码像素，只读图像头）
+- 常见告警：某类 0 个框、train/val 类别集合不一致、空标比例过高、孤儿标注
+
+**预览能看到什么**
+
+- 「原图 vs 增强后」对照：`mosaic → 仿射 → hsv → flip → bgr → mixup` 按当前表单参数真实生效
+- 同 `seed` 同参数必出同图，便于逐个参数对比
+- 不预览 `copy_paste`（需分割掩码）与 `close_mosaic`（只在最后 N 轮生效的调度），结果里会列在 `ignored`
+
+> 预览是 **OpenCV 近似**，不是 Ultralytics 逐像素复刻（概率采样顺序、缓存等无法一比一）。
+> 它的定位是「确认方向和量级」，不是验收依据。
+
 
 ### 3.3 Anomalib 训练（三选一）
 

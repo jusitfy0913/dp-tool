@@ -110,6 +110,83 @@
               <button type="button" class="mini" id="augReset">清空（用默认）</button>
             </div>
           </details>
+
+          <!-- 数据集概览：开训前的体检报告。
+               只读扫描，不写任何文件；大目录靠后端 60 秒缓存兜住连点。 -->
+          <details class="augbox" id="dsOverviewBox">
+            <summary>数据集概览（开训前先看清里面有什么）</summary>
+            <p class="hint">
+              扫描 dataset.yaml 指向的真实目录：图片数、每类实例数、空标签、孤儿标签、缺失标签、
+              分辨率分布。只读，不会改动任何文件。
+            </p>
+            <div class="actions">
+              <button type="button" class="mini" id="btnScanData">扫描数据集</button>
+              <span class="hint" id="dsOverviewHint"></span>
+            </div>
+            <div id="dsOverviewBody" hidden>
+              <div class="stat-grid" id="dsCounts"></div>
+              <div class="bars" id="dsClassBars"></div>
+              <p class="hint" id="dsResolution"></p>
+              <ul class="warnlist" id="dsWarnings"></ul>
+            </div>
+          </details>
+
+          <!-- 增强预览：调完参数先看一眼，比训完一轮再后悔便宜得多 -->
+          <details class="augbox" id="augPreviewBox">
+            <summary>增强预览（用当前参数生成一张真实样本）</summary>
+            <p class="hint">
+              拿训练集里的一张真实图片，按上面填的 15 项参数做一次增强。
+              <b>这是像素级近似</b>：几何与颜色变换与训练等价，但实际训练中每轮的触发顺序与强度
+              由 Ultralytics 随机决定，不能拿预览当验收依据。
+            </p>
+            <div class="actions">
+              <button type="button" class="mini" id="btnPreview">生成预览</button>
+              <button type="button" class="mini" id="btnPreviewSeed">换个种子</button>
+              <button type="button" class="mini" id="btnPreviewNext">换一张</button>
+              <span class="hint" id="previewHint"></span>
+            </div>
+            <div class="preview-grid" id="previewBody" hidden>
+              <figure>
+                <img id="previewOrigin" alt="原图（已 letterbox 到 imgsz）">
+                <figcaption>原图</figcaption>
+              </figure>
+              <figure>
+                <img id="previewAug" alt="增强后">
+                <figcaption id="previewAugCap">增强后</figcaption>
+              </figure>
+            </div>
+            <ul class="warnlist" id="previewApplied" hidden></ul>
+          </details>
+
+          <!-- 断点续训：显式挑一个 last.pt，不再让 Ultralytics 去猜「最近一次 run」 -->
+          <details class="augbox" id="resumeBox">
+            <summary>断点续训（从 last.pt 接着训）</summary>
+            <p class="hint">
+              扫描历史训练目录，挑一次从它的 <code>last.pt</code> 继续。
+              <b>续训时 epochs / 优化器等参数以检查点里记录的为准</b>，表单上改了也不生效——
+              这是 Ultralytics 的固有语义，界面上必须说清楚。
+            </p>
+            <div class="actions">
+              <button type="button" class="mini" id="btnScanRuns">扫描历史训练</button>
+              <button type="button" class="mini" id="btnClearResume" hidden>取消续训</button>
+              <span class="hint" id="resumeHint"></span>
+            </div>
+            <p class="resume-active" id="resumeActive" hidden></p>
+            <div class="scrollbox" id="resumeTableBox" hidden>
+              <table class="data-table" id="resumeTable">
+                <thead>
+                  <tr>
+                    <th>实验</th>
+                    <th class="num">已完成</th>
+                    <th class="num">最佳 mAP50-95</th>
+                    <th class="num">last.pt</th>
+                    <th>操作</th>
+                  </tr>
+                </thead>
+                <tbody id="resumeRows"></tbody>
+              </table>
+            </div>
+          </details>
         </div>
 
         <!-- Anomalib 专用 -->

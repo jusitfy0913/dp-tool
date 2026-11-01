@@ -508,7 +508,7 @@ def build_train_kwargs(args: argparse.Namespace) -> Dict[str, Any]:
         "momentum": args.momentum,
         "weight_decay": args.weight_decay,
         "freeze": args.freeze,
-        "resume": args.resume,
+        "resume": str(Path(args.resume_from).resolve()) if args.resume_from else args.resume,
         "plots": args.plots,
         "verbose": True,
         # 增强参数：默认值与 Ultralytics 默认一致，只有用户显式指定才会改变行为
@@ -690,7 +690,14 @@ def mode_probe_model(args: argparse.Namespace) -> int:
 
 def mode_train(args: argparse.Namespace) -> int:
     validate_task(args.task)
-    model_path = args.model or default_model_for_task(args.task)
+    if args.resume_from:
+        checkpoint = Path(args.resume_from).expanduser()
+        if not checkpoint.is_file():
+            emit_error("CHECKPOINT_NOT_FOUND", "续训检查点不存在", path=str(checkpoint))
+            return 2
+        model_path = str(checkpoint.resolve())
+    else:
+        model_path = args.model or default_model_for_task(args.task)
     model = load_yolo(model_path)
     add_train_callbacks(model, args)
     emit({"type": "event", "name": "launcher_train", "task": args.task, "model": model_path})
@@ -774,6 +781,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--data", default="")
     parser.add_argument("--pretrained", default=None)
     parser.add_argument("--resume", action="store_true")
+    # 显式续训：拿到具体某个 last.pt，而不是让 Ultralytics 用 get_latest_run()
+    # 去当前工作目录里猜「最近一次 run」。Web 端子进程的 cwd 是 launcher 目录，
+    # 猜错就等于静默换了数据集/模型接着训，而且不会报错。
+    parser.add_argument("--resume-from", default="", help="从指定的 .pt 检查点续训（优先级高于 --resume）")
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--imgsz", type=int, default=640)
     parser.add_argument("--batch", default="16")

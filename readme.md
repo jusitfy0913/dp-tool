@@ -133,6 +133,44 @@ python tf_anomalib_launcher.py --mode check-env
 
 ## 版本更新记录
 
+### v1.14 — 2026-11-01（训练前体检：数据集概览、增强预览、断点续训）
+
+上一版解决了「训练中看得见」，这一版解决「开跑前看得见」。三个功能都指向同一类返工：
+**跑到一半才发现数据集配错、增强配错、或者白重跑了 30 轮。**
+
+| 项目 | 老版本 | 新版本 | 影响 |
+| --- | --- | --- | --- |
+| 数据集体检 | 只能靠训练时 YOLO 自己打印的几行摘要，跑起来才知道少标注 | 训练页「数据集概览」：三 split 图片/标注/空标/漏标/孤儿标、每类框数条形图、抽样分辨率 | 开跑前 1 秒看清数据长什么样，不用等训练报错 |
+| 扫描成本 | — | 只读 `dataset.yaml` + 标签文本首列，**不解码图像**；分辨率只读图像头 | 692 张图的真实 PCB 数据集 225 ms 出结果 |
+| 重复扫描 | — | 按 `yaml 路径 + mtime + 大小` 缓存 60 秒，可 `refresh` 强制重扫 | 上万张图点第二次秒回，不会以为卡死 |
+| 增强效果 | 改完 `mosaic`/`scale` 只能等训练出的 `train_batch*.jpg` | 训练页「增强预览」：按当前表单参数出「原图 vs 增强后」对照图 | 参数填错立刻看见，不用等一轮训完 |
+| 预览可复现 | — | `seed` 决定样本与全部随机量，同参数同 seed 必出同图 | 逐个参数对比「到底变了什么」 |
+| 续训入口 | `--resume` 靠 `get_latest_run()` **猜**最近一次 run | 表格列出所有可续训 run（轮次 / 最佳 mAP / last.pt 大小 / 不可续训原因），点一下就填好表单 | 多项目并存时不会续错到别的实验 |
+| 续训实现 | — | launcher 新增 `--resume-from <last.pt>`，`model.train(resume=该路径)` | 显式指定检查点，不再依赖「最近一次」这个脆弱假设 |
+
+**两处刻意的取舍**
+
+1. **预览用 OpenCV 近似，不是跑 Ultralytics 本体**。后端环境没有 torch 也能用（不需要 GPU、不占显存），
+   代价是概率采样顺序、缓存这些无法一比一复刻。所以预览是「确认方向和量级」，不是验收依据；
+   `copy_paste`（需要分割掩码）与 `close_mosaic`（只在最后 N 轮生效的调度）明确不预览，
+   并在响应 `ignored` 里列出来，避免用户以为「预览里有就是训练里也有」。
+2. **扫 run 不加载 `.pt`**。只读 `args.yaml`（纯文本）与 `results.csv`（行数 = 已完成轮次，
+   最大 `mAP50-95` = 最佳指标），所以 Web 后端不需要 torch 就能列出全部历史实验，
+   也不会有「扫一下就吃了 30GB 显存」的问题。
+
+**必须记住的一条**：续训会**写回原 run 目录**。Ultralytics 的 `check_resume` 用检查点里记录的
+`project/name`，所以 `results.csv` 是继续往后追加行，而不是另开目录。想开新实验就别点「继续训练」，
+改 `--name` 正常训练。
+
+验收：`test_train_info.py` **34/34**、`test_aug_preview.py` **24/24**、`test_checkpoints.py` **22/22** 通过；
+回归 `test_engine_progress`(26)、`test_exit_codes`(6)、`test_augment_params`(26)、
+`test_dataset_workbench`(20)、`test_infer_params`(71)、`test_onnx_fallback`(36)、
+`test_annotation_project`(138) 全通过。浏览器实测：扫描真实 PCB 数据集（692 图 / 2950 框 / 6 类）225 ms、
+定位到孤儿标注 `04_mouse_bite_17.txt` 并给告警；增强预览出原图与增强对照并列出生效项与忽略项；
+从中断的 `base_interrupt`（1/2 轮）续训，命令行带 `--resume-from ...\weights\last.pt`，
+从 `epoch 2/2` 接着跑完，产物列表按路径去重。细节见 `6-web/README.md` 的 v1.14 小节与
+`docs/WORKFLOW_GUIDE.md` 的 3.2.2。
+
 ### v1.13 — 2026-11-01（训练与引擎构建的进度可视化：终于知道它在干什么、还要多久）
 
 问题很具体：**引擎构建页在 960×960 上会静默 473 秒**，训练页只有一条不会动的进度条。
@@ -547,7 +585,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_web_studio.ps1
 
 | 页面 | 能力 |
 | --- | --- |
-| 训练导出 | 选 YOLO / Anomalib、填参数（含优化器/学习率/workers/patience/amp/resume）、环境自检、实时日志、参数回显、阶段与 `epoch n/N` 进度、每轮耗时与预计剩余、每轮指标表、loss/mAP 内联 SVG 曲线、一键停止 |
+| 训练导出 | 选 YOLO / Anomalib、填参数（含优化器/学习率/workers/patience/amp/resume）、环境自检、实时日志、参数回显、阶段与 `epoch n/N` 进度、每轮耗时与预计剩余、每轮指标表、loss/mAP 内联 SVG 曲线、一键停止；**v1.14 新增**数据集概览（漏标/孤儿标/类别分布/分辨率）、增强预览（原图 vs 增强后）、断点续训（扫历史 run → 一键续训） |
 | 引擎构建 | 选 ONNX 自动探测形状、fp16/fp32、动态 shape、实时编译日志、8 阶段进度条 + 预计剩余（历史耗时自学习）、产物落盘校验 |
 | 数据集 | 扫描 YOLO 目录 / `.tfanno`、固定哈希划分预览、导出 YOLO / COCO / VOC |
 | 标注 | 打开 / 新建 `.tfanno`、六种形状绘制（矩形/旋转矩形/多边形/线/点/关键点组）、缩放平移吸附、撤销重做、3 秒自动保存、修订号冲突弹窗、类别与属性面板、自动标注草稿层、导出 YOLO / COCO / VOC |
@@ -657,6 +695,27 @@ OCR 推理页的画面区与右侧结果列表支持拖动分隔条调整比例�
 
 > 15 项增强参数的默认值与 Ultralytics `DEFAULT_CFG` 逐项一致；不填即行为不变。
 > 小缺陷（如 PCB 70px）推荐组合：`--mosaic 0.1 --close-mosaic 20 --scale 0.3`。
+
+### 断点续训（v1.14 新增 `--resume-from`）
+
+| 参数 | 默认 | 说明 |
+| --- | --- | --- |
+| `--resume` | 关 | 靠 `get_latest_run()` **猜**「最近一次 run」，机器上并存多个项目时容易猜错 |
+| `--resume-from` | 空 | **显式指定** `weights/last.pt` 的绝对路径；launcher 执行 `model.train(resume=该路径)`，同时把它当初始模型加载 |
+
+```powershell
+python tf_yolo_launcher.py --mode train `
+  --model  runs\trtforge\my_yolo\weights\last.pt `
+  --data   configs\pcb_detect.yaml `
+  --resume-from runs\trtforge\my_yolo\weights\last.pt `
+  --project runs\trtforge --name my_yolo
+```
+
+- 续训**写回原 run 目录**（Ultralytics `check_resume` 用检查点里记录的 `project/name`），`results.csv` 继续追加行。
+  想开新实验就别续训，直接改 `--name`。
+- Web 端只用 `--resume-from`：训练页「断点续训」会列出所有可续训的 run（已完成 / 计划轮次、最佳 mAP、
+  `last.pt` 大小、不可续训原因），点「继续训练」自动填好表单。
+- 扫描只读 `args.yaml` 与 `results.csv`，**不加载 `.pt`**，所以后端不需要 torch 也能列出历史实验。
 
 ## Anomalib 训练导出设计
 

@@ -569,6 +569,103 @@ button.danger:hover:not(:disabled) { background: var(--danger-a12); border-color
 .augbox[open] summary { margin-bottom: var(--sp-1); }
 .augbox .actions { margin-top: var(--sp-2); }
 
+/* ---- 4.2b 开训前体检：概览计数 / 类别条形 / 预览图 / 续训提示（v1.14） ---- */
+/* 计数格：数字优先，标签次要，扫一眼就能读出规模 */
+.stat-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+  gap: var(--sp-2);
+  margin-top: var(--sp-2);
+}
+.stat {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: var(--sp-2) var(--sp-3);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+}
+.stat-label { color: var(--text-dim); font-size: var(--fs-2xs); letter-spacing: .04em; }
+.stat b { color: var(--cyan); font-size: var(--fs-lg); font-weight: 600; font-family: var(--font-mono); }
+
+/* 每类实例数条形：长度相对最多的类，0 用红色实心块标出，比「0」这个数字更醒目 */
+.bars { display: flex; flex-direction: column; gap: 3px; margin-top: var(--sp-3); }
+.bar-row { display: grid; grid-template-columns: 96px minmax(0, 1fr) 52px; gap: var(--sp-2); align-items: center; }
+.bar-label {
+  color: var(--text-dim);
+  font-size: var(--fs-2xs);
+  font-family: var(--font-mono);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.bar-track { height: 8px; border-radius: 999px; background: var(--surface-2); overflow: hidden; }
+.bar-fill {
+  display: block;
+  height: 100%;
+  min-width: 2px;
+  border-radius: 999px;
+  background: linear-gradient(90deg, var(--cyan), var(--teal));
+}
+.bar-fill.is-zero { background: var(--danger); }
+.bar-value { color: var(--text-dim); font-size: var(--fs-2xs); font-family: var(--font-mono); text-align: right; }
+
+/* 警告清单：等级只在文字颜色上体现，左侧再加一条竖线，不靠图标 */
+.warnlist { margin: var(--sp-3) 0 0; padding: 0 0 0 var(--sp-3); list-style: none; display: flex; flex-direction: column; gap: var(--sp-1); }
+.warnlist li {
+  position: relative;
+  padding-left: var(--sp-2);
+  border-left: 2px solid var(--line-strong);
+  color: var(--text-dim);
+  font-size: var(--fs-xs);
+  line-height: 1.5;
+}
+.warnlist li.warn-bad { border-left-color: var(--danger); color: var(--danger); }
+.warnlist li.warn-warn { border-left-color: var(--amber); color: var(--amber); }
+.warnlist li.warn-info { border-left-color: var(--line-strong); color: var(--text-dim); }
+
+/* 增强预览：两张图并排，等比缩放到容器宽度 */
+.preview-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: var(--sp-2);
+  margin-top: var(--sp-2);
+}
+.preview-grid figure { margin: 0; display: flex; flex-direction: column; gap: var(--sp-1); }
+.preview-grid img {
+  width: 100%;
+  height: auto;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+  image-rendering: pixelated;
+}
+.preview-grid figcaption { color: var(--text-dim); font-size: var(--fs-2xs); text-align: center; }
+
+/* 续训状态条：一旦选中续训点就常亮，避免用户在「以为在重新训练」里填参数 */
+.resume-active {
+  margin: var(--sp-2) 0 0;
+  padding: var(--sp-2) var(--sp-3);
+  border: 1px solid var(--amber-a40, #6b5220);
+  border-radius: var(--radius-sm);
+  background: var(--amber-a12, rgba(251, 191, 36, .12));
+  color: var(--amber);
+  font-size: var(--fs-xs);
+  line-height: 1.55;
+  word-break: break-all;
+}
+/* 表格里的次要说明（任务类型、不能续训的原因） */
+.row-sub { color: var(--text-dim); font-size: var(--fs-2xs); line-height: 1.45; margin-top: 2px; }
+.augbox code {
+  padding: 0 4px;
+  border-radius: 3px;
+  background: var(--surface-2);
+  color: var(--cyan);
+  font-family: var(--font-mono);
+  font-size: .95em;
+}
+
 /* ---- 4.3 徽标 / 胶囊 / 标签 ---- */
 .badge {
   display: inline-flex;

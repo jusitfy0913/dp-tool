@@ -1,4 +1,4 @@
-# 6-web —— TRTForge Web Studio
+﻿# 6-web —— TRTForge Web Studio
 
 浏览器版工作站，用来替代 `4-qt-studio` 的 Qt 桌面程序。
 
@@ -150,6 +150,69 @@ powershell -File scripts\run_web_studio.ps1 -HostName 0.0.0.0
   - 「小缺陷预设」→ `mosaic=0.1, close_mosaic=20, scale=0.3, translate=0.05`
   - 「清空（用默认）」→ 所有增强字段恢复留空
 - 概率类字段超出 `0~1` 或 `close_mosaic` 为负时，后端**启动前**直接返回 400，不会白等几十秒才报错。
+
+#### 训练前体检：概览 / 增强预览 / 断点续训（v1.14）
+
+这三块折叠区解决同一个问题：**别等训练跑了半小时才发现数据集配错、增强配错、或者白重跑了一遍。**
+三块都是「手动触发」，点按钮才算，不点不影响训练。
+
+**1）数据集概览**
+
+点「扫描数据集」→ 后端只读 `dataset.yaml` 和标注文本的行首数字，不解码图像像素。
+
+| 列 | 含义 |
+| --- | --- |
+| 各 split 图片数 / 标注数 | `train` / `val` / `test` 分别多少张图、多少个标注框 |
+| 空标注 | 大小为 0 或没有有效行的 txt（YOLO 允许留作文本为负样本，但比例过高要先查） |
+| 有图无标 / 有标无图 | 前者是漏标，后者是删图没删标（**孤儿标注**，训练时直接被忽略） |
+| 类别分布 | 每个类别的框数条形图，一眼看出长尾 |
+| 分辨率采样 | 抽样读图像头（不解码），给出宽高最常见的几个尺寸 |
+
+扫描结果**按 `yaml 路径 + mtime + 大小` 缓存 60 秒**。大目录（上万张图）第一次要几秒，
+之后再点秒回，避免以为卡死重复点。改过 `dataset.yaml` 缓存自动失效。
+
+**2）增强预览**
+
+点「生成预览」→ 后端用 OpenCV 复刻 Ultralytics 的增强流水线，出「原图 vs 增强后」对照图。
+
+- 用当前表单里的增强参数（留空即默认值）**真实生效**：`mosaic → 仿射(degrees/translate/scale/shear/perspective) → hsv → flipud → fliplr → bgr → mixup`
+- **seed 决定全部随机**：同参数同 seed 必出同一张图，便于对比「改了某个参数到底变了什么」
+- 输出 `imgsz × imgsz` 正方形、灰边(114) letterbox，与训练时预处理一致
+- 明确不预览的项会在结果里列出 `ignored`：`copy_paste`（需要分割掩码，检测任务没有）、
+  `close_mosaic`（只在最后 N 轮关掉的调度，不影响单张图效果）
+
+> 这是 **OpenCV 近似**，不是 Ultralytics 逐像素复刻：概率性/调度性的东西（每轮比例、缓存、
+> 多图拼接时的采样顺序）无法一比一还原。用途是**肉眼确认方向和量级对不对**，
+> 不是拿它当训练结果的依据。
+
+**3）断点续训**
+
+点「扫描历史」→ 列出 `--project` 目录下所有能续训的 run：
+
+| 列 | 来源 |
+| --- | --- |
+| run 名 / 任务 / imgsz | run 目录下的 `args.yaml`（纯文本解析，**不加载 `.pt`**，所以后端不需要 torch 也能扫） |
+| `12/100` | `results.csv` 行数 = 已完成轮次；`args.yaml` 的 `epochs` = 计划轮次 |
+| 最佳 mAP | `results.csv` 里 `metrics/mAP50-95(B)` 的最大值 |
+| `last.pt` 大小 | `weights/last.pt` 的文件大小（MB） |
+| 能否续训 | `weights/last.pt` 存在、`data` 指向的 yaml 还在 → 可续训；否则给出 `blocked_reason` |
+
+点某行的「继续训练」→ 自动填好 `model=…/weights/last.pt`、`project`、`name`，
+并在按钮上写明「继续训练（从第 N 轮）」。**`--epochs` 照样按你表单里的值传，不会改动历史 run。**
+
+后端多了一个参数：
+
+```
+--resume-from <last.pt 的绝对路径>
+```
+
+它和 Ultralytics 自带的 `--resume`（从 `get_latest_run()` **猜**一个 run）不同：
+`--resume-from` 是你**显式指定**哪个检查点，launcher 用 `model.train(resume=该路径)` 恢复。
+`--resume` 在多项目/多目录并存时经常猜到别的 run 上，所以 Web 端只用 `--resume-from`。
+
+> 续训会**写回原 run 目录**（Ultralytics 的 `check_resume` 会用检查点里记录的
+> `project/name`），所以历史目录里的 `results.csv` 会继续往后追加行，不会另开一个目录。
+> 如果你想要「续训成新实验」，请用表单里正常训练的 `--name` 另起名字，不要用续训按钮。
 
 
 ### 推理演示
@@ -604,11 +667,14 @@ offset1 = cursor - p_image * scale1
 
 | 方法 | 路径 | 用途 |
 | --- | --- | --- |
-| GET | `/api/health` | 存活探针，返回 `{"ok":true,"version":"1.13.0"}`；版本号用来识别「连到了旧进程」 |
+| GET | `/api/health` | 存活探针，返回 `{"ok":true,"version":"1.14.0"}`；版本号用来识别「连到了旧进程」 |
 | GET | `/api/capabilities` | 环境探测（前端状态灯用） |
 | POST | `/api/train/yolo` | 启动 YOLO 训练 |
 | POST | `/api/train/anomalib` | 启动 Anomalib 训练 |
 | POST | `/api/train/{yolo\|anomalib}/check-env` | 环境自检（开训前查缺依赖） |
+| POST | `/api/train/dataset-overview` | **v1.14**：训练前数据集体检（split 计数 / 空标 / 孤儿标 / 类别分布 / 分辨率采样，60s 缓存） |
+| POST | `/api/train/augment-preview` | **v1.14**：按当前增强参数用 cv2 生成「原图 vs 增强后」对照图（base64 JPEG） |
+| GET | `/api/runs/checkpoints?project=` | **v1.14**：扫描可续训的 run（读 `args.yaml` + `results.csv`，不加载 `.pt`） |
 | GET | `/api/runs` | 任务列表 |
 | GET | `/api/runs/{run_id}` | 单任务状态 |
 | POST | `/api/runs/{run_id}/stop` | 停止任务 |
@@ -656,6 +722,33 @@ offset1 = cursor - p_image * scale1
 `POST /api/train/yolo` 的增强字段（全部可选，留空即用 Ultralytics 默认）：
 `hsv_h` `hsv_s` `hsv_v` `degrees` `translate` `scale` `shear` `perspective`
 `flipud` `fliplr` `bgr` `mosaic` `mixup` `copy_paste` `close_mosaic`。
+
+`POST /api/train/yolo` 的续训字段（**v1.14**）：
+
+| 字段 | 类型 | 默认 | 说明 |
+| --- | --- | --- | --- |
+| `resume_from` | str | 空 | `weights/last.pt` 的绝对路径。非空时 launcher 执行 `model.train(resume=该路径)`，并把该权重作为初始模型加载；为空则行为与升级前一致 |
+
+`POST /api/train/dataset-overview` 的请求体：
+
+| 字段 | 类型 | 默认 | 说明 |
+| --- | --- | --- | --- |
+| `source` | str | 必填 | `dataset.yaml` 绝对路径，必须在白名单根内 |
+| `refresh` | bool | `false` | `true` = 跳过缓存强制重扫（默认命中 60 秒内的缓存） |
+
+响应关键字段：`splits[]`（每个 split 的图片数 / 标注数 / 空标 / 有图无标 / 孤儿标 / 框数）、
+`classes[]`（`{id, name, boxes}`）、`resolutions[]`、`warnings[]`、`elapsed_ms`、`cached`。
+
+`POST /api/train/augment-preview` 的请求体：
+
+| 字段 | 类型 | 默认 | 说明 |
+| --- | --- | --- | --- |
+| `data` | str | 必填 | `dataset.yaml`，从中取指定 split 的图片与标签 |
+| `params` | object | `{}` | 把表单里 15 个增强值原样传上来，**空串 = 用默认值**（与训练一致） |
+| `index` | int | 0 | 取第几张图；`seed` 为空时用它固定样本 |
+| `seed` | int\|null | `null` | 非空则决定全部随机量，同 seed 同参数必出同图 |
+| `imgsz` | int | 640 | 输出边长（`64~4096`），原图与增强图都 letterbox 到这个尺寸 |
+| `split` | str | `train` | 从哪个 split 采样 |
 
 `POST /api/engine/build` 的额外响应字段：
 
@@ -914,14 +1007,14 @@ D:\Anaconda3\envs\dpenv\python.exe -m uvicorn app:app --app-dir 6-web\backend `
 判断标准只有一条：**`CreationDate` 必须晚于你最后一次改后端代码的时间。**
 `--reload` 只监听 `.py`，改了前端 HTML/CSS/JS 仍需浏览器 `Ctrl+F5`。
 
-更快的判断办法：**看顶栏标题下方的版本号徽标**（`v1.13.0` 这种，来自 `/api/health`）。
+更快的判断办法：**看顶栏标题下方的版本号徽标**（`v1.14.0` 这种，来自 `/api/health`）。
 后端代码一改，`app.py` 里的 `APP_VERSION` 就要跟着加，页面上的徽标才会变。
 徽标数字没变 = 页面连的还是旧进程，这时候改什么都不会生效。
 
 ```powershell
 # 一条命令确认后端版本
 Invoke-WebRequest http://127.0.0.1:8060/api/health -UseBasicParsing | Select-Object -ExpandProperty Content
-# 期望输出类似 {"ok":true,"version":"1.13.0"}
+# 期望输出类似 {"ok":true,"version":"1.14.0"}
 ```
 
 ## 与 Qt 版的关系
