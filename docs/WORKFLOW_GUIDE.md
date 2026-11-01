@@ -633,3 +633,4 @@ Invoke-WebRequest http://127.0.0.1:8060/api/capabilities
 | DLL C API 调用与打包 | `docs/TRTForge_yolo_infer与anomalib_infer_DLL调用与源码打包说明.md` |
 | YOLO TRT 推理细节 | `docs/trtexec_gui_YOLO_TRT推理流程说明.md` |
 | 小白版算法与场景说明 | `docs/TRTForge_算法与应用场景说明_小白版.md` |
+| 接 VLM 自动标注 / LLM 训练诊断要花多少 token | `docs/VLM_LLM接入方案与Token成本评估.md` |
