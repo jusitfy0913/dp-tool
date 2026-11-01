@@ -9,6 +9,9 @@
 #   powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_web_studio.ps1
 #   powershell ... -File scripts\run_web_studio.ps1 -Port 8070
 #   powershell ... -File scripts\run_web_studio.ps1 -PythonExe D:\Anaconda3\envs\dpenv\python.exe
+#   powershell ... -File scripts\run_web_studio.ps1 -OpenBrowser   服务就绪后开浏览器
+#
+# 不想记参数就双击仓库根目录的 启动Web端.bat（它转调 scripts\start_web.bat 再到本脚本）。
 #
 # 可选环境变量：
 #   TRTFORGE_PYTHON      训练用解释器（不设则自动探测）
@@ -21,7 +24,9 @@ param(
     [int]$Port = 0,
     [string]$HostName = "",
     [string]$PythonExe = "",
-    [switch]$Reload
+    [switch]$Reload,
+    # 服务就绪后自动打开浏览器（由 start_web.bat 打开，命令行手跑默认不开）
+    [switch]$OpenBrowser
 )
 
 $ErrorActionPreference = "Stop"
@@ -31,7 +36,9 @@ $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $BackendDir = Join-Path $RepoRoot "6-web\backend"
 
 if (-not (Test-Path (Join-Path $BackendDir "app.py"))) {
-    throw "找不到后端入口：$BackendDir\app.py"
+    # 启动器脚本面向双击使用，出错只给一句人话 + 非零退出码，不抛堆栈。
+    Write-Host "找不到后端入口：$BackendDir\app.py" -ForegroundColor Red
+    exit 1
 }
 # 解释器：显式参数 > 环境变量 > 已知 conda 环境 > PATH
 #
@@ -68,7 +75,10 @@ foreach ($c in $candidates) {
     if (Test-PythonUsable $c) { $PythonExe = $c; break }
 }
 if (-not $PythonExe) {
-    throw "找不到可用的 Python。请用 -PythonExe 指定，或设置环境变量 TRTFORGE_PYTHON。"
+    Write-Host "找不到可用的 Python。请用 -PythonExe 指定，或设置环境变量 TRTFORGE_PYTHON。" -ForegroundColor Red
+    Write-Host "  常见做法：conda create -n dpenv python=3.10"
+    Write-Host "  或先执行：set TRTFORGE_PYTHON=D:\Anaconda3\envs\dpenv\python.exe"
+    exit 1
 }
 
 if ($Port -le 0) {
@@ -97,16 +107,28 @@ if ($owner) {
     $name = if ($proc) { $proc.ProcessName } else { "(已退出)" }
     $started = if ($proc -and $proc.StartTime) { $proc.StartTime.ToString("yyyy-MM-dd HH:mm:ss") } else { "未知" }
     Write-Host ""
-    Write-Host "端口 $Port 已被占用，启动中止。" -ForegroundColor Yellow
+    Write-Host "端口 $Port 已被占用。" -ForegroundColor Yellow
     Write-Host "  占用进程 : $name (PID $owner)"
     Write-Host "  启动时间 : $started"
     Write-Host ""
-    Write-Host "如果这是上次没关干净的旧实例，先清掉再启动：" -ForegroundColor Yellow
-    Write-Host "  Stop-Process -Id $owner -Force"
-    Write-Host ""
-    Write-Host "想换个端口启动：" -ForegroundColor Yellow
-    Write-Host "  powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_web_studio.ps1 -Port 8070"
-    throw "端口 $Port 被 PID $owner 占用"
+    # 交互式终端里直接问一句：绝大多数情况就是上次没关干净的后端。
+    # 输入被重定向（脚本/CI 调用）时不猜，保持原来的中止行为。
+    $answer = ""
+    if (-not [Console]::IsInputRedirected) {
+        $answer = Read-Host "  结束它并继续启动？(Y/N)"
+    }
+    if ($answer -match '^[Yy]') {
+        Stop-Process -Id $owner -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Milliseconds 800
+        Write-Host "  已结束 PID $owner。" -ForegroundColor Green
+    } else {
+        Write-Host "启动已取消。如果这是上次没关干净的旧实例，先清掉再启动：" -ForegroundColor Yellow
+        Write-Host "  Stop-Process -Id $owner -Force"
+        Write-Host ""
+        Write-Host "想换个端口启动：" -ForegroundColor Yellow
+        Write-Host "  powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_web_studio.ps1 -Port 8070"
+        exit 1
+    }
 }
 
 # DLL 依赖：Python 3.8+ 不会用 PATH 找依赖 DLL，这里显式告知后端
@@ -127,6 +149,22 @@ Write-Host ""
 
 $Env:PYTHONIOENCODING = "utf-8"
 $Env:PYTHONUNBUFFERED = "1"
+
+# 浏览器要等后端真正能应答再开：uvicorn 首次启动要几秒，直接开会是空白页。
+# 用后台作业轮询 /api/health，返回 200 再 Start-Process。
+if ($OpenBrowser) {
+    $probe = {
+        param($Url)
+        for ($i = 0; $i -lt 120; $i++) {
+            try {
+                $resp = Invoke-WebRequest -Uri ($Url + "api/health") -UseBasicParsing -TimeoutSec 1
+                if ($resp.StatusCode -eq 200) { Start-Process $Url; return }
+            } catch { }
+            Start-Sleep -Milliseconds 500
+        }
+    }
+    Start-Job -ScriptBlock $probe -ArgumentList "http://${HostName}:$Port/" | Out-Null
+}
 
 $uvicornArgs = @("-m", "uvicorn", "app:app", "--host", $HostName, "--port", "$Port")
 if ($Reload) { $uvicornArgs += "--reload" }

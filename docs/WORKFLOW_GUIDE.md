@@ -523,6 +523,17 @@ libiomp5md.dll         yaml-cpp.dll polyclipping.dll
 
 ### 7.1 启动 Web 工作站
 
+**最快的方式**：双击仓库根目录的 `启动Web端.bat`（自动找 Python、查端口、就绪后开浏览器）。
+
+```bat
+启动Web端.bat                :: 默认 http://127.0.0.1:8060
+启动Web端.bat 8070           :: 换端口
+启动Web端.bat 8070 nobrowser :: 不自动开浏览器
+启动Web端.bat 8060 reload    :: 改后端代码时热重载
+```
+
+等价的 PowerShell 方式（参数更全）：
+
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run_web_studio.ps1
 # 浏览器打开 http://127.0.0.1:8060
@@ -531,8 +542,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run_web_studio.ps1
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run_web_studio.ps1 -Port 8070
 ```
 
-**端口被占用怎么办**：脚本会在启动前检查端口，被占用时直接打印「占用进程名 + PID + 启动时间」并中止，
-不再丢一个 `10048` 后让人猜。按提示清理即可：
+**端口被占用怎么办**：两个脚本都会在启动前检查端口，打印「占用进程名 + PID + 启动时间」。
+交互式终端里会直接问「结束它并继续启动？(Y/N)」，答 Y 自动清掉旧进程；
+输入被重定向（脚本/CI 调用）时不猜，直接中止并给出清理命令：
 
 ```powershell
 Stop-Process -Id <提示里的 PID> -Force

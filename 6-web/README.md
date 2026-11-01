@@ -50,11 +50,32 @@ powershell -File scripts\build_infer_dlls.ps1
 
 ### 3. 启动
 
+**最省事的方式（推荐）**：双击仓库根目录的 `启动Web端.bat`。
+它会自动找 Python、检查端口、等服务起来后再打开浏览器。
+
+```bat
+启动Web端.bat              :: 默认 127.0.0.1:8060
+启动Web端.bat 8070         :: 换端口
+启动Web端.bat 8070 nobrowser  :: 不自动开浏览器
+启动Web端.bat 8060 reload     :: 改后端代码时热重载
+```
+
+也可以直接跑 PowerShell 脚本（参数更全）：
+
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_web_studio.ps1
 ```
 
 打开 <http://127.0.0.1:8060>。顶部状态灯变绿写「环境就绪」就说明一切正常。
+
+两个脚本都会做**端口预检**：端口被占用时会告诉你占用进程与启动时间，
+交互式终端里还会问一句「结束它并继续启动？」（答 N 则中止，退出码 1）。
+这条检查不是多余的——旧进程没关干净时 uvicorn 只报 10048，
+用户却以为重启成功，实际连的还是旧代码。
+
+> `scripts\start_web.bat` 内部刻意只用 ASCII：cmd.exe 解析含多字节字符的
+> UTF-8 批处理时会截断/错行（码页老问题），中文提示因此全部放在
+> `run_web_studio.ps1` 里。
 
 常用参数：
 
