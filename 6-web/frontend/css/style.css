@@ -2082,3 +2082,93 @@ input[type="range"]:disabled { cursor: not-allowed; }
 
 #batchTable td.bad { color: var(--danger); }
 
+
+/* ---------------------------------------------------------------------------
+ * 全流程串联卡片
+ * 横向铺满训练页：串联的每个阶段都带状态点，纵向排下来一眼能看出卡在哪一段。
+ * ------------------------------------------------------------------------- */
+.card.wide { grid-column: 1 / -1; }
+
+.pipe-stages {
+  list-style: none;
+  margin: var(--sp-4) 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  counter-reset: pipe;
+}
+
+.pipe-stage {
+  display: grid;
+  grid-template-columns: 18px 1fr auto auto;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: 6px var(--sp-3);
+  border-left: 2px solid var(--line);
+  background: var(--surface-2);
+  border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+  font-size: var(--fs-sm);
+}
+.pipe-stage .pipe-step { color: var(--text-dim); font-family: var(--font-mono); font-size: var(--fs-xs); }
+.pipe-stage .pipe-name { color: var(--text); }
+.pipe-stage .pipe-status { font-size: var(--fs-xs); color: var(--text-dim); font-family: var(--font-mono); }
+.pipe-stage .pipe-time { font-size: var(--fs-xs); color: var(--text-dim); font-family: var(--font-mono); }
+
+/* 状态色只画左边那条线，整行不变色：整行染色在长列表里显得很吵 */
+.pipe-stage.running { border-left-color: var(--cyan); background: var(--cyan-a12); }
+.pipe-stage.running .pipe-status { color: var(--cyan); }
+.pipe-stage.success { border-left-color: var(--ok); }
+.pipe-stage.success .pipe-status { color: var(--ok); }
+.pipe-stage.failed { border-left-color: var(--danger); background: var(--danger-a12); }
+.pipe-stage.failed .pipe-status { color: var(--danger); }
+.pipe-stage.cancelled { border-left-color: var(--amber); }
+.pipe-stage.cancelled .pipe-status { color: var(--amber); }
+.pipe-stage.skipped { opacity: .55; }
+
+/* 失败原因：单独一行，占满整行宽度，长错误信息也能读 */
+.pipe-stage .pipe-error {
+  grid-column: 2 / -1;
+  color: var(--danger);
+  font-size: var(--fs-xs);
+  line-height: 1.5;
+  word-break: break-all;
+}
+
+.pipe-stage .mini { padding: 1px 8px; }
+
+/* 阶段日志：卡片内的只读尾巴。历史记录（run 已不在内存）只能走这条路。 */
+.pipe-log {
+  margin-top: var(--sp-3);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--bg-void);
+  overflow: hidden;
+}
+
+.pipe-log-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-2);
+  padding: var(--sp-2) var(--sp-3);
+  border-bottom: 1px solid var(--line);
+  color: var(--text-dim);
+  font-size: var(--fs-xs);
+}
+
+.pipe-log-pre {
+  margin: 0;
+  max-height: 320px;
+  overflow: auto;
+  padding: var(--sp-3);
+  font-family: var(--font-mono);
+  font-size: var(--fs-xs);
+  line-height: 1.55;
+  color: var(--text-log);
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.pipe-log-pre.bad { color: var(--danger); }
+

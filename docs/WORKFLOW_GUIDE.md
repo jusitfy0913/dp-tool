@@ -2,7 +2,7 @@
 
 > 本文回答一个核心问题：**从原始图片到产线推理，每一步该做什么、用什么命令、产出什么文件、怎么验证。**
 > 面向对象：需要独立跑通全流程的工程师（不需要深入算法细节）。
-> 最后更新：2026-10-30
+> 最后更新：2026-11-02（v1.17 新增「一键全流程串联」与引擎精度验证）
 
 ---
 
@@ -24,15 +24,19 @@ flowchart TD
     G --> I
     I --> J["model_fp16.engine"]
 
-    J --> K["⑥ 推理验证<br/>单张 / 目录批量 / 视频 / 摄像头<br/>6-web 或 DLL"]
-    K --> L{"⑦ 精度达标？"}
+    J --> V["⑥ 引擎精度验证<br/>val_engine.py（v1.17）"]
+    V --> K["⑦ 推理验证<br/>单张 / 目录批量 / 视频 / 摄像头<br/>6-web 或 DLL"]
+    K --> L{"⑧ 精度达标？"}
     L -->|否| B
-    L -->|是| M["⑧ 产线部署"]
+    L -->|是| M["⑨ 产线部署"]
 
     style E fill:#e1f5ff
     style I fill:#fff4e1
+    style V fill:#f3e8ff
     style K fill:#e8f5e9
 ```
+
+> ③~⑥ 可以一键串起来跑：见 [5.5 一键全流程串联](#55-一键全流程串联v117)。
 
 ---
 
@@ -541,6 +545,77 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_web_studio.ps1
 验证：`python 6-web\backend\tools\test_engine_progress.py`（26 项，含真实日志按时间戳回放）。
 
 构建产物路径可直接填进「推理演示」页的引擎文件栏。
+
+### 5.5 一键全流程串联（v1.17）
+
+「训练导出」页底部的 **全流程串联** 卡片把第 3~5 节再加上精度验证串成一条链：
+
+```
+训练 → 导出 .transd.onnx → 校验转置布局 → 编译引擎 → 生成 labels_*.json → 引擎精度验证
+```
+
+参数直接复用上面的「训练参数」表单（dataset.yaml / epochs / imgsz / project / name），
+卡片里只多出四项串联独有的设置：
+
+| 控件 | 说明 | 默认 |
+| --- | --- | --- |
+| 引擎精度 | `fp16` 省显存 / `fp32` 精度优先 | fp16 |
+| 验证用 split | `val` / `test` / `train` | val |
+| 编译后用引擎做精度验证 | 关掉就只到「生成标签」为止 | 勾选 |
+| 跳过训练（用已有 .pt） | 勾选后必须给出 `.pt` 绝对路径，从导出开始跑 | 不勾 |
+
+**每一段都是独立任务**：串联本身不 spawn 子进程，只负责决定"下一段跑什么"。
+每段仍是一个普通 run，好处是停止只停当前那一个（Windows 上杀父进程不会连带杀子进程，
+否则点"停止"后训练还会在后台占着 GPU）、每段都有独立日志与 `WS /ws/runs/{id}`、
+某段失败时前面已完成的产物照常保留。
+
+**看某一段的日志**：阶段行的「日志」按钮分两条路——该段还在跑就切到右侧训练日志面板
+（实时流）；已结束或服务重启过则读 `runtime/logs/{run_id}.log` 的尾部，显示在卡片内。
+只做实时流是不够的：那个面板只认内存里的 run，重启后点开只会看到「未知任务」，
+而排障需要的恰恰是已经结束的那一段。
+
+**状态语义**
+
+| 阶段状态 | 含义 |
+| --- | --- |
+| `pending` / `running` / `success` | 等待 / 进行中 / 完成 |
+| `failed` | 该段失败，整链 `failed`，后面全部 `skipped` |
+| `cancelled` | 该段被「停止」打断 |
+| `skipped` | 前面某段失败或已停止，这一段没跑 |
+
+失败**不自动重试**：训练 OOM、数据配错这类问题重试一次只是再烧一遍时间。
+停止后已完成的产物（`best.pt` / `.transd.onnx` / `.engine` / `labels_*.json`）全部保留。
+
+**精度报告**来自 `val_engine.py`：用 `yolo_infer.dll` 在验证集上逐张推理，
+按 COCO 口径（IoU 0.50:0.95、全点插值）算 AP，页面直接显示 mAP50 / mAP50-95 / P / R。
+产物落在 `<run_dir>/val/val_report.json` 与 `val_report.csv`（UTF-8 BOM，Excel 直接双击）。
+> 精度评估目前只支持 `detect`：分割 / 姿态 / OBB 的 GT 解码口径不同，还没对齐。
+
+**服务重启后的行为**：内存里的编排线程没了，但记录还在 `runtime/pipelines/*.json`。
+启动时会把上次遗留的 `running` 记录标成 `cancelled`（原因写「服务重启，任务已中断」），
+历史列表里仍可查看——不这样处理的话，页面会对着一条永远不动的记录一直轮询。
+
+接口：
+
+```powershell
+# 启动（示例：跳过训练，从已有权重跑到精度报告）
+curl -X POST http://127.0.0.1:8060/api/pipeline/yolo -H "Content-Type: application/json" -d '{
+  "data": "D:/data/dataset.yaml", "task": "detect", "precision": "fp16",
+  "skip_train": true, "weights": "D:/runs/exp/weights/best.pt",
+  "run_val": true, "val_split": "val"
+}'
+
+GET  /api/pipeline                 # 最近记录（含磁盘上的历史，带 live 标记）
+GET  /api/pipeline/{id}            # 单条详情；live=false 表示只能从磁盘读到
+GET  /api/pipeline/{id}/log?stage=export&lines=400   # 某一段的日志尾巴（纯文本）
+POST /api/pipeline/{id}/stop       # 停止整条链
+```
+
+验证：`python 6-web\backend\tools\test_pipeline_stages.py`（50 项，用假 run 管理器跑完
+整条状态机：全成功 / 中途失败 / 可执行段 / 停止 / 报告收集 / 重启遗留 / 产物去重），
+`python 6-web\backend\tools\test_pipeline_log.py`（9 项，日志尾部截断与路径穿越）。
+
+
 
 
 ---

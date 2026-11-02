@@ -116,6 +116,10 @@ class RunManager:
         run_id = uuid.uuid4().hex[:12]
         log_file = LOG_DIR / f"{run_id}.log"
         log_file.parent.mkdir(parents=True, exist_ok=True)
+        # 允许调用方传字符串：这条路径上的代码在读取线程里跑，
+        # 一旦类型不对就是「线程带异常死掉、run 永远 running」，不划算。
+        if isinstance(expect_file, str):
+            expect_file = Path(expect_file) if expect_file else None
 
         child_env = os.environ.copy()
         child_env.setdefault("PYTHONIOENCODING", "utf-8")

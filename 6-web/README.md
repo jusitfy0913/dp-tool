@@ -1,4 +1,4 @@
-# 6-web —— TRTForge Web Studio
+﻿# 6-web —— TRTForge Web Studio
 
 浏览器版工作站，用来替代 `4-qt-studio` 的 Qt 桌面程序。
 
@@ -254,6 +254,55 @@ powershell -File scripts\run_web_studio.ps1 -HostName 0.0.0.0
 > Cast/Concat 就转错，且错误是静默的），改成**按形状识别预测头**（3 维输出；多个时用
 > 「通道维 < anchors 维」裁决），并在转置前按任务校验通道数。任务类型以权重自带为准，
 > 填错时会提示 `task_overridden`。转置失败只报 `TRANSD_FAILED`，**已导出的原始 ONNX 保留**。
+
+#### 训练完成后一键跑完全流程（v1.17）
+
+页面底部新增 **全流程串联** 卡片（宽度占满整行），把「训练 → 导出 → 校验 → 编译 →
+补标签 → 精度验证」六步串起来：
+
+```
+train → export(.transd.onnx) → probe(形状校验) → build(.engine) → labels(labels_*.json) → val(精度报告)
+```
+
+参数**直接复用上面的「训练参数」表单**，不重复填；卡片只多出四项：
+
+| 控件 | 作用 | 默认 | 什么时候改 |
+| --- | --- | --- | --- |
+| 引擎精度 | 编译用 `fp16` / `fp32` | fp16 | 精度验收不达标、要看上限时用 fp32 |
+| 验证用 split | 精度报告用哪个子集 | val | 想只在没调过参的 test 上验收时改 test |
+| 编译后用引擎做精度验证 | 关掉就停在「生成标签」 | 勾选 | 只想要引擎、不想等验证 |
+| 跳过训练（用已有 .pt） | 勾上后从导出开始，必须给 `.pt` 绝对路径 | 不勾 | 复用老权重重新出引擎 |
+
+**每一段都是独立任务**，所以：
+
+- 每段有自己的日志。阶段行的「日志」按钮走两条路：**还在跑**的段切到右侧训练日志面板
+  （实时流），**已结束 / 服务重启过**的段没有 run 可连，改读 `runtime/logs/{run_id}.log`
+  的尾巴显示在卡片内。只做实时流的话，重启后点「日志」只会看到「未知任务」——
+  而排障要看的恰恰是结束了的日志；
+- 「停止」只停当前那一段。这一点在 Windows 上是必须的——杀父进程不会连带杀子进程，
+  如果把整条链做成一个进程组，点了停止训练还在后台占着 GPU；
+- 某段失败整条链 `failed`，后面全部 `skipped`，**已完成阶段的产物全部保留**
+  （`best.pt` / `.transd.onnx` / `.engine` / `labels_*.json` 都还在磁盘上，可以手工接着往下跑）；
+- **不自动重试**：OOM、数据配错这类问题重试一次只是再烧一遍时间。
+
+跑完的产物表直接给下一步的入口：
+
+| 产物行 | 按钮 | 效果 |
+| --- | --- | --- |
+| TensorRT 引擎 | 去推理引擎 | 填好引擎路径、切到「推理演示」页 |
+| 标签文件 | 带到推理页 | 填好 `labels_*.json` |
+| 任意一行 | 复制路径 | 复制绝对路径（局域网 http 下走 `execCommand` 兜底） |
+| 阶段行 | 日志 | 还在跑 → 切训练日志面板实时看；已结束/重启过 → 读 `runtime/logs/{run_id}.log` 尾部显示在卡片内 |
+
+精度汇总卡片来自 `val_engine.py`：用 `yolo_infer.dll` 在验证集上逐张推理，按 COCO 口径
+（IoU 0.50:0.95、全点插值）算 AP，显示 mAP50 / mAP50-95 / P / R / 评估图片数 / GT 实例数。
+报告落在 `<run_dir>/val/val_report.json` 与 `.csv`。**目前只支持 `detect`**：
+分割 / 姿态 / OBB 的 GT 解码口径还没对齐，勾了也不会算。
+
+**服务重启后**：编排线程没了，但记录还在 `runtime/pipelines/*.json`，历史列表照常显示。
+启动时会把遗留的 `running` 记录标成 `cancelled`（原因「服务重启，任务已中断」）——
+不这么做，页面会对着一条永远不动的记录轮询，点「停止」还只能拿到 409。
+
 
 
 ### 推理演示
@@ -808,6 +857,11 @@ offset1 = cursor - p_image * scale1
 | POST | `/api/train/augment-preview` | **v1.14**：按当前增强参数用 cv2 生成「原图 vs 增强后」对照图（base64 JPEG） |
 | GET | `/api/runs/checkpoints?project=` | **v1.14**：扫描可续训的 run（读 `args.yaml` + `results.csv`，不加载 `.pt`） |
 | POST | `/api/export/yolo` | **v1.15**：把 `.pt` 导出为 ONNX，可选生成 `.transd.onnx`；返回 `run_id`，日志与产物走 `WS /ws/runs/{id}` |
+| POST | `/api/pipeline/yolo` | **v1.17**：启动「训练→导出→校验→编译→补标签→精度验证」串联，返回整条链记录（每段各有 `run_id`） |
+| GET | `/api/pipeline` | **v1.17**：最近的串联记录（内存 + 磁盘历史，历史项带 `live:false`） |
+| GET | `/api/pipeline/{id}` | **v1.17**：单条串联详情（阶段状态、产物、精度报告） |
+| POST | `/api/pipeline/{id}/stop` | **v1.17**：停止整条链（只停当前那一段） |
+| GET | `/api/pipeline/{id}/log?stage=&lines=` | **v1.17**：读某一段的日志尾巴（plain text）。服务重启后 run 已不在内存，只能靠它看历史阶段日志 |
 | GET | `/api/runs` | 任务列表 |
 | GET | `/api/runs/{run_id}` | 单任务状态 |
 | POST | `/api/runs/{run_id}/stop` | 停止任务 |
@@ -999,6 +1053,8 @@ offset1 = cursor - p_image * scale1
 │   ├── dataset.py        数据集扫描 / 固定哈希划分 / YOLO·COCO·VOC 导出
 │   ├── annotation.py     `.tfanno` 读写与规范化（2 点矩形 / 关键点单对象 / rev 乐观锁）
 │   ├── autolabel.py      自动标注双通道编排（本地引擎 + 可选外部 HTTP 服务）+ 草稿清洗
+│   ├── pipeline.py       **v1.17**：串联编排（阶段状态机 / 停止 / 重启遗留清理 / 磁盘持久化）
+│   ├── valmetrics.py     **v1.17**：COCO 口径 mAP 计算（IoU 0.50:0.95 全点插值，带边界容差）
 │   └── tools/
 │       ├── abi_probe.cpp       打印 C 侧结构体布局，用于和 Python 对齐比对
 │       ├── infer_batch.py      **v1.16**：目录批量推理 CLI（YOLO / Anomalib，事件走 TRTFORGE_JSON）
@@ -1013,6 +1069,9 @@ offset1 = cursor - p_image * scale1
 │       ├── test_infer_jobs.py         **v1.16**：批量产物验收（文件收集 / 命名净化 / CSV BOM / zip / 路径穿越）
 │       ├── test_infer_batch.py        **v1.16**：目录批量验收（命令拼装 / 坏图容错 / Anomalib / 下载接口）
 │       ├── test_infer_video.py        **v1.16**：视频验收（编码器探测 / 步长时长不变 / 帧数上限 / 失败路径）
+│       ├── test_pipeline_stages.py    **v1.17**：串联状态机验收（全成功 / 中途失败 / 停止 / 重启遗留 / 产物去重）
+│       ├── test_pipeline_log.py       **v1.17**：阶段日志接口验收（尾部截断 / 长行 / 路径穿越 / 404）
+│       ├── test_val_metrics.py        **v1.17**：mAP 验收（IoU 边界 / 多类 AP / P-R 曲线 / 无 GT 容错）
 │       ├── run_all_tests.py           总入口：扫描并串行跑完所有 test_*.py（CI 共用）
 │       └── test_exit_codes.py  退出码语义化测试（exit 2/130 的补事件逻辑）
 ├── frontend/
@@ -1030,6 +1089,7 @@ offset1 = cursor - p_image * scale1
 │   │   ├── annotate.js   标注工作台（Canvas 2D 六形状 / 缩放平移 / 吸附 / 撤销重做 / 自动保存 / 草稿层 / 导出）
 │   │   ├── infer.js      推理控制台（模型扫描 / 参数联动 / 表格 / 直方图 / 导出）
 │   │   ├── inferbatch.js **v1.16**：目录批量 / 视频 / 摄像头（事件流、进度、结果表、canvas 叠框）
+│   │   ├── pipeline.js   **v1.17**：全流程串联卡片（阶段清单 / 产物表 / 精度卡片 / 历史记录）
 │   │   └── main.js       页签 / 环境状态 / 目录浏览
 │   └── tests/            零依赖前端单测（node 直跑）
 │       ├── test_viewer_math.mjs  缩放锚点、坐标互逆、滚轮归一化
@@ -1042,7 +1102,7 @@ offset1 = cursor - p_image * scale1
 **一条命令跑完全部后端测试**（v1.15 起，CI 与本地共用同一个入口）：
 
 ```powershell
-D:\Anaconda3\envs\dpenv\python.exe 6-web\backend\tools\run_all_tests.py      # 15 个脚本
+D:\Anaconda3\envs\dpenv\python.exe 6-web\backend\tools\run_all_tests.py      # 18 个脚本
 D:\Anaconda3\envs\dpenv\python.exe 6-web\backend\tools\run_all_tests.py transd  # 只跑名字含 transd 的
 ```
 
@@ -1073,6 +1133,15 @@ node 6-web\frontend\tests\test_contrast.mjs
 
 # 引擎构建进度与耗时估算（不需要服务、不需要 trtexec；有真实日志时自动回放全量）
 D:\Anaconda3\envs\dpenv\python.exe 6-web\backend\tools\test_engine_progress.py
+
+# 全流程串联状态机（不需要服务、不需要 GPU，用假 run 管理器）
+D:\Anaconda3\envs\dpenv\python.exe 6-web\backend\tools\test_pipeline_stages.py
+
+# 阶段日志接口（不需要服务；临时文件写在 runtime/ 下，跑完自动删）
+D:\Anaconda3\envs\dpenv\python.exe 6-web\backend\tools\test_pipeline_log.py
+
+# 引擎精度指标（COCO 口径 mAP，纯计算）
+D:\Anaconda3\envs\dpenv\python.exe 6-web\backend\tools\test_val_metrics.py
 ```
 
 2026-10-29 实测结果：`smoke_test` **13 项全通过**（能力探测、参数校验、越权拦截、

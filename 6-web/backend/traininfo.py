@@ -96,8 +96,13 @@ def _split_dirs(value: str) -> list[str]:
     return [value] if value else []
 
 
-def _labels_dir(images_dir: Path, yaml_dir: Path, split: str) -> Path:
-    """按 Ultralytics 的约定推导标签目录。"""
+def labels_dir_for(images_dir: Path, yaml_dir: Path, split: str) -> Path:
+    """按 Ultralytics 的约定推导标签目录。
+
+    公开的原因：精度评估（tools/val_engine.py）也要按同一套规则找标签。
+    两边各写一份的话，某一方改了约定，另一边会静默地把所有图当成"无标注"，
+    然后报告 mAP=0——看起来像模型坏了，其实是路径错了。
+    """
     parts = list(images_dir.parts)
     if "images" in parts:
         # 从后往前替换最后一个 images 段，兼容 images/train 与 a/b/images/train
@@ -159,6 +164,16 @@ def resolve_splits(yaml_path: str | Path) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 # 单个 split 统计
 # ---------------------------------------------------------------------------
+def collect_images(root: Path) -> list[Path]:
+    """递归收集目录下的图片（公开版，供 val_engine 复用同一套后缀与排序规则）。"""
+    return _collect_files(Path(root))
+
+
+def _labels_dir(images_dir: Path, yaml_dir: Path, split: str) -> Path:
+    """兼容旧调用：内部统一走 labels_dir_for。"""
+    return labels_dir_for(images_dir, yaml_dir, split)
+
+
 def _collect_files(root: Path) -> list[Path]:
     """递归收集图片（嵌套目录在真实数据集里很常见）。"""
     if not root.is_dir():

@@ -7,6 +7,9 @@ import { connectRunEvents } from "./ws.js";
 const state = {
   runId: null,
   stream: null,
+  //: 当前日志面板跟踪的 run。串联的每段都能点「日志」，靠它避免把正在跟踪的
+  //: 训练任务顶掉（顶掉后停止按钮会指向另一个 run，很难察觉）。
+  streamRunId: null,
   artifacts: [],
 };
 
@@ -309,9 +312,12 @@ async function onSubmit(event) {
 
 function openStream(runId) {
   state.stream?.close();
+  state.streamRunId = runId;
   state.stream = connectRunEvents(runId, {
     onEvent: handleEvent,
     onClose: (payload) => {
+      state.stream = null;
+      state.streamRunId = null;
       dom.btnTrain.disabled = false;
       dom.btnCheckEnv.disabled = false;
       dom.btnStop.disabled = true;
@@ -343,6 +349,21 @@ function openStream(runId) {
     },
     onError: (message) => appendLog(message, "warn"),
   });
+}
+
+/**
+ * 在训练页的日志面板里查看任意一个 run（串联的每一段都有自己的 run_id）。
+ * 只复用现成的日志/进度渲染。若面板正在跟踪另一个任务，返回 false 让调用方提示，
+ * 而不是悄悄把它顶掉：顶掉后「停止」按钮会指向另一个 run，很难察觉。
+ */
+export function focusRun(runId) {
+  if (!runId) return false;
+  if (state.streamRunId && state.streamRunId !== runId) return false;
+  resetRunView();
+  state.runId = runId;
+  setBadge("查看日志", "run");
+  openStream(runId);
+  return true;
 }
 
 async function onStop() {

@@ -23,11 +23,12 @@ import os
 import shlex
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -42,17 +43,23 @@ import inferjobs
 import labels as labels_mod
 import models as models_mod
 import onnx_fallback
+import pipeline as pipeline_mod
 import progress
 import traininfo
 from runners import manager
 
 #: 应用版本号。前端顶栏与 /api/health 都读它，方便一眼看出「页面连的是哪个后端」。
 #: 起因：改了代码但 8060 上跑的是几小时前的旧进程，排查很久才发现。
-APP_VERSION = "1.16.0"
+APP_VERSION = "1.17.0"
 
 #: 本文件所在目录（6-web/backend）。子进程脚本路径都以它为基准，
 #: 不依赖启动时的工作目录——从仓库根启动和从 backend 启动必须都能跑。
 BACKEND_DIR = Path(__file__).resolve().parent
+
+#: 全流程串联的注册表。每段仍是一个普通 run，所以这里的职责只有「决定下一段跑什么」。
+pipeline_manager = pipeline_mod.PipelineManager(
+    manager, config.RUNTIME_DIR / "pipelines"
+)
 
 # ---------------------------------------------------------------------------
 # 应用与生命周期
@@ -67,6 +74,8 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        # 先停串联（它可能正握着某个 run），再停所有子进程
+        pipeline_manager.shutdown_all()
         manager.shutdown_all()
         infer.release_handles()
 
@@ -190,6 +199,62 @@ def _resolve_python(override: str | None) -> str:
     return resolved
 
 
+def build_train_command(request: "YoloTrainRequest", python: str) -> list[str]:
+    """拼 YOLO 训练命令行。
+
+    抽成纯函数的原因和 `build_export_command` 一样：全流程串联要复用同一份拼装逻辑。
+    两边各写一份的后果是"页面上训练用的增强参数，串联时被悄悄丢掉"——
+    跑出来的模型和用户以为的不是同一个，而日志里一切正常。
+    """
+    command = [
+        python, str(config.YOLO_LAUNCHER),
+        "--mode", "train",
+        "--task", request.task,
+        "--model", request.model,
+        "--data", str(Path(request.data)),
+        "--epochs", str(request.epochs),
+        "--imgsz", str(request.imgsz),
+        "--batch", request.batch,
+        "--device", request.device,
+        "--project", request.project,
+        "--name", request.name,
+        "--patience", str(request.patience),
+        "--workers", str(request.workers),
+        "--pretrained", request.pretrained,
+    ]
+    if request.resume:
+        command.append("--resume")
+    if request.resume_from.strip():
+        checkpoint = Path(request.resume_from).expanduser()
+        if not checkpoint.is_file():
+            raise ValueError(f"续训检查点不存在：{checkpoint}")
+        command += ["--resume-from", str(checkpoint.resolve())]
+
+    # 增强参数只在用户填了才拼进命令行：留空 = 用 launcher 默认 = 用 Ultralytics 默认
+    augment_fields = (
+        ("hsv_h", "--hsv-h"),
+        ("hsv_s", "--hsv-s"),
+        ("hsv_v", "--hsv-v"),
+        ("degrees", "--degrees"),
+        ("translate", "--translate"),
+        ("scale", "--scale"),
+        ("shear", "--shear"),
+        ("perspective", "--perspective"),
+        ("flipud", "--flipud"),
+        ("fliplr", "--fliplr"),
+        ("bgr", "--bgr"),
+        ("mosaic", "--mosaic"),
+        ("mixup", "--mixup"),
+        ("copy_paste", "--copy-paste"),
+        ("close_mosaic", "--close-mosaic"),
+    )
+    for field_name, flag in augment_fields:
+        value = getattr(request, field_name)
+        if value is not None:
+            command += [flag, str(value)]
+    return command
+
+
 @app.post("/api/train/yolo")
 def train_yolo(request: YoloTrainRequest) -> dict:
     """启动 YOLO 训练。"""
@@ -215,53 +280,18 @@ def train_yolo(request: YoloTrainRequest) -> dict:
     if request.close_mosaic is not None and request.close_mosaic < 0:
         raise HTTPException(status_code=400, detail="close_mosaic 不能为负数")
 
-    command = [
-        python, str(config.YOLO_LAUNCHER),
-        "--mode", "train",
-        "--task", request.task,
-        "--model", request.model,
-        "--data", str(data_yaml),
-        "--epochs", str(request.epochs),
-        "--imgsz", str(request.imgsz),
-        "--batch", request.batch,
-        "--device", request.device,
-        "--project", request.project,
-        "--name", request.name,
-        "--patience", str(request.patience),
-        "--workers", str(request.workers),
-        "--pretrained", request.pretrained,
-    ]
-    if request.resume:
-        command.append("--resume")
+    # 续训检查点必须存在且在允许的根目录内。命令行拼装里也会再查一次存在性，
+    # 但白名单校验属于接口职责，不能挪进纯函数。
     if request.resume_from.strip():
         checkpoint = Path(request.resume_from).expanduser()
         if not checkpoint.is_file():
             raise HTTPException(status_code=400, detail=f"续训检查点不存在：{checkpoint}")
         _ensure_allowed_path(str(checkpoint))
-        command += ["--resume-from", str(checkpoint.resolve())]
 
-    # 增强参数只在用户填了才拼进命令行：留空 = 用 launcher 默认 = 用 Ultralytics 默认
-    augment_fields = (
-        ("hsv_h", "--hsv-h"),
-        ("hsv_s", "--hsv-s"),
-        ("hsv_v", "--hsv-v"),
-        ("degrees", "--degrees"),
-        ("translate", "--translate"),
-        ("scale", "--scale"),
-        ("shear", "--shear"),
-        ("perspective", "--perspective"),
-        ("flipud", "--flipud"),
-        ("fliplr", "--fliplr"),
-        ("bgr", "--bgr"),
-        ("mosaic", "--mosaic"),
-        ("mixup", "--mixup"),
-        ("copy_paste", "--copy-paste"),
-        ("close_mosaic", "--close-mosaic"),
-    )
-    for field_name, flag in augment_fields:
-        value = getattr(request, field_name)
-        if value is not None:
-            command += [flag, str(value)]
+    try:
+        command = build_train_command(request, python)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     try:
         run = manager.create("yolo-train", command, str(config.YOLO_LAUNCHER_DIR))
@@ -757,6 +787,359 @@ def build_engine(request: EngineBuildRequest) -> dict:
         "onnx_probe": probe,
         "estimate_seconds": round(estimate, 1),
     }
+
+
+# ---------------------------------------------------------------------------
+# 全流程串联：训练 → 导出 ONNX → 校验转置 → 编译引擎 → 补标签 → 引擎验证
+# ---------------------------------------------------------------------------
+class PipelineYoloRequest(BaseModel):
+    """一键全流程的参数。
+
+    刻意与 `YoloTrainRequest` 分开：串联多了精度、跳过训练、验证这几项，
+    塞进训练表单会让「只想训一次」的人也看到一堆用不到的字段。
+    """
+
+    data: str = Field(..., description="dataset.yaml 绝对路径")
+    model: str = Field(default="yolov8n.pt", description="初始权重（.pt 或模型名）")
+    task: str = Field(default="detect", description="检测任务类型；精度评估目前只支持 detect")
+    epochs: int = Field(default=100, ge=1, le=1000)
+    imgsz: int = Field(default=640, ge=32, le=2048)
+    batch: str = Field(default="16")
+    device: str = Field(default="0")
+    project: str = Field(default="runs/trtforge", description="相对路径按 launcher 目录解析")
+    name: str = Field(default="", description="留空自动生成 exp_<时间戳>")
+    patience: int = Field(default=50, ge=0)
+    workers: int = Field(default=8, ge=0)
+    pretrained: str = Field(default="true")
+
+    precision: str = Field(default="fp16", description="引擎精度 fp16 / fp32")
+    workspace_mb: int = Field(default=4096, ge=256, le=65536)
+
+    skip_train: bool = Field(default=False, description="跳到已有 .pt，只跑导出之后的部分")
+    weights: str = Field(default="", description="skip_train 时的 .pt 绝对路径")
+
+    run_val: bool = Field(default=True, description="编译完成后用引擎跑精度评估")
+    val_split: str = Field(default="val", description="train / val / test")
+    val_conf: float = Field(default=0.25, ge=0.01, le=1.0)
+    val_nms: float = Field(default=0.45, ge=0.01, le=1.0)
+    val_limit: int = Field(default=0, ge=0, description="最多评估多少张，0 = 全部")
+
+    python: str | None = Field(default=None, description="覆盖训练解释器")
+
+
+def _sanitize_part(text: str) -> str:
+    """实验名 → 可安全做文件名的片段（与 launcher 的 labels 命名规则对齐）。"""
+    cleaned = "".join(ch if ch.isalnum() or ch in "-_." else "_" for ch in str(text))
+    return cleaned.strip("_") or "exp"
+
+
+def _pipeline_run_dir(project: str, name: str) -> Path:
+    """训练产物目录。相对 project 是相对 launcher 目录（launcher 的 cwd 就是那里）。"""
+    root = Path(project).expanduser()
+    if not root.is_absolute():
+        root = config.YOLO_LAUNCHER_DIR / root
+    return (root / name).resolve()
+
+
+def _labels_json_path(run_dir: Path, name: str) -> Path:
+    return run_dir / f"labels_{_sanitize_part(name)}.json"
+
+
+def _ensure_labels_json(data_yaml: str, run_dir: Path, name: str) -> dict:
+    """从 dataset.yaml 的 names 生成 labels_*.json。
+
+    训练阶段 launcher 自己会写一份，这里只处理「跳过训练」或「launcher 没写」的情况。
+    先查存在再写：不覆盖已有文件，避免把训练时记下的类别顺序改掉。
+    """
+    target = _labels_json_path(run_dir, name)
+    if target.is_file():
+        return {"artifact": str(target), "created": False}
+
+    text = Path(data_yaml).read_text(encoding="utf-8", errors="replace")
+    # parse_names_from_yaml 返回 [{"id": 0, "name": "..."}]，标签文件里要的是纯字符串数组
+    entries = dataset.parse_names_from_yaml(text)
+    classes = [
+        entry["name"] if isinstance(entry, dict) else str(entry) for entry in entries
+    ]
+    if not classes:
+        raise ValueError(
+            f"dataset.yaml 里读不到类别名（names 字段）：{data_yaml}，无法生成标签文件"
+        )
+    run_dir.mkdir(parents=True, exist_ok=True)
+    payload = {"name": _sanitize_part(name), "classes": list(classes)}
+    target.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return {"artifact": str(target), "created": True, "classes": len(classes)}
+
+
+def _pipeline_probe_transd(transd_onnx: Path) -> dict:
+    """编译前确认输出是「已转置」布局。
+
+    放到独立阶段而不是塞进 export：导出成功不代表布局正确（旧版 launcher 只转一个
+    输出也能"导出成功"），等到编译完、推理出垃圾框才发现就太晚了。
+    """
+    probe = _probe_onnx(transd_onnx)
+    output_shape = probe.get("output_shape") or []
+    if _looks_like_untransposed_yolo(output_shape):
+        raise ValueError(
+            f"{transd_onnx.name} 的输出形状是 {output_shape}，仍是「未转置」布局。"
+            "用它编译的引擎会被 DLL 误解析（结果全错但不报错），已中止。"
+        )
+    return {"artifact": str(transd_onnx), "output_shape": output_shape}
+
+
+@app.post("/api/pipeline/yolo")
+def pipeline_yolo(request: PipelineYoloRequest) -> dict:
+    """一键跑完「训练 → 导出 → 校验 → 编译 → 标签 → 引擎验证」。"""
+    data_yaml = Path(request.data).expanduser()
+    if not data_yaml.is_file():
+        raise HTTPException(status_code=400, detail=f"dataset.yaml 不存在：{request.data}")
+    _ensure_allowed_path(str(data_yaml))
+    if request.task != "detect" and request.run_val:
+        raise HTTPException(
+            status_code=400,
+            detail="精度评估目前只支持 detect；请关闭「完成后验证」，或把任务类型改为 detect",
+        )
+    if request.precision not in ("fp16", "fp32"):
+        raise HTTPException(status_code=400, detail="precision 只能是 fp16 / fp32")
+
+    trtexec = config.resolve_trtexec()
+    if not trtexec:
+        raise HTTPException(
+            status_code=500,
+            detail="找不到 trtexec.exe（设置 TRTFORGE_TRTEXEC 或确认 CUDA\\bin 下有它）",
+        )
+
+    python = _resolve_python(request.python)
+    name = request.name.strip() or f"exp_{time.strftime('%Y%m%d_%H%M%S')}"
+    run_dir = _pipeline_run_dir(request.project, name)
+
+    weights = run_dir / "weights" / "best.pt"
+    if request.skip_train:
+        if not request.weights.strip():
+            raise HTTPException(status_code=400, detail="跳过训练时必须给出已有 .pt 权重路径")
+        weights = Path(request.weights).expanduser()
+        if not weights.is_file():
+            raise HTTPException(status_code=400, detail=f"权重不存在：{request.weights}")
+        if weights.suffix.lower() != ".pt":
+            raise HTTPException(status_code=400, detail="权重必须是 .pt")
+        _ensure_allowed_path(str(weights))
+        run_dir = weights.parent.parent  # weights/best.pt → run 目录
+
+    transd_onnx = weights.with_name(f"{weights.stem}.transd.onnx")
+    onnx_file = weights.with_suffix(".onnx")
+    tag = "fp16" if request.precision == "fp16" else "fp32"
+    engine_path = weights.with_name(f"{weights.stem}_{tag}.engine")
+    labels_path = _labels_json_path(run_dir, name if not request.skip_train else run_dir.name)
+
+    stages: list[pipeline_mod.StagePlan] = []
+    if not request.skip_train:
+        train_request = YoloTrainRequest(
+            data=str(data_yaml),
+            model=request.model,
+            task=request.task,
+            epochs=request.epochs,
+            imgsz=request.imgsz,
+            batch=request.batch,
+            device=request.device,
+            project=request.project,
+            name=name,
+            patience=request.patience,
+            workers=request.workers,
+            pretrained=request.pretrained,
+        )
+        stages.append(
+            pipeline_mod.StagePlan(
+                name="train",
+                label="训练",
+                command=build_train_command(train_request, python),
+                cwd=str(config.YOLO_LAUNCHER_DIR),
+                expect_file=str(weights),
+                meta={"epochs": request.epochs, "imgsz": request.imgsz},
+            )
+        )
+
+    export_request = YoloExportRequest(
+        weights=str(weights),
+        task=request.task,
+        imgsz=request.imgsz,
+        make_transd=True,
+        simplify=True,
+    )
+    stages.append(
+        pipeline_mod.StagePlan(
+            name="export",
+            label="导出 ONNX",
+            command=build_export_command(export_request, python),
+            cwd=str(config.YOLO_LAUNCHER_DIR),
+            expect_file=str(transd_onnx),
+            meta={"weights": str(weights)},
+        )
+    )
+    stages.append(
+        pipeline_mod.StagePlan(
+            name="probe",
+            label="校验转置布局",
+            callable=lambda: _pipeline_probe_transd(transd_onnx),
+        )
+    )
+    build_command = [
+        trtexec,
+        f"--onnx={transd_onnx}",
+        f"--saveEngine={engine_path}",
+    ]
+    if request.precision == "fp16":
+        build_command.append("--fp16")
+    build_command.append(f"--workspace={request.workspace_mb}")
+
+    stages.append(
+        pipeline_mod.StagePlan(
+            name="build",
+            label=f"编译引擎（{request.precision}）",
+            command=build_command,
+            cwd=str(config.REPO_ROOT),
+            expect_file=str(engine_path),
+            meta={"precision": request.precision, "imgsz": request.imgsz},
+        )
+    )
+    stages.append(
+        pipeline_mod.StagePlan(
+            name="labels",
+            label="生成标签文件",
+            callable=lambda: _ensure_labels_json(str(data_yaml), run_dir, name),
+        )
+    )
+    if request.run_val:
+        report_dir = run_dir / "val"
+        stages.append(
+            pipeline_mod.StagePlan(
+                name="val",
+                label="引擎精度验证",
+                command=[
+                    python,
+                    str(BACKEND_DIR / "tools" / "val_engine.py"),
+                    "--engine", str(engine_path),
+                    "--data", str(data_yaml),
+                    "--labels", str(labels_path),
+                    "--split", request.val_split,
+                    "--task", request.task,
+                    "--conf", str(request.val_conf),
+                    "--nms", str(request.val_nms),
+                    "--limit", str(request.val_limit),
+                    "--out", str(report_dir),
+                ],
+                cwd=str(BACKEND_DIR),
+                expect_file=str(report_dir / "val_report.json"),
+                report_file=str(report_dir / "val_report.json"),
+                meta={"split": request.val_split},
+            )
+        )
+
+    pipeline = pipeline_manager.create(
+        kind="yolo",
+        title=f"{name}（{request.task} / {request.precision}）",
+        stages=stages,
+        artifacts={
+            "run_dir": str(run_dir),
+            "pt": str(weights),
+            "onnx": str(onnx_file),
+            "transd_onnx": str(transd_onnx),
+            "engine": str(engine_path),
+            "labels": str(labels_path),
+        },
+        meta={
+            "data": str(data_yaml),
+            "name": name,
+            "project": request.project,
+            "precision": request.precision,
+            "skip_train": request.skip_train,
+            "run_val": request.run_val,
+        },
+    )
+    return pipeline
+
+
+@app.get("/api/pipeline")
+def pipeline_list(limit: int = 10) -> dict:
+    """最近若干条串联记录。刷新页面后还能看到上次跑到哪。"""
+    return {"items": pipeline_manager.list(max(1, min(limit, 50)))}
+
+
+@app.get("/api/pipeline/{pipeline_id}/log")
+def pipeline_stage_log(pipeline_id: str, stage: str, lines: int = 400) -> Response:
+    """读某一段的日志尾巴。
+
+    为什么不复用训练页的日志面板：那是 WebSocket 流，只能看**内存里还活着**的 run。
+    服务重启后 run 已经没了，但 `runtime/logs/{run_id}.log` 还在——排障要的恰恰是
+    这条已经结束的日志，所以这里直接读文件。
+    """
+    record = pipeline_manager.get(pipeline_id)
+    if record is None:
+        record = pipeline_mod.read_persisted(
+            config.RUNTIME_DIR / "pipelines", pipeline_id
+        )
+    if record is None:
+        raise HTTPException(status_code=404, detail=f"没有这条串联记录：{pipeline_id}")
+
+    stage_state = next(
+        (item for item in record.get("stages") or [] if item.get("name") == stage), None
+    )
+    if stage_state is None:
+        raise HTTPException(status_code=404, detail=f"没有这个阶段：{stage}")
+    run_id = stage_state.get("run_id")
+    if not run_id:
+        raise HTTPException(status_code=404, detail=f"阶段 {stage} 没有日志（未启动或被跳过）")
+
+    log_file = (config.LOG_DIR / f"{run_id}.log").resolve()
+    # 路径只认 runtime/logs 下的 {run_id}.log，run_id 里带 .. 也不能跳出去
+    if log_file.parent != config.LOG_DIR.resolve() or not log_file.is_file():
+        raise HTTPException(status_code=404, detail=f"阶段 {stage} 的日志文件不存在")
+
+    limit = max(1, min(int(lines), 5000))
+    text = _read_log_tail(log_file, limit)
+    return Response(content=text, media_type="text/plain; charset=utf-8")
+
+
+def _read_log_tail(path: Path, limit: int) -> str:
+    """取最后 N 行。整个文件读进来在几百 MB 的构建日志上会很难受。"""
+    try:
+        with path.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            block = 64 * 1024
+            data = b""
+            while size > 0 and data.count(b"\n") <= limit:
+                step = min(block, size)
+                size -= step
+                handle.seek(size)
+                data = handle.read(step) + data
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"读取日志失败：{exc}") from exc
+    lines = data.decode("utf-8", errors="replace").splitlines()
+    return "\n".join(lines[-limit:])
+
+
+@app.get("/api/pipeline/{pipeline_id}")
+def pipeline_detail(pipeline_id: str) -> dict:
+    record = pipeline_manager.get(pipeline_id)
+    live = record is not None
+    if record is None:
+        record = pipeline_mod.read_persisted(
+            config.RUNTIME_DIR / "pipelines", pipeline_id
+        )
+    if record is None:
+        raise HTTPException(status_code=404, detail=f"没有这条串联记录：{pipeline_id}")
+    # live=False 表示这条只能从磁盘读到：前端不该再按它轮询，也不该给「停止」按钮
+    record["live"] = live
+    return record
+
+
+@app.post("/api/pipeline/{pipeline_id}/stop")
+def pipeline_stop(pipeline_id: str) -> dict:
+    """停止整条链：只停当前阶段，已完成的阶段产物保留。"""
+    if not pipeline_manager.stop(pipeline_id):
+        raise HTTPException(status_code=409, detail="该串联已结束，无法停止")
+    record = pipeline_manager.get(pipeline_id) or {}
+    return {"ok": True, "pipeline": record}
 
 
 # ---------------------------------------------------------------------------
@@ -1783,3 +2166,18 @@ def index() -> FileResponse:
 # 挂在最后，避免覆盖 /api 路由
 if config.FRONTEND_DIR.is_dir():
     app.mount("/static", StaticFiles(directory=str(config.FRONTEND_DIR)), name="static")
+
+
+@app.middleware("http")
+async def no_cache_static(request, call_next):
+    """静态资源一律要求重新校验。
+
+    不带这个头时浏览器会按启发式规则把 .js 缓存住，改了前端、重启了后端，
+    刷新页面跑的仍是旧模块。排查「按钮点了没反应」时遇到过：HTML 是新的、
+    ES module 却是几小时前的。这些文件都在本机、体积很小，每次 revalidate
+    的代价可以忽略，换来的是"刷新即最新"。
+    """
+    response = await call_next(request)
+    if request.url.path.startswith("/static/"):
+        response.headers["Cache-Control"] = "no-cache, must-revalidate"
+    return response

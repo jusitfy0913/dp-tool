@@ -324,6 +324,85 @@
 
         <pre class="log" id="logBox"></pre>
       </div>
+
+      <!-- 全流程串联：训练 → 导出 → 校验转置 → 编译 → 补标签 → 引擎精度验证。
+           为什么不塞进上面的表单：只想训一次的人不需要看到精度、跳过训练这些选项；
+           而串联本身可能跑一两个小时，需要一块能一直盯着看的进度区。 -->
+      <div class="card wide" id="pipeCard">
+        <h2>全流程串联 <span class="badge" id="pipeBadge">未开始</span></h2>
+        <p class="hint">
+          用上面「训练参数」里的 dataset.yaml / epochs / imgsz / project / name，从训练一路跑到引擎精度验证。
+          每一段都是一个独立任务，可单独看日志；某段失败就整条停下，已完成阶段的产物照常保留。
+        </p>
+
+        <div class="grid2">
+          <label>引擎精度
+            <select id="pipePrecision">
+              <option value="fp16">fp16（默认，速度优先）</option>
+              <option value="fp32">fp32（精度优先）</option>
+            </select>
+          </label>
+          <label>验证用 split
+            <select id="pipeSplit">
+              <option value="val">val</option>
+              <option value="test">test</option>
+              <option value="train">train</option>
+            </select>
+          </label>
+        </div>
+
+        <div class="actions">
+          <label class="check-row"><input type="checkbox" id="pipeRunVal" checked> 编译后用引擎做精度验证</label>
+          <label class="check-row"><input type="checkbox" id="pipeSkipTrain"> 跳过训练（用已有 .pt）</label>
+        </div>
+
+        <label id="pipeWeightsBox" hidden>已有权重 .pt
+          <div class="row">
+            <input type="text" id="pipeWeights" placeholder="…\weights\best.pt">
+            <button type="button" class="mini" data-browse="pipeWeights" data-mode="file">浏览</button>
+            <button type="button" class="mini" id="btnPipePickBest">用当前实验 best.pt</button>
+          </div>
+        </label>
+
+        <div class="actions">
+          <button type="button" class="primary" id="btnPipeStart">开始全流程</button>
+          <button type="button" id="btnPipeStop" disabled>停止</button>
+          <span class="hint" id="pipeHint"></span>
+        </div>
+
+        <ol class="pipe-stages" id="pipeStages" hidden></ol>
+
+        <div class="scrollbox" id="pipeArtifactsBox" hidden>
+          <table class="data-table" id="pipeArtifacts">
+            <thead>
+              <tr><th>产物</th><th>路径</th><th>操作</th></tr>
+            </thead>
+            <tbody id="pipeArtifactRows"></tbody>
+          </table>
+        </div>
+
+        <div class="stat-grid" id="pipeMetrics" hidden></div>
+
+        <div class="pipe-log" id="pipeLog" hidden>
+          <div class="pipe-log-head">
+            <span>阶段日志</span>
+            <button type="button" class="mini" id="btnPipeLogClose">收起</button>
+          </div>
+          <pre class="pipe-log-pre" id="pipeLogPre"></pre>
+        </div>
+
+        <details class="run-fold" id="pipeHistoryBox">
+          <summary>最近的串联记录</summary>
+          <div class="scrollbox">
+            <table class="data-table" id="pipeHistory">
+              <thead>
+                <tr><th>实验</th><th>状态</th><th class="num">耗时</th><th>开始时间</th><th>操作</th></tr>
+              </thead>
+              <tbody id="pipeHistoryRows"></tbody>
+            </table>
+          </div>
+        </details>
+      </div>
     </div>
   </section>
 

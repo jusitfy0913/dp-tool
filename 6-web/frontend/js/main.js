@@ -7,6 +7,7 @@ import { initEngine } from "./engine.js";
 import { initExport } from "./export.js";
 import { initInfer } from "./infer.js";
 import { initInferBatch } from "./inferbatch.js";
+import { initPipeline } from "./pipeline.js";
 import { initTrain } from "./train.js";
 
 // ---------------------------------------------------------------------------
@@ -180,6 +181,7 @@ if (new URLSearchParams(location.search).has("reduced-motion")) {
 
 initTabs();
 initTrain();
+initPipeline();
 initExport();
 initEngine();
 initDataset();
