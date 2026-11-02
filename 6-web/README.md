@@ -864,10 +864,10 @@ POST {service}/predict    multipart/form-data
 | 撤销 | 无 | 双栈各 50 步，拖动只在真正位移后才入栈 |
 | 并发 | 无概念 | `rev` 乐观锁 + `mtime_ns` 字符串指纹，冲突弹「重新加载 / 强制覆盖」二选一 |
 | 自动标注 | 无 | 本地引擎为主 + 可选外部服务，草稿层独立渲染，可单条 / 全部接受与拒绝 |
-| 类别名 | 只在推理页 | 标注页与推理页共用 `labels.py` 的配色与命名 |
+| 类别名 | 只在推理页 | 标注页的类别配色用与 Qt 逐位一致的公式（`annotation.default_color` / 前端 `defaultColor`），推理页用 `labels.py` 的调色板——**两套色卡不通用**，同一 class_id 在两侧颜色可能不同 |
 | 导出 | 只能导出推理结果图 | 工程级导出 YOLO / COCO / VOC，与数据集页同实现 |
 
-验收脚本：`python 6-web/backend/tools/test_annotation_project.py`（138 项）、
+验收脚本：`python 6-web/backend/tools/test_annotation_project.py`（140 项）、
 `python 6-web/backend/tools/test_annotation_import.py`（63 项），
 外加浏览器实测六种形状、撤销重做、冲突弹窗、真实 `.engine` 自动标注与三种格式导出。
 
@@ -1379,7 +1379,7 @@ D:\Anaconda3\envs\dpenv\python.exe 6-web\backend\tools\test_val_metrics.py
 | 脚本 | 结果 |
 | --- | --- |
 | `test_infer_params.py` | **71 / 71 通过** |
-| `test_annotation_project.py` | **138 / 138 通过** |
+| `test_annotation_project.py` | **140 / 140 通过** |
 | `test_augment_params.py` | 26 / 26 通过 |
 | `test_dataset_workbench.py` | 20 / 20 通过 |
 | `test_exit_codes.py` | 6 / 6 通过 |

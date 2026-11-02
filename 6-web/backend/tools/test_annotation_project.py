@@ -749,7 +749,20 @@ def test_api(tmp: Path) -> None:
     check("接口：image-meta 返回尺寸", meta.json().get("width") == 320 and meta.json().get("height") == 240, meta.text[:200])
 
     scan = client.post("/api/annotation/scan-images", params={"root": str(root)})
-    check("接口：扫描目录找到图片", scan.json().get("count", 0) >= 2, scan.text[:200])
+    scan_body = scan.json()
+    check("接口：扫描目录找到图片", scan_body.get("count", 0) >= 2, scan.text[:200])
+    # 图片数正好等于 limit 时不能误报截断（否则前端会提示「已截断」却一张没少）
+    exact = client.post(
+        "/api/annotation/scan-images",
+        params={"root": str(root), "limit": scan_body.get("count", 0)},
+    )
+    check(
+        "接口：正好 limit 张不误报截断",
+        exact.json().get("truncated") is False,
+        exact.text[:200],
+    )
+    capped = client.post("/api/annotation/scan-images", params={"root": str(root), "limit": 1})
+    check("接口：超过 limit 才报截断", capped.json().get("truncated") is True, capped.text[:200])
 
     exported = client.post(
         "/api/annotation/export",

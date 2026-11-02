@@ -2528,8 +2528,12 @@ def annotation_scan_images(root: str, recursive: bool = True, limit: int = 5000)
     suffixes = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
     pattern = "**/*" if recursive else "*"
     found: list[dict] = []
+    truncated = False
     for item in base.glob(pattern):
         if len(found) >= limit:
+            # 命中上限就停：truncated 必须由「还有没被收录的文件」推出，
+            # 不能用 len(found) >= limit 判断，否则正好 limit 张时会误报截断。
+            truncated = True
             break
         if not item.is_file() or item.suffix.lower() not in suffixes:
             continue
@@ -2537,7 +2541,7 @@ def annotation_scan_images(root: str, recursive: bool = True, limit: int = 5000)
         found.append({"path": str(item), "width": width, "height": height})
 
     found.sort(key=lambda entry: entry["path"].lower())
-    return {"ok": True, "root": str(base), "count": len(found), "images": found, "truncated": len(found) >= limit}
+    return {"ok": True, "root": str(base), "count": len(found), "images": found, "truncated": truncated}
 
 
 @app.post("/api/annotation/import")
