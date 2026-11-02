@@ -11,7 +11,7 @@
 //     实时推理会让拖动滑块变成卡顿，而且每次都要重建引擎句柄。
 //   · 结果表、分布图、导出三者都从同一份 `lastResult` 生成，不会出现"导出的和看到的不一样"。
 
-import { getJSON, postForm } from "./api.js";
+import { anomalyMetadataInfo, getJSON, postForm } from "./api.js";
 import { applyOverlayScale, buildOverlay, setOverlayHighlight } from "./overlay.js";
 import { createViewerStrip } from "./viewer.js";
 
@@ -24,6 +24,12 @@ let models = [];
 let lastParamKey = "";
 let lastResult = null;
 let lastKind = "yolo";
+
+// metadata.json 的推荐阈值回显。state: idle / loading / ok / error。
+// 只用于界面展示——真正提交给后端的是"是否覆盖"这个语义，不是这里的数字。
+let metaInfo = { state: "idle", path: "", image: null, pixel: null, model: "", size: null, accuracy: null, error: "" };
+// 请求序号：路径连改几次时，只有最后一次的响应能落到界面上
+let metaSeq = 0;
 
 // 叠加层状态
 let overlaySvg = null;
@@ -62,6 +68,11 @@ export function initInfer() {
 
     useMetaThresh: document.getElementById("anomUseMetaThresh"),
     anomThreshHint: document.getElementById("anomThreshHint"),
+    metaReadout: document.getElementById("anomMetaReadout"),
+    metaTag: document.getElementById("anomMetaTag"),
+    metaImageThr: document.getElementById("anomMetaImageThr"),
+    metaPixelThr: document.getElementById("anomMetaPixelThr"),
+    metaModel: document.getElementById("anomMetaModel"),
     colormap: document.getElementById("anomColormap"),
     overlayOpacity: document.getElementById("anomOverlayOpacity"),
   };
@@ -89,6 +100,14 @@ export function initInfer() {
   dom.modelSelect.addEventListener("change", onModelChange);
   dom.btnRefreshModels.addEventListener("click", () => loadModels(true));
 
+  // metadata 路径一改就重读推荐值：手动输入走 change（失焦提交），
+  // 点「浏览」选文件走 writeValue() 也会派发 change，两条路都能覆盖。
+  document.getElementById("anomMetadata")?.addEventListener("change", () => refreshMetaThresholds());
+  // 从别的页签切回来时再看一眼：可能在训练页/串联页里刚换了 metadata
+  document.addEventListener("tab-change", (event) => {
+    if (event.detail && event.detail.name === "infer") refreshMetaThresholds();
+  });
+
   for (const id of ["optShowBoxes", "optShowLabels", "optFadeLow"]) {
     const el = document.getElementById(id);
     if (el) el.addEventListener("change", () => rebuildOverlay());
@@ -112,6 +131,7 @@ export function initInfer() {
 
   syncKind();
   syncThresholdControls();
+  refreshMetaThresholds();
   loadModels(false);
 }
 
@@ -167,10 +187,136 @@ function syncThresholdControls() {
       input.disabled = useMeta;
     }
   }
-  dom.anomThreshHint.textContent = useMeta
-    ? "直接使用 metadata 里记录的阈值。取消勾选后可手动覆盖。"
+  // 勾选状态下把文件里的推荐值写进这两个只读框。
+  // 之前这里只切 disabled，框里留着默认 0.5，用户完全看不出实际会用多少。
+  if (useMeta) applyMetaThresholdsToInputs();
+  dom.anomThreshHint.textContent = thresholdHint(useMeta);
+}
+
+// ---------------------------------------------------------------------------
+// metadata 推荐值回显
+// ---------------------------------------------------------------------------
+/** 读一次 metadata.json 的推荐值并刷新界面。 */
+async function refreshMetaThresholds() {
+  const path = value("anomMetadata");
+  const seq = ++metaSeq;
+  if (!path) {
+    metaInfo = { state: "idle", path: "", image: null, pixel: null, model: "", size: null, accuracy: null, error: "" };
+    renderMetaReadout();
+    syncThresholdControls();
+    return;
+  }
+  metaInfo = { ...metaInfo, state: "loading", path };
+  renderMetaReadout();
+  try {
+    const info = await anomalyMetadataInfo(path);
+    if (seq !== metaSeq) return; // 路径又变了，这次响应已经过时
+    metaInfo = {
+      state: "ok",
+      path,
+      image: asNumber(info.image_threshold),
+      pixel: asNumber(info.pixel_threshold),
+      model: info.model_type || "",
+      size: Array.isArray(info.input_size) ? info.input_size : null,
+      accuracy: asNumber(info.sample_accuracy),
+      error: "",
+    };
+  } catch (error) {
+    if (seq !== metaSeq) return;
+    metaInfo = { state: "error", path, image: null, pixel: null, model: "", size: null, accuracy: null,
+      error: error && error.message ? error.message : String(error) };
+  }
+  renderMetaReadout();
+  syncThresholdControls();
+}
+
+/** 把 metadata 的推荐阈值写进两个（此时只读的）输入框与滑块。 */
+function applyMetaThresholdsToInputs() {
+  const pairs = [
+    ["anomImageThr", "anomImageThrRange", metaInfo.image],
+    ["anomPixelThr", "anomPixelThrRange", metaInfo.pixel],
+  ];
+  for (const [numberId, rangeId, raw] of pairs) {
+    const number = document.getElementById(numberId);
+    const range = document.getElementById(rangeId);
+    if (!Number.isFinite(raw)) {
+      // 读不到就清空，别把上一个 metadata 的数字留在那里冒充本次的推荐值
+      if (number) number.value = "";
+      continue;
+    }
+    const text = String(round4(raw));
+    if (number) number.value = text;
+    if (range) range.value = text;
+  }
+}
+
+/** 卡片：列出文件里记录的值；读不到时说明原因，而不是静默隐藏。 */
+function renderMetaReadout() {
+  if (!dom.metaReadout) return;
+  const info = metaInfo;
+  if (info.state === "idle") {
+    dom.metaReadout.hidden = true;
+    return;
+  }
+  dom.metaReadout.hidden = false;
+  dom.metaImageThr.textContent = fmtThreshold(info.image);
+  dom.metaPixelThr.textContent = fmtThreshold(info.pixel);
+  dom.metaModel.textContent = [info.model || "未记录", info.size ? `${info.size[0]}×${info.size[1]}` : ""]
+    .filter(Boolean)
+    .join(" / ");
+  for (const el of [dom.metaImageThr, dom.metaPixelThr]) {
+    el.classList.toggle("is-missing", !Number.isFinite(
+      el === dom.metaImageThr ? info.image : info.pixel,
+    ));
+  }
+  if (info.state === "loading") {
+    setMetaTag("读取中…", false);
+  } else if (info.state === "error") {
+    setMetaTag("读取失败", false);
+  } else if (Number.isFinite(info.accuracy)) {
+    // 有 calibration 区块说明阈值是按现场样本重新标定过的，可信度更高
+    setMetaTag(`已校准 ${(info.accuracy * 100).toFixed(0)}%`, true);
+  } else {
+    setMetaTag("文件原值", false);
+  }
+  // 失败原因通常较长（后端原文），塞进卡片会撑爆两列网格，挂到 title 上按需查看
+  if (dom.metaTag) dom.metaTag.title = info.state === "error" ? info.error : info.path || "";
+}
+
+function setMetaTag(text, calibrated) {
+  if (!dom.metaTag) return;
+  dom.metaTag.textContent = text;
+  dom.metaTag.classList.toggle("is-calibrated", Boolean(calibrated));
+}
+
+/** 提示语：明确说清"现在用的是文件里的值"还是"你手填的值"，并把数字带上。 */
+function thresholdHint(useMeta) {
+  const hasValues = Number.isFinite(metaInfo.image) || Number.isFinite(metaInfo.pixel);
+  const pairs = `图像 ${fmtThreshold(metaInfo.image)} ／ 像素 ${fmtThreshold(metaInfo.pixel)}`;
+  if (useMeta) {
+    if (metaInfo.state === "error") {
+      return `沿用 metadata，但读取失败：${metaInfo.error}（推理时后端仍会读这个文件）`;
+    }
+    if (metaInfo.state === "loading") return "正在读取 metadata 里的推荐阈值…";
+    if (hasValues) {
+      return `沿用中：直接使用 metadata 记录的值（${pairs}）。取消勾选后可手动覆盖。`;
+    }
+    return "直接使用 metadata 里记录的阈值。取消勾选后可手动覆盖。";
+  }
+  return hasValues
+    ? `手动覆盖中：当前用界面上的阈值，metadata 原值 ${pairs}。`
     : "手动覆盖 metadata 阈值。改阈值同样会重建引擎句柄。";
 }
+
+function asNumber(raw) {
+  const parsed = Number(raw);
+  return raw === null || raw === undefined || raw === "" || !Number.isFinite(parsed) ? null : parsed;
+}
+
+function round4(raw) {
+  return Math.round(Number(raw) * 10000) / 10000;
+}
+
 
 /** 参数改动后提示"会重建引擎"，改回原值则提示"命中缓存"。 */
 function markParamsDirty() {
@@ -283,6 +429,8 @@ function onModelChange() {
       const mapped = normalizeModelType(item.model_type);
       if (mapped) setValue("anomModelType", mapped);
     }
+    // setValue 不派发 change，这里显式补一次，否则推荐阈值卡片还停在上一个模型
+    refreshMetaThresholds();
   }
 
   // 未转置的引擎会让 DLL 解码越界，产出的框是垃圾值。必须提前拦。
@@ -327,6 +475,7 @@ function syncKind() {
   }
   // 切到 Anomalib 时不预先开放这两个窗口：等真有图了再开放，
   // 由 renderAnomalib 决定，避免"点开了却是空的"
+  if (!isYolo) refreshMetaThresholds();
   markParamsDirty();
 }
 

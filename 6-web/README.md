@@ -396,6 +396,49 @@ train_export（训练 + 导出 ONNX + 校准 metadata） → probe（校验 meta
 | 结果明细 | 只有一段文字 | 可排序表格，点行高亮对应框；置信度直方图；计时分解条 |
 | 导出 | 只能右键存图 | JSON / CSV 客户端导出，内容与屏幕完全一致 |
 
+#### 推理页：metadata 推荐阈值回显（v1.21）
+
+勾上「沿用 metadata 默认阈值」之后，两个阈值框是**只读**的，值来自 `metadata.json`。
+v1.20 及以前这里只有一个 `disabled`，框里留着默认 `0.5`——推荐值藏在文件里，
+必须跑一次推理、再去结果行看 `（metadata）` 才知道实际用了多少。v1.21 把它提前读出来：
+
+| 项 | v1.20 | v1.21 | 意义 |
+| --- | --- | --- | --- |
+| 只读框显示 | 默认 `0.5` | 文件里的真实值（`0.172` / `0.1634`） | 不跑推理也知道会用多少 |
+| 推荐值卡片 | 无 | 「图像阈值 / 像素阈值 / 模型 + 输入尺寸」三行 | 阈值与模型一起看，避免张冠李戴 |
+| 精度 | — | 4 位小数（`0.1720` ≈ `0.17198532`） | 校准值不会被糊成 `0.17` |
+| 来源标记 | 无 | 有 `calibration` → 「已校准 100%」；否则「文件原值」 | 分清现场标定值与训练集默认值 |
+| 读取失败 | 框里留着旧数字（误导） | 框清空 + 卡片「读取失败」+ hint 给原因 | 不拿上一次的数字冒充本次推荐值 |
+| 手动覆盖 | 看不出原值 | hint 变成「手动覆盖中：… metadata 原值 图像 … ／ 像素 …」 | 过几天回来也知道改没改 |
+| 滑块步长 | `0.01` | `0.0001` | 想复现 `0.172` 这种阈值不用改源码 |
+
+**数据怎么来**：`GET /api/infer/anomalib/metadata?path=<metadata.json>`，只读文件、
+**不建引擎句柄**，所以改路径可以随时刷新，不会卡几秒去加载模型。
+
+**刷新时机**（三条都会触发）：
+
+1. 手改 `metadata.json` 路径并失焦（`change` 事件）；
+2. 点「浏览」从原生对话框选文件（`writeValue()` 会补发 `change`）；
+3. 从下拉选训练产物（自动填好路径后显式刷新一次），以及从别的页签切回「推理演示」。
+
+**响应字段**
+
+| 字段 | 类型 | 说明 | 应用场景 |
+| --- | --- | --- | --- |
+| `path` | str | 实际读取的绝对路径 | 核对读的是不是那个校准版文件 |
+| `image_threshold` | float \| null | 图像级判定阈值（0~1） | 判定 OK / NG 的门槛 |
+| `pixel_threshold` | float \| null | 像素级异常区域阈值 | 圈异常区域的门槛 |
+| `model_type` | str | `Patchcore` / `Padim` / `EfficientAd` | 确认引擎与 metadata 是否配套 |
+| `input_size` | [int, int] \| null | ONNX 的 H/W | 与引擎形状对不上时先看这里 |
+| `normalization` | str | 归一化方式 | 排查分数尺度问题 |
+| `pred_scores` / `anomaly_maps` | [float, float] \| null | 分数 / 异常图的 `min`、`max` | 判断 0~1 归一化是否成立 |
+| `sample_accuracy` | float \| null | 校准样本判对率 | 低于 1.0 说明阈值可能偏松 |
+| `error` | str | 解析失败原因 | 失败时接口返 400，`detail` 就是这句 |
+
+**容错**：BOM、字段缺失、类型不对、坏 JSON、`0.0` 阈值都有明确语义——`0.0` 是**有效值**
+（校准后的正常样本分数恒为 0 时会出现），不能当成"没读到"；坏 JSON 与越界路径分别是
+400 / 403，前端会原样显示原因。
+
 结果区是**独立窗口**，排在同一排，每个都能单独操作：
 
 | 窗口 | 内容 | 默认 |
@@ -1084,6 +1127,7 @@ offset1 = cursor - p_image * scale1
 | POST | `/api/browse/dialog` | **v1.20**：在服务端桌面弹原生对话框（`file` / `files` / `dir` / `save`），返回选中路径 |
 | POST | `/api/infer/yolo` | YOLO 推理 |
 | POST | `/api/infer/anomalib` | Anomalib 推理 |
+| GET | `/api/infer/anomalib/metadata?path=` | **v1.21**：只读 `metadata.json`，返回推荐阈值 / 模型类型 / 输入尺寸 / 校准精度（不建引擎句柄） |
 | POST | `/api/infer/batch` | **v1.16**：目录批量推理（子进程），返回 `run_id`，进度与产物走 `WS /ws/runs/{id}` |
 | POST | `/api/infer/video` | **v1.16**：视频推理（子进程），事件流同上，产出 `*_annotated.mp4` |
 | POST | `/api/infer/frame` | **v1.16**：摄像头单帧推理，同步返回纯 JSON 框（不落盘、不建运行记录） |
@@ -1356,6 +1400,7 @@ offset1 = cursor - p_image * scale1
 │       ├── test_pipeline_resolve.py   **v1.18**：串联 resolve 验收（延迟派生 / 产物定位 / metadata 校验 / 动态 batch）
 │       ├── test_anomaly_metrics.py    **v1.18**：异常指标验收（归一化 / AUROC 同分 / 混淆矩阵边界 / 最优阈值）
 │       ├── test_native_dialog.py      **v1.20**：原生对话框验收（扩展名归一化 / 起始目录 / 四种类型 / 单例锁 / 超时 / 放行表 / 远程 403）
+│       ├── test_metadata_readout.py   **v1.21**：metadata 推荐值回显验收（字段解析 / BOM / 坏 JSON / 0.0 阈值 / 403 / 400 / 不建引擎句柄）
 │       ├── run_all_tests.py           总入口：扫描并串行跑完所有 test_*.py（CI 共用）
 │       └── test_exit_codes.py  退出码语义化测试（exit 2/130 的补事件逻辑）
 ├── frontend/
@@ -1387,7 +1432,7 @@ offset1 = cursor - p_image * scale1
 **一条命令跑完全部后端测试**（v1.15 起，CI 与本地共用同一个入口）：
 
 ```powershell
-D:\Anaconda3\envs\dpenv\python.exe 6-web\backend\tools\run_all_tests.py      # 22 个脚本
+D:\Anaconda3\envs\dpenv\python.exe 6-web\backend\tools\run_all_tests.py      # 23 个脚本
 D:\Anaconda3\envs\dpenv\python.exe 6-web\backend\tools\run_all_tests.py transd  # 只跑名字含 transd 的
 ```
 
@@ -1434,6 +1479,9 @@ D:\Anaconda3\envs\dpenv\python.exe 6-web\backend\tools\test_val_metrics.py
 
 # 原生对话框（不需要真弹窗：子进程换成假实现，用临时目录跑）
 D:\Anaconda3\envs\dpenv\python.exe 6-web\backend\tools\test_native_dialog.py
+
+# metadata 推荐值回显（不需要 GPU：真读临时 metadata.json + TestClient 打接口）
+D:\Anaconda3\envs\dpenv\python.exe 6-web\backend\tools\test_metadata_readout.py
 ```
 
 2026-10-29 实测结果：`smoke_test` **13 项全通过**（能力探测、参数校验、越权拦截、
@@ -1506,6 +1554,26 @@ D:\Anaconda3\envs\dpenv\python.exe 6-web\backend\tools\test_native_dialog.py
 | 按 Esc 取消 | 字段保持原值、按钮恢复、**不会**误开页面内浏览 |
 | `Shift` + 点「浏览」 | 页面内目录浏览正常打开（显示仓库根 15 项） |
 | 标注页「新建…」 | 弹的是**保存**框（带 `.tfanno` 默认后缀），取消后字段不动 |
+
+2026-11-02 metadata 推荐值回显实测结果（v1.21）：
+
+| 脚本 | 结果 |
+| --- | --- |
+| `test_metadata_readout.py` | **37 / 37 通过** |
+
+脚本不需要 GPU：解析部分直接写临时 `metadata.json`（含 BOM / 坏 JSON / 类型错乱 / `0.0` 阈值），
+接口部分用 `TestClient` 打真请求（正常 200、空路径与文件不存在 400、坏 JSON 400、白名单外 403），
+并用一个「一被调用就抛异常」的假 DLL 证明回显接口**不会建立引擎句柄**。
+
+浏览器实测（真实 metadata：`results/Patchcore/cmp_patchcore/v0/weights/lightning/metadata.json`）：
+
+| 场景 | 结果 |
+| --- | --- |
+| 填入 metadata 路径并失焦 | 卡片显示 `图像 0.1720 ／ 像素 0.1634`、`已校准 100%`、`Patchcore / 256×256` |
+| 勾着「沿用 metadata 默认阈值」 | 两个只读框同步变成 `0.172` / `0.1634`（原来是 `0.5` / `0.5`） |
+| 勾掉勾选框 | 提示变「手动覆盖中：当前用界面上的阈值，metadata 原值 图像 0.1720 ／ 像素 0.1634。」，框可编辑且保留推荐值作为起点 |
+| 路径改成不存在的文件 | 卡片标「读取失败」、两个数值变 `—`、输入框被清空、提示写明「metadata.json 不存在：…」 |
+| 从下拉选训练产物 | 自动填好引擎 + metadata 后卡片立即刷新，不会停在上一个模型 |
 
 2026-11-02 批量 · 视频 · 摄像头实测结果（v1.16）：
 

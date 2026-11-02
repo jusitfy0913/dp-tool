@@ -1391,6 +1391,56 @@ code {
 }
 .param.is-disabled { opacity: .55; }
 
+/* ---- metadata 推荐值回显卡 ----
+   勾了「沿用 metadata」后阈值框是只读的，这张卡负责把文件里的原值摆到台面上，
+   等宽数字 + 右对齐，方便和下面的输入框逐位对照。 */
+.meta-readout {
+  margin: var(--sp-2) 0;
+  padding: var(--sp-2) var(--sp-3);
+  border: 1px solid var(--cyan-a40);
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+}
+.meta-readout-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-2);
+  margin-bottom: 4px;
+}
+.meta-readout-title {
+  font-size: var(--fs-2xs);
+  color: var(--cyan);
+  letter-spacing: .04em;
+}
+.meta-readout-tag {
+  font-size: var(--fs-2xs);
+  color: var(--text-faint);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 1px 8px;
+}
+.meta-readout-tag.is-calibrated {
+  color: var(--ok);
+  border-color: var(--ok-a40);
+  background: var(--ok-a12);
+}
+.meta-readout-grid {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 2px var(--sp-3);
+  font-size: var(--fs-2xs);
+  line-height: 1.5;
+}
+.meta-readout-key { color: var(--text-faint); }
+.meta-readout-val {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+  text-align: right;
+}
+.meta-readout-val.is-missing { color: var(--amber); }
+
 /* 使用原生 range 但统一配色，避免各浏览器默认蓝色与主题冲突 */
 input[type="range"] {
   width: 100%;

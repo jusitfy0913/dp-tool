@@ -586,19 +586,37 @@
           </label>
           <p class="hint" id="anomThreshHint">默认直接使用 metadata 里记录的阈值。</p>
 
+          <!-- metadata 推荐值回显：勾了「沿用」时两个阈值框是只读的，
+               如果不把它显式列出来，用户只能先跑一次推理才知道文件里写了什么。
+               数值由 /api/infer/anomalib/metadata 读出，改路径即刷新。 -->
+          <div class="meta-readout" id="anomMetaReadout" hidden>
+            <div class="meta-readout-head">
+              <span class="meta-readout-title">metadata 推荐值</span>
+              <span class="meta-readout-tag" id="anomMetaTag">已读取</span>
+            </div>
+            <div class="meta-readout-grid">
+              <span class="meta-readout-key">图像阈值</span>
+              <span class="meta-readout-val" id="anomMetaImageThr">—</span>
+              <span class="meta-readout-key">像素阈值</span>
+              <span class="meta-readout-val" id="anomMetaPixelThr">—</span>
+              <span class="meta-readout-key">模型 / 输入</span>
+              <span class="meta-readout-val" id="anomMetaModel">—</span>
+            </div>
+          </div>
+
           <div class="param" data-param="imageThreshold">
             <div class="param-head">
               <span class="param-name">图像阈值（判定 OK / NG）</span>
-              <input type="number" id="anomImageThr" value="0.5" step="0.01" min="0" max="1">
+              <input type="number" id="anomImageThr" value="0.5" step="0.0001" min="0" max="1">
             </div>
-            <input type="range" id="anomImageThrRange" value="0.5" step="0.01" min="0" max="1">
+            <input type="range" id="anomImageThrRange" value="0.5" step="0.0001" min="0" max="1">
           </div>
           <div class="param" data-param="pixelThreshold">
             <div class="param-head">
               <span class="param-name">像素阈值（圈出异常区域）</span>
-              <input type="number" id="anomPixelThr" value="0.5" step="0.01" min="0" max="1">
+              <input type="number" id="anomPixelThr" value="0.5" step="0.0001" min="0" max="1">
             </div>
-            <input type="range" id="anomPixelThrRange" value="0.5" step="0.01" min="0" max="1">
+            <input type="range" id="anomPixelThrRange" value="0.5" step="0.0001" min="0" max="1">
           </div>
           <div class="param" data-param="overlayOpacity">
             <div class="param-head">

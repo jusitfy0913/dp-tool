@@ -54,6 +54,11 @@ export function getCapabilities() {
   return getJSON("/api/capabilities");
 }
 
+/** 只读 anomalib 的 metadata.json：拿推荐阈值/模型类型/输入尺寸用于界面回显。 */
+export function anomalyMetadataInfo(path) {
+  return getJSON(`/api/infer/anomalib/metadata?${new URLSearchParams({ path: String(path || "") })}`);
+}
+
 /** 存活探针，同时带回后端版本号（用来识别「连到了旧进程」）。 */
 export function getHealth() {
   return getJSON("/api/health");

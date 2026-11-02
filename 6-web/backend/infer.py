@@ -685,8 +685,12 @@ def read_metadata_thresholds(metadata_path: str) -> dict:
 
     读失败不抛错：原值只用于展示，不影响推理。
     """
+    # 除了阈值，顺手带上模型类型/输入尺寸/校准精度：推理页要在"还没跑推理"时
+    # 就把这些推荐值显示出来，只回两个阈值的话界面上仍然只有一个干巴巴的数字。
     info = {"image_threshold": None, "pixel_threshold": None,
-            "pred_scores": None, "anomaly_maps": None, "error": ""}
+            "pred_scores": None, "anomaly_maps": None,
+            "model_type": "", "input_size": None,
+            "normalization": "", "sample_accuracy": None, "error": ""}
     try:
         import json
 
@@ -707,6 +711,26 @@ def read_metadata_thresholds(metadata_path: str) -> dict:
             low, high = block.get("min"), block.get("max")
             if isinstance(low, (int, float)) and isinstance(high, (int, float)):
                 info[key] = [float(low), float(high)]
+
+    for key in ("model_type", "normalization"):
+        value = raw.get(key)
+        if isinstance(value, str) and value.strip():
+            info[key] = value.strip()
+
+    size = raw.get("input_size")
+    if isinstance(size, (list, tuple)) and len(size) == 2:
+        try:
+            info["input_size"] = [int(size[0]), int(size[1])]
+        except (TypeError, ValueError):
+            info["input_size"] = None
+
+    # 校准区块是我们自己的 trtforge_metadata.py 写的：有它说明阈值是按现场数据
+    # 重新标定过的，界面上值得标一句"已校准"，用户才知道该不该直接信这个数。
+    calibration = raw.get("calibration")
+    if isinstance(calibration, dict):
+        accuracy = calibration.get("sample_accuracy")
+        if isinstance(accuracy, (int, float)) and not isinstance(accuracy, bool):
+            info["sample_accuracy"] = float(accuracy)
     return info
 
 

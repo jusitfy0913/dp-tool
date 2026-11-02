@@ -53,7 +53,7 @@ from runners import manager
 
 #: 应用版本号。前端顶栏与 /api/health 都读它，方便一眼看出「页面连的是哪个后端」。
 #: 起因：改了代码但 8060 上跑的是几小时前的旧进程，排查很久才发现。
-APP_VERSION = "1.20.0"
+APP_VERSION = "1.21.0"
 
 #: 本文件所在目录（6-web/backend）。子进程脚本路径都以它为基准，
 #: 不依赖启动时的工作目录——从仓库根启动和从 backend 启动必须都能跑。
@@ -2134,6 +2134,22 @@ def _require_file(raw: str, field: str) -> Path:
     if not path.is_file():
         raise HTTPException(status_code=400, detail=f"{field} 不存在：{path}")
     return path
+
+
+@app.get("/api/infer/anomalib/metadata")
+def inspect_anomaly_metadata(path: str = "") -> dict:
+    """只读 `metadata.json`，把里面的推荐阈值提前暴露给推理页。
+
+    为什么需要这个接口：勾选「沿用 metadata 默认阈值」时两个阈值输入框是
+    只读的，值来自 metadata 文件——但文件内容在界面上没有任何出口，用户只能
+    先跑一次推理、再去看结果行里的"（metadata）"才间接看到数字，等于把推荐值
+    藏起来了。这个接口只读文件、不建引擎句柄，可以随路径改动随时刷新。
+    """
+    target = _require_file(path, "metadata.json")
+    info = infer.read_metadata_thresholds(str(target))
+    if info.get("error"):
+        raise HTTPException(status_code=400, detail=info["error"])
+    return {"path": str(target), **info}
 
 
 def build_batch_command(
