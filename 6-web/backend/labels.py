@@ -74,17 +74,57 @@ def class_colors(count: int) -> dict[str, list[int]]:
     return {str(i): color_for(i) for i in range(total)}
 
 
+#: 标签解析缓存上限。现场通常只有几套标签文件，8 条足够，
+#: 超了整表清空而不是做 LRU：命中率本来就是 100%，复杂度不值得。
+_LABEL_CACHE_LIMIT = 8
+_LABEL_CACHE: dict[tuple, dict] = {}
+
+
+def _copy_result(result: dict) -> dict:
+    """返回一份浅拷贝（classes 也复制）。
+
+    缓存里存的字典若不复制就交给调用方，任何一次「当场改一下类别名」的代码
+    都会把缓存污染，后面所有请求都跟着错，且极难复现。
+    """
+    copy = dict(result)
+    copy["classes"] = list(result.get("classes") or [])
+    return copy
+
+
 def load_labels(path: str | Path | None) -> dict:
     """读取标签文件，返回 `{ok, name, classes, error}`。
 
     永远不抛异常：调用方只需要看 `ok` 决定是否使用类别名。
+
+    结果按 (路径, mtime, 大小) 缓存：摄像头推理每帧都会调它，
+    不缓存的话 10fps 就是每秒 10 次文件读取 + JSON 解析，
+    白白占掉摄像头链路的延迟预算。文件一改 mtime 就变，缓存自动失效。
     """
-    result = {"ok": False, "name": "", "classes": [], "error": ""}
     if path is None or not str(path).strip():
-        result["error"] = "未提供标签文件"
-        return result
+        return {"ok": False, "name": "", "classes": [], "error": "未提供标签文件"}
 
     file = Path(str(path))
+    try:
+        stat = file.stat()
+        key = (str(file.resolve()), stat.st_mtime_ns, stat.st_size)
+    except OSError:
+        # stat 失败（文件不存在/无权限）就不缓存，交给下面的解析给出具体原因
+        key = None
+
+    if key is not None and key in _LABEL_CACHE:
+        return _copy_result(_LABEL_CACHE[key])
+
+    result = _load_labels_uncached(file)
+    if key is not None:
+        if len(_LABEL_CACHE) >= _LABEL_CACHE_LIMIT:
+            _LABEL_CACHE.clear()
+        _LABEL_CACHE[key] = _copy_result(result)
+    return result
+
+
+def _load_labels_uncached(file: Path) -> dict:
+    """真正的解析逻辑，缓存层只是包在外面。"""
+    result = {"ok": False, "name": "", "classes": [], "error": ""}
     if not file.is_file():
         result["error"] = f"标签文件不存在：{file}"
         return result
@@ -126,6 +166,15 @@ def load_labels(path: str | Path | None) -> dict:
     result["ok"] = True
     result["classes"] = cleaned
     return result
+
+
+def cache_clear() -> None:
+    """清空标签缓存。
+
+    只给测试用：同一秒内改写标签文件（mtime 精度不足或内容长度不变）时
+    缓存可能仍命中旧值，测试必须能显式清空。
+    """
+    _LABEL_CACHE.clear()
 
 
 def name_for(class_id: int, classes: list[str] | None) -> str:

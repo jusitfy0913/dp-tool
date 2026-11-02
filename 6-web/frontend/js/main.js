@@ -6,6 +6,7 @@ import { initDataset } from "./dataset.js";
 import { initEngine } from "./engine.js";
 import { initExport } from "./export.js";
 import { initInfer } from "./infer.js";
+import { initInferBatch } from "./inferbatch.js";
 import { initTrain } from "./train.js";
 
 // ---------------------------------------------------------------------------
@@ -110,7 +111,7 @@ function initBrowse() {
 
       if (browseState.mode === "file") {
         data.entries
-          .filter((e) => !e.is_dir && /\.(trt|engine|onnx|json|yaml|yml|tfanno|pt)$/i.test(e.name))
+          .filter((e) => !e.is_dir && /\.(trt|engine|onnx|json|yaml|yml|tfanno|pt|mp4|avi|mov|mkv|m4v|flv|ts|wmv)$/i.test(e.name))
           .forEach((entry) => list.appendChild(makeItem(entry, btnPick)));
       }
 
@@ -184,6 +185,7 @@ initEngine();
 initDataset();
 initAnnotate();
 initInfer();
+initInferBatch();
 initBrowse();
 refreshVersion();
 refreshEnvironment();

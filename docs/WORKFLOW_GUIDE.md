@@ -24,7 +24,7 @@ flowchart TD
     G --> I
     I --> J["model_fp16.engine"]
 
-    J --> K["⑥ 推理验证<br/>6-web 或 DLL"]
+    J --> K["⑥ 推理验证<br/>单张 / 目录批量 / 视频 / 摄像头<br/>6-web 或 DLL"]
     K --> L{"⑦ 精度达标？"}
     L -->|否| B
     L -->|是| M["⑧ 产线部署"]
@@ -719,6 +719,97 @@ Invoke-WebRequest http://127.0.0.1:8060/api/capabilities
 # 判定口径：normalized_score >= 0.5 为 NG
 # 验收线建议：漏检 = 0，误报率 < 5%
 ```
+
+### 7.5 目录批量 · 视频 · 摄像头（v1.16）
+
+推理页底部的「批量 · 视频 · 摄像头」卡片。**引擎、标签、任务类型、`conf` / `nms` 全部沿用上方
+「推理设置」**，所以顺序是：先在上面选好引擎并确认单张能出框，再切到这张卡片。
+
+#### 7.5.1 三种模式的执行位置（先搞清楚这个，排查才有方向）
+
+| 模式 | 跑在哪 | 有 `run_id` | 能停止 | 产物 |
+| --- | --- | --- | --- | --- |
+| 目录批量 | 子进程 `backend/tools/infer_batch.py` | 有 | 能（杀进程，已写文件保留） | `annotated/`、`results.csv`、`results.json`、`annotated.zip`、`job.json` |
+| 视频 | 子进程 `backend/tools/infer_video.py` | 有 | 能 | `*_annotated.mp4`、`detections.json` |
+| 摄像头 | 后端进程内 `POST /api/infer/frame` | **无** | 点「关闭」 | 不落盘 |
+
+判断"到底跑没跑"看产物目录：`runtime/infer/<时间戳>-<batch|video>-<随机>/`。
+
+#### 7.5.2 目录批量
+
+1. 在「图片目录」填服务端路径（可点「浏览」，支持中文与空格）。
+2. 调试时把「最多处理张数」填 3：先确认引擎与标签对不对，再跑全量。
+3. 点「开始批量推理」，进度条与逐文件表格实时刷新。
+4. 完成后点「下载标注包」，或直接去产物目录拿 `results.csv`。
+
+`results.csv` 是 `utf-8-sig` + `\n` 换行，**故意带 BOM**：不带的话 Excel 打开中文类别名是乱码；
+换行必须是 `\n`，`\r\n` 会在部分工具里多出空行。
+
+单张坏图（截断的 JPEG、0 字节文件）不会中断整批：
+
+```
+index,file,width,height,count,status,error,classes
+7,mask_07.jpg,0,0,0,error,decode failed,
+```
+
+遇到 `status=error` 先看 `error` 列，再单独用单张推理复现那一张。
+
+#### 7.5.3 视频
+
+1. 填视频绝对路径（「浏览」已放开 mp4/avi/mov/mkv）。
+2. 先设「最多处理帧数 = 30」验证编码器与画面，再放开跑全片。
+3. 编码器保持 `auto` 即可：依次试 `avc1` → `H264` → `mp4v`，**实写一帧验证文件非空**才算可用。
+4. 完成后视频直接在卡片里内联播放，可下载 mp4 与 `detections.json`。
+
+抽帧（步长 N > 1）时输出帧率写为 `源帧率 ÷ N`，**播放时长与原片一致**。
+如果看到"快进"，说明这一步被改坏了——它不是可选的显示细节，而是让产物可用的前提。
+
+#### 7.5.4 摄像头
+
+1. 选分辨率（640×480 / 1280×720 / 1920×1080）与帧率上限（默认 8）。
+2. 点「开启摄像头」，浏览器首次会请求授权。
+3. 画面上直接叠框；右上角显示当前帧率与单帧耗时。
+4. 点「关闭」停止；关页面也会自动释放摄像头。
+
+这条链路**不落盘、不上传图片**：每帧压成 JPEG 发一次请求，后端只回 JSON 坐标与类别色。
+如果画面卡但延迟不累积，是"掉帧"（设计如此：上一帧没回来就跳过，不排队）；
+如果延迟越来越长，说明在途判断失效了，属于 bug。
+
+没有摄像头或拒绝授权时，卡片回到「未启动」并显示原因，
+例如 `无法打开摄像头：Requested device not found`——不会卡在「启动中」。
+
+#### 7.5.5 命令行等价用法（不经过页面）
+
+```powershell
+# 目录批量（自己跑，便于写进其他流水线）
+D:\Anaconda3\envs\dpenv\python.exe 6-web\backend\tools\infer_batch.py `
+  --source D:\pcb\images --engine <engine路径> --labels <labels_*.json> `
+  --task detect --conf 0.25 --nms 0.45 --jpeg-quality 92
+
+# 视频（--stride 3 表示每 3 帧处理一次，输出帧率自动除以 3）
+D:\Anaconda3\envs\dpenv\python.exe 6-web\backend\tools\infer_video.py `
+  --source D:\pcb\line.mp4 --engine <engine路径> --stride 3 --max-frames 300
+```
+
+两者都会把事件以 `TRTFORGE_JSON {...}` 单行 JSON 打到 stdout（与训练任务同一套协议），
+`runners.py` 就是靠这个把进度转成 WebSocket 事件的。
+
+#### 7.5.6 验收与回归
+
+```powershell
+D:\Anaconda3\envs\dpenv\python.exe 6-web\backend\tools\test_infer_jobs.py    # 34 项
+D:\Anaconda3\envs\dpenv\python.exe 6-web\backend\tools\test_infer_batch.py   # 75 项
+D:\Anaconda3\envs\dpenv\python.exe 6-web\backend\tools\test_infer_video.py   # 43 项
+```
+
+三个脚本都不需要 GPU / DLL / 真实视频，能进 CI。**实测验收线**：
+
+| 检查项 | 期望 |
+| --- | --- |
+| 批量 3 张小图 | < 2 s，CSV 行数 = 3，`annotated/` 张数 = 3，zip 可解压 |
+| 视频 30 帧 | < 3 s，产 mp4 能在浏览器播放（`readyState=4`），时长 = 30 / 帧率 |
+| 摄像头单帧 | < 500 ms，响应无 base64 图 |
+| 越权下载 | `path` 指向 `runtime/infer` 之外返回 404 |
 
 ---
 

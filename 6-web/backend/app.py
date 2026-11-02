@@ -21,6 +21,7 @@ import json
 import mimetypes
 import os
 import shlex
+import sys
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -37,6 +38,7 @@ import checkpoints
 import config
 import dataset
 import infer
+import inferjobs
 import labels as labels_mod
 import models as models_mod
 import onnx_fallback
@@ -46,7 +48,11 @@ from runners import manager
 
 #: 应用版本号。前端顶栏与 /api/health 都读它，方便一眼看出「页面连的是哪个后端」。
 #: 起因：改了代码但 8060 上跑的是几小时前的旧进程，排查很久才发现。
-APP_VERSION = "1.15.0"
+APP_VERSION = "1.16.0"
+
+#: 本文件所在目录（6-web/backend）。子进程脚本路径都以它为基准，
+#: 不依赖启动时的工作目录——从仓库根启动和从 backend 启动必须都能跑。
+BACKEND_DIR = Path(__file__).resolve().parent
 
 # ---------------------------------------------------------------------------
 # 应用与生命周期
@@ -986,41 +992,68 @@ def _check_yolo_output_sane(result: dict, img_w: int, img_h: int) -> None:
 def _resolve_fallback_onnx(engine_path: str, metadata_path: str) -> tuple[str | None, str]:
     """为降级路径找出可用的 .onnx 模型，返回 (路径, 说明)。
 
-    用户选的是 TensorRT 引擎（.engine/.trt），onnxruntime 读不了它，
-    所以必须找回同源的 ONNX。按可信度依次尝试：
-
-    1. 用户直接选的就是 .onnx —— 直接用；
-    2. 同目录同名 .onnx（`best.engine` -> `best.onnx`，`best.transd.engine` -> `best.transd.onnx`）；
-    3. metadata.json 里记录的 `onnx_path`（训练时写下的原始 ONNX 位置。
-
-    第 2 条优先于第 3 条：metadata 里的 onnx_path 往往是训练机上的绝对路径，
-    模型拷到别的机器后就失效了，而同目录同名文件通常跟着一起拷过来。
+    实现已下沉到 `onnx_fallback.resolve_onnx_path`：批量/视频子进程要用同一套
+    查找规则，留在路由层就会出现两份互相漂移的实现。
     """
-    path = Path(engine_path)
-    if path.suffix.lower() == ".onnx":
-        return (str(path), "") if path.is_file() else (None, f"ONNX 文件不存在：{engine_path}")
-
-    sibling = path.with_suffix(".onnx")
-    if sibling.is_file():
-        return str(sibling), ""
-
-    if metadata_path and Path(metadata_path).is_file():
-        try:
-            meta = json.loads(Path(metadata_path).read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            meta = {}
-        recorded = str(meta.get("onnx_path", "") or "").strip()
-        if recorded and Path(recorded).is_file():
-            return recorded, ""
-
-    return None, (
-        f"降级推理需要 .onnx，但没找到与 {path.name} 对应的 ONNX。"
-        f"请把同名的 {path.stem}.onnx 放到同一目录，或直接选择 .onnx 模型。"
-    )
+    return onnx_fallback.resolve_onnx_path(engine_path, metadata_path)
 
 
 def _fallback_reason(primary: str, detail: str) -> str:
     return f"{primary} 不可用（{detail}），已自动降级为 onnxruntime"
+
+
+def _run_yolo_once(
+    engine: str,
+    task: str,
+    array,
+    conf: float,
+    nms: float,
+    labels: str = "",
+) -> tuple[dict, str | None]:
+    """执行一次 YOLO 推理并补齐类别名与配色，返回 (结果, 降级说明)。
+
+    抽出来的原因：单图接口与摄像头接口必须走**完全同一套**后端选择与
+    输出结构。摄像头每秒调 10 次，如果它是"另一条实现"，两边框的顺序、
+    字段名、降级行为迟早对不上，而屏幕上看起来都"能出框"，极难发现。
+    """
+    backend = infer.status()
+    warning: str | None = None
+    onnx_path = ""
+    if not backend.yolo_ok:
+        onnx_path, reason = _resolve_fallback_onnx(engine, "")
+        if onnx_path is None:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "yolo_infer.dll 不可用："
+                    f"{backend.detail}。请确认已编译 DLL，并设置 OPENCV_DIR / CUDA_PATH。"
+                    f"（也可改用 ONNX 降级，但{reason}）"
+                ),
+            )
+        warning = _fallback_reason("yolo_infer.dll", backend.detail or "未知原因")
+
+    label_info = labels_mod.load_labels(labels)
+    try:
+        if backend.yolo_ok:
+            result = infer.run_yolo(engine, task, array, conf=conf, nms=nms)
+        else:
+            result = onnx_fallback.run_yolo(
+                onnx_path, task, array, conf=conf, nms=nms,
+                num_classes=len(label_info["classes"]) or None,
+            )
+    except onnx_fallback.FallbackError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    _check_yolo_output_sane(result, int(array.shape[1]), int(array.shape[0]))
+    infer.attach_labels(result, label_info["classes"])
+    result["labels"] = {
+        "path": labels or None,
+        "ok": label_info["ok"],
+        "name": label_info["name"],
+        "count": len(label_info["classes"]),
+        "error": label_info["error"],
+    }
+    return result, warning
 
 
 @app.post("/api/infer/yolo")
@@ -1037,43 +1070,10 @@ def infer_yolo(
     DLL 优先；DLL 不可用时自动降级到 onnxruntime，返回结构完全一致。
     `labels` 是标签文件路径，缺失时框上只有 `cls{id}`，不报错。
     """
-    backend = infer.status()
-    warning: str | None = None
-    if not backend.yolo_ok:
-        onnx_path, reason = _resolve_fallback_onnx(engine, "")
-        if onnx_path is None:
-            raise HTTPException(
-                status_code=503,
-                detail=(
-                    "yolo_infer.dll 不可用："
-                    f"{backend.detail}。请确认已编译 DLL，并设置 OPENCV_DIR / CUDA_PATH。"
-                    f"（也可改用 ONNX 降级，但{reason}）"
-                ),
-            )
-        warning = _fallback_reason("yolo_infer.dll", backend.detail or "未知原因")
-
     data, temp_path = _save_upload(image)
     try:
         array = infer.decode_image(data)
-        if backend.yolo_ok:
-            result = infer.run_yolo(engine, task, array, conf=conf, nms=nms)
-        else:
-            try:
-                result = onnx_fallback.run_yolo(onnx_path, task, array, conf=conf, nms=nms)
-            except onnx_fallback.FallbackError as exc:
-                raise HTTPException(status_code=400, detail=str(exc)) from exc
-        _check_yolo_output_sane(result, array.shape[1], array.shape[0])
-
-        # 类别名与配色在这里补齐，两条后端路径共用同一份逻辑
-        label_info = labels_mod.load_labels(labels)
-        infer.attach_labels(result, label_info["classes"])
-        result["labels"] = {
-            "path": labels or None,
-            "ok": label_info["ok"],
-            "name": label_info["name"],
-            "count": len(label_info["classes"]),
-            "error": label_info["error"],
-        }
+        result, warning = _run_yolo_once(engine, task, array, conf, nms, labels)
         # 先补标签再画图：draw_yolo 要读 label_name 才能把类别名烧进去
         annotated = infer.draw_yolo(array, result["boxes"], result["class_colors"])
     except infer.InferError as exc:
@@ -1161,6 +1161,309 @@ def infer_anomalib(
     if warning:
         result["warning"] = warning
     return JSONResponse(result)
+
+
+class BatchInferRequest(BaseModel):
+    """目录批量推理请求。只接受服务端可访问的路径，不做文件上传。
+
+    为什么不做上传：批量动辄几千张图、上百 MB，走 HTTP 上传等于把数据
+    先拷一遍到临时目录再读一遍；前后端本来就在同一台机器上，路径更直接。
+    """
+
+    kind: str = Field(default="yolo", description="yolo / anomalib")
+    engine: str = Field(..., description=".engine / .trt / .onnx")
+    task: str = Field(default="detect", description="detect / segment / pose / obb")
+    labels: str = Field(default="", description="labels_*.json，可留空")
+    conf: float = Field(default=0.25, gt=0.0, le=1.0)
+    nms: float = Field(default=0.45, gt=0.0, le=1.0)
+    source: str = Field(..., description="图片目录或单张图片")
+    limit: int = Field(default=0, ge=0, description="只跑前 N 张，0 表示全部")
+    recursive: bool = Field(default=True)
+    jpeg_quality: int = Field(default=92, ge=60, le=100)
+    make_zip: bool = Field(default=True)
+    full_json: bool = Field(default=True, description="results.json 是否包含每个框")
+    # Anomalib 专用
+    metadata: str = Field(default="", description="anomalib metadata.json")
+    model_type: str = Field(default="Auto")
+    image_threshold: float = Field(default=-1.0)
+    pixel_threshold: float = Field(default=-1.0)
+    colormap: str = Field(default="TURBO")
+    heatmap: bool = Field(default=False, description="额外保存热能图")
+
+
+class VideoInferRequest(BaseModel):
+    """视频推理请求。输出 mp4 落在产物目录里。"""
+
+    engine: str = Field(..., description=".engine / .trt / .onnx")
+    task: str = Field(default="detect")
+    labels: str = Field(default="")
+    conf: float = Field(default=0.25, gt=0.0, le=1.0)
+    nms: float = Field(default=0.45, gt=0.0, le=1.0)
+    source: str = Field(..., description="视频文件")
+    stride: int = Field(default=1, ge=1, le=600, description="每 N 帧处理一次")
+    max_frames: int = Field(default=0, ge=0)
+    max_side: int = Field(default=0, ge=0, description="输出长边上限，0 保持原尺寸")
+    codec: str = Field(default="auto", description="auto / avc1 / H264 / mp4v")
+    save_detections: bool = Field(default=False)
+
+
+#: 视频容器扩展名。只挡明显选错文件的输入（比如把图片当视频提交）。
+VIDEO_SUFFIXES = {".mp4", ".avi", ".mov", ".mkv", ".flv", ".ts", ".m4v", ".wmv"}
+ENGINE_SUFFIXES = {".engine", ".trt", ".plan", ".onnx"}
+
+
+def _require_file(raw: str, field: str) -> Path:
+    """校验「必须是已存在的文件且在允许目录内」，返回解析后的路径。"""
+    if not str(raw or "").strip():
+        raise HTTPException(status_code=400, detail=f"{field} 不能为空")
+    path = _ensure_allowed_path(raw)
+    if not path.is_file():
+        raise HTTPException(status_code=400, detail=f"{field} 不存在：{path}")
+    return path
+
+
+def build_batch_command(
+    request: "BatchInferRequest",
+    python: str,
+    job_dir: str | Path,
+) -> list[str]:
+    """组装批量推理命令。
+
+    单独成函数是为了能被测试直接断言：参数在表单里填了却没进命令行，
+    用户只能从日志里翻完整命令才能发现（`--simplify true` 就是这么漏的）。
+    """
+    if request.kind not in ("yolo", "anomalib"):
+        raise HTTPException(status_code=400, detail=f"kind 只能是 yolo / anomalib，实际 {request.kind}")
+
+    engine = _require_file(request.engine, "引擎文件")
+    if engine.suffix.lower() not in ENGINE_SUFFIXES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"引擎需为 {', '.join(sorted(ENGINE_SUFFIXES))} 之一，实际 {engine.suffix}",
+        )
+    source = _ensure_allowed_path(request.source)
+    if not source.exists():
+        raise HTTPException(status_code=400, detail=f"数据源不存在：{source}")
+    if request.labels.strip():
+        _require_file(request.labels, "标签文件")
+
+    command = [
+        python,
+        str(BACKEND_DIR / "tools" / "infer_batch.py"),
+        "--kind", request.kind,
+        "--engine", str(engine),
+        "--source", str(source),
+        "--output", str(job_dir),
+        "--limit", str(int(request.limit)),
+        "--jpeg-quality", str(int(request.jpeg_quality)),
+    ]
+
+    if request.kind == "yolo":
+        if request.task not in ("detect", "segment", "pose", "obb"):
+            raise HTTPException(status_code=400, detail=f"不支持的任务类型：{request.task}")
+        command += [
+            "--task", request.task,
+            "--conf", f"{request.conf:g}",
+            "--nms", f"{request.nms:g}",
+        ]
+    else:
+        metadata = _require_file(request.metadata, "metadata.json")
+        command += [
+            "--metadata", str(metadata),
+            "--model-type", request.model_type,
+            "--image-threshold", f"{request.image_threshold:g}",
+            "--pixel-threshold", f"{request.pixel_threshold:g}",
+            "--colormap", request.colormap,
+        ]
+        if request.heatmap:
+            command.append("--heatmap")
+
+    if request.labels.strip():
+        command += ["--labels", str(Path(request.labels).expanduser())]
+    if not request.recursive:
+        command.append("--no-recursive")
+    if not request.make_zip:
+        command.append("--no-zip")
+    if not request.full_json:
+        command.append("--no-full-json")
+    return command
+
+
+def build_video_command(
+    request: "VideoInferRequest",
+    python: str,
+    output_path: str | Path,
+) -> list[str]:
+    """组装视频推理命令。校验规则与 bulk 接口保持一致。"""
+    engine = _require_file(request.engine, "引擎文件")
+    if engine.suffix.lower() not in ENGINE_SUFFIXES:
+        raise HTTPException(status_code=400, detail=f"引擎格式不支持：{engine.suffix}")
+    if request.task not in ("detect", "segment", "pose", "obb"):
+        raise HTTPException(status_code=400, detail=f"不支持的任务类型：{request.task}")
+
+    source = _require_file(request.source, "视频文件")
+    if source.suffix.lower() not in VIDEO_SUFFIXES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"视频需为 {', '.join(sorted(VIDEO_SUFFIXES))} 之一，实际 {source.suffix}",
+        )
+    if request.labels.strip():
+        _require_file(request.labels, "标签文件")
+    if request.codec not in ("auto", "avc1", "H264", "mp4v"):
+        raise HTTPException(status_code=400, detail=f"不支持的编码器：{request.codec}")
+
+    command = [
+        python,
+        str(BACKEND_DIR / "tools" / "infer_video.py"),
+        "--engine", str(engine),
+        "--task", request.task,
+        "--source", str(source),
+        "--output", str(output_path),
+        "--conf", f"{request.conf:g}",
+        "--nms", f"{request.nms:g}",
+        "--stride", str(int(request.stride)),
+        "--max-frames", str(int(request.max_frames)),
+        "--max-side", str(int(request.max_side)),
+        "--codec", request.codec,
+    ]
+    if request.labels.strip():
+        command += ["--labels", str(Path(request.labels).expanduser())]
+    if request.save_detections:
+        command.append("--save-detections")
+    return command
+
+
+@app.post("/api/infer/batch")
+def infer_batch(request: BatchInferRequest) -> dict:
+    """启动目录批量推理，返回 run_id；进度经 `/ws/runs/{run_id}` 推送。"""
+    config.ensure_dirs()
+    try:
+        job = inferjobs.new_job_dir("batch")
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"创建产物目录失败：{exc}") from exc
+
+    command = build_batch_command(request, sys.executable, job)
+    expect = (job / "annotated.zip") if request.make_zip else (job / "results.csv")
+
+    try:
+        run = manager.create(
+            "infer-batch",
+            command,
+            cwd=str(BACKEND_DIR),
+            expect_file=expect,
+            meta={
+                "kind": request.kind,
+                "source": str(Path(request.source).expanduser()),
+                "engine": str(Path(request.engine).expanduser()),
+                "output": str(job),
+            },
+        )
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"启动批量推理失败：{exc}") from exc
+
+    return {
+        **run.snapshot(),
+        "output": str(job),
+        "expect": str(expect),
+        "artifact_url": f"/api/infer/artifact?path={expect.as_posix()}&download=1",
+    }
+
+
+@app.post("/api/infer/video")
+def infer_video(request: VideoInferRequest) -> dict:
+    """启动视频推理，产物是一个带框的 mp4。"""
+    config.ensure_dirs()
+    try:
+        job = inferjobs.new_job_dir("video")
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"创建产物目录失败：{exc}") from exc
+
+    source = Path(request.source).expanduser()
+    output = job / f"{inferjobs.safe_stem(source.stem)}_annotated.mp4"
+    command = build_video_command(request, sys.executable, output)
+
+    try:
+        run = manager.create(
+            "infer-video",
+            command,
+            cwd=str(BACKEND_DIR),
+            expect_file=output,
+            meta={
+                "source": str(source),
+                "engine": str(Path(request.engine).expanduser()),
+                "stride": int(request.stride),
+                "output": str(job),
+            },
+        )
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"启动视频推理失败：{exc}") from exc
+
+    return {
+        **run.snapshot(),
+        "output": str(job),
+        "video": str(output),
+        "artifact_url": f"/api/infer/artifact?path={output.as_posix()}",
+        "download_url": f"/api/infer/artifact?path={output.as_posix()}&download=1",
+    }
+
+
+@app.post("/api/infer/frame")
+def infer_frame(
+    image: UploadFile = File(...),
+    engine: str = Form(...),
+    task: str = Form("detect"),
+    conf: float = Form(0.25),
+    nms: float = Form(0.45),
+    labels: str = Form(""),
+) -> JSONResponse:
+    """摄像头单帧推理：只回检测框，不回图片。
+
+    与 `/api/infer/yolo` 的差别就是「不烧图」：摄像头每帧把标注图 base64
+    回传，1080p 一帧约 400KB，10fps 就是 4MB/s，浏览器解码也会卡。
+    前端拿到框自己在 canvas 上画，既省带宽也不掉帧。
+    """
+    data = image.file.read()
+    frame_limit = 8 * 1024 * 1024
+    if len(data) > frame_limit:
+        raise HTTPException(
+            status_code=413,
+            detail=f"单帧超过 {frame_limit // (1024 * 1024)} MB，请调小采集分辨率",
+        )
+
+    try:
+        array = infer.decode_image(data)
+        result, warning = _run_yolo_once(engine, task, array, conf, nms, labels)
+    except infer.InferError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    result.pop("annotated_png", None)
+    if warning:
+        result["warning"] = warning
+    return JSONResponse(result)
+
+
+@app.get("/api/infer/artifact")
+def infer_artifact(path: str, download: bool = False) -> FileResponse:
+    """下载/播放大批量或视频任务的产物。
+
+    只允许读 `runtime/infer` 下的文件：这是 Web 端最容易变成
+    「读任意磁盘」后门的地方，白名单必须收到产物目录，而不是仓库根。
+    `download=True` 时带 Content-Disposition，方便另存为；
+    默认不带，`<video>` 标签才能直接在页面里播放。
+    """
+    try:
+        target = inferjobs.resolve_artifact(path)
+    except ValueError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+
+    if not target.is_file():
+        raise HTTPException(status_code=404, detail=f"产物不存在：{target}")
+
+    return FileResponse(
+        target,
+        media_type=inferjobs.guess_media_type(target),
+        filename=target.name if download else None,
+    )
 
 
 @app.get("/api/models")

@@ -79,6 +79,45 @@ def available() -> tuple[bool, str]:
     return True, f"onnxruntime {ort.__version__}，providers={','.join(ort.get_available_providers())}"
 
 
+def resolve_onnx_path(engine_path: str, metadata_path: str = "") -> tuple[str | None, str]:
+    """为降级路径找出可用的 .onnx 模型，返回 (路径, 说明)。
+
+    用户选的是 TensorRT 引擎（.engine/.trt），onnxruntime 读不了它，
+    所以必须找回同源的 ONNX。按可信度依次尝试：
+
+    1. 用户直接选的就是 .onnx —— 直接用；
+    2. 同目录同名 .onnx（`best.engine` -> `best.onnx`，`best.transd.engine` -> `best.transd.onnx`）；
+    3. metadata.json 里记录的 `onnx_path`（训练时写下的原始 ONNX 位置）。
+
+    第 2 条优先于第 3 条：metadata 里的 onnx_path 往往是训练机上的绝对路径，
+    模型拷到别的机器后就失效了，而同目录同名文件通常跟着一起拷过来。
+
+    放在这里而不是 app.py：批量/视频子进程也要走同一套降级规则，
+    留在路由层就只能复制一份，迟早两边挑文件的优先级不一致。
+    """
+    path = Path(engine_path)
+    if path.suffix.lower() == ".onnx":
+        return (str(path), "") if path.is_file() else (None, f"ONNX 文件不存在：{engine_path}")
+
+    sibling = path.with_suffix(".onnx")
+    if sibling.is_file():
+        return str(sibling), ""
+
+    if metadata_path and Path(metadata_path).is_file():
+        try:
+            meta = json.loads(Path(metadata_path).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            meta = {}
+        recorded = str(meta.get("onnx_path", "") or "").strip()
+        if recorded and Path(recorded).is_file():
+            return recorded, ""
+
+    return None, (
+        f"降级推理需要 .onnx，但没找到与 {path.name} 对应的 ONNX。"
+        f"请把同名的 {path.stem}.onnx 放到同一目录，或直接选择 .onnx 模型。"
+    )
+
+
 # ---------------------------------------------------------------------------
 # YOLO
 # ---------------------------------------------------------------------------

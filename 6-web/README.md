@@ -1,4 +1,4 @@
-﻿# 6-web —— TRTForge Web Studio
+# 6-web —— TRTForge Web Studio
 
 浏览器版工作站，用来替代 `4-qt-studio` 的 Qt 桌面程序。
 
@@ -326,6 +326,97 @@ YOLO 返回干净原图与每个目标的类别名/置信度，框由前端画�
 > 提示「请用 `.transd.onnx` 编译」。
 >
 > 完整实测链路见根目录 `readme.md` 的 v1.3 记录（PCB 6 类 / mAP50 0.945 / 引擎 8.41ms）。
+
+#### 目录批量 · 视频 · 摄像头（v1.16）
+
+单张推理只能看一张图，产线要的是"一批"和"一段"。这个卡片加了三种批量形态，
+**引擎、标签、任务类型、`conf` / `nms` 全部复用上方「推理设置」**，不需要重复填：
+
+| 模式 | 怎么跑 | 适合 | 产物 |
+| --- | --- | --- | --- |
+| 目录批量 | 子进程 `infer_batch.py` | 跑完一个文件夹、出报表 | `annotated/` + `results.json` + `results.csv` + `annotated.zip` |
+| 视频 | 子进程 `infer_video.py` | 离线跑一段录像 | `*_annotated.mp4` + `detections.json` |
+| 摄像头 | 在进程内逐帧 `POST /api/infer/frame` | 现场看实时画面 | 不落盘（帧不出本机） |
+
+为什么前两者走子进程、摄像头走 HTTP 单帧：
+
+- 批量与视频是**长任务**，需要随时停止、要看进度、要能关掉页面继续跑。
+  子进程天然支持这三件事（`runners.py` 杀进程即取消），WebSocket 直接复用训练那套事件流。
+- 摄像头是**闭环实时**。若也落个"视频任务"，每帧都要过一次任务队列，
+  延迟会越堆越大；单帧接口请求-应答完就结束，前端拿框自己画，端到端就是一次推理的时间。
+
+**目录批量**
+
+| 参数 | 默认 | 说明 |
+| --- | --- | --- |
+| 图片目录 | 必填 | 服务端路径，可填单个图片文件；「浏览」用后端目录选择器 |
+| 最多处理张数 | 0 | 0 = 全部；调试时填 3 能快速验证引擎对不对 |
+| JPEG 质量 | 92 | 标注图重编码质量。原图 PNG 转 JPEG 体积能降一个数量级 |
+| 包含子目录 | 开 | 关掉只扫当前层 |
+| 打包 `annotated.zip` | 开 | 单文件下载，省得一张张右键另存 |
+| `results.json` 含每个框 | 开 | 关掉只留统计，文件能小十倍（几百张图时很关键） |
+
+产物目录 `runtime/infer/<时间戳>-batch-<随机>/`，结构固定：
+
+```
+annotated/00001_xxx.jpg      # 与输入顺序一致，文件名做了净化（中文/括号/空格都安全）
+results.csv                  # utf-8-sig + \n 换行，Excel 双击不乱码、不空行
+results.json                 # 全量框（可关）
+annotated.zip                # 上面 annotated/ 的压缩包
+job.json                     # 本次参数与耗时，便于复现
+```
+
+`results.csv` 的列：`index,file,width,height,count,status,error,classes`。
+单张图解码失败或推理抛异常**不会中断整批**：那一行 `status=error`、`error` 写原因，
+其余照常跑完——产线上一张坏图不该让 500 张白跑。
+
+**视频**
+
+| 参数 | 默认 | 说明 |
+| --- | --- | --- |
+| 视频文件 | 必填 | mp4 / avi / mov / mkv |
+| 抽帧步长 | 1 | 每 N 帧处理一次，1 = 逐帧 |
+| 最多处理帧数 | 0 | 0 = 全部 |
+| 输出长边上限 | 0 | 0 = 原尺寸；填 960 可以显著加快编码 |
+| 编码器 | auto | `auto` 依次试 `avc1` → `H264` → `mp4v` |
+| 逐帧明细 | 开 | 额外产出 `detections.json`（每帧的框），体积较大 |
+
+两个坑，代码里都做了处理：
+
+1. **`cv2.VideoWriter.isOpened()` 会骗人。** 机器上没有 `libopenh264` 时，
+   `avc1` 也会返回 `True`，但写出来的文件是 0 字节。所以选编码器时是
+   **真写一帧黑帧再看文件大小**，能写出非空文件才算可用。
+2. **抽帧不能改播放速度。** 步长 N > 1 时输出帧率写为 `原帧率 ÷ N`，
+   而不是照抄原帧率——否则 30 帧的 3 秒片会变成 1 秒的"快进"。
+
+**摄像头**
+
+浏览器 `getUserMedia` 采集，逐帧压成 JPEG 发到 `/api/infer/frame`，后端只回
+**纯 JSON 的框 / 多边形 / 关键点 / 类别色**，不回图片（回 base64 图会让带宽和
+渲染一起爆掉），框由前端 canvas 画。
+
+| 参数 | 默认 | 说明 |
+| --- | --- | --- |
+| 采集分辨率 | 1280×720 | 640×480 更快，1920×1080 更细 |
+| 帧率上限 | 8 | 相机按这个间隔取帧；上一帧没回来就跳过，不排队 |
+| 显示类别与置信度 | 开 | 只影响绘制，不影响后端 |
+
+"上一帧没回来就跳过"是刻意的：用 `setInterval` + 在途标志位，而不是等上一帧回来再发下一帧。
+网络或引擎一慢，表现是**掉帧**而不是**延迟累积**——实时画面最不能忍的是越跑越滞后。
+
+没有摄像头 / 用户拒绝授权时，卡片回到「未启动」并给出原因
+（实测：`无法打开摄像头：Requested device not found`），不会卡在「启动中」。
+
+**v1.16 与 v1.15 的区别**
+
+| 项 | v1.15 | v1.16 |
+| --- | --- | --- |
+| 推理输入 | 一张图 | 一张图 / 一个目录 / 一段视频 / 摄像头实时画面 |
+| 批量产物 | 无 | 标注图目录 + CSV + JSON + ZIP，可单文件下载 |
+| 取消 | 只能等单张跑完 | 子进程 `terminate`，已产出的文件保留 |
+| 坏图 | 整个请求 500 | 单条 `status=error`，整批继续 |
+| Anomalib | 单张 | 支持目录批量（视频/摄像头仍只支持 YOLO） |
+| 下载安全 | — | `/api/infer/artifact` 限定在 `runtime/infer` 内，越界返回 404 |
 
 ### 引擎构建
 
@@ -708,7 +799,7 @@ offset1 = cursor - p_image * scale1
 
 | 方法 | 路径 | 用途 |
 | --- | --- | --- |
-| GET | `/api/health` | 存活探针，返回 `{"ok":true,"version":"1.15.0"}`；版本号用来识别「连到了旧进程」 |
+| GET | `/api/health` | 存活探针，返回 `{"ok":true,"version":"1.16.0"}`；版本号用来识别「连到了旧进程」 |
 | GET | `/api/capabilities` | 环境探测（前端状态灯用） |
 | POST | `/api/train/yolo` | 启动 YOLO 训练 |
 | POST | `/api/train/anomalib` | 启动 Anomalib 训练 |
@@ -724,6 +815,10 @@ offset1 = cursor - p_image * scale1
 | GET | `/api/browse?path=` | 目录浏览（Web 无法弹系统选择框） |
 | POST | `/api/infer/yolo` | YOLO 推理 |
 | POST | `/api/infer/anomalib` | Anomalib 推理 |
+| POST | `/api/infer/batch` | **v1.16**：目录批量推理（子进程），返回 `run_id`，进度与产物走 `WS /ws/runs/{id}` |
+| POST | `/api/infer/video` | **v1.16**：视频推理（子进程），事件流同上，产出 `*_annotated.mp4` |
+| POST | `/api/infer/frame` | **v1.16**：摄像头单帧推理，同步返回纯 JSON 框（不落盘、不建运行记录） |
+| GET | `/api/infer/artifact?path=` | **v1.16**：下载 `runtime/infer` 内的产物；`download=1` 走附件下载，否则内联播放 |
 | GET | `/api/models` | 扫描训练产物（引擎 + ONNX + 标签 + metadata） |
 | GET | `/api/infer/cache` | 查看常驻引擎句柄（调试显存用） |
 | GET | `/api/engine/probe?onnx=` | 探测 ONNX 输入/输出形状，判断是否可用 |
@@ -840,6 +935,52 @@ offset1 = cursor - p_image * scale1
 > 想拿文件里的原值，必须自己读 `metadata.json`——`infer.read_metadata_thresholds()` 就是干这个的。
 > 响应里的 `thresholds.{image,pixel}` 同时给出 `effective`、`metadata`、`overridden` 三个字段。
 
+`POST /api/infer/batch` 的字段（**v1.16**，JSON body）：
+
+| 字段 | 类型 | 默认 | 说明 |
+| --- | --- | --- | --- |
+| `kind` | str | 必填 | `yolo` / `anomalib` |
+| `source` | str | 必填 | 目录或单张图片的绝对路径 |
+| `engine` | str | 必填 | `.engine` 路径 |
+| `labels` | str | 空 | `labels_*.json` |
+| `onnx` | str | 空 | 引擎加载失败时用于提示「请用 `.transd.onnx`」 |
+| `task` | str | `detect` | YOLO 的 `detect` / `segment` / `pose` / `obb` |
+| `conf` / `nms` | float | 0.25 / 0.45 | 与单张推理共用句柄缓存键 |
+| `metadata` | str | 空 | Anomalib 必填 |
+| `image_threshold` / `pixel_threshold` | float | -1 | `< 0` = 沿用 metadata |
+| `limit` | int | 0 | 0 = 全部 |
+| `recursive` | bool | true | 是否递归子目录 |
+| `jpeg_quality` | int | 92 | 1~100 |
+| `make_zip` | bool | true | 是否产出 `annotated.zip` |
+| `include_boxes` | bool | true | `results.json` 是否写每个框 |
+
+`POST /api/infer/video` 的字段（**v1.16**）：
+
+| 字段 | 类型 | 默认 | 说明 |
+| --- | --- | --- | --- |
+| `source` | str | 必填 | 视频绝对路径 |
+| `engine` / `labels` / `onnx` | str | 同上 | 仅 YOLO |
+| `task` / `conf` / `nms` | — | 同上 | 进入句柄缓存键 |
+| `stride` | int | 1 | 每 N 帧处理一次；输出帧率按 `源帧率 ÷ N` 写入 |
+| `max_frames` | int | 0 | 0 = 全部 |
+| `long_side` | int | 0 | 输出长边上限，0 = 原尺寸 |
+| `codec` | str | `auto` | `auto` / `avc1` / `mp4v`，`auto` 会实写一帧验证可用性 |
+| `save_detections` | bool | true | 额外产出 `detections.json` |
+
+`POST /api/infer/frame` 的字段（**v1.16**，multipart）：
+
+| 字段 | 类型 | 默认 | 说明 |
+| --- | --- | --- | --- |
+| `frame` | Form file | 必填 | 浏览器画布的 JPEG/PNG 单帧 |
+| `engine` / `labels` | Form str | 必填 / 空 | 同单张推理 |
+| `task` / `conf` / `nms` | Form | 同上 | 同上 |
+| `draw` | Form bool | false | 固定回 `false`：不回标注图，避免带宽与渲染双重开销 |
+
+响应含 `{kind, task, width, height, boxes[], class_colors{}, elapsed_ms}`。
+`boxes[]` 与单张推理的 `detections` 同构（OBB 有 `angle`，pose 有 `kpts`，segment 有 `polygon`），
+前端据此在 canvas 上画框，不需要图片回流。
+
+
 
 ## 代码结构
 
@@ -851,6 +992,8 @@ offset1 = cursor - p_image * scale1
 │   ├── progress.py       引擎构建阶段识别 + 耗时自学习估算（trtexec 不给真实进度）
 │   ├── runners.py        子进程管理 + TRTFORGE_JSON 事件解析 + 广播 + 进度心跳
 │   ├── infer.py          ctypes 调 DLL（结构体定义、LRU 句柄缓存、热能图渲染）
+│   ├── inferjobs.py      **v1.16**：批量产物的公共逻辑（文件名净化 / CSV(utf-8-sig) / 原子 zip / 产物路径沙箱）
+│   ├── onnx_fallback.py  **v1.16**：统一解析「引擎加载失败时该提示哪个 ONNX」
 │   ├── labels.py         标签文件解析 + 统一定义类别配色（后端绘制与前端共用）
 │   ├── models.py         训练产物扫描（引擎配对 ONNX / 标签 / metadata / 任务类型）
 │   ├── dataset.py        数据集扫描 / 固定哈希划分 / YOLO·COCO·VOC 导出
@@ -858,6 +1001,8 @@ offset1 = cursor - p_image * scale1
 │   ├── autolabel.py      自动标注双通道编排（本地引擎 + 可选外部 HTTP 服务）+ 草稿清洗
 │   └── tools/
 │       ├── abi_probe.cpp       打印 C 侧结构体布局，用于和 Python 对齐比对
+│       ├── infer_batch.py      **v1.16**：目录批量推理 CLI（YOLO / Anomalib，事件走 TRTFORGE_JSON）
+│       ├── infer_video.py      **v1.16**：视频推理 CLI（编码器探测 / 抽帧步长 / 逐帧明细）
 │       ├── smoke_test.py       端到端冒烟测试（HTTP + WebSocket + 真实子进程）
 │       ├── test_dataset_workbench.py  数据集工作台验收（划分 / 导出 / 错误路径）
 │       ├── test_infer_params.py       推理控制台验收（阈值 / 标签 / 配色 / LRU / 扫描 / 热能图）
@@ -865,6 +1010,9 @@ offset1 = cursor - p_image * scale1
 │       ├── test_engine_progress.py    构建进度与耗时估算验收（真实日志回放 + 自学习）
 │       ├── test_transd_onnx.py        .transd.onnx 转置验收（四任务头 / 输出重排 / 通道校验）
 │       ├── test_export_request.py     导出命令拼装验收（开关透传 / 非法参数提前拒绝）
+│       ├── test_infer_jobs.py         **v1.16**：批量产物验收（文件收集 / 命名净化 / CSV BOM / zip / 路径穿越）
+│       ├── test_infer_batch.py        **v1.16**：目录批量验收（命令拼装 / 坏图容错 / Anomalib / 下载接口）
+│       ├── test_infer_video.py        **v1.16**：视频验收（编码器探测 / 步长时长不变 / 帧数上限 / 失败路径）
 │       ├── run_all_tests.py           总入口：扫描并串行跑完所有 test_*.py（CI 共用）
 │       └── test_exit_codes.py  退出码语义化测试（exit 2/130 的补事件逻辑）
 ├── frontend/
@@ -881,6 +1029,7 @@ offset1 = cursor - p_image * scale1
 │   │   ├── dataset.js    数据集页（扫描预览 + 导出）
 │   │   ├── annotate.js   标注工作台（Canvas 2D 六形状 / 缩放平移 / 吸附 / 撤销重做 / 自动保存 / 草稿层 / 导出）
 │   │   ├── infer.js      推理控制台（模型扫描 / 参数联动 / 表格 / 直方图 / 导出）
+│   │   ├── inferbatch.js **v1.16**：目录批量 / 视频 / 摄像头（事件流、进度、结果表、canvas 叠框）
 │   │   └── main.js       页签 / 环境状态 / 目录浏览
 │   └── tests/            零依赖前端单测（node 直跑）
 │       ├── test_viewer_math.mjs  缩放锚点、坐标互逆、滚轮归一化
@@ -893,7 +1042,7 @@ offset1 = cursor - p_image * scale1
 **一条命令跑完全部后端测试**（v1.15 起，CI 与本地共用同一个入口）：
 
 ```powershell
-D:\Anaconda3\envs\dpenv\python.exe 6-web\backend\tools\run_all_tests.py      # 12 个脚本
+D:\Anaconda3\envs\dpenv\python.exe 6-web\backend\tools\run_all_tests.py      # 15 个脚本
 D:\Anaconda3\envs\dpenv\python.exe 6-web\backend\tools\run_all_tests.py transd  # 只跑名字含 transd 的
 ```
 
@@ -976,6 +1125,30 @@ D:\Anaconda3\envs\dpenv\python.exe 6-web\backend\tools\test_engine_progress.py
 | 320×320 引擎构建 | 估算 53 s（当时的错误公式）→ 实际 5 分 17 秒，收尾提示「实际 5 分 17 秒，估算 53 秒」；`engine_stats.json` 记下 313.55 s，**该次实测直接推翻了「按面积平方」的假设并改成了幂律模型** |
 | 训练进度面板（3 轮 / 320px / PCB 553 张） | `epoch 3/3`、100%、已用 0:59、每轮 ≈ 0:06、剩余 0:00；最终验证那行标成 `final`（不再出现 `epoch 4/3`）；loss 与 mAP 两条曲线各 1 / 2 条折线，`stroke` 解析为 `rgb(34,211,238)`，页面无横向溢出 |
 | 参数回显 | 折叠块里的命令行与后端 `run.command` 逐字一致 |
+
+2026-11-02 批量 · 视频 · 摄像头实测结果（v1.16）：
+
+| 脚本 | 结果 |
+| --- | --- |
+| `test_infer_jobs.py` | **34 / 34 通过** |
+| `test_infer_batch.py` | **75 / 75 通过** |
+| `test_infer_video.py` | **43 / 43 通过** |
+
+三个脚本都**不需要 GPU / DLL / 真实视频**：批量与视频的关键逻辑（命令拼装、坏图容错、
+编码器可用性探测、抽帧后的时长不变、帧数上限、路径穿越拦截）都能用假引擎桩与
+一把可用编码器的探测结果跑完，所以能进 CI。
+
+真实产物联调（后端 1.16.0，PCB `best.transd_fp16.engine`）：
+
+| 场景 | 结果 |
+| --- | --- |
+| 目录批量（3 张：bus / plane2 / zidane） | 0.7 s，`results.csv` 三行齐全，标注图 3 张，`annotated.zip` 713 KB 可下载解压 |
+| 视频（30 帧测试片） | 编码器 `avc1`，写 30 帧，46.2 fps，产出 `clip_annotated.mp4` + `detections.json` |
+| Anomalib 目录批量（4 张 bottle） | 1.1 s，CSV 带 OK / NG 判定，`results.json` 含 `image_score` |
+| 摄像头单帧接口 | 单帧 327 ms 返回 8 个框，**响应里没有 base64 图**，前端 canvas 叠框正常 |
+| 浏览器播放 | `readyState=4`、`duration=3`、`640×480`、无 `MediaError`——H.264 编码产物可直接内联播放 |
+| 无摄像头机器 | 点「开启摄像头」后徽标回到「未启动」，提示 `无法打开摄像头：Requested device not found`，按钮状态正确复位 |
+| 越权下载 | `path` 指向 `runtime/infer` 之外时返回 404，不泄露文件是否存在 |
 
 ### ctypes 结构体对齐
 
@@ -1068,14 +1241,14 @@ D:\Anaconda3\envs\dpenv\python.exe -m uvicorn app:app --app-dir 6-web\backend `
 判断标准只有一条：**`CreationDate` 必须晚于你最后一次改后端代码的时间。**
 `--reload` 只监听 `.py`，改了前端 HTML/CSS/JS 仍需浏览器 `Ctrl+F5`。
 
-更快的判断办法：**看顶栏标题下方的版本号徽标**（`v1.14.0` 这种，来自 `/api/health`）。
+更快的判断办法：**看顶栏标题下方的版本号徽标**（`v1.16.0` 这种，来自 `/api/health`）。
 后端代码一改，`app.py` 里的 `APP_VERSION` 就要跟着加，页面上的徽标才会变。
 徽标数字没变 = 页面连的还是旧进程，这时候改什么都不会生效。
 
 ```powershell
 # 一条命令确认后端版本
 Invoke-WebRequest http://127.0.0.1:8060/api/health -UseBasicParsing | Select-Object -ExpandProperty Content
-# 期望输出类似 {"ok":true,"version":"1.14.0"}
+# 期望输出类似 {"ok":true,"version":"1.16.0"}
 ```
 
 ## 与 Qt 版的关系

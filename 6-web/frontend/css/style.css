@@ -1984,3 +1984,101 @@ input[type="range"]:disabled { cursor: not-allowed; }
   .anno-stage { min-height: 360px; }
   .anno-status { max-width: calc(100% - var(--sp-5)); }
 }
+
+/* ===========================================================================
+   批量 / 视频 / 摄像头（推理页底部卡片）
+   ---------------------------------------------------------------------------
+   三个模式共用一张卡片：切模式只切 `.batch-pane`，进度区与日志始终在下面，
+   所以从目录批量切到视频时，用户不会丢失"上一次跑到哪"的视觉位置。
+   =========================================================================== */
+.mode-tabs {
+  display: flex;
+  gap: var(--sp-2);
+  margin: var(--sp-3) 0 var(--sp-4);
+  padding: 4px;
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  width: fit-content;
+}
+
+.mode-tab {
+  appearance: none;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--text-dim);
+  font: inherit;
+  font-size: var(--fs-sm);
+  padding: 6px 14px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: color var(--dur-fast) var(--ease), background var(--dur-fast) var(--ease);
+}
+
+.mode-tab:hover { color: var(--text); }
+
+.mode-tab.active {
+  color: var(--ink-on-accent);
+  background: linear-gradient(135deg, var(--cyan), var(--teal));
+  border-color: var(--cyan);
+  font-weight: 650;
+}
+
+.batch-pane {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+  margin-bottom: var(--sp-4);
+}
+
+/* 摄像头舞台：video 决定高度，canvas 绝对定位严格贴合，
+   否则两者会因为默认 inline 基线差出几像素，框就会整体偏移。 */
+.camera-wrap {
+  position: relative;
+  background: var(--bg-void);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  overflow: hidden;
+  line-height: 0;
+}
+
+.camera-wrap video {
+  display: block;
+  width: 100%;
+  height: auto;
+  /* 镜像预览会让左右框看起来反了，这里保持原样 */
+}
+
+.camera-wrap canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+}
+
+.camera-stat {
+  position: absolute;
+  left: 8px;
+  bottom: 8px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  background: rgba(5, 8, 11, .78);
+  border: 1px solid var(--line);
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: var(--fs-xs);
+  line-height: 1.5;
+}
+
+/* 视频结果播放器：与查看器同一视觉语言，避免"另一个黑框" */
+.result-video {
+  width: 100%;
+  max-height: 520px;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--line);
+  background: #000;
+}
+
+#batchTable td.bad { color: var(--danger); }
+

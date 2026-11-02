@@ -395,6 +395,26 @@ def _encode_png(image: np.ndarray) -> bytes:
     return buffer.tobytes()
 
 
+def encode_image(image: np.ndarray, suffix: str = ".jpg", quality: int = 92) -> bytes:
+    """按扩展名编码图片字节。
+
+    批量推理默认要 JPEG：同样的 PCB 图，PNG 约 1.8MB、JPEG(q=92) 约 220KB，
+    一次跑 5000 张时这个差别决定了「能不能一次性打包下载」。
+    单图接口仍然用 PNG——只有一张，无损更划算。
+    """
+    import cv2
+
+    ext = (suffix or ".jpg").lower()
+    if ext in (".jpg", ".jpeg"):
+        ok, buffer = cv2.imencode(".jpg", image, [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)])
+    else:
+        ext = ".png"
+        ok, buffer = cv2.imencode(ext, image)
+    if not ok:
+        raise InferError(f"结果图编码失败（{ext}）")
+    return buffer.tobytes()
+
+
 # ---------------------------------------------------------------------------
 # YOLO 推理
 # ---------------------------------------------------------------------------
@@ -556,6 +576,19 @@ def draw_yolo(image: np.ndarray, boxes: list[dict], class_colors: dict | None = 
     颜色取 `class_colors`（接口下发的同一份），据此保证"导出的图和屏幕上看到的一致"。
     没传配色时退回按类别号现算，结果与下发的一致（同一个纯函数）。
     """
+    return _encode_png(render_yolo(image, boxes, class_colors))
+
+
+def render_yolo(
+    image: np.ndarray,
+    boxes: list[dict],
+    class_colors: dict | None = None,
+) -> np.ndarray:
+    """把检测框画到图上，返回 BGR 数组（不编码）。
+
+    单独成函数的原因：批量推理要按扩展名选编码（JPEG 省 8 倍体积），
+    视频要直接拿数组喂 VideoWriter，两者都不该为了拿 PNG 再解码一次。
+    """
     import cv2
 
     canvas = image.copy()
@@ -601,7 +634,7 @@ def draw_yolo(image: np.ndarray, boxes: list[dict], class_colors: dict | None = 
             if len(kpt) >= 2:
                 cv2.circle(canvas, (int(kpt[0]), int(kpt[1])), thickness + 1, (0, 255, 255), -1)
 
-    return _encode_png(canvas)
+    return canvas
 
 
 # ---------------------------------------------------------------------------

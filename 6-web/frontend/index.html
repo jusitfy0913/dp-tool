@@ -524,6 +524,141 @@
         </div>
       </div>
     </div>
+
+    <!-- ==================== 批量 / 视频 / 摄像头 ====================
+         三种模式共用上方「引擎 / 标签 / 任务类型 / conf / nms」的设置：
+         同一张产线图，用户不可能希望批量用 0.25、摄像头用 0.5。
+         路径全部是**服务端路径**（浏览按钮选），不上传大文件。 -->
+    <div class="card" id="batchCard">
+      <h2>批量 · 视频 · 摄像头 <span class="badge" id="batchBadge">待开始</span></h2>
+      <p class="hint">
+        引擎、标签、任务类型与 conf / nms 直接复用上方设置。目录与视频填服务端路径（浏览按钮可选）。
+        Anomalib 支持目录批量；视频与摄像头只支持 YOLO。
+      </p>
+
+      <div class="mode-tabs" id="batchModes">
+        <button type="button" class="mode-tab active" data-mode="dir">目录批量</button>
+        <button type="button" class="mode-tab" data-mode="video">视频</button>
+        <button type="button" class="mode-tab" data-mode="camera">摄像头</button>
+      </div>
+
+      <!-- 目录批量 -->
+      <div class="batch-pane" data-pane="dir">
+        <label>图片目录
+          <div class="row">
+            <input type="text" id="batchSource" placeholder="服务端目录或单张图片，例如 D:\pcb\images">
+            <button type="button" class="mini" data-browse="batchSource" data-mode="dir">浏览</button>
+          </div>
+        </label>
+        <div class="grid2">
+          <label>最多处理张数
+            <input type="number" id="batchLimit" value="0" min="0" step="1">
+          </label>
+          <label>JPEG 质量
+            <input type="number" id="batchQuality" value="92" min="60" max="100" step="1">
+          </label>
+        </div>
+        <label class="check-row"><input type="checkbox" id="batchRecursive" checked><span>包含子目录</span></label>
+        <label class="check-row"><input type="checkbox" id="batchZip" checked><span>打包 annotated.zip（推荐）</span></label>
+        <label class="check-row"><input type="checkbox" id="batchFullJson" checked><span>results.json 包含每个框（关掉可把文件缩小十倍）</span></label>
+        <div class="actions">
+          <button type="button" class="primary" id="btnBatchStart">开始批量推理</button>
+          <button type="button" id="btnBatchStop" disabled>停止</button>
+          <a class="mini hidden" id="batchDownload" href="#">下载标注包</a>
+        </div>
+      </div>
+
+      <!-- 视频 -->
+      <div class="batch-pane hidden" data-pane="video">
+        <label>视频文件
+          <div class="row">
+            <input type="text" id="videoSource" placeholder="mp4 / avi / mov / mkv">
+            <button type="button" class="mini" data-browse="videoSource" data-mode="file">浏览</button>
+          </div>
+        </label>
+        <div class="grid2">
+          <label>抽帧步长（每 N 帧处理一次）
+            <input type="number" id="videoStride" value="1" min="1" max="600" step="1">
+          </label>
+          <label>最多处理帧数（0 = 全部）
+            <input type="number" id="videoMaxFrames" value="0" min="0" step="1">
+          </label>
+          <label>输出长边上限（0 = 原尺寸）
+            <input type="number" id="videoMaxSide" value="0" min="0" step="2">
+          </label>
+          <label>编码器
+            <select id="videoCodec">
+              <option value="auto">自动（优先 H.264，浏览器可直接播）</option>
+              <option value="avc1">avc1 (H.264)</option>
+              <option value="mp4v">mp4v (MPEG-4，兼容性最好但浏览器可能不支持)</option>
+            </select>
+          </label>
+        </div>
+        <p class="hint">
+          抽帧步长 &gt; 1 时输出帧率会按「原帧率 ÷ 步长」写入，播放时长与原视频一致。
+        </p>
+        <label class="check-row"><input type="checkbox" id="videoSaveDetections"><span>额外输出逐帧检测明细 detections.json</span></label>
+        <div class="actions">
+          <button type="button" class="primary" id="btnVideoStart">开始视频推理</button>
+          <button type="button" id="btnVideoStop" disabled>停止</button>
+          <a class="mini hidden" id="videoDownload" href="#">下载 mp4</a>
+        </div>
+        <video class="result-video hidden" id="videoResult" controls playsinline></video>
+        <p class="hint" id="videoNote"></p>
+      </div>
+
+      <!-- 摄像头 -->
+      <div class="batch-pane hidden" data-pane="camera">
+        <p class="hint">
+          浏览器采集画面，逐帧发到后端只取检测框，再由前端 canvas 叠框。
+          不上传图片、不落盘，帧不出本机。
+        </p>
+        <div class="grid2">
+          <label>采集分辨率
+            <select id="cameraResolution">
+              <option value="640x480">640×480</option>
+              <option value="1280x720" selected>1280×720</option>
+              <option value="1920x1080">1920×1080</option>
+            </select>
+          </label>
+          <label>帧率上限
+            <input type="number" id="cameraFps" value="8" min="1" max="30" step="1">
+          </label>
+        </div>
+        <label class="check-row"><input type="checkbox" id="cameraDrawLabels" checked><span>在框上显示类别名与置信度</span></label>
+        <div class="camera-wrap">
+          <video id="cameraVideo" autoplay muted playsinline></video>
+          <canvas id="cameraCanvas"></canvas>
+          <div class="camera-stat" id="cameraStat">未启动</div>
+        </div>
+        <div class="actions">
+          <button type="button" class="primary" id="btnCameraStart">开启摄像头</button>
+          <button type="button" id="btnCameraStop" disabled>关闭</button>
+        </div>
+        <p class="hint" id="cameraHint"></p>
+      </div>
+
+      <!-- 进度与日志：三种模式共用，避免同一个页面出现三套进度条 -->
+      <div class="progress hidden" id="batchProgressWrap"><div class="bar" id="batchBar"></div></div>
+      <div class="build-line hidden" id="batchLine">
+        <span id="batchPct">0%</span>
+        <span id="batchStage">等待开始</span>
+        <span id="batchElapsed">已用 0:00</span>
+        <span id="batchEta">预计剩余 —</span>
+      </div>
+
+      <!-- 最近处理的文件：大批量时用户需要确认"确实在推进、推的是对的目录" -->
+      <div class="scrollbox scrollbox-sm hidden" id="batchTableWrap">
+        <table class="data-table" id="batchTable">
+          <thead>
+            <tr><th>#</th><th>文件</th><th>检出</th><th>状态</th></tr>
+          </thead>
+          <tbody id="batchRows"></tbody>
+        </table>
+      </div>
+
+      <pre class="log hidden" id="batchLog"></pre>
+    </div>
   </section>
 
   <!-- ==================== 引擎构建页 ==================== -->
