@@ -1,7 +1,9 @@
 # anomalib-training-export Specification
 
 ## Purpose
-TBD - created by archiving change add-anomalib-training-export. Update Purpose after archive.
+定义 Qt 版 Anomalib 异常检测的训练与导出能力：PatchCore / PaDiM / EfficientAd 三个模型共用
+一个 `tf_anomalib_launcher.py`，在 Folder 数据集上完成训练、导出 ONNX 与写 `metadata.json`，
+并通过结构化 JSON 事件把进度回传给界面，任何失败都以可读原因返回而不是崩溃。
 ## Requirements
 ### Requirement: Anomalib Training Mode
 The system SHALL provide an Anomalib anomaly detection mode in the existing TRTForge training/export page without removing or changing the existing YOLO training modes.

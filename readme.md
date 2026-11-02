@@ -179,6 +179,20 @@ python tf_anomalib_launcher.py --mode check-env
 细节见 `6-web/README.md` 的「推理页：metadata 推荐阈值回显（v1.21）」与
 `docs/WORKFLOW_GUIDE.md` 的 §7.1.2。
 
+**配套的规范收尾（同一批完成）**
+
+- **补回漏落的能力**：`openspec/specs/web-yolo-pipeline/` 此前不存在——v1.17 的 YOLO 串联
+  5 个 Requirement、20+ 个场景只活在归档目录里（`openspec show web-yolo-pipeline` 直接报
+  `Spec not found`）。现已落到正式 specs，`--specs` 从 13 个变成 **14 个**。
+- **12 个 spec 的 `## Purpose` 不再是 `TBD`**：归档时漏写的"Update Purpose after archive"
+  已全部补成真实描述，现在 14 个能力都有一句话说明"这个能力解决什么问题"。
+- **本次改动有提案可查**：新增 `openspec/changes/update-infer-metadata-readout` →
+  已归档为 `2026-11-02-update-infer-metadata-readout`，给 `web-infer-console` 追加了
+  `Metadata Threshold Inspection` 要求，并把这个 UI 要求的 4 个新场景并入。
+- **CI 注释修正**：`.github/workflows/tests.yml` 里「12 个脚本 / 444 项断言」更新为
+  「23 个脚本 / 891 项断言」，并写明新增脚本会被 `run_all_tests.py` 自动收录。
+- 校验：`openspec validate --all --strict` **14/14 通过**，`openspec list` 无活跃变更。
+
 ### v1.20 — 2026-11-02（路径选择：直接弹 Windows 系统对话框）
 
 之前所有要填路径的输入框只有两条路：手打绝对路径，或用页面内那个「列目录」弹窗一层层钻。

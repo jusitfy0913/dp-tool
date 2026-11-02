@@ -1,7 +1,9 @@
 # annotation-dataset-workbench Specification
 
 ## Purpose
-TBD - created by archiving change add-custom-dataset-split-ratio. Update Purpose after archive.
+定义 Qt 版标注工作台与数据集划分能力：以 `.tfanno` 为原生工程格式，覆盖 `detect` /
+`segment` / `pose` / `obb` 四种任务，支持绘制、类别管理、按比例或手动划分数据集，
+并能在 YOLO / COCO / VOC 之间双向导入导出。
 ## Requirements
 ### Requirement: Custom Dataset Split Ratio
 The annotation workbench SHALL allow users to configure train/val/test percentages for automatic dataset splitting.

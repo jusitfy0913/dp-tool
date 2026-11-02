@@ -1,7 +1,8 @@
 # web-annotation-workbench Specification
 
 ## Purpose
-TBD - created by archiving change add-web-annotation-workbench. Update Purpose after archive.
+定义浏览器内的标注工作台：与 Qt 版共用 `.tfanno` 工程格式，提供画布绘制/撤销重做/显示控制/
+自动保存，并能用自有引擎或外部服务做自动标注。设计目标是「不装 Qt 也能把框画完并交给训练」。
 ## Requirements
 ### Requirement: Tfanno Project Interoperability
 后端 SHALL 读写 `.tfanno` 标注工程文件，且读写的字段结构 MUST 与 Qt 版实现兼容。

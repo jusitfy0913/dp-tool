@@ -1,7 +1,8 @@
 # web-studio-theme Specification
 
 ## Purpose
-TBD - created by archiving change refactor-web-studio-theme. Update Purpose after archive.
+定义 Web 工作站的视觉体系与图像查看器：颜色/间距/字号全部走设计令牌，风格为深色工业风，
+并提供可多窗口并列、可独立开关、支持光标锚点缩放与拖动平移的查看器组件。
 ## Requirements
 ### Requirement: Design Token System
 前端样式 SHALL 通过 CSS 自定义属性集中定义语义色、尺度与效果三组设计令牌，页面中不得出现硬编码的颜色与间距字面量。

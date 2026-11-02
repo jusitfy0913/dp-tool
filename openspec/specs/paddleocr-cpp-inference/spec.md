@@ -1,7 +1,8 @@
 # paddleocr-cpp-inference Specification
 
 ## Purpose
-TBD - created by archiving change add-paddleocr-cpp-inference. Update Purpose after archive.
+定义 `ocr_infer.dll` 承载的 PaddleOCR C++ 推理能力：由 Paddle Inference 直接跑检测与识别模型，
+返回带坐标与置信度的原始文本行，再由界面负责可视化，避免为 OCR 单独引入 Python 运行时。
 ## Requirements
 ### Requirement: PaddleOCR C++ Inference Mode
 TRTForge SHALL provide an `OCR 文本识别 OCR` mode in the inference demo for running PaddleOCR C++ inference.

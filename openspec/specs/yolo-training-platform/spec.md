@@ -1,7 +1,9 @@
 # yolo-training-platform Specification
 
 ## Purpose
-TBD - created by archiving change add-yolo-training-export-platform. Update Purpose after archive.
+定义 Qt 版 YOLO 训练平台：统一 launcher 覆盖 `detect` / `segment` / `pose` / `obb` 四种任务头，
+在界面里完成环境探测、参数分层填写、训练监控与日志回显，并导出 ONNX 与 TRTForge 自有标签文件；
+所有失败都以可读对话框呈现，不允许静默崩溃或挂死。
 ## Requirements
 ### Requirement: Python Environment Detection
 The system SHALL detect a usable Python environment before starting YOLO training, validation, or export.

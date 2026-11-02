@@ -1,7 +1,8 @@
 # web-anomalib-pipeline Specification
 
 ## Purpose
-TBD - created by archiving change add-anomalib-auto-pipeline. Update Purpose after archive.
+定义 Web 端的 Anomalib 全流程串联：把「训练 + 导出 + 阈值校准 → 校验 metadata → 编译引擎 →
+引擎精度验证」压成一条可停止、可看日志的链，并在产物路径只有训练完才知道的前提下延迟派生命令。
 ## Requirements
 ### Requirement: Anomalib Pipeline Orchestration
 后端 SHALL 提供异常检测全流程串联接口，按固定顺序推进四个阶段，每阶段独立可观测。

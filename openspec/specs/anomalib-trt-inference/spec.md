@@ -1,7 +1,8 @@
 # anomalib-trt-inference Specification
 
 ## Purpose
-TBD - created by archiving change add-anomalib-trt-inference. Update Purpose after archive.
+定义 Qt 版 Anomalib 的 TensorRT 推理链路：`anomalib_infer.dll` 按 `metadata.json` 装载引擎，
+输出原始分数、归一化分数与异常图，界面据此展示判定、热力图与异常轮廓，并保证中文路径可用。
 ## Requirements
 ### Requirement: Anomalib TensorRT Mode
 TRTForge SHALL provide an `异常检测 ANOMALY` mode in the inference demo for running existing Anomalib TensorRT engines.

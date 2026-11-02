@@ -1,7 +1,8 @@
 # project-layout Specification
 
 ## Purpose
-TBD - created by archiving change refactor-five-tier-layout. Update Purpose after archive.
+定义仓库的五级目录结构与路径解析规则：脚本按自身位置推导仓库根，所有产物写入单一构建目录，
+不得出现指向具体机器的绝对路径或旧结构残留，文档必须与目录现状一致。
 ## Requirements
 ### Requirement: Five-Tier Repository Layout
 仓库 SHALL 使用按用途划分的五级目录表达工程结构，层级名称固定为 `1-python-yolo`、`2-python-anomaly`、`3-cpp-tensorrt`、`4-qt-studio`、`5-reference`，并 SHALL 额外保留旁挂目录 `ocr`。

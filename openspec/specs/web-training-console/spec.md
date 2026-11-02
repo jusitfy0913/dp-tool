@@ -1,7 +1,8 @@
 # web-training-console Specification
 
 ## Purpose
-TBD - created by archiving change add-training-console. Update Purpose after archive.
+定义 Web 训练页在「开训之前 / 训完之后」补齐的四件事：数据集概览、增强效果预览、
+断点续训入口、训练产物导出 ONNX。四者都为减少「盲训」——先看清数据、再确认增强、再决定续训与导出。
 ## Requirements
 ### Requirement: 训练数据集概览
 

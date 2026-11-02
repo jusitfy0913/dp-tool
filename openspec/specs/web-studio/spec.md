@@ -1,7 +1,9 @@
 # web-studio Specification
 
 ## Purpose
-TBD - created by archiving change add-web-studio. Update Purpose after archive.
+定义 Web 工作站的总体约束：训练/导出/编译/推理全部由本地 FastAPI 后端驱动并复用既有 C++ DLL，
+浏览器只做展示（前端无构建步骤），事件通过 WebSocket 回传；路径选择走服务端原生对话框，
+Qt 版程序归档保留作为参考实现。
 ## Requirements
 ### Requirement: Web Backend Exposes Training API
 系统 SHALL 提供 HTTP 接口启动 YOLO 与 Anomalib 训练，且 SHALL 通过子进程调用现有 launcher 脚本，不得在服务进程内直接训练。
