@@ -1,4 +1,4 @@
-# Change: 训练页补三块面板（数据集概览 / 增强预览 / 断点续训）
+# Change: 训练页补四块面板（数据集概览 / 增强预览 / 断点续训 / 导出 ONNX）
 
 ## Why
 
@@ -16,7 +16,9 @@ v1.13 之后训练页能看见「进度、剩余时间、每轮指标、曲线�
 - **增强预览**：新增 `POST /api/train/augment-preview`，用当前 15 项参数（其中 11 项参与像素变换）对训练集真实样本做一次增强，返回「原图 / 增强后」两张 JPEG（base64）+ 本次抽样实际触发了哪些项。相同 `seed` 必然得到相同像素，便于对比不同参数。
 - **断点续训**：新增 `GET /api/runs/checkpoints`，扫 `runs/**/args.yaml` + `results.csv` 而不加载 `.pt`（后端解释器没有 torch），返回每次训练的已完成轮数、最佳 mAP、`last.pt` 路径与大小；前端一键回填参数并走新的 `--resume-from <last.pt>`。
 - **修正 resume 语义**：`tf_yolo_launcher.py` 新增 `--resume-from <path>`，把显式路径传给 `model.train(resume=path)`，不再依赖 `get_latest_run()` 猜；旧的 `--resume` 开关保留兼容。
-- 版本号 `APP_VERSION` 1.13.0 → **1.14.0**。
+- **导出 ONNX（v1.15 追加）**：新增 `POST /api/export/yolo`，把训练好的 `.pt` 导出为 ONNX 并可选生成 `.transd.onnx`，日志与产物复用训练那套子进程 + WebSocket。页面上的「训练导出」终于名副其实：训练 → 导出 → 编译 → 推理全程不用命令行。
+- **修正 `.transd.onnx` 的生成逻辑（v1.15 追加）**：不再假设「图里最后一个节点就是检测头」，改为按形状识别预测头；转置前按任务校验通道数；`segment` 额外把 proto 输出提到第一位——C++ 侧对 V8Seg 硬性要求 binding1=proto，而 Ultralytics 导出的顺序正好相反，不重排就是「编译能过、推理报错」。
+- 版本号 `APP_VERSION` 1.13.0 → **1.14.0** → **1.15.0**。
 
 ## Impact
 
@@ -27,6 +29,9 @@ v1.13 之后训练页能看见「进度、剩余时间、每轮指标、曲线�
   - 修改 `1-python-yolo/launcher/tf_yolo_launcher.py`（`--resume-from`）
   - 修改 `6-web/frontend/index.html`、`js/train.js`、`css/style.css`
   - 新增 `6-web/backend/tools/test_train_info.py`、`test_aug_preview.py`
+  - **v1.15 追加**：修改 `1-python-yolo/launcher/tf_yolo_launcher.py`（`make_transd_onnx` 按形状识别预测头 + 任务通道校验 + seg 输出重排；`mode_export` 以权重自带任务为准）
+  - **v1.15 追加**：修改 `6-web/backend/app.py`（`POST /api/export/yolo` + 抽出的 `build_export_command`）、新增 `6-web/frontend/js/export.js`、修改 `js/main.js`（browse 支持 `.pt`）、`index.html`
+  - **v1.15 追加**：新增 `6-web/backend/tools/test_transd_onnx.py`、`test_export_request.py`
   - 文档：`6-web/README.md`、`docs/WORKFLOW_GUIDE.md`、根 `readme.md`
 
 ## Non-Goals

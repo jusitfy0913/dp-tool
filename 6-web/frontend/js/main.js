@@ -4,6 +4,7 @@ import { browse, getCapabilities, getHealth } from "./api.js";
 import { initAnnotate } from "./annotate.js";
 import { initDataset } from "./dataset.js";
 import { initEngine } from "./engine.js";
+import { initExport } from "./export.js";
 import { initInfer } from "./infer.js";
 import { initTrain } from "./train.js";
 
@@ -109,7 +110,7 @@ function initBrowse() {
 
       if (browseState.mode === "file") {
         data.entries
-          .filter((e) => !e.is_dir && /\.(trt|engine|onnx|json|yaml|yml|tfanno)$/i.test(e.name))
+          .filter((e) => !e.is_dir && /\.(trt|engine|onnx|json|yaml|yml|tfanno|pt)$/i.test(e.name))
           .forEach((entry) => list.appendChild(makeItem(entry, btnPick)));
       }
 
@@ -178,6 +179,7 @@ if (new URLSearchParams(location.search).has("reduced-motion")) {
 
 initTabs();
 initTrain();
+initExport();
 initEngine();
 initDataset();
 initAnnotate();

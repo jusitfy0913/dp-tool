@@ -50,7 +50,7 @@
 
 ## 6. 验证与文档
 - [x] 6.1 使用极小 YOLO detect 数据集验证 `check-env/train/val/export`。（改用真实 PCB 数据集验证，更强：553 train/139 val，train→val→export→trtexec→推理全通）
-- [ ] 6.2 使用极小 YOLO OBB 数据集验证 `.transd.onnx` 生成。（detect 的 `.transd.onnx` 已生成并验证可用：输出 `[1,18900,10]`；OBB 任务头未测）
+- [x] 6.2 验证 OBB / 分割 / 姿态的 `.transd.onnx` 生成。（v1.15 完成：不再依赖「最后一个节点」，改为按形状识别预测头；四任务头实测——detect `[1,2100,84]`、segment proto `[1,32,80,80]`+头 `[1,2100,116]`（proto 提到 binding 1）、pose `[1,2100,56]`、obb `[1,2100,20]`；各自 trtexec 编译后经 DLL 推理通过。未训练 OBB 数据集，改用官方 `yolov8n-obb.pt` 导出的真实图结构验证，覆盖同一段代码路径）
 - [x] 6.3 使用已有标注工作台导出的 `dataset.yaml` 验证 Ultralytics 可识别。（当前用 `1-python-yolo/launcher/configs/pcb_detect.yaml` 验证；工作台导出的 yaml 走同一 schema，`check_det_dataset()` 已确认可解析）
 - [x] 6.3.1 使用短训练验证指标表、图表刷新、GPU 状态和 `labels_*.json` 生成。
 - [x] 6.4 更新 `docs/Qt_Cpp_Python训练平台_架构设计.md`。

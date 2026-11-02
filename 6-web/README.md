@@ -215,6 +215,47 @@ powershell -File scripts\run_web_studio.ps1 -HostName 0.0.0.0
 > 如果你想要「续训成新实验」，请用表单里正常训练的 `--name` 另起名字，不要用续训按钮。
 
 
+#### 训练后导出 ONNX（v1.15）
+
+以前「训练导出」这个页签名不副实：训完拿到 `best.pt`，要变引擎必须跳出浏览器敲
+`--mode export`，整条网页链路最后一步断在命令行。v1.15 把这一步搬回页面。
+
+展开「导出 ONNX」折叠块：
+
+| 控件 | 说明 | 默认 |
+| --- | --- | --- |
+| 权重 .pt | 训练产物的 `best.pt` / `last.pt`；「用当前实验 best.pt」按 `project/name` 自动拼路径 | 空 |
+| 导出尺寸 imgsz | 必须是 **32 的倍数**，范围 32~2048；不是就**直接拒绝**，不静默取整 | 640 |
+| opset | 留空用 Ultralytics 默认 | 空 |
+| 生成 .transd.onnx | TensorRT 必须用它（输出转成 `[1, anchors, 4+nc]`） | **勾选** |
+| simplify | `onnxslim` 化简；关掉时传 `--no-simplify` | 勾选 |
+| dynamic | 动态 batch/尺寸 | 不勾 |
+| half | 半精度导出（需要 GPU） | 不勾 |
+
+产物命名与 Ultralytics 一致：**与权重同目录同名**，`best.pt` → `best.onnx` + `best.transd.onnx`。
+结果表里 `.transd.onnx` 那一行有「去编译引擎」按钮：点了会自动切到引擎页、填好 ONNX 路径并
+触发形状探测，看到「布局正确，可以编译」就能直接构建。
+
+**四个任务头都验证过**（`detect` / `segment` / `pose` / `obb`）：
+
+| 任务 | `.transd.onnx` 输出 | 说明 |
+| --- | --- | --- |
+| detect | `[1, anchors, 4+nc]` | 常规转置 |
+| segment | **`[proto, 检测头]` 两路**，proto 为 `[1,32,H,W]`，检测头 `[1,anchors,4+nc+32]` | proto **必须排第一位**，见下 |
+| pose | `[1, anchors, 56]` | 4 框 + 1 类 + 17×3 关键点 |
+| obb | `[1, anchors, 4+nc+1]` | 最后一路是角度（弧度） |
+
+> **为什么分割要重排输出**：C++ 侧 `yolo.cu` 对 V8Seg 直接读 `static_dims(1)` 当 proto、
+> `static_dims(2)` 当检测头；而 Ultralytics 导出的顺序是「检测头在前、proto 在后」。
+> 不重排的话 **trtexec 能编译成功**，推理时才抛
+> `V8Seg channel layout invalid (det=32, proto_dim=116)` —— 属于最难查的那种错。
+
+> 转置逻辑 v1.15 也换了判据：不再取「图里最后一个节点」（那是导出顺序的巧合，多一个
+> Cast/Concat 就转错，且错误是静默的），改成**按形状识别预测头**（3 维输出；多个时用
+> 「通道维 < anchors 维」裁决），并在转置前按任务校验通道数。任务类型以权重自带为准，
+> 填错时会提示 `task_overridden`。转置失败只报 `TRANSD_FAILED`，**已导出的原始 ONNX 保留**。
+
+
 ### 推理演示
 
 > **v1.8 起为「推理控制台」，相对 v1.7 的变化见本节末尾的「v1.8 变更点」。**
@@ -667,7 +708,7 @@ offset1 = cursor - p_image * scale1
 
 | 方法 | 路径 | 用途 |
 | --- | --- | --- |
-| GET | `/api/health` | 存活探针，返回 `{"ok":true,"version":"1.14.0"}`；版本号用来识别「连到了旧进程」 |
+| GET | `/api/health` | 存活探针，返回 `{"ok":true,"version":"1.15.0"}`；版本号用来识别「连到了旧进程」 |
 | GET | `/api/capabilities` | 环境探测（前端状态灯用） |
 | POST | `/api/train/yolo` | 启动 YOLO 训练 |
 | POST | `/api/train/anomalib` | 启动 Anomalib 训练 |
@@ -675,6 +716,7 @@ offset1 = cursor - p_image * scale1
 | POST | `/api/train/dataset-overview` | **v1.14**：训练前数据集体检（split 计数 / 空标 / 孤儿标 / 类别分布 / 分辨率采样，60s 缓存） |
 | POST | `/api/train/augment-preview` | **v1.14**：按当前增强参数用 cv2 生成「原图 vs 增强后」对照图（base64 JPEG） |
 | GET | `/api/runs/checkpoints?project=` | **v1.14**：扫描可续训的 run（读 `args.yaml` + `results.csv`，不加载 `.pt`） |
+| POST | `/api/export/yolo` | **v1.15**：把 `.pt` 导出为 ONNX，可选生成 `.transd.onnx`；返回 `run_id`，日志与产物走 `WS /ws/runs/{id}` |
 | GET | `/api/runs` | 任务列表 |
 | GET | `/api/runs/{run_id}` | 单任务状态 |
 | POST | `/api/runs/{run_id}/stop` | 停止任务 |

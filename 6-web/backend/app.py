@@ -46,7 +46,7 @@ from runners import manager
 
 #: 应用版本号。前端顶栏与 /api/health 都读它，方便一眼看出「页面连的是哪个后端」。
 #: 起因：改了代码但 8060 上跑的是几小时前的旧进程，排查很久才发现。
-APP_VERSION = "1.14.0"
+APP_VERSION = "1.15.0"
 
 # ---------------------------------------------------------------------------
 # 应用与生命周期
@@ -308,6 +308,107 @@ def train_anomalib(request: AnomalibTrainRequest) -> dict:
         run = manager.create("anomalib-train", command, str(config.ANOMALIB_LAUNCHER_DIR))
     except OSError as exc:
         raise HTTPException(status_code=500, detail=f"启动训练进程失败：{exc}") from exc
+    return run.snapshot()
+
+
+# ---------------------------------------------------------------------------
+# 导出 ONNX（训练 -> 导出 -> 编译 的中间一环）
+# ---------------------------------------------------------------------------
+class YoloExportRequest(BaseModel):
+    """导出参数。字段名与 launcher 的 `--mode export` 一一对应。"""
+
+    weights: str = Field(..., description="训练得到的 best.pt / last.pt 绝对路径")
+    task: str = Field(default="detect", description="detect/segment/pose/obb；与权重不符时以权重为准")
+    imgsz: int = Field(default=640, description="导出输入尺寸，必须是 32 的倍数")
+    batch: int = Field(default=1, ge=1, le=32, description="导出 batch，TensorRT 侧通常为 1")
+    opset: int | None = Field(default=None, ge=9, le=20, description="ONNX opset，留空用 Ultralytics 默认")
+    dynamic: bool = Field(default=False, description="动态 batch/尺寸")
+    half: bool = Field(default=False, description="半精度导出（需要 GPU）")
+    simplify: bool = Field(default=True, description="onnx-simplifier 化简")
+    make_transd: bool = Field(default=True, description="同时生成 .transd.onnx（TensorRT 必须）")
+    python: str | None = Field(default=None, description="覆盖训练解释器")
+
+
+def build_export_command(request: "YoloExportRequest", python: str) -> list[str]:
+    """拼导出命令行。
+
+    抽成纯函数是为了能单测：参数拼错一位，用户要等 30 秒才在日志里看到 argparse
+    的 usage，而 usage 里根本看不出「少了 --export-batch」。
+    """
+    # Ultralytics 会把尺寸取整到 stride 的倍数，静默改数值会让用户以为填错了
+    if request.imgsz % 32 != 0 or not 32 <= request.imgsz <= 2048:
+        raise ValueError(
+            f"imgsz 必须是 32 的倍数且在 32~2048 之间，当前为 {request.imgsz}"
+        )
+    if request.task not in {"detect", "segment", "pose", "obb"}:
+        raise ValueError(f"不支持的任务类型：{request.task}")
+
+    command = [
+        python, str(config.YOLO_LAUNCHER),
+        "--mode", "export",
+        "--task", request.task,
+        "--weights", request.weights,
+        "--format", "onnx",
+        "--imgsz", str(request.imgsz),
+        "--export-batch", str(request.batch),
+        # 注意：--simplify 是 BooleanOptionalAction，只接受 --simplify / --no-simplify，
+        # 写成 `--simplify true` 会被 argparse 判成「多余的参数」直接退出 2。
+        "--simplify" if request.simplify else "--no-simplify",
+        "--make-transd", "true" if request.make_transd else "false",
+    ]
+    if request.opset is not None:
+        command += ["--opset", str(request.opset)]
+    if request.dynamic:
+        command.append("--dynamic")
+    if request.half:
+        command.append("--half")
+    return command
+
+
+@app.post("/api/export/yolo")
+def export_yolo(request: YoloExportRequest) -> dict:
+    """把训练好的 `.pt` 导出成 ONNX（可选顺带生成 `.transd.onnx`）。
+
+    为什么做成任务而不是同步接口：导出要加载 torch 与权重，实测 5~30 秒，
+    同步会卡住整个事件循环。复用训练那套子进程 + WebSocket，日志和产物一条路。
+    """
+    if not config.YOLO_LAUNCHER.is_file():
+        raise HTTPException(status_code=500, detail=f"找不到 launcher：{config.YOLO_LAUNCHER}")
+
+    weights = _ensure_allowed_path(request.weights)
+    if not weights.is_file():
+        raise HTTPException(status_code=400, detail=f"权重文件不存在：{request.weights}")
+    if weights.suffix.lower() != ".pt":
+        raise HTTPException(status_code=400, detail=f"只能导出 .pt 权重，当前为 {weights.suffix}")
+
+    python = _resolve_python(request.python)
+    try:
+        command = build_export_command(request, python)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    # 预期产物先算出来：Ultralytics 的 ONNX 与权重同目录同名不同后缀。
+    # dynamic / half 都不改文件名，所以这个推断是稳的；真没落盘时由
+    # runners 的 ARTIFACT_MISSING 事件报出来，不用等用户去点下一步才发现。
+    expect_onnx = weights.with_suffix(".onnx")
+
+    try:
+        run = manager.create(
+            "yolo-export",
+            command,
+            str(config.YOLO_LAUNCHER_DIR),
+            expect_file=expect_onnx,
+            meta={
+                "weights": str(weights),
+                "task": request.task,
+                "imgsz": request.imgsz,
+                "make_transd": request.make_transd,
+                "expect_onnx": str(expect_onnx),
+                "expect_transd": str(weights.with_suffix(".transd.onnx")),
+            },
+        )
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"启动导出进程失败：{exc}") from exc
     return run.snapshot()
 
 

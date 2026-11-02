@@ -361,11 +361,36 @@ python tf_yolo_launcher.py --mode export --model runs\trtforge\my_yolo\weights\b
   --imgsz 640 --opset 12
 ```
 
+> **不想敲命令行**：Web Studio 训练页的「导出 ONNX」折叠块（v1.15）做的是同一件事，
+> 还能一键把 `.transd.onnx` 送到引擎构建页。详见 `6-web/README.md`。
+>
+> 任务类型以**权重自带**的为准：拿 `yolov8n-seg.pt` 配 `--task detect` 时，launcher 会自动
+> 按 `segment` 导出并打印 `task_overridden`，避免生成一个通道数不对的「检测头」。
+
 > `.transd.onnx` 仅用于 TRTForge 自定义推理链路，**不要用 `YOLO()` 直接加载**
 > （Ultralytics 认的是原始输出布局，转置后会解析失败）。
 >
 > 但反过来：**编译 TensorRT 引擎时必须用它**，见 §5.1。导出后目录里应有
 > `best.onnx` 和 `best.transd.onnx` 两个文件；如果只有前者，加 `--make-transd` 重跑。
+
+#### 4.1.1 四种任务头的 `.transd.onnx` 布局（v1.15 起）
+
+| 任务 | 图输出 | 布局 |
+| --- | --- | --- |
+| `detect` | `output0` | `[1, anchors, 4+nc]` |
+| `segment` | **`output1`(proto) 在前，`output0`(检测头) 在后** | proto `[1,32,H,W]`；检测头 `[1,anchors,4+nc+32]` |
+| `pose` | `output0` | `[1, anchors, 56]`（4+1+17×3） |
+| `obb` | `output0` | `[1, anchors, 4+nc+1]`（最后一路是角度） |
+
+> ⚠️ **分割的输出顺序是硬约定，不是风格问题。**
+> C++ 侧 `yolo.cu` 对 `V8Seg` 直接读 `static_dims(1)` 当 proto、`static_dims(2)` 当检测头；
+> 而 Ultralytics 导出的顺序正好相反。v1.15 在生成 `.transd.onnx` 时会把 proto 提到第一位。
+> 不重排的后果是 **trtexec 编译成功、推理时才报**
+> `V8Seg channel layout invalid (det=32, proto_dim=116)`。
+
+> v1.15 同时换了转置的定位方式：不再取「图里最后一个节点」（导出顺序的巧合，多一个
+> Cast/Concat 就转错，且静默），改成按形状识别预测头，并在转置前校验通道数。
+
 
 ### 4.2 Anomalib
 

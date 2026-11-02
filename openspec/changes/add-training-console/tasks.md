@@ -31,3 +31,16 @@
 - [x] 4.4 回归：`test_engine_progress`、`test_exit_codes`、`test_augment_params`、`test_dataset_workbench`、`test_infer_params`、`test_onnx_fallback`、`test_annotation_project`
 - [x] 4.5 浏览器实测：扫描真实 PCB 数据集、生成预览截图核对、真实续训 2 轮
 - [x] 4.6 更新 `6-web/README.md`、`docs/WORKFLOW_GUIDE.md`、根 `readme.md`，`APP_VERSION` → 1.14.0
+
+## 5. 导出 ONNX（v1.15）
+
+- [x] 5.1 重写 `tf_yolo_launcher.py` 的转置逻辑：`make_transd_onnx(path, task)` 按形状识别预测头（3 维输出），不再取 `graph.node[-1]`
+- [x] 5.2 转置前按任务校验通道数：pose=56、obb≥6、segment 需要 proto 且通道 > 4+proto 通道
+- [x] 5.3 `segment` 把 proto 输出提到 `graph.output` 第一位，对齐 C++ 的 binding1=proto 约定
+- [x] 5.4 `mode_export` 以权重自带 task 为准，不一致时发 `task_overridden` 事件；转置失败只报 `TRANSD_FAILED`，保留原始 ONNX
+- [x] 5.5 新增 `POST /api/export/yolo` + 纯函数 `build_export_command`（`--simplify` 用 `--no-simplify`，不能跟值）
+- [x] 5.6 前端新增 `js/export.js`：权重选择（含「用当前实验 best.pt」）、参数区、结果表、「去编译引擎」联动
+- [x] 5.7 `tools/test_transd_onnx.py`（17 项）覆盖四任务头、非末尾节点、动态维、seg 重排与各类报错
+- [x] 5.8 `tools/test_export_request.py`（24 项）覆盖开关透传、非法参数提前拒绝
+- [x] 5.9 真实链路验证：detect/segment/pose/obb 四任务导出 → transd → trtexec 编译 → Web 推理
+- [x] 5.10 浏览器实测：真实 PCB `best.pt` 导出 6.5 秒出两个产物，点「去编译引擎」自动切页并探测「布局正确」

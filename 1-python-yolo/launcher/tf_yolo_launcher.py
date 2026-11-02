@@ -422,43 +422,203 @@ def generate_labels_json(save_dir: Any, experiment_name: Optional[str], names: A
     return written
 
 
-def apply_onnx_last_output_transpose(onnx_path: str) -> str:
+def _output_dims(output: Any) -> List[Any]:
+    """把一个 graph output 的维度取成 list；动态维用 None 表示。"""
+    dims: List[Any] = []
+    for dim in output.type.tensor_type.shape.dim:
+        if dim.HasField("dim_value"):
+            dims.append(int(dim.dim_value))
+        else:
+            # dim_param / 未标注都当作动态维。动态批次不影响「通道在前」的判断，
+            # 但通道与 anchors 两个位置都动态时就无法认定谁是预测头。
+            dims.append(None)
+    return dims
+
+
+def _pick_prediction_head(model: Any, task: str) -> str:
+    """按形状找出「检测头」输出名，而不是靠「图里最后一个节点」。
+
+    为什么要改：旧实现取 `graph.node[-1]`，那是「导出顺序」的巧合，不是契约。
+    Ultralytics 一改图结构（比如末尾多一个 Cast/Concat）就会转错张量，而错误是
+    静默的——生成的 ONNX 依然能编译，只是推理结果全错。
+
+    真实导出实测（ultralytics 8.4.192，imgsz=320）：
+        detect  output0 [1, 84, 2100]          4 + 80 类
+        segment output0 [1, 116, 2100]         4 + 80 类 + 32 mask 系数
+                output1 [1, 32, 80, 80]        proto（4 维）
+        pose    output0 [1, 56, 2100]          4 + 1 类 + 17*3 关键点
+        obb     output0 [1, 20, 2100]          4 + 15 类 + 1 角度
+
+    判据分两层：
+    1. **预测头必然是 3 维输出**（proto 是 4 维），四种任务都只有它一个 3 维输出；
+    2. 若出现多个 3 维输出（未来模型可能如此），再用「通道维 < anchors 维」裁决。
+    不能只用第 2 条：imgsz 很小时 anchors 会小于通道数（如 64px 的检测头
+    `[1, 84, 84]`），单看大小关系会判不出。
+    """
+    three_d: List[tuple[str, List[Any]]] = [
+        (out.name, _output_dims(out))
+        for out in model.graph.output
+        if len(_output_dims(out)) == 3
+    ]
+    if not three_d:
+        raise RuntimeError(
+            "无法识别预测头输出：图里没有 3 维输出。"
+            f"当前输出为 {[(o.name, _output_dims(o)) for o in model.graph.output]}"
+        )
+
+    if len(three_d) == 1:
+        det_name, dims = three_d[0]
+    else:
+        candidates = [
+            (name, dims)
+            for name, dims in three_d
+            if dims[1] is not None and dims[2] is not None and dims[1] < dims[2]
+        ]
+        if len(candidates) != 1:
+            raise RuntimeError(
+                f"识别到多个 3 维输出 {[name for name, _ in three_d]}，无法确定该转置哪一个。"
+                "请固定 export_batch=1、关闭 dynamic 后再试，或排查导出图结构。"
+            )
+        det_name, dims = candidates[0]
+
+    _validate_head_channels(task, dims, model)
+    return det_name
+
+
+def _validate_head_channels(task: str, dims: List[Any], model: Any) -> None:
+    """转置前校验通道数，把「任务选错」变成一句能看懂的话。
+
+    不校验的代价：错误会一路带到 TensorRT，最后在推理时抛
+    "V8Pose expects channels=56, got 116"，用户根本不知道是导出阶段就错了。
+    """
+    channels = dims[1]
+    if task == "pose":
+        # 4 框 + 1 类 + 17*3 关键点
+        if channels != 56:
+            raise RuntimeError(
+                f"pose 模型通道数应为 56（4+1+17*3），实际 {channels}。"
+                "请确认 --task pose 与权重匹配。"
+            )
+    elif task == "obb":
+        # 4 框 + nc 类 + 1 角度；至少 1 个类别
+        if channels < 6:
+            raise RuntimeError(f"obb 模型通道数应 ≥ 6（4+nc+1），实际 {channels}")
+    elif task == "segment":
+        proto = [o for o in model.graph.output if len(_output_dims(o)) == 4]
+        if not proto:
+            raise RuntimeError(
+                f"segment 模型应有 proto 输出（4 维），实际输出为 "
+                f"{[(o.name, _output_dims(o)) for o in model.graph.output]}"
+            )
+        proto_channels = _output_dims(proto[0])[1]
+        if proto_channels is None:
+            raise RuntimeError("segment 的 proto 输出通道维是动态的，无法校验；请使用静态导出")
+        # 4 框 + nc 类 + proto 通道（mask 系数），nc 至少 1
+        if channels <= 4 + proto_channels:
+            raise RuntimeError(
+                f"segment 检测头通道数 {channels} 应大于 4 + proto 通道 {proto_channels}（= {4 + proto_channels}）"
+            )
+
+
+def _reorder_segment_outputs(model: Any, det_name: str) -> None:
+    """把 proto 提到 graph.output 第 1 位（= 引擎的 binding 1）。
+
+    这不是「风格问题」，是硬性契约：C++ 侧 `yolo.cu` 对 V8Seg 直接
+        segment_head_dims_ = static_dims(1);   // 期望 proto
+        bbox_head_dims_    = static_dims(2);   // 期望检测头
+    而 Ultralytics 导出的顺序恰好相反（output0=检测头, output1=proto）。
+    不重排的话：trtexec 能编译成功，推理时才报
+    "V8Seg channel layout invalid (det=32, proto_dim=116)"。
+    """
+    proto = [o for o in model.graph.output if o.name != det_name and len(_output_dims(o)) == 4]
+    if not proto:
+        raise RuntimeError("segment 重排失败：找不到 proto 输出")
+    others = [o for o in model.graph.output if o.name != proto[0].name and o.name != det_name]
+    det = [o for o in model.graph.output if o.name == det_name]
+    ordered = [proto[0], det[0], *others]
+    del model.graph.output[:]
+    model.graph.output.extend(ordered)
+
+
+def make_transd_onnx(onnx_path: str, task: str = "detect") -> str:
+    """生成「输出转置为 [batch, anchors, channels]」的 `.transd.onnx`。
+
+    与旧实现的区别（旧函数名为 apply_onnx_last_output_transpose）：
+    1. 不再假设「最后一个节点就是检测头」，改为按形状识别预测头；
+    2. 转置前按任务校验通道数，任务与权重不匹配时直接报错；
+    3. segment 额外把 proto 输出提到第一位，与 C++ 的 binding 约定对齐。
+
+    原始 ONNX 保留不动：Ultralytics 自己的推理依赖原始布局，只有 TensorRT
+    自定义引擎才需要转置版本。
+    """
     onnx = ensure_import("onnx")
     helper = ensure_import("onnx.helper")
     src = Path(onnx_path)
     if not src.exists():
         raise FileNotFoundError(str(src))
 
-    dst = src.with_name(src.stem + ".transd" + src.suffix)
     model = onnx.load(str(src))
     if not model.graph.node:
         raise RuntimeError("ONNX graph has no node")
 
-    node = model.graph.node[-1]
-    old_output = node.output[0]
-    node.output[0] = "pre_transpose"
+    det_name = _pick_prediction_head(model, task)
+
+    # 预测头输出若还被别的节点当作输入，改名会破坏那些节点，宁可报错也不产出坏图
+    for node in model.graph.node:
+        if det_name in node.input:
+            raise RuntimeError(
+                f"预测头输出 {det_name} 仍被节点 {node.op_type} 使用，无法安全插转置"
+            )
+
+    producer = None
+    for node in model.graph.node:
+        if det_name in node.output:
+            producer = node
+            break
+    if producer is None:
+        raise RuntimeError(f"找不到产生 {det_name} 的节点")
+
+    # 一个节点可能有多路输出，只改名字匹配的那一路
+    slot = list(producer.output).index(det_name)
+    producer.output[slot] = "pre_transpose"
 
     for specout in model.graph.output:
-        if specout.name == old_output:
+        if specout.name == det_name:
             dims = specout.type.tensor_type.shape.dim
-            if len(dims) >= 3:
-                shape0 = dims[0]
-                shape1 = dims[1]
-                shape2 = dims[2]
-                new_out = helper.make_tensor_value_info(
-                    specout.name,
-                    specout.type.tensor_type.elem_type,
-                    [0, 0, 0],
-                )
-                new_dims = new_out.type.tensor_type.shape.dim
-                new_dims[0].CopyFrom(shape0)
-                new_dims[1].CopyFrom(shape2)
-                new_dims[2].CopyFrom(shape1)
-                specout.CopyFrom(new_out)
+            if len(dims) != 3:
+                raise RuntimeError(f"预测头 {det_name} 维度为 {len(dims)}，期望 3 维")
+            new_out = helper.make_tensor_value_info(
+                specout.name,
+                specout.type.tensor_type.elem_type,
+                [0, 0, 0],
+            )
+            new_dims = new_out.type.tensor_type.shape.dim
+            new_dims[0].CopyFrom(dims[0])
+            new_dims[1].CopyFrom(dims[2])
+            new_dims[2].CopyFrom(dims[1])
+            specout.CopyFrom(new_out)
             break
 
-    model.graph.node.append(helper.make_node("Transpose", ["pre_transpose"], [old_output], perm=[0, 2, 1]))
+    model.graph.node.append(
+        helper.make_node("Transpose", ["pre_transpose"], [det_name], perm=[0, 2, 1])
+    )
+
+    if task == "segment":
+        _reorder_segment_outputs(model, det_name)
+
+    dst = src.with_name(src.stem + ".transd" + src.suffix)
     onnx.save(model, str(dst))
+    emit(
+        {
+            "type": "event",
+            "name": "transd_written",
+            "task": task,
+            "path": str(dst),
+            "outputs": [
+                {"name": o.name, "dims": _output_dims(o)} for o in model.graph.output
+            ],
+        }
+    )
     return str(dst)
 
 
@@ -748,6 +908,24 @@ def mode_export(args: argparse.Namespace) -> int:
         emit_error("ARGUMENT_ERROR", "export 需要 --weights 或 --model")
         return 2
     model = load_yolo(weight)
+
+    # 以权重自带的 task 为准：拿 seg 权重配 --task detect 导出，会生成一个
+    # 通道数 116 的「检测头」，编译能过、推理时通道数校验才炸。
+    # 这里不静默改，而是明确告诉用户改了什么，避免「我明明填了 detect」的困惑。
+    model_task = str(getattr(model, "task", "") or "").strip()
+    task = args.task
+    if model_task and model_task in SUPPORTED_TASKS and model_task != args.task:
+        emit(
+            {
+                "type": "event",
+                "name": "task_overridden",
+                "requested": args.task,
+                "actual": model_task,
+                "message": f"权重实际任务为 {model_task}，已忽略命令行传入的 {args.task}",
+            }
+        )
+        task = model_task
+
     kwargs = {
         "format": args.format,
         "imgsz": args.imgsz,
@@ -758,7 +936,7 @@ def mode_export(args: argparse.Namespace) -> int:
         "opset": args.opset,
         "simplify": args.simplify,
     }
-    emit({"type": "event", "name": "export_start", "weights": weight, "format": args.format})
+    emit({"type": "event", "name": "export_start", "weights": weight, "format": args.format, "task": task})
     exported = model.export(**{k: v for k, v in kwargs.items() if v is not None})
     onnx_path = str(exported) if exported else ""
     if not onnx_path or not Path(onnx_path).exists():
@@ -766,9 +944,20 @@ def mode_export(args: argparse.Namespace) -> int:
         return 1
     emit({"type": "artifact", "kind": "onnx", "path": onnx_path})
     if str_to_bool(args.make_transd):
-        transd = apply_onnx_last_output_transpose(onnx_path)
+        try:
+            transd = make_transd_onnx(onnx_path, task)
+        except Exception as exc:  # noqa: BLE001 - 转置失败要给出可读原因
+            emit_error(
+                "TRANSD_FAILED",
+                f"生成 .transd.onnx 失败：{type(exc).__name__}: {exc}",
+                onnx=onnx_path,
+                task=task,
+            )
+            # 原始 ONNX 已导出成功，转置属于附加产物，不算整个导出失败
+            emit({"type": "event", "name": "finished", "exit": 0, "transd": False})
+            return 0
         emit({"type": "artifact", "kind": "transd_onnx", "path": transd})
-    emit({"type": "event", "name": "finished", "exit": 0})
+    emit({"type": "event", "name": "finished", "exit": 0, "transd": True})
     return 0
 
 

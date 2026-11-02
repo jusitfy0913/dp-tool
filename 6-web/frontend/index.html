@@ -1,4 +1,4 @@
-<!DOCTYPE html>
+﻿<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
@@ -186,6 +186,52 @@
                 <tbody id="resumeRows"></tbody>
               </table>
             </div>
+          </details>
+
+          <!-- 导出 ONNX：训练 -> 导出 -> 编译 的中间一环。
+               以前这一段只能回命令行敲，导致「网页一条龙」在最后一步断掉。 -->
+          <details class="augbox" id="exportBox">
+            <summary>导出 ONNX（训练完成后生成 .transd.onnx）</summary>
+            <p class="hint">
+              把训练得到的 <code>best.pt</code> 导出成 ONNX，并顺带生成 TensorRT 需要的
+              <code>.transd.onnx</code>（输出转成 <code>[1, anchors, 4+nc]</code>）。
+              产物与权重同目录同名：<code>best.pt</code> → <code>best.onnx</code> / <code>best.transd.onnx</code>。
+            </p>
+            <label>权重 .pt
+              <div class="row">
+                <input type="text" id="expWeights" placeholder="…\weights\best.pt">
+                <button type="button" class="mini" data-browse="expWeights" data-mode="file">浏览</button>
+                <button type="button" class="mini" id="btnPickBest">用当前实验 best.pt</button>
+              </div>
+            </label>
+            <div class="grid2">
+              <label>导出尺寸 imgsz
+                <input type="number" id="expImgsz" value="640" step="32" min="32" max="2048">
+              </label>
+              <label>opset（留空用默认）
+                <input type="text" id="expOpset" placeholder="留空">
+              </label>
+            </div>
+            <div class="actions">
+              <label class="check-row"><input type="checkbox" id="expTransd" checked> 生成 .transd.onnx</label>
+              <label class="check-row"><input type="checkbox" id="expSimplify" checked> simplify</label>
+              <label class="check-row"><input type="checkbox" id="expDynamic"> dynamic</label>
+              <label class="check-row"><input type="checkbox" id="expHalf"> half（需 GPU）</label>
+            </div>
+            <div class="actions">
+              <button type="button" class="primary" id="btnExport">开始导出</button>
+              <button type="button" id="btnStopExport" disabled>停止导出</button>
+              <span class="hint" id="exportHint"></span>
+            </div>
+            <div class="scrollbox" id="exportTableBox" hidden>
+              <table class="data-table" id="exportTable">
+                <thead>
+                  <tr><th>产物</th><th>路径</th><th>操作</th></tr>
+                </thead>
+                <tbody id="exportRows"></tbody>
+              </table>
+            </div>
+            <pre class="log log-mini" id="exportLog" hidden></pre>
           </details>
         </div>
 

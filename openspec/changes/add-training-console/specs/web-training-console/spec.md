@@ -77,3 +77,42 @@
 
 - **WHEN** 调用方仍使用旧的 `--resume` 布尔开关（例如 Qt 版）
 - **THEN** 行为与升级前一致，`--resume-from` 未出现时不改变任何既有参数语义
+
+### Requirement: 训练产物导出 ONNX
+
+系统 SHALL 允许用户在训练页直接把 `.pt` 权重导出为 ONNX，并可选生成 `.transd.onnx`（输出转置为 `[batch, anchors, channels]`），无需回到命令行。
+
+#### Scenario: 导出 detect 权重
+
+- **WHEN** 用户选择 `best.pt`、`imgsz=320` 并勾选「生成 .transd.onnx」后点击「开始导出」
+- **THEN** 后端以 `--mode export` 启动 launcher 子进程，日志与产物经 `WS /ws/runs/{id}` 推送
+- **AND** 产物为与权重同目录同名的 `best.onnx` 与 `best.transd.onnx`
+- **AND** 结果表对 `.transd.onnx` 提供「去编译引擎」按钮，点击后切到引擎页并自动探测输入输出形状
+
+#### Scenario: 任务类型与权重不匹配
+
+- **WHEN** 用户对 `yolov8n-seg.pt` 提交 `task=detect`
+- **THEN** 导出以权重自带任务为准（`segment`），并发出 `task_overridden` 事件说明改了什么
+- **AND** 不静默生成一个通道数与任务不符的 ONNX
+
+#### Scenario: 分割模型的输出顺序
+
+- **WHEN** 导出 `segment` 任务的 `.transd.onnx`
+- **THEN** 图输出顺序为 `[proto, 检测头]`，proto 保持 `[1, 32, H, W]`，检测头为 `[1, anchors, 4+nc+32]`
+- **AND** 该顺序与 C++ 引擎对 V8Seg 的 binding 约定一致
+
+#### Scenario: 转置失败不影响原始 ONNX
+
+- **WHEN** 通道数与任务不匹配（如用 detect 权重配 `pose`）导致无法生成 `.transd.onnx`
+- **THEN** 系统发出 `TRANSD_FAILED` 错误事件并保留已成功导出的原始 ONNX
+- **AND** 不产出结构错误的 `.transd.onnx`
+
+#### Scenario: 参数非法提前拒绝
+
+- **WHEN** `imgsz` 不是 32 的倍数或超出 `32~2048`
+- **THEN** 接口直接返回 400 并说明取值范围，不启动导出进程
+
+#### Scenario: 不生成转置版本
+
+- **WHEN** 用户取消勾选「生成 .transd.onnx」
+- **THEN** 命令行传 `--make-transd false`，只产出 `best.onnx`，结果表不出现「去编译引擎」按钮

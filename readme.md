@@ -133,6 +133,56 @@ python tf_anomalib_launcher.py --mode check-env
 
 ## 版本更新记录
 
+### v1.15 — 2026-11-02（导出 ONNX 进页面 + 四种任务头的 `.transd.onnx` 全部修通）
+
+上一版把「开跑前」和「中断后」补上了，这一版补的是**链路最后一环**：训练完的 `best.pt`
+以前只能回命令行才变得成引擎，而且分割/姿态/旋转框的 `.transd.onnx` 实际上从未跑通过。
+
+| 项目 | 老版本 | 新版本 | 影响 |
+| --- | --- | --- | --- |
+| 导出入口 | 页面叫「训练导出」但只有训练；导出要敲 `--mode export --make-transd true` | 训练页新增「导出 ONNX」折叠块：选权重（可一键取当前实验 `best.pt`）、imgsz/opset/dynamic/half/simplify、勾选是否生成 `.transd.onnx` | 训练 → 导出 → 编译 → 推理全程不用离开浏览器 |
+| 导出后衔接 | 手填 ONNX 路径到引擎页 | 结果表 `.transd.onnx` 行有「去编译引擎」，点击自动切页 + 填路径 + 触发形状探测 | 少一次「我该填哪个文件」的困惑 |
+| 转置定位 | 取 `graph.node[-1]`，即「图里最后一个节点」 | 按形状识别预测头（3 维输出；多个时用通道<anchors 裁决） | 图末尾多一个 Cast/Concat 不会再静默转错 |
+| 任务校验 | 不校验，错了留到推理时报 `expects channels=56` | 转置前按任务校验：pose=56、obb≥6、segment 需 proto 且通道 > 4+proto | 导出阶段就能看出「任务选错了」 |
+| **分割转置** | **未实现**（只转一个输出，且 proto 在 binding 2） | **proto 提到 binding 1**，检测头转成 `[1, anchors, 4+nc+32]` | 以前分割引擎**编译能过、推理必报** `channel layout invalid`；现在可用 |
+| 任务不匹配 | 用 `--task detect` 导 seg 权重会产出通道 116 的「检测头」 | 以权重自带 task 为准，打印 `task_overridden` | 少一类最难查的错 |
+| 转置失败 | 抛异常，整个导出判失败 | 只报 `TRANSD_FAILED`，**保留已导出的原始 ONNX** | 至少还有原始 ONNX 可用 |
+
+**必须记住的一条**：C++ 侧对 `V8Seg` 直接读 `static_dims(1)` 当 proto、`static_dims(2)` 当检测头，
+而 Ultralytics 导出的顺序是「检测头在前、proto 在后」。**必须在生成 `.transd.onnx` 时重排**，
+否则 trtexec 编译成功、推理时才炸——这是本次唯一一处「不修就等于功能不存在」的地方。
+
+**两处刻意的取舍**
+
+1. **导出仍写成任务（子进程 + WebSocket），不做同步接口**。导出要加载 torch 与权重，实测 2~30 秒，
+   同步会卡住整个事件循环；复用训练那套机制，日志与「停止」按钮都不用重写。
+2. **产物不做「另存为」**。与 Ultralytics 保持一致：`best.pt` → 同目录 `best.onnx` / `best.transd.onnx`。
+   少一个输出目录参数，就少一类「ONNX 在哪」的问题；需要保留旧产物就先复制一份权重。
+
+验收（全部实测）：
+
+- 新增 `test_transd_onnx.py` **17/17**：四任务头转置、预测头不在末尾、动态维保留 `dim_param`、
+  分割输出重排、通道数不符/缺 proto 时报错。
+- 新增 `test_export_request.py` **24/24**：开关透传、`--simplify` 不能跟值（踩过）、非法 imgsz/task 提前拒绝。
+- 回归 12 个后端脚本全绿：`test_annotation_project`(138)、`test_infer_params`(71)、
+  `test_onnx_fallback`(36)、`test_train_info`(34)、`test_augment_params`(26)、`test_engine_progress`(26)、
+  `test_aug_preview`(24)、`test_checkpoints`(22)、`test_dataset_workbench`(20)、`test_exit_codes`(6)；
+  前端 `test_contrast`(23)、`test_viewer_math`(37)。
+- **四任务头真链路**（导出 → `.transd.onnx` → trtexec → DLL 推理）：
+
+| 任务 | `.transd.onnx` 输出 | 引擎编译 | 推理结果 |
+| --- | --- | --- | --- |
+| detect | `[1, 2100, 84]` | 340 s | `pcb_best.transd.onnx`（10 类）→ 313 s 编译，PCB 图片出 1 框（conf 0.585） |
+| segment | proto `[1,32,80,80]` + 头 `[1,2100,116]` | 340 s | `bus.jpg` 4 框，全部 `has_mask=true` |
+| pose | `[1, 2100, 56]` | 370 s | `zidane.jpg` 2 人，各 17 个关键点（置信度 0.87） |
+| obb | `[1, 2100, 20]` | 368 s | `plane2.jpg` 11 个旋转框，带角度 |
+
+- 浏览器实测：真实 PCB `best.pt` → 导出 **6.5 秒**出 `pcb_best.onnx`(12.1 MB) 与
+  `pcb_best.transd.onnx`(输出 `[1,2100,10]`)，点「去编译引擎」自动切页并探测出
+  「布局正确，可以编译」。
+
+细节见 `6-web/README.md` 的 v1.15 小节与 `docs/WORKFLOW_GUIDE.md` 的 §4.1.1。
+
 ### v1.14 — 2026-11-01（训练前体检：数据集概览、增强预览、断点续训）
 
 上一版解决了「训练中看得见」，这一版解决「开跑前看得见」。三个功能都指向同一类返工：
@@ -585,7 +635,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_web_studio.ps1
 
 | 页面 | 能力 |
 | --- | --- |
-| 训练导出 | 选 YOLO / Anomalib、填参数（含优化器/学习率/workers/patience/amp/resume）、环境自检、实时日志、参数回显、阶段与 `epoch n/N` 进度、每轮耗时与预计剩余、每轮指标表、loss/mAP 内联 SVG 曲线、一键停止；**v1.14 新增**数据集概览（漏标/孤儿标/类别分布/分辨率）、增强预览（原图 vs 增强后）、断点续训（扫历史 run → 一键续训） |
+| 训练导出 | 选 YOLO / Anomalib、填参数（含优化器/学习率/workers/patience/amp/resume）、环境自检、实时日志、参数回显、阶段与 `epoch n/N` 进度、每轮耗时与预计剩余、每轮指标表、loss/mAP 内联 SVG 曲线、一键停止；v1.14 新增数据集概览（漏标/孤儿标/类别分布/分辨率）、增强预览（原图 vs 增强后）、断点续训（扫历史 run → 一键续训）；**v1.15 新增导出 ONNX**（四任务头 / `.transd.onnx` / 一键送去编译） |
 | 引擎构建 | 选 ONNX 自动探测形状、fp16/fp32、动态 shape、实时编译日志、8 阶段进度条 + 预计剩余（历史耗时自学习）、产物落盘校验 |
 | 数据集 | 扫描 YOLO 目录 / `.tfanno`、固定哈希划分预览、导出 YOLO / COCO / VOC |
 | 标注 | 打开 / 新建 `.tfanno`、六种形状绘制（矩形/旋转矩形/多边形/线/点/关键点组）、缩放平移吸附、撤销重做、3 秒自动保存、修订号冲突弹窗、类别与属性面板、自动标注草稿层、导出 YOLO / COCO / VOC |
