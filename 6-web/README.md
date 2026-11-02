@@ -362,8 +362,64 @@ train_export（训练 + 导出 ONNX + 校准 metadata） → probe（校验 meta
 | best F1 阈值 | 扫全部唯一分数找最优 F1 | 只作参考，不会回写 metadata |
 | decision_mismatch | 报告判定与引擎判定不一致的张数 | 非 0 说明归一化口径有偏差，需排查 |
 
-**像素级暂不提供**：需要 ground_truth 掩码，PRO/AUPRO 成本远高于图像级；卡片里会写明
-「不可用」及原因，而不是给一个空白数字。
+#### 像素级诊断（v1.22）
+
+**老版本**只有图像级 AUROC，`pixel` 块是写死的 `{"available": false, "reason": "本版只做图像级"}`。
+**新版本**用引擎本来就返回的归一化异常图算出三项诊断，不解掩码：
+
+| 指标 | 字段 | 含义 | 好模型的期望 |
+| --- | --- | --- | --- |
+| 好图乱指像素 | `diagnostic.normal_false_pixel_rate` | 正常图上被判为缺陷的像素占比（所有正常图取平均） | 接近 0 |
+| 异常图定位面积 | `diagnostic.abnormal_marked_rate` | 异常图上超阈值像素占比（异常图取平均） | 小而集中 |
+| 指不出位置 | `diagnostic.abnormal_undirected` | 引擎判 NG、但异常图里没有任何像素达标的张数 | **0**（非 0 是硬伤） |
+
+**判定线是 0.5，不是 `pixel_threshold`**
+
+`anomalib_infer_c.cpp:479` 在返回异常图前已经归一化过一次：
+
+    normalizedMap = ((rawMap - pixel_threshold) / (mapMax - mapMin)) + 0.5
+
+所以恰好等于 `pixel_threshold` 的像素在返回图上就是 `0.5`，DLL 自己生成缺陷掩码时也是
+`threshold(displayMap, mask, 0.5, ...)`（`:499`）。拿 `pixel_threshold`（例如 `0.172`）去比，
+会把绝大多数像素判成异常——报告立刻变成"好板上到处是缺陷"。
+
+**报告字段**
+
+```json
+"pixel": {
+  "available": true,
+  "mode": "diagnostic",
+  "auroc": null,
+  "auroc_reason": "像素级 AUROC / PRO / AUPRO 需要 ground_truth 掩码…",
+  "reason": null,
+  "diagnostic": {
+    "cutoff": 0.5,
+    "normal_false_pixel_rate": 0.0,
+    "abnormal_marked_rate": 0.16195,
+    "abnormal_undirected": 0,
+    "pixel_skipped": 0,
+    "map_size": [224, 224],
+    "images": { "normal": 4, "abnormal": 4 }
+  }
+}
+```
+
+| 字段 | 应用场景 |
+| --- | --- |
+| `mode` | `diagnostic`（无掩码）/ `mask`（后续版本有掩码时） |
+| `auroc` | 无掩码恒为 `null`，不要拿它当"精度 0" |
+| `reason` | 跳过张数、尺寸不统一等提示；正常时为 `null` |
+| `pixel_skipped` | 异常图缺失或尺寸为 0 的图数，不影响其余图 |
+| `map_size` | 异常图分辨率，用于判断阈值该量级 |
+
+CSV 同时多一列 `pixel_above_ratio`，可以直接定位到"哪一张图在乱指"。
+
+**为什么不算像素级 AUROC / PRO / AUPRO**
+
+三者都需要 ground_truth 掩码，当前数据集只有 `good` / `bad` 两个目录
+（`Folder` 数据模块没配掩码）。用整图标签冒充像素标签能算出数字，但它在惩罚模型
+"把好区域判正常"，比不给数字更有害。掩码目录的约定（显式 `--mask-dir` 优先、
+其次 MVTec 风格 `ground_truth/<类别>/*_mask.png`）已定为下一版接口。
 
 **跳过训练**适合反复调编译参数：填上次的 `weights/lightning` 目录，`probe → build → val`
 照常跑，不必再等训练。
@@ -1482,6 +1538,9 @@ D:\Anaconda3\envs\dpenv\python.exe 6-web\backend\tools\test_native_dialog.py
 
 # metadata 推荐值回显（不需要 GPU：真读临时 metadata.json + TestClient 打接口）
 D:\Anaconda3\envs\dpenv\python.exe 6-web\backend\tools\test_metadata_readout.py
+
+# 像素级诊断（纯 numpy：合成异常图，不需要 GPU / DLL / 掩码）
+D:\Anaconda3\envs\dpenv\python.exe 6-web\backend\tools\test_anomaly_pixel.py
 ```
 
 2026-10-29 实测结果：`smoke_test` **13 项全通过**（能力探测、参数校验、越权拦截、

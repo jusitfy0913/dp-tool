@@ -588,6 +588,10 @@ button.danger:hover:not(:disabled) { background: var(--danger-a12); border-color
 }
 .stat-label { color: var(--text-dim); font-size: var(--fs-2xs); letter-spacing: .04em; }
 .stat b { color: var(--cyan); font-size: var(--fs-lg); font-weight: 600; font-family: var(--font-mono); }
+/* 硬伤行：数值本身说明问题（如「指不出位置 3 张」），用红色比加感叹号更直接 */
+.stat.is-warn { border-color: var(--danger-a45); background: var(--danger-a12); }
+.stat.is-warn b { color: var(--danger); }
+.stat.is-warn .stat-label { color: var(--danger); }
 
 /* 每类实例数条形：长度相对最多的类，0 用红色实心块标出，比「0」这个数字更醒目 */
 .bars { display: flex; flex-direction: column; gap: 3px; margin-top: var(--sp-3); }

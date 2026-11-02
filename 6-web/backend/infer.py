@@ -791,12 +791,17 @@ def run_anomalib_score(
     model_type: str = "Auto",
     image_threshold: float = -1.0,
     pixel_threshold: float = -1.0,
+    want_map: bool = False,
 ) -> dict:
     """只取分数与判定，不渲染任何 PNG。
 
     精度评估要逐张跑几千次，`run_anomalib` 每次都会编码叠加图/轮廓图/热能图/原图
     四张 PNG 并拷贝出指针内容，一张 1080p 的图光编码就要几十毫秒，整体耗时
     会被图片编码彻底主导（推理本身只有几毫秒）。这里只搬运三个标量。
+
+    `want_map=True` 时额外把 `normalized_map` 拷成 numpy 副本（`anomaly_map`）：
+    像素级诊断要的就是这张图，拷一份 float 的比重编码成 PNG 便宜得多。
+    DLL 的指针只在下一次推理前有效，所以必须在锁内当场拷走。
 
     判定用 DLL 的 `is_anomaly`：评估报告里的漏检率必须与页面上单张推理的判定
     完全一致，自己拿 raw_score 再判一次是引入分歧的最短路径。
@@ -826,6 +831,16 @@ def run_anomalib_score(
         if code != 0:
             raise InferError(_lib_error(lib, "ai_infer_rgb"))
         result = result_ptr.contents
+        anomaly_map = None
+        if want_map and result.normalized_map and result.map_w > 0 and result.map_h > 0:
+            # 与 _render_heatmap 同一套搬法，只是不放大、不上色、不编码
+            count = int(result.map_w) * int(result.map_h)
+            raw_map = ctypes.string_at(
+                ctypes.cast(result.normalized_map, ctypes.c_void_p), count * 4
+            )
+            anomaly_map = np.frombuffer(raw_map, dtype=np.float32).reshape(
+                int(result.map_h), int(result.map_w)
+            ).astype(np.float32, copy=True)
         return {
             "raw_score": float(result.raw_score),
             "normalized_score": float(result.normalized_score),
@@ -833,6 +848,7 @@ def run_anomalib_score(
             "total_ms": float(stat.total_ms),
             "image_width": width,
             "image_height": height,
+            "anomaly_map": anomaly_map,
         }
 
 

@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
-"""异常检测（Anomalib）的精度口径：图像级 AUROC / F1 / 误报率 / 漏检率。
+"""异常检测（Anomalib）的精度口径：图像级 AUROC / F1 / 误报率 / 漏检率，
+以及无需 ground_truth 掩码的像素级诊断（乱指率 / 定位面积 / 指不出位置）。
 
 ## 为什么不复刻 anomalib 自己的 metric
 
@@ -197,3 +198,123 @@ def pixel_auroc_from_histograms(
     fpr = np.concatenate([[0.0], fpr])
     area = float(np.trapezoid(tpr, fpr)) if hasattr(np, "trapezoid") else float(np.trapz(tpr, fpr))
     return max(0.0, min(1.0, area))
+
+
+# ---------------------------------------------------------------------------
+# 像素级诊断（无需 ground_truth 掩码）
+#
+# ## 为什么判定线是 0.5 而不是 pixel_threshold
+#
+# DLL（`anomalib_infer_c.cpp:479`）在返回异常图之前已经做过一次归一化：
+#
+#     normalizedMap = ((rawMap - pixel_threshold) / (mapMax - mapMin)) + 0.5
+#
+# 也就是说「恰好等于 pixel_threshold 的像素」在返回的图上就是 **0.5**，
+# 高于阈值 → > 0.5，低于阈值 → < 0.5（并夹到 [0,1]）。DLL 自己生成缺陷掩码时
+# 也是 `threshold(displayMap, mask, 0.5, ...)`（`:499`）。
+#
+# 所以这里必须用 0.5 当判定线。若照字面拿 `pixel_threshold` 去比（比如 0.172），
+# 会把几乎所有像素都算成异常，得出"好板上 40% 是缺陷"这种荒谬结论——
+# 与图像级那个 `normalized >= 0.5` 的坑是同一个，只是换到了像素上。
+# ---------------------------------------------------------------------------
+
+PIXEL_MAP_CUTOFF = 0.5
+
+
+def pixel_ratio_above(
+    anomaly_map: Any, cutoff: float = PIXEL_MAP_CUTOFF
+) -> float | None:
+    """归一化异常图里被判为异常的像素占比；拿不到有效图时返回 None。
+
+    `anomaly_map` 是 DLL 返回的 `normalized_map`（float32 二维，已以
+    `pixel_threshold` 为中心归一化），判定线固定 `>= 0.5`，见上方说明。
+    """
+    if anomaly_map is None:
+        return None
+    values = np.asarray(anomaly_map, dtype=np.float64)
+    if values.size == 0:
+        return None
+    if values.ndim != 2:
+        # 一维或三维说明搬错了内存布局，宁可不算也不要给一个错的占比
+        return None
+    above = int(np.count_nonzero(values >= float(cutoff)))
+    return above / float(values.size)
+
+
+def _mean_or_none(values: Sequence[float]) -> float | None:
+    """均值；空列表返回 None（不是 0）——"没有样本"和"全是 0"必须能区分。"""
+    items = [float(value) for value in values if value is not None]
+    if not items:
+        return None
+    return round(sum(items) / len(items), 6)
+
+
+def pixel_diagnostics(
+    samples: Sequence[dict],
+    skipped: int = 0,
+    cutoff: float = PIXEL_MAP_CUTOFF,
+) -> dict:
+    """由逐图统计汇总像素级诊断结论。
+
+    `samples` 每项形如：
+        {"label": 0 | 1, "pred": 0 | 1, "above": float | None, "size": (w, h)}
+
+    其中 `label` 是人工标签（0 正常 / 1 异常），`pred` 是引擎判定，
+    `above` 是该图异常图中被判为异常的像素占比（`pixel_ratio_above` 的结果）。
+
+    三个指标回答三个不同问题：
+      - `normal_false_pixel_rate`：好板上被乱指的比例。期望接近 0。
+      - `abnormal_marked_rate`：异常图上报出缺陷的面积占比。小而集中才算定位成功。
+      - `abnormal_undirected`：引擎说这张图坏、但图上没有一个像素达标。
+        这是硬伤——分数与位置自相矛盾，比"定位面积偏大"严重得多。
+    """
+    valid = [s for s in samples if s.get("above") is not None]
+    if not valid:
+        return {
+            "available": False,
+            "mode": "diagnostic",
+            "auroc": None,
+            "reason": (
+                "引擎未返回可用的归一化异常图，无法做像素级诊断"
+                if not samples
+                else "所有图片的异常图均为空或尺寸为 0，无法做像素级诊断"
+            ),
+            "diagnostic": None,
+        }
+
+    normal = [s for s in valid if int(s.get("label", 0)) == 0]
+    abnormal = [s for s in valid if int(s.get("label", 0)) == 1]
+    # 「判 NG 却指不出位置」按引擎判定统计，正常图被误报 NG 且无边也一样计入：
+    # 那同样是一句无法支撑的结论，只是错的方向不同。
+    undirected = sum(
+        1
+        for s in valid
+        if int(s.get("pred", 0)) == 1 and float(s["above"]) <= 0.0
+    )
+
+    sizes = [tuple(int(v) for v in s["size"]) for s in valid if s.get("size")]
+    map_size = list(sizes[0]) if sizes else None
+    # 尺寸不统一说明中途换了引擎或输入尺寸，指标之间不可比，得说出来
+    size_mixed = any(size != tuple(map_size) for size in sizes) if map_size else False
+
+    reason = None
+    if size_mixed:
+        reason = "异常图尺寸不统一，各图占比不可直接横向比较"
+    elif skipped > 0:
+        reason = f"有 {skipped} 张图未参与像素统计（异常图缺失或尺寸为 0）"
+
+    return {
+        "available": True,
+        "mode": "diagnostic",
+        "auroc": None,
+        "reason": reason,
+        "diagnostic": {
+            "cutoff": float(cutoff),
+            "normal_false_pixel_rate": _mean_or_none([s["above"] for s in normal]),
+            "abnormal_marked_rate": _mean_or_none([s["above"] for s in abnormal]),
+            "abnormal_undirected": undirected,
+            "pixel_skipped": int(skipped),
+            "map_size": map_size,
+            "images": {"normal": len(normal), "abnormal": len(abnormal)},
+        },
+    }

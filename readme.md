@@ -133,6 +133,58 @@ python tf_anomalib_launcher.py --mode check-env
 
 ## 版本更新记录
 
+### v1.22 — 2026-11-02（异常检测能说清「缺陷找没找准」了）
+
+以前的异常检测精度只回答一个问题：**这张图有没有缺陷**（图像级 AUROC）。
+但产线上更常见的失败是另一种：**判对了却说不出缺陷在哪**——分数报了 NG，热能图一片平坦，
+或者好板上到处点红点。这种问题在报告里一个字都看不到，因为 `pixel` 块是写死的常量。
+
+这一版不解掩码，用引擎本来就返回的归一化异常图算出三项诊断，让"能判不能定位"暴露出来。
+
+| 项目 | 老版本（v1.21） | 新版本（v1.22） | 影响 |
+| --- | --- | --- | --- |
+| `pixel` 块 | 常量 `{"available": false, "reason": "本版只做图像级"}` | 按真实异常图计算，`mode="diagnostic"` | 报告第一次有了像素信息 |
+| 好图乱指 | 无 | `normal_false_pixel_rate`：正常图上被判缺陷的像素占比 | 好板被点红多少，一眼可见 |
+| 定位面积 | 无 | `abnormal_marked_rate`：异常图上超阈值像素占比 | 区分「小而集中」与「糊成一片」 |
+| 指不出位置 | 无 | `abnormal_undirected`：判 NG 但异常图无一个像素达标 | 分数与位置自相矛盾，硬伤直接暴露 |
+| 引擎搬运 | `run_anomalib_score` 只搬 3 个标量 | 新增 `want_map=True`，拷 `normalized_map` 副本 | 评估链路仍然不编码 PNG，8 张图 1 秒 |
+| CSV | 6 列 | 多一列 `pixel_above_ratio` | 能定位到具体哪张图乱指 |
+| 界面 | 10 个指标块 | 多 3 行，「指不出位置」> 0 时整行标红 | 不用翻 JSON 也能看见硬伤 |
+
+**判定线是 0.5，不是 `pixel_threshold`**
+
+DLL 在返回异常图之前已经做过一次归一化：
+
+    normalizedMap = ((rawMap - pixel_threshold) / (mapMax - mapMin)) + 0.5
+
+所以「恰好等于 `pixel_threshold` 的像素」在返回的图上就是 `0.5`，DLL 自己生成缺陷掩码时
+也是 `threshold(displayMap, mask, 0.5, ...)`。照字面拿 `pixel_threshold`（例如 `0.172`）去比，
+会把绝大多数像素算成异常，报告立刻变成"好板上 40% 是缺陷"——和图像级那个
+`normalized >= 0.5` 的坑是同一个，只是换到了像素上。
+
+**为什么不顺便算像素级 AUROC / PRO / AUPRO**
+
+三者的分母都需要 ground_truth 掩码，而当前数据集只有 `good` / `bad` 两个目录
+（`Folder` 数据模块没配掩码目录）。拿整图标签冒充像素标签能算出一个数，
+但它在惩罚模型"把好区域判正常"，比不给数字更有害。所以 `pixel.auroc` 明确为 `null`，
+`pixel.auroc_reason` 写明原因。掩码目录的两种约定（`--mask-dir` 优先、
+其次 MVTec 风格 `ground_truth/<类别>/*_mask.png`）已记录，留给下一版。
+
+**验收**
+
+- 新增 `test_anomaly_pixel.py` **36/36**：判定线边界（`0.499` / `0.5` / `0.501`）、
+  「0.2 的图不会被当成整幅异常」、占比计算、`None` / 空图 / 一维 / 三维输入、
+  「没有样本」与「全是 0」必须区分、尺寸不统一要说出来、无掩码时 `auroc` 必须为 `null`。
+- 回归 `run_all_tests.py`：**24 个脚本全绿**。
+- 真跑：bottle 数据集（Patchcore / fp16，正常 4 张 + 异常 4 张）→ AUROC `1.0000`、
+  好图乱指 `0.000%`、定位面积 `16.20%`、指不出位置 `0`，异常图 `224×224`，
+  产物同时写出 `anomaly_val_report.json` 与带 `pixel_above_ratio` 列的 CSV。
+- 浏览器实测：卡片多出「好图乱指像素 / 异常图定位面积 / 指不出位置」三行；
+  把 `abnormal_undirected` 改成 3 后该行变成 `stat is-warn`（红底红字）；
+  旧报告（`available=false`）仍只显示一行原因，不会留空数字。
+
+细节见 `6-web/README.md` 的「像素级诊断（v1.22）」与 `docs/WORKFLOW_GUIDE.md` 的 §7.2.1。
+
 ### v1.21 — 2026-11-02（推理页把 metadata 的推荐阈值摆到台面上）
 
 勾了「沿用 metadata 默认阈值」之后，两个阈值输入框只是被置灰，框里留着默认 `0.5`。

@@ -10,9 +10,9 @@
 | | YOLO | Anomalib |
 | --- | --- | --- |
 | 标签 | 每张图若干框 | 每张图 OK / NG 一个标签 |
-| 主指标 | mAP50 / mAP50-95 | 图像级 AUROC |
+| 主指标 | mAP50 / mAP50-95 | 图像级 AUROC + 免掩码像素诊断 |
 | 阈值 | `conf` 用来过滤框 | metadata 的 `image_threshold` 决定 OK/NG |
-| 验收口径 | mAP 越高越好 | 漏检 = 0，误报率 < 5% |
+| 验收口径 | mAP 越高越好 | 漏检 = 0，误报率 < 5%，指不出位置 = 0 |
 
 用法（在 6-web/backend 目录下）：
 
@@ -22,7 +22,7 @@
 
 产物：
     anomaly_val_report.json   指标 + 每张图的分数与判定（供前端展示与回溯）
-    anomaly_val_report.csv    每张图一行，给 Excel
+    anomaly_val_report.csv    每张图一行，给 Excel（含 pixel_above_ratio 列）
 
 事件：每 10 张（或 0.5 秒）打一条 `TRTFORGE_JSON {...}`，与其他脚本同一套协议。
 """
@@ -99,9 +99,11 @@ def write_csv(path: Path, rows: list[dict]) -> None:
     with path.open("w", encoding="utf-8-sig", newline="") as handle:
         writer = csv.writer(handle, lineterminator="\n")
         writer.writerow(
-            ["file", "label", "raw_score", "normalized_score", "pred", "correct", "total_ms"]
+            ["file", "label", "raw_score", "normalized_score", "pred", "correct",
+             "pixel_above_ratio", "total_ms"]
         )
         for row in rows:
+            above = row.get("pixel_above")
             writer.writerow([
                 row["file"],
                 "NG" if row["label"] == 1 else "OK",
@@ -109,6 +111,7 @@ def write_csv(path: Path, rows: list[dict]) -> None:
                 f"{row['normalized_score']:.6f}",
                 "NG" if row["pred"] == 1 else "OK",
                 "1" if row["pred"] == row["label"] else "0",
+                "" if above is None else f"{above:.6f}",
                 f"{row.get('total_ms', 0.0):.2f}",
             ])
 
@@ -185,6 +188,8 @@ def main(argv: list[str]) -> int:
     started = time.time()
     rows: list[dict] = []
     failed: list[dict] = []
+    pixel_samples: list[dict] = []
+    pixel_skipped = 0
     last_emit = 0.0
 
     for index, (image_path, label) in enumerate(jobs, start=1):
@@ -198,7 +203,12 @@ def main(argv: list[str]) -> int:
                     str(metadata_path),
                     image,
                     model_type=args.model_type,
+                    want_map=True,
                 )
+                # 像素级诊断：只要占比与尺寸，异常图本身用完即弃
+                # （一张 256×256 的 float 图 256KB，几千张攒下来就是几百 MB）
+                anomaly_map = result.get("anomaly_map")
+                ratio = anomalymetrics.pixel_ratio_above(anomaly_map)
                 rows.append({
                     "file": str(image_path),
                     "label": label,
@@ -206,7 +216,18 @@ def main(argv: list[str]) -> int:
                     "normalized_score": result["normalized_score"],
                     "pred": 1 if result["is_anomaly"] else 0,
                     "total_ms": result.get("total_ms", 0.0),
+                    "pixel_above": ratio,
                 })
+                if ratio is None:
+                    pixel_skipped += 1
+                else:
+                    height, width = anomaly_map.shape
+                    pixel_samples.append({
+                        "label": label,
+                        "pred": 1 if result["is_anomaly"] else 0,
+                        "above": ratio,
+                        "size": (int(width), int(height)),
+                    })
             except Exception as exc:  # noqa: BLE001 - 单张失败不该毁掉整次评估
                 failed.append({"file": str(image_path), "error": f"{type(exc).__name__}: {exc}"})
 
@@ -247,6 +268,14 @@ def main(argv: list[str]) -> int:
         "normal": sum(1 for label in labels if label == 0),
         "abnormal": sum(1 for label in labels if label == 1),
     }
+    pixel = anomalymetrics.pixel_diagnostics(pixel_samples, skipped=pixel_skipped)
+    if pixel.get("available"):
+        # 没有掩码就只能做诊断：AUROC 需要逐像素真值，绝不能用整图标签凑
+        pixel["auroc_reason"] = (
+            "像素级 AUROC / PRO / AUPRO 需要 ground_truth 掩码，"
+            "当前数据集只有正常/异常两个目录，故只给诊断指标。"
+        )
+
     report: dict = {
         "kind": "anomaly",
         "model": {
@@ -268,11 +297,7 @@ def main(argv: list[str]) -> int:
             "best_f1": best,
             "decision_mismatch": mismatches,
         },
-        "pixel": {
-            "available": False,
-            "reason": "本版只做图像级：像素级需要 ground_truth 掩码，"
-                      "且 PRO/AUPRO 的成本远高于图像级，等有真实需求再加。",
-        },
+        "pixel": pixel,
         "elapsed": round(time.time() - started, 2),
         "note": "AUROC 用秩统计（Mann-Whitney U，同分取平均秩）；"
                 "阈值下指标以 metadata 的 image_threshold 判定，"
@@ -294,6 +319,15 @@ def main(argv: list[str]) -> int:
         "elapsed": report["elapsed"],
         "report": str(json_path),
     }
+    pixel_diag = (pixel.get("diagnostic") or {}) if pixel.get("available") else {}
+    if pixel_diag:
+        summary["pixel"] = {
+            "mode": pixel.get("mode"),
+            "normal_false_pixel_rate": pixel_diag.get("normal_false_pixel_rate"),
+            "abnormal_marked_rate": pixel_diag.get("abnormal_marked_rate"),
+            "abnormal_undirected": pixel_diag.get("abnormal_undirected"),
+            "skipped": pixel_diag.get("pixel_skipped"),
+        }
     if at_metadata:
         summary.update({
             "precision": at_metadata["precision"],
@@ -314,6 +348,14 @@ def main(argv: list[str]) -> int:
         )
     if mismatches:
         text += f" [警告] 与引擎判定有 {mismatches} 张不一致"
+    if pixel_diag:
+        normal_rate = pixel_diag.get("normal_false_pixel_rate")
+        marked = pixel_diag.get("abnormal_marked_rate")
+        undirected = pixel_diag.get("abnormal_undirected") or 0
+        text += " | 像素诊断"
+        text += f" 好图乱指={normal_rate:.3%}" if normal_rate is not None else " 好图乱指=n/a"
+        text += f" 定位面积={marked:.2%}" if marked is not None else " 定位面积=n/a"
+        text += f" 指不出位置={undirected} 张"
     print(text + f" 报告={json_path}", flush=True)
     return 0
 

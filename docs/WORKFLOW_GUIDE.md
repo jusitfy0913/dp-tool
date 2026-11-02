@@ -1014,6 +1014,27 @@ Invoke-WebRequest http://127.0.0.1:8060/api/capabilities
 # 验收线建议：漏检 = 0，误报率 < 5%
 ```
 
+#### 7.4.1 怎么看像素级诊断（v1.22）
+
+图像级 AUROC 只回答「这张图有没有缺陷」。**判对了却说不出缺陷在哪**是另一类失败，
+v1.22 起报告里多了一个 `pixel` 块专门暴露它，不需要掩码。
+
+| 指标 | 字段 | 含义 | 期望 | 看到不对劲先查什么 |
+| --- | --- | --- | --- | --- |
+| 好图乱指像素 | `pixel.diagnostic.normal_false_pixel_rate` | 正常图被判缺陷的像素占比均值 | 接近 0 | `pixel_threshold` 是否偏低；`anomaly_maps` 的 min/max 与导出时是否一致 |
+| 异常图定位面积 | `pixel.diagnostic.abnormal_marked_rate` | 异常图超阈值像素占比均值 | 小而集中 | 面积 > 50% 说明热力图糊了，只能报 NG 指不出位置 |
+| 指不出位置 | `pixel.diagnostic.abnormal_undirected` | 判 NG 但异常图无一个像素达标 | **0** | 非 0 是硬伤：分数与位置自相矛盾，先怀疑 fp16 溢出或阈值被手工改过 |
+
+**判定线为什么是 0.5**：DLL 返回的 `normalized_map` 已经以 `pixel_threshold` 为中心归一化过
+（`normalizedMap = ((rawMap - pixel_threshold) / (mapMax - mapMin)) + 0.5`），
+所以恰好等于阈值的像素在返回图上就是 `0.5`。拿 `pixel_threshold` 去比会把整幅图判成异常。
+
+**`pixel.auroc` 为什么是 `null`**：像素级 AUROC / PRO / AUPRO 都需要 ground_truth 掩码，
+当前数据集只有 `good` / `bad` 两个目录。用整图标签冒充像素标签算出来的数在惩罚模型
+「把好区域判正常」，比不给数字更有害。报告里的 `pixel.auroc_reason` 会写明这一点。
+
+想定位到具体哪张图在乱指，看 CSV 的 `pixel_above_ratio` 列（越大越可疑）。
+
 ### 7.5 目录批量 · 视频 · 摄像头（v1.16）
 
 推理页底部的「批量 · 视频 · 摄像头」卡片。**引擎、标签、任务类型、`conf` / `nms` 全部沿用上方

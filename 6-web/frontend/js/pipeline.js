@@ -455,10 +455,12 @@ function renderMetrics(record) {
   // 两条链的精度口径完全不同：检测是 mAP/P/R，异常检测是 AUROC/漏检/误报。
   // 用同一个渲染器 + 分支，而不是写两张卡片，是因为「有没有报告、报告在哪、
   // 怎么看历史」这些逻辑一模一样，复制一份只会让两边逐渐长得不一样。
-  const items = metrics.kind === "anomaly" ? anomalyMetricItems(metrics) : yoloMetricItems(metrics);
-  items.forEach(([label, text]) => {
+  const items = metrics.kind === "anomaly"
+    ? anomalyMetricItems(metrics).concat(pixelMetricItems(metrics))
+    : yoloMetricItems(metrics);
+  items.forEach(([label, text, flag]) => {
     const box = document.createElement("div");
-    box.className = "stat";
+    box.className = flag === "warn" ? "stat is-warn" : "stat";
     const span = document.createElement("span");
     span.className = "stat-label";
     span.textContent = label;
@@ -505,8 +507,33 @@ function anomalyMetricItems(metrics) {
   ];
   // 判定口径不一致时，报告里的漏检率不可信；这不是"精度差"，是"数据或阈值被改过"
   if (image.decision_mismatch) {
-    items.push(["⚠ 判定不一致", `${image.decision_mismatch} 张`]);
+    items.push(["⚠ 判定不一致", `${image.decision_mismatch} 张`, "warn"]);
   }
+  return items;
+}
+
+/// 像素级诊断的 3 行。
+/// 与图像级指标分开放：这三项回答的是「缺陷找没找准」，和「有没有判对」是两件事，
+/// 混在一列里会让人把"定位糊了"误读成"模型不准"。
+function pixelMetricItems(metrics) {
+  const pixel = metrics.pixel || {};
+  if (!pixel.available) {
+    // 不给空数字：说明为什么没这个数，比摆三个 "—" 有用
+    return [["像素级诊断", pixel.reason || "不可用（引擎未返回异常图）"]];
+  }
+  const diag = pixel.diagnostic || {};
+  const items = [
+    ["好图乱指像素", diag.normal_false_pixel_rate == null ? "n/a" : fmtPct(diag.normal_false_pixel_rate)],
+    ["异常图定位面积", diag.abnormal_marked_rate == null ? "n/a" : fmtPct(diag.abnormal_marked_rate)],
+  ];
+  const undirected = Number(diag.abnormal_undirected) || 0;
+  // 分数说坏、图上却一个像素都没超阈值：这是硬伤（分数与位置自相矛盾），
+  // 比"定位面积偏大"严重，所以只在 > 0 时标红；0 是正常值，不给红色制造焦虑
+  items.push(
+    undirected > 0
+      ? ["指不出位置", `${undirected} 张`, "warn"]
+      : ["指不出位置", "0 张"]
+  );
   return items;
 }
 
