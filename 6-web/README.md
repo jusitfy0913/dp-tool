@@ -694,6 +694,68 @@ job.json                     # 本次参数与耗时，便于复现
 5. `Ctrl+S` 手动保存；不按也会在停止编辑 3 秒后自动保存（保存不进撤销栈）。
 6. 「自动标注」展开后可生成草稿；「导出」选格式与目录。
 
+#### 导入已有 YOLO 标签（v1.19 新增）
+
+已经有 `data.yaml + images/ + labels/` 的数据集，不用先转格式：导入进来的框就是工程里
+**普通的标注对象**，可以拖动、改类别、改集合、删框，`Ctrl+S` 存成 `.tfanno`，
+再按需导出回 YOLO / COCO / VOC。原始 `labels/*.txt` **只读不改**。
+
+| 场景 | 用法 |
+| --- | --- |
+| 在已有 YOLO 数据集上改标 | 填 `data.yaml` → 预览 → 「导入并保存」，生成同名 `.tfanno`，txt 保持原样 |
+| 把 txt 数据集交给 Qt 继续标 | 导入后「另存为」`.tfanno`，用 `4-qt-studio` 打开，双向兼容 |
+| 合并两批数据 | 导入方式选「合并到当前工程」：类别按**名字**复用 id，同名图片默认跳过 |
+| 只要验证集 | 只勾 `val`，避免把训练集 692 张全塞进内存 |
+
+步骤：
+
+1. 左栏展开「导入 YOLO 数据集」，填 `data.yaml` 或数据集根目录；
+2. 勾选要导入的 split（`train` / `val` / `test`，只列出真实存在的目录）；
+3. 点「预览」：先核对任务类型、类别数、每 split 图片/框数、被跳过的脏数据，再决定导入；
+4. 「导入并保存」= 生成工程并立刻写盘；「导入」= 只进内存，之后自己 `Ctrl+S`。
+   任何参数改动都会作废上一次预览，防止拿旧报告导新数据源。
+
+参数说明：
+
+| 参数 | 默认 | 说明 |
+| --- | --- | --- |
+| `source` | 必填 | `data.yaml` / `.yml`，或数据集根目录（自动找 `data.yaml`，没有则按 `images/` 约定推断） |
+| `splits` | 全部 | 只导指定 split；所选 split 没有图片会直接报错，而不是生成空工程 |
+| `mode` | `new` | `new` 新建工程 / `merge` 合并到当前工程 |
+| `duplicate` | `skip` | 同名图片：`skip` 跳过 / `replace` 用 txt 覆盖标注 / `append` 追加成另一张 |
+| `task` | `auto` | 按标签每行字段数推断；手动指定时必须是 `detect` / `segment` / `pose` / `obb` |
+| `limit` | 5000 | 单次导入图片上限，超出会截断并在报告里说明 |
+
+YOLO → `.tfanno` 映射：
+
+| YOLO 输入 | 导入结果 |
+| --- | --- |
+| `data.yaml` 第 N 个 `names` | `classes[N]`，颜色用与 Qt 逐位一致的 `default_color(N)`，反复导入颜色不变 |
+| detect 行 `cls cx cy w h` | `rectangle`，2 个像素点（左上、右下） |
+| segment 行（≥6 且偶数个值） | `polygon`，N 个像素点 |
+| obb 行（8 个值） | `polygon`，4 个角点。**不存旋转框**：`.tfanno` 的旋转框只存 2 点 + 角度，而导出 OBB 只认前 4 个点，存旋转框会让再导出的标签丢角度 |
+| pose 行 | `keypoints` 单对象 + `keypoint_visibility`；可见性是 `0/1/2` 枚举，**不参与坐标夹取** |
+| 目录 `train`/`val`/`test` | `image.split`，保持原划分，导出时不会被重新洗牌 |
+| 图片路径 | 同盘时存**相对工程目录**（工程可整体搬移）；跨盘回退绝对路径 |
+
+脏数据处理（都计数并在报告里说明，不会中断整批）：
+
+| 情况 | 处理 |
+| --- | --- |
+| 标签类别号 ≥ `names` 长度 | 该框跳过（猜成别的类会直接污染训练标签） |
+| 归一化坐标轻微越界（≤5%） | 先夹回 `[0,1]` 换算，再把越界顶点夹到图像边界 |
+| 归一化坐标明显越界（>5%） | 整条丢弃（基本是解码错了） |
+| 字段数不足 / 非数字 | 跳过该行并计数 |
+| 有 txt 没图（孤儿标签） | 只警告，不导入（没有图就没有坐标系） |
+| 有图没 txt | 照常导入为 0 框 |
+| 同名图片（不同 split 重名） | `image.id` 自动加 `_2` 后缀，避免草稿串图 |
+
+#### 另存为（v1.19 新增）
+
+顶部「另存为」把当前工程写到输入框里的新路径，**不动原文件**。目标已存在时会先确认。
+换目录保存时，相对图片路径会自动改写成绝对路径——否则新工程按自己的目录解析相对路径，
+图片会全部裂开；状态栏会写明改了多少张。
+
 #### 快捷键
 
 | 键 | 作用 | 键 | 作用 |
@@ -805,8 +867,23 @@ POST {service}/predict    multipart/form-data
 | 类别名 | 只在推理页 | 标注页与推理页共用 `labels.py` 的配色与命名 |
 | 导出 | 只能导出推理结果图 | 工程级导出 YOLO / COCO / VOC，与数据集页同实现 |
 
-验收脚本：`python 6-web/backend/tools/test_annotation_project.py`（138 项），
+验收脚本：`python 6-web/backend/tools/test_annotation_project.py`（138 项）、
+`python 6-web/backend/tools/test_annotation_import.py`（63 项），
 外加浏览器实测六种形状、撤销重做、冲突弹窗、真实 `.engine` 自动标注与三种格式导出。
+
+#### v1.19 变更点（相对 v1.18.1）
+
+| 项 | v1.18.1 | v1.19 |
+| --- | --- | --- |
+| 已有 YOLO 标签 | 只能「批量加入图片」，框全丢 | 「导入 YOLO 数据集」：data.yaml + txt → 可编辑标注，预览后才落盘 |
+| 相对图片路径 | Qt 工程里存相对路径，浏览器直接拼给图片接口 → 全裂 | 载入时补 `resolved` 绝对路径（不写盘），前端统一用它取图 |
+| 保存到别处 | 只能靠「新建」时指定新路径 | 新增「另存为」，跨目录时自动把相对路径改成绝对路径 |
+| 重复导入 | 无概念 | 合并模式按类别名复用 id、按真实路径去重，整次导入一个撤销步骤 |
+
+新增文件：`backend/annotationimport.py`、`backend/tools/test_annotation_import.py`。
+改动文件：`backend/annotation.py`（`with_resolved_paths`）、`backend/dataset.py`
+（公开 `parse_yolo_label` / `guess_task`）、`backend/app.py`（`/api/annotation/import`）、
+`frontend/index.html`、`frontend/js/annotate.js`、`frontend/js/api.js`、`frontend/css/style.css`。
 
 #### v1.13 新增（训练与转换进度可视化）
 
@@ -976,6 +1053,7 @@ offset1 = cursor - p_image * scale1
 | GET | `/api/annotation/image?path=` | 图片流（支持中文与空格路径），MIME 按扩展名推断 |
 | GET | `/api/annotation/image-meta?path=` | 探测单张图片宽高，供「添加图片」填字段 |
 | POST | `/api/annotation/scan-images` | 递归扫描目录里的图片，返回路径与尺寸 |
+| POST | `/api/annotation/import` | **v1.19**：把 YOLO 数据集（`data.yaml` + `labels/*.txt`）导入工程；`dry_run` 只出报告 |
 | POST | `/api/annotation/export` | 把**内存中**的工程导出 YOLO / COCO / VOC |
 | POST | `/api/annotation/autolabel` | 本地引擎（必要时 + 外部服务）生成草稿，返回 `shapes` / `warnings` |
 
@@ -988,6 +1066,25 @@ offset1 = cursor - p_image * scale1
 | `rev` | int | 是 | 客户端基于的修订号；新建传 `-1` |
 | `stamp` | object | 否 | `{"mtime_ns":"...","size":123}`，识别「保存前文件被别人改过」 |
 | `force` | bool | 否 | `true` = 强制覆盖，跳过两项校验（冲突弹窗的「强制覆盖」） |
+
+`POST /api/annotation/import` 的请求体：
+
+| 字段 | 类型 | 默认 | 说明 |
+| --- | --- | --- | --- |
+| `source` | str | 必填 | `data.yaml` 或数据集根目录，必须在白名单根内 |
+| `project_path` | str | 空 | 目标 `.tfanno` 路径；决定图片存相对还是绝对、以及同名图片判定 |
+| `project` | object | 空 | **合并模式必填**：内存中的当前工程（磁盘上的可能是旧版本） |
+| `splits` | array | 全部 | 只导入指定 split |
+| `mode` | str | `new` | `new` / `merge` |
+| `duplicate` | str | `skip` | `skip` / `replace` / `append` |
+| `task` | str | `auto` | `auto` 或 `detect` / `segment` / `pose` / `obb` |
+| `limit` | int | 5000 | 单次导入图片上限（`1~20000`） |
+| `dry_run` | bool | `false` | `true` 只返回 `report` + `issues`，不返回 `project` |
+
+返回的 `report` 包含：`task` / `classes` / `images` / `objects` / `per_split` /
+`added_images` / `skipped_existing` / `replaced_images` / `empty_images` /
+`unknown_class_objects` / `orphan_labels` / `malformed_lines` / `out_of_range_objects` /
+`clamped_lines` / `clamped_points` / `truncated` / `path_mode` / `warnings`。
 
 `POST /api/annotation/autolabel` 的请求体：
 
@@ -1165,7 +1262,8 @@ offset1 = cursor - p_image * scale1
 │   ├── labels.py         标签文件解析 + 统一定义类别配色（后端绘制与前端共用）
 │   ├── models.py         训练产物扫描（引擎配对 ONNX / 标签 / metadata / 任务类型）
 │   ├── dataset.py        数据集扫描 / 固定哈希划分 / YOLO·COCO·VOC 导出
-│   ├── annotation.py     `.tfanno` 读写与规范化（2 点矩形 / 关键点单对象 / rev 乐观锁）
+│   ├── annotation.py     `.tfanno` 读写与规范化（2 点矩形 / 关键点单对象 / rev 乐观锁 / 相对路径解析）
+│   ├── annotationimport.py **v1.19**：YOLO 数据集导入（data.yaml 解析 / 坐标清洗 / 类别合并 / 去重 / 导入报告）
 │   ├── autolabel.py      自动标注双通道编排（本地引擎 + 可选外部 HTTP 服务）+ 草稿清洗
 │   ├── pipeline.py       **v1.17**：串联编排（阶段状态机 / 停止 / 重启遗留清理 / 磁盘持久化 / `resolve` 延迟派生命令）
 │   ├── anomalymetrics.py **v1.18**：异常检测指标（AUROC 秩统计 / 阈值混淆矩阵 / F1 最优阈值 / 直方图 AUROC）
@@ -1179,6 +1277,7 @@ offset1 = cursor - p_image * scale1
 │       ├── test_dataset_workbench.py  数据集工作台验收（划分 / 导出 / 错误路径）
 │       ├── test_infer_params.py       推理控制台验收（阈值 / 标签 / 配色 / LRU / 扫描 / 热能图）
 │       ├── test_annotation_project.py 标注工程验收（往返 / 冲突 / 回退 / 导出回读）
+│       ├── test_annotation_import.py  **v1.19**：YOLO 导入验收（四任务几何 / 脏数据 / 合并 / 去重 / PCB 冒烟）
 │       ├── test_engine_progress.py    构建进度与耗时估算验收（真实日志回放 + 自学习）
 │       ├── test_transd_onnx.py        .transd.onnx 转置验收（四任务头 / 输出重排 / 通道校验）
 │       ├── test_export_request.py     导出命令拼装验收（开关透传 / 非法参数提前拒绝）
@@ -1204,7 +1303,7 @@ offset1 = cursor - p_image * scale1
 │   │   ├── export.js     导出 ONNX 面板（权重选择 / 任务参数 / 产物表 / 一键送去编译）
 │   │   ├── engine.js     引擎构建页（阶段清单 + 估算进度 + 日志流 + 探测预警 + **v1.18.1** 输出路径规范化）
 │   │   ├── dataset.js    数据集页（扫描预览 + 导出）
-│   │   ├── annotate.js   标注工作台（Canvas 2D 六形状 / 缩放平移 / 吸附 / 撤销重做 / 自动保存 / 草稿层 / 导出）
+│   │   ├── annotate.js   标注工作台（Canvas 2D 六形状 / 缩放平移 / 吸附 / 撤销重做 / 自动保存 / 草稿层 / 导出 / **v1.19** 导入 YOLO 与另存为）
 │   │   ├── infer.js      推理控制台（模型扫描 / 参数联动 / 表格 / 直方图 / 导出）
 │   │   ├── inferbatch.js **v1.16**：目录批量 / 视频 / 摄像头（事件流、进度、结果表、canvas 叠框）
 │   │   ├── pipeline.js   **v1.17/v1.18**：全流程串联卡片（YOLO / Anomalib 双模式、阶段清单、产物表、精度卡片、历史记录）
@@ -1221,7 +1320,7 @@ offset1 = cursor - p_image * scale1
 **一条命令跑完全部后端测试**（v1.15 起，CI 与本地共用同一个入口）：
 
 ```powershell
-D:\Anaconda3\envs\dpenv\python.exe 6-web\backend\tools\run_all_tests.py      # 20 个脚本
+D:\Anaconda3\envs\dpenv\python.exe 6-web\backend\tools\run_all_tests.py      # 21 个脚本
 D:\Anaconda3\envs\dpenv\python.exe 6-web\backend\tools\run_all_tests.py transd  # 只跑名字含 transd 的
 ```
 
@@ -1245,6 +1344,9 @@ D:\Anaconda3\envs\dpenv\python.exe 6-web\backend\tools\test_infer_params.py
 
 # 标注工程数据层（不需要服务、不需要 DLL）
 D:\Anaconda3\envs\dpenv\python.exe 6-web\backend\tools\test_annotation_project.py
+
+# YOLO 数据集导入（不需要服务；真实 PCB 数据在时自动加一次冒烟）
+D:\Anaconda3\envs\dpenv\python.exe 6-web\backend\tools\test_annotation_import.py
 
 # 前端单测（不需要服务，有 node 就行）
 node 6-web\frontend\tests\test_viewer_math.mjs

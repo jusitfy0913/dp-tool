@@ -10,7 +10,7 @@
 
 ```mermaid
 flowchart TD
-    A["① 原始图片"] --> B["② 标注 / 数据整理<br/>Web「数据集」页可重划分与导出"]
+    A["① 原始图片"] --> B["② 标注 / 数据整理<br/>Web「标注」页可直接导入 YOLO 标签改标<br/>Web「数据集」页可重划分与导出"]
     B --> C{"③ 任务类型"}
 
     C -->|"目标检测 / 分割 / 姿态 / OBB"| D["YOLO 训练<br/>1-python-yolo"]
@@ -212,7 +212,48 @@ node 6-web\frontend\tests\test_contrast.mjs
 
 改配色的正确流程：改令牌 → 跑 `test_contrast` → 不达标就再调，别靠眼睛判断。
 
+### 2.7 把已有 YOLO 标签导入标注页直接改（v1.19）
+
+不需要先转格式。标注页「导入 YOLO 数据集」把 `data.yaml + images/ + labels/` 读成
+`.tfanno` 工程，导入后的框就是工程里**普通的标注对象**，可拖动、改类别、改集合、删框，
+再存盘并导出回 YOLO / COCO / VOC。**原始 `labels/*.txt` 只读不改**。
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_web_studio.ps1
+# 浏览器打开 http://127.0.0.1:8060 → 顶部「标注」→ 左栏展开「导入 YOLO 数据集」
+```
+
+| 步骤 | 操作 | 说明 |
+| --- | --- | --- |
+| 1 | 填数据源 | `...\PCB data\PCB缺陷检测\data.yaml`，或数据集根目录 |
+| 2 | 勾 split | `train` / `val` / `test`，只列出真实存在的目录；单跑验证集只勾 `val` |
+| 3 | 预览 | 核对任务类型、类别数、每 split 图/框数、脏数据计数，再决定导不导 |
+| 4 | 导入并保存 / 导入 | 前者立刻写 `.tfanno`；后者只进内存，之后自己 `Ctrl+S` |
+| 5 | 改标 | 画布上拖框、改标签、`Delete` 删框，`Ctrl+S` 存盘 |
+| 6 | 另存为 | 换目录另存，同盘相对路径会自动改成绝对路径，避免另存后图全丢 |
+
+**关键映射与限制**
+
+| 项 | 行为 |
+| --- | --- |
+| detect 行 | `rectangle`（2 个像素点） |
+| segment 行 | `polygon` |
+| obb 行（8 值） | `polygon` 4 角点。`.tfanno` 的旋转框只存 2 点 + 角度，存旋转框会让**再导出丢角度** |
+| pose 行 | 单对象 `keypoints` + 可见性 `0/1/2`；可见性不参与坐标夹取 |
+| 类别 id | 按 `data.yaml` 的 `names` 顺序；合并时按**名字**复用已有 id |
+| 图片路径 | 同盘存相对工程目录，跨盘回退绝对路径 |
+| 脏数据 | 轻微越界（≤5%）夹回 `[0,1]` 并计 `clamped_lines`；明显越界/字段错整条丢弃并计数；孤儿 txt 只警告 |
+| 同名图片 | 默认 `skip`；也可 `replace` 覆盖标注或 `append` 追加 |
+
+验收脚本（不启动服务也能跑，真实 PCB 数据在时会自动加一次冒烟）：
+
+```powershell
+python 6-web\backend\tools\test_annotation_import.py
+# 期望：通过 63 项，失败 0 项
+```
+
 ---
+
 
 ## 3. 训练
 

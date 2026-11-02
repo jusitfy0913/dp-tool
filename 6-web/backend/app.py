@@ -34,6 +34,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 import annotation
+import annotationimport
 import augpreview
 import autolabel
 import checkpoints
@@ -51,7 +52,7 @@ from runners import manager
 
 #: 应用版本号。前端顶栏与 /api/health 都读它，方便一眼看出「页面连的是哪个后端」。
 #: 起因：改了代码但 8060 上跑的是几小时前的旧进程，排查很久才发现。
-APP_VERSION = "1.18.1"
+APP_VERSION = "1.19.0"
 
 #: 本文件所在目录（6-web/backend）。子进程脚本路径都以它为基准，
 #: 不依赖启动时的工作目录——从仓库根启动和从 backend 启动必须都能跑。
@@ -2338,6 +2339,25 @@ class AnnotationProjectRequest(BaseModel):
     force: bool = Field(default=False, description="跳过修订号校验，强制覆盖")
 
 
+class AnnotationImportRequest(BaseModel):
+    """把 YOLO 数据集（data.yaml + images/ + labels/）导入标注工程。
+
+    ``dry_run=True`` 只返回报告，用来让用户先核对「几张图、几个框、有哪些警告」；
+    ``mode="merge"`` 时必须带上 ``project``（当前内存中的工程，可能还没保存），
+    否则会读到磁盘上的旧版本，把用户刚画的框覆盖掉。
+    """
+
+    source: str = Field(..., description="data.yaml 或数据集根目录")
+    project_path: str = Field(default="", description="目标 .tfanno 路径，用于算相对路径")
+    project: dict | None = Field(default=None, description="合并模式下的当前工程内容")
+    splits: list[str] | None = Field(default=None, description="要导入的 split，留空表示全部")
+    mode: str = Field(default="new", description="new 新建工程 / merge 合并到当前工程")
+    duplicate: str = Field(default="skip", description="同名图片：skip / replace / append")
+    task: str = Field(default="auto", description="auto 或 detect/segment/pose/obb")
+    limit: int = Field(default=5000, ge=1, le=20000, description="单次导入图片上限")
+    dry_run: bool = Field(default=False, description="只出报告，不返回工程内容")
+
+
 class AnnotationExportRequest(BaseModel):
     """从标注工程导出训练数据集。"""
 
@@ -2414,7 +2434,9 @@ def annotation_load(path: str) -> dict:
         "ok": True,
         "exists": True,
         "path": str(target),
-        "project": project,
+        # resolved：相对路径（Qt 写法）解析成绝对路径给浏览器用；
+        # 保存时会被 normalize_project 丢掉，不会写进 .tfanno。
+        "project": annotation.with_resolved_paths(project, target),
         "meta": meta,
         "stats": annotation.stats(project),
     }
@@ -2516,6 +2538,47 @@ def annotation_scan_images(root: str, recursive: bool = True, limit: int = 5000)
 
     found.sort(key=lambda entry: entry["path"].lower())
     return {"ok": True, "root": str(base), "count": len(found), "images": found, "truncated": len(found) >= limit}
+
+
+@app.post("/api/annotation/import")
+def annotation_import(request: AnnotationImportRequest) -> dict:
+    """把已有 YOLO 标签导入标注工程（不落盘）。
+
+    导入只是把 txt 变成工程里的普通标注对象：返回的 ``project`` 交给前端接管后，
+    用户照常拖框、改类、按 Ctrl+S 存成 .tfanno。之所以不在后端直接写盘：
+    合并模式要拿到「内存里还没保存的工程」，后端写盘会覆盖用户刚画的框。
+    """
+    source = _ensure_allowed_path(request.source)
+    project_path = str(_ensure_allowed_path(request.project_path)) if request.project_path.strip() else ""
+
+    try:
+        project, report = annotationimport.build(
+            source,
+            project_path=project_path,
+            base_project=request.project,
+            splits=request.splits,
+            mode=request.mode,
+            duplicate=request.duplicate,
+            task=request.task,
+            limit=request.limit,
+        )
+    except annotation.AnnotationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except OSError as exc:
+        raise HTTPException(status_code=400, detail=f"读取数据源失败：{exc}") from exc
+
+    payload: dict = {"ok": True, "path": project_path, "report": report}
+    if request.dry_run:
+        # 预览也要跑一次校验：像「图片 id 重复」这种问题必须在导入前暴露，
+        # 否则用户要等到导出时才看见红字。
+        payload["issues"] = annotation.validate(project)
+        return payload
+
+    normalized, warnings = annotation.normalize_project(project)
+    payload["project"] = annotation.with_resolved_paths(normalized, project_path)
+    payload["issues"] = annotation.validate(normalized)
+    payload["warnings"] = warnings
+    return payload
 
 
 @app.post("/api/annotation/export")

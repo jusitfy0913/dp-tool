@@ -967,6 +967,7 @@
           <button type="button" class="primary" id="annoOpen">打开</button>
           <button type="button" id="annoCreate">新建</button>
           <button type="button" id="annoSaveNow" title="Ctrl+S">保存</button>
+          <button type="button" id="annoSaveAs" title="保存到输入框里的新路径，不动原工程">另存为</button>
         </div>
         <p class="anno-hint" id="annoSaveState">未打开工程</p>
 
@@ -980,6 +981,43 @@
             <button type="button" class="mini" id="annoAddImages">批量加入</button>
           </div>
         </div>
+
+        <!-- 导入已有 YOLO 标签：data.yaml 的 names 决定类别表，labels/*.txt 变成可编辑的框 -->
+        <details class="anno-import" id="annoImportBox">
+          <summary title="把 data.yaml + images/ + labels/ 里的已有标注读进工程">导入 YOLO 数据集</summary>
+          <div class="anno-row anno-stack">
+            <input type="text" id="annoImportSource" placeholder="data.yaml 或数据集根目录" />
+            <div class="anno-row">
+              <button type="button" class="mini" data-browse="annoImportSource" data-mode="file" title="浏览">…</button>
+            </div>
+          </div>
+          <div class="anno-row anno-splits" id="annoImportSplits">
+            <label class="anno-toggle"><input type="checkbox" value="train" checked />train</label>
+            <label class="anno-toggle"><input type="checkbox" value="val" checked />val</label>
+            <label class="anno-toggle"><input type="checkbox" value="test" />test</label>
+          </div>
+          <div class="anno-row anno-stack">
+            <label class="anno-field">导入方式
+              <select id="annoImportMode">
+                <option value="new">新建工程（按上面的路径另存）</option>
+                <option value="merge">合并到当前工程</option>
+              </select>
+            </label>
+            <label class="anno-field">同名图片
+              <select id="annoImportDuplicate">
+                <option value="skip">跳过（推荐）</option>
+                <option value="replace">覆盖标注</option>
+                <option value="append">追加成另一张</option>
+              </select>
+            </label>
+          </div>
+          <div class="anno-row">
+            <button type="button" class="mini" id="annoImportPreview">预览</button>
+            <button type="button" class="mini" id="annoImportApply" disabled>导入</button>
+            <button type="button" class="mini" id="annoImportApplySave" disabled title="导入并立刻写成 .tfanno">导入并保存</button>
+          </div>
+          <p class="anno-hint" id="annoImportReport">选好 data.yaml 先「预览」，核对图数与框数再导入。</p>
+        </details>
       </aside>
 
       <!-- 中：画布 -->

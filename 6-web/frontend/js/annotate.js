@@ -14,6 +14,7 @@ import {
   autoLabel,
   browse,
   exportAnnotationProject,
+  importAnnotationProject,
   loadAnnotationProject,
   saveAnnotationProject,
   scanAnnotationImages,
@@ -114,6 +115,8 @@ const state = {
   /** 保存进行中又被请求保存：结束后补跑一次，不能直接丢掉。 */
   saveQueued: false,
   conflict: null,
+  /** 最近一次「导入 YOLO 数据集」的预览报告；有值才允许点导入，避免参数改了还按旧结果落盘。 */
+  importReport: null,
 };
 
 const el = {};
@@ -550,6 +553,18 @@ function showConflict(error) {
 // ---------------------------------------------------------------------------
 // 图片
 // ---------------------------------------------------------------------------
+/**
+ * 传给后端的图片路径。
+ *
+ * `.tfanno` 里 Qt 存的是相对工程目录的路径，浏览器只能把字符串原样拼进
+ * `/api/annotation/image?path=`，后端按服务进程的 cwd 解析 → 图片全裂。
+ * 后端加载工程时补了 `resolved`（绝对路径），这里必须优先用它。
+ */
+function imageApiPath(image) {
+  if (!image) return "";
+  return image.resolved || image.path || "";
+}
+
 async function loadCurrentImage() {
   const image = currentImage();
   if (!image) {
@@ -565,7 +580,7 @@ async function loadCurrentImage() {
 
   if (!image.width || !image.height) {
     try {
-      const meta = await annotationImageMeta(image.path);
+      const meta = await annotationImageMeta(imageApiPath(image));
       image.width = meta.width;
       image.height = meta.height;
     } catch {
@@ -586,9 +601,9 @@ async function loadCurrentImage() {
     if (seq !== state.imageLoadSeq) return;
     state.image = null;
     renderCanvas();
-    setStatus(`图片无法显示：${image.path}（检查是否在 TRTFORGE_BROWSE_ROOTS 内）`, "bad");
+    setStatus(`图片无法显示：${imageApiPath(image)}（检查是否在 TRTFORGE_BROWSE_ROOTS 内）`, "bad");
   };
-  bitmap.src = annotationImageUrl(image.path);
+  bitmap.src = annotationImageUrl(imageApiPath(image));
 }
 
 function fitView() {
@@ -1735,7 +1750,7 @@ async function runAutoLabel() {
   setStatus("预标注中…", "warn");
   try {
     const result = await autoLabel({
-      image: image.path,
+      image: imageApiPath(image),
       task: state.project.task || "detect",
       engine,
       labels: (el.alLabels?.value || "").trim(),
@@ -2176,11 +2191,13 @@ async function addImages() {
       return;
     }
     pushHistory(true);
-    const known = new Set(state.project.images.map((image) => image.path));
+    // 用「后端能打开的绝对路径」比较：导入进来的图存的是相对路径，
+    // 拿原始 path 去比会把同一张图再加一遍。
+    const known = new Set(state.project.images.map((image) => imageApiPath(image).toLowerCase()));
     const usedIds = new Set(state.project.images.map((image) => image.id));
     let added = 0;
     for (const item of data.images) {
-      if (known.has(item.path)) continue;
+      if (known.has((item.path || "").toLowerCase())) continue;
       // 不同子目录里可能存在同名图片；id 一旦重复，草稿会串到别的图上，
       // 导出校验也会报"图片 id 重复"，所以在入口就做成唯一。
       const stem = item.path.split(/[\\/]/).pop().replace(/\.[^.]+$/, "");
@@ -2194,6 +2211,8 @@ async function addImages() {
       state.project.images.push({
         id,
         path: item.path,
+        // 扫描接口给的就是绝对路径，直接当 resolved 用，前端只认这一个字段取图
+        resolved: item.path,
         width: item.width,
         height: item.height,
         split: "train",
@@ -2215,6 +2234,267 @@ async function addImages() {
   } catch (error) {
     setStatus(`扫描失败：${error.message}`, "bad");
   }
+}
+
+// ---------------------------------------------------------------------------
+// 导入已有 YOLO 标签（v1.19）
+//
+// 为什么「预览」是必经一步：导入会一次性改掉几百张图的标注，
+// 先给出「几张图 / 几个框 / 哪些数据被跳过」，用户核对完再落盘。
+// 任何参数改动都会作废上一次预览，防止拿旧结果去导入新的数据源。
+// ---------------------------------------------------------------------------
+function importSplits() {
+  const box = document.getElementById("annoImportSplits");
+  if (!box) return [];
+  return [...box.querySelectorAll('input[type="checkbox"]')]
+    .filter((input) => input.checked)
+    .map((input) => input.value);
+}
+
+function setImportEnabled(enabled) {
+  if (el.importApply) el.importApply.disabled = !enabled;
+  if (el.importApplySave) el.importApplySave.disabled = !enabled;
+}
+
+function setImportReport(text, cls = "") {
+  if (!el.importReport) return;
+  el.importReport.textContent = text || "";
+  el.importReport.className = cls ? `anno-hint ${cls}` : "anno-hint";
+}
+
+function invalidateImport() {
+  state.importReport = null;
+  setImportEnabled(false);
+  setImportReport("参数改了，请重新「预览」。", "warn");
+}
+
+function importPayload(dryRun) {
+  const mode = el.importMode?.value || "new";
+  return {
+    source: (el.importSource?.value || "").trim(),
+    project_path: (el.path?.value || "").trim(),
+    // 合并模式必须带上内存里的工程：磁盘上的可能是旧版本，会把刚画的框覆盖掉
+    project: mode === "merge" ? state.project : null,
+    splits: importSplits(),
+    mode,
+    duplicate: el.importDuplicate?.value || "skip",
+    dry_run: Boolean(dryRun),
+  };
+}
+
+function formatImportReport(report, issues) {
+  const lines = [];
+  const splitText = Object.entries(report.per_split || {})
+    .map(([name, item]) => `${name} ${item.images} 图 / ${item.objects} 框`)
+    .join("　");
+  lines.push(
+    `任务 ${report.task} ｜ ${(report.classes || []).length} 类 ｜ ` +
+      `${report.images} 图 / ${report.objects} 框`,
+  );
+  if (splitText) lines.push(splitText);
+
+  const bits = [];
+  if (report.added_images) bits.push(`新增 ${report.added_images} 图 / ${report.added_objects} 框`);
+  if (report.skipped_existing) bits.push(`跳过已存在 ${report.skipped_existing} 图`);
+  if (report.replaced_images) bits.push(`覆盖 ${report.replaced_images} 图`);
+  if (report.empty_images) bits.push(`空标注 ${report.empty_images} 图`);
+  if (report.unknown_class_objects) bits.push(`未知类别 ${report.unknown_class_objects} 框`);
+  if (report.orphan_labels) bits.push(`孤儿标签 ${report.orphan_labels}`);
+  if (report.malformed_lines) bits.push(`畸形行 ${report.malformed_lines}`);
+  if (report.truncated) bits.push("已按上限截断");
+  if (bits.length) lines.push(bits.join(" ｜ "));
+
+  lines.push(`图片路径：${report.path_mode === "relative" ? "相对工程目录（可搬移）" : "绝对路径"}`);
+  (report.warnings || []).forEach((text) => lines.push(`⚠ ${text}`));
+  (issues || []).forEach((text) => lines.push(`✗ ${text}`));
+  return lines.join("\n");
+}
+
+async function previewImport() {
+  const payload = importPayload(true);
+  if (!payload.source) {
+    setImportReport("请先填 data.yaml 或数据集根目录", "bad");
+    return;
+  }
+  if (payload.mode === "merge" && !state.project) {
+    setImportReport("先打开一个工程，或把导入方式改成「新建工程」", "bad");
+    return;
+  }
+  setImportEnabled(false);
+  setImportReport("解析中…（几百张图通常一两秒）", "warn");
+  try {
+    const data = await importAnnotationProject(payload);
+    state.importReport = data.report;
+    const bad = (data.issues || []).length > 0;
+    setImportReport(formatImportReport(data.report, data.issues), bad ? "warn" : "ok");
+    setImportEnabled(true);
+  } catch (error) {
+    state.importReport = null;
+    setImportReport(`预览失败：${error.message}`, "bad");
+  }
+}
+
+async function applyImport({ save }) {
+  if (!state.importReport) {
+    setImportReport("请先「预览」，确认图数与框数没问题再导入", "warn");
+    return;
+  }
+  const mode = el.importMode?.value || "new";
+  const payload = importPayload(false);
+
+  if (mode === "new") {
+    const raw = (el.path?.value || "").trim();
+    if (!raw) {
+      setImportReport("新建工程要先填上面的 .tfanno 路径", "bad");
+      return;
+    }
+    const resolved = await resolveProjectPath(raw);
+    el.path.value = resolved.path;
+    payload.project_path = resolved.path;
+    // 先把手上的修改落盘，再确认「要丢弃吗」——否则确认框说的和磁盘上的不一致
+    if (state.project) await flushSave();
+    if (state.project && state.dirty && !window.confirm("当前工程有未保存的修改，导入新工程会丢弃它。继续？")) {
+      return;
+    }
+    let existed = false;
+    try {
+      existed = Boolean((await loadAnnotationProject(resolved.path)).exists);
+    } catch {
+      /* 读不到就交给保存阶段报错 */
+    }
+    if (
+      existed &&
+      !window.confirm(`磁盘上已存在工程：\n${resolved.path}\n\n导入会覆盖它，确定继续？`)
+    ) {
+      return;
+    }
+  } else if (!state.project) {
+    setImportReport("合并模式需要先打开一个工程", "bad");
+    return;
+  }
+
+  setImportEnabled(false);
+  setImportReport("导入中…", "warn");
+  try {
+    const data = await importAnnotationProject(payload);
+    const report = data.report;
+
+    if (mode === "new") {
+      // 换了一份文档：旧的撤销栈属于另一个工程，留着会「撤销出一条不存在的历史」
+      state.project = data.project;
+      state.path = payload.project_path;
+      state.meta = { rev: -1, mtime_ns: "0", size: 0 };
+      state.exists = false;
+      state.undo.length = 0;
+      state.redo.length = 0;
+      state.selectedId = "";
+      state.drafts.clear();
+      state.currentIndex = state.project.images.length ? 0 : -1;
+      el.path.value = payload.project_path;
+      updateHistoryButtons();
+      markDirty();
+      if (state.currentIndex >= 0) await loadCurrentImage();
+      renderAll();
+      renderCanvas();
+      if (save) await saveProject({ force: true, silent: true });
+    } else {
+      // 一次导入 = 一个可撤销步骤：按一下 Ctrl+Z 能整批回退
+      pushHistory(true);
+      state.project = data.project;
+      markDirty();
+      renderAll();
+      if (state.currentIndex >= 0) await loadCurrentImage();
+      renderCanvas();
+      if (save) await saveProject({ silent: true });
+    }
+
+    const suffix = save
+      ? `，已写入 ${(state.path.split(/[\\/]/).pop() || ".tfanno")}`
+      : "，记得按 Ctrl+S 保存";
+    setImportReport(`${formatImportReport(report, data.issues)}\n✓ 导入完成${suffix}`, "ok");
+    setStatus(`导入 ${report.added_images} 图 / ${report.added_objects} 框`);
+  } catch (error) {
+    setImportReport(`导入失败：${error.message}`, "bad");
+  } finally {
+    // 工程已经变了：再点一次就会重复导入，必须重新预览
+    state.importReport = null;
+    setImportEnabled(false);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 另存为
+// ---------------------------------------------------------------------------
+function isAbsolutePath(value) {
+  return /^[a-zA-Z]:[\\/]/.test(value) || value.startsWith("\\\\") || value.startsWith("/");
+}
+
+function dirOf(path) {
+  const index = Math.max(path.lastIndexOf("\\"), path.lastIndexOf("/"));
+  return index > 0 ? path.slice(0, index) : path;
+}
+
+async function saveAs() {
+  if (!state.project) {
+    setStatus("没有可保存的工程", "bad");
+    return;
+  }
+  const raw = (el.path?.value || "").trim();
+  if (!raw) {
+    setStatus("请先填另存为的 .tfanno 路径", "bad");
+    return;
+  }
+  const resolved = await resolveProjectPath(raw);
+  el.path.value = resolved.path;
+  if (resolved.path === state.path) {
+    setStatus("路径没变，用「保存」即可", "warn");
+    return;
+  }
+
+  let existed = false;
+  try {
+    existed = Boolean((await loadAnnotationProject(resolved.path)).exists);
+  } catch {
+    /* 读不到就交给保存阶段报错 */
+  }
+  if (existed && !window.confirm(`目标已存在：\n${resolved.path}\n\n另存为会覆盖它，确定继续？`)) {
+    el.path.value = state.path;
+    return;
+  }
+
+  const previousPath = state.path;
+  const previousMeta = { ...state.meta };
+  const previousExists = state.exists;
+
+  // 换了目录后相对路径会指向错的地方。这里把它们就地改成绝对路径，
+  // 保证新文件打开时图还在——比起"静默裂图"，多几个绝对路径是更好的取舍。
+  let rebased = 0;
+  if (dirOf(previousPath).toLowerCase() !== dirOf(resolved.path).toLowerCase()) {
+    pushHistory(true);
+    for (const image of state.project.images) {
+      if (isAbsolutePath(image.path || "")) continue;
+      if (!image.resolved) continue;
+      image.path = image.resolved;
+      rebased += 1;
+    }
+    if (rebased) markDirty();
+  }
+
+  state.path = resolved.path;
+  state.meta = { rev: -1, mtime_ns: "0", size: 0 };
+  state.exists = false;
+  await saveProject({ force: true, silent: false });
+
+  if (!state.exists) {
+    // 失败就把路径还原：否则界面显示已存到新文件，磁盘上其实还没有
+    state.path = previousPath;
+    state.meta = previousMeta;
+    state.exists = previousExists;
+    el.path.value = previousPath;
+    return;
+  }
+  const note = rebased ? `（${rebased} 张图的相对路径已改成绝对路径）` : "";
+  setStatus(`已另存为 ${resolved.path.split(/[\\/]/).pop()}${note}`, "ok");
 }
 
 // ---------------------------------------------------------------------------
@@ -2382,12 +2662,28 @@ export function initAnnotate() {
     alService: document.getElementById("annoAlService"),
     conflictModal: document.getElementById("annoConflictModal"),
     conflictText: document.getElementById("annoConflictText"),
+    importSource: document.getElementById("annoImportSource"),
+    importMode: document.getElementById("annoImportMode"),
+    importDuplicate: document.getElementById("annoImportDuplicate"),
+    importReport: document.getElementById("annoImportReport"),
+    importApply: document.getElementById("annoImportApply"),
+    importApplySave: document.getElementById("annoImportApplySave"),
   });
 
   document.getElementById("annoOpen")?.addEventListener("click", () => openProject((el.path.value || "").trim()));
   document.getElementById("annoCreate")?.addEventListener("click", createProject);
   document.getElementById("annoSaveNow")?.addEventListener("click", () => saveProject({ silent: false }));
+  document.getElementById("annoSaveAs")?.addEventListener("click", saveAs);
   document.getElementById("annoAddImages")?.addEventListener("click", addImages);
+  document.getElementById("annoImportPreview")?.addEventListener("click", previewImport);
+  document.getElementById("annoImportApply")?.addEventListener("click", () => applyImport({ save: false }));
+  document.getElementById("annoImportApplySave")?.addEventListener("click", () => applyImport({ save: true }));
+  // 任何影响结果的参数一改，上一次预览就作废：不能拿旧报告去导新数据源
+  el.importMode?.addEventListener("change", invalidateImport);
+  el.importDuplicate?.addEventListener("change", invalidateImport);
+  el.importSource?.addEventListener("input", invalidateImport);
+  el.importSource?.addEventListener("change", invalidateImport);
+  document.getElementById("annoImportSplits")?.addEventListener("change", invalidateImport);
   document.getElementById("annoUndo")?.addEventListener("click", undo);
   document.getElementById("annoRedo")?.addEventListener("click", redo);
   document.getElementById("annoDelete")?.addEventListener("click", deleteSelected);

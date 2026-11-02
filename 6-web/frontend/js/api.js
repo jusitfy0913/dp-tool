@@ -108,6 +108,12 @@ export function exportAnnotationProject(payload) {
   return postJSON("/api/annotation/export", payload);
 }
 
+export function importAnnotationProject(payload) {
+  // 导入是「读数据源 + 生成工程」，不改磁盘；落盘仍走 saveAnnotationProject，
+  // 这样导入结果能参与撤销、冲突检测和自动保存。
+  return postJSON("/api/annotation/import", payload);
+}
+
 export function autoLabel(payload) {
   return postJSON("/api/annotation/autolabel", payload);
 }

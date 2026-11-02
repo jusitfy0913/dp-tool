@@ -748,6 +748,29 @@ def resolve_image_path(project_path: str | Path, image_path: str) -> Path:
     return direct
 
 
+def with_resolved_paths(project: dict, project_path: str | Path) -> dict:
+    """给每张图补一个只读的 ``resolved`` 绝对路径，供浏览器显示。
+
+    为什么需要：`.tfanno` 里 Qt 写的是相对工程目录的路径，而浏览器只能把
+    路径字符串原样拼进 `/api/annotation/image?path=`，后端会按服务进程的
+    工作目录解析——结果就是「工程能打开，图片全裂」。解析放在这里，
+    前端只认 ``resolved``，两边就只剩一份「相对路径怎么解析」的实现。
+
+    ``resolved`` 是计算字段：保存时 ``normalize_project`` 会把它丢掉，
+    所以不会写进 `.tfanno`，也不会影响 Qt 的读取。
+    """
+    images = []
+    for image in project.get("images") or []:
+        decorated = dict(image)
+        try:
+            decorated["resolved"] = str(resolve_image_path(project_path, image.get("path") or ""))
+        except OSError:
+            # 解析不出来就给原值：前端至少还能把原始路径显示在报错里。
+            decorated["resolved"] = str(image.get("path") or "")
+        images.append(decorated)
+    return {**project, "images": images}
+
+
 def to_dataset_project(project: dict, source: str | Path | None = None):
     """把内存中的标注工程转成 ``dataset.DatasetProject``，供既有导出实现复用。
 

@@ -1968,6 +1968,45 @@ input[type="range"]:disabled { cursor: not-allowed; }
 .anno-autolabel summary:hover { color: var(--cyan); }
 .anno-autolabel .anno-row { margin-bottom: var(--sp-2); }
 
+/* ---- 导入 YOLO 数据集（v1.19） ---- */
+.anno-import {
+  margin-top: var(--sp-3);
+  border-top: 1px solid var(--line);
+  padding-top: var(--sp-2);
+}
+.anno-import summary {
+  cursor: pointer;
+  font-size: var(--fs-md);
+  color: var(--text-dim);
+  margin-bottom: var(--sp-2);
+}
+.anno-import summary:hover { color: var(--cyan); }
+.anno-import .anno-row { margin-bottom: var(--sp-2); }
+/* 左栏只有两百多像素：标签压在上面，留给输入框和下拉框整行 */
+.anno-import .anno-field {
+  grid-template-columns: minmax(0, 1fr);
+  gap: 2px;
+}
+.anno-import .anno-field > select { width: 100%; }
+.anno-import select {
+  background: var(--surface-2);
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: var(--r-1);
+  padding: 3px var(--sp-2);
+  font-size: var(--fs-2xs);
+}
+.anno-splits { flex-wrap: wrap; gap: var(--sp-2); }
+.anno-import .anno-hint {
+  margin: 0;
+  white-space: pre-line;
+  font-size: var(--fs-2xs);
+  color: var(--text-dim);
+}
+.anno-import .anno-hint.bad { color: var(--danger); }
+.anno-import .anno-hint.ok { color: var(--ok); }
+.anno-import .anno-hint.warn { color: var(--amber); }
+
 /* ---- 兼容现有的 hidden 约定 ---- */
 #annoConflictModal .modal-box { max-width: 480px; }
 #annoConflictModal p { white-space: pre-line; margin: 0 0 var(--sp-4); }

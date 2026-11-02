@@ -278,6 +278,21 @@ def _parse_yolo_label(text: str, width: int, height: int, task: str) -> list[Dat
     return objects
 
 
+def parse_yolo_label(text: str, width: int, height: int, task: str) -> list[DatasetObject]:
+    """公开入口：把一段 YOLO 标签文本解析成像素坐标对象。
+
+    标注导入（``annotationimport.py``）与数据集载入必须共用同一份几何换算。
+    各写一份的话，同一份 txt 在「数据集预览」和「标注页」里可能差半个像素、
+    甚至上下颠倒——而这种错不会报错，只会让标注框看起来"稍微有点歪"。
+    """
+    return _parse_yolo_label(text, width, height, task)
+
+
+def guess_task(token_counts: list[int]) -> str:
+    """按标签每行字段数推断任务类型（公开版，供标注导入复用同一套判据）。"""
+    return _guess_task(token_counts)
+
+
 def _collect_yolo_images(root: Path, warnings: list[str]) -> list[tuple[Path, str, Path | None]]:
     """返回 (图片路径, 原划分, 标签路径) 列表。"""
     found: list[tuple[Path, str, Path | None]] = []
