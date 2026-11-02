@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import os
+import threading
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -119,13 +120,52 @@ def allowed_roots() -> list[Path]:
     return roots
 
 
+# ---------------------------------------------------------------------------
+# 运行期临时放行（原生对话框选中的路径）
+# ---------------------------------------------------------------------------
+# 原生对话框能选到白名单外的目录（比如 D:\数据集）。如果选完就 403，
+# 用户会觉得"选了个路径却打不开"，比现在的目录列表还难用。
+# 因此接口在确认"是本机用户亲手选的"之后，把该目录加进这份进程级放行表。
+#
+# 三条约束，缺一不可：
+#   1. 只有 127.0.0.1 / ::1 的请求才能触发（远程访问一律回退到页面内浏览）；
+#   2. 只加"用户点中的那个目录"，不递归整盘；
+#   3. 不落盘，服务重启即失效——临时授权不该有持久副作用。
+ALLOWED_RUNTIME: set[Path] = set()
+_ALLOW_LOCK = threading.Lock()
+
+
+def allow_path(path: str | Path) -> Path | None:
+    """把一条路径加入本次运行的放行表（不写配置、不落盘）。"""
+    try:
+        target = Path(path).expanduser().resolve()
+    except OSError:
+        return None
+    if not target.is_dir():
+        target = target.parent
+    with _ALLOW_LOCK:
+        ALLOWED_RUNTIME.add(target)
+    return target
+
+
+def clear_runtime_allowed() -> None:
+    """清空运行期放行表（测试用）。"""
+    with _ALLOW_LOCK:
+        ALLOWED_RUNTIME.clear()
+
+
 def is_path_allowed(path: str | Path) -> bool:
-    """判断路径是否落在白名单内（含根目录自身）。"""
+    """判断路径是否落在白名单内（含根目录自身，含运行期临时放行）。"""
     try:
         target = Path(path).expanduser().resolve()
     except OSError:
         return False
+    with _ALLOW_LOCK:
+        extra = tuple(ALLOWED_RUNTIME)
+    if any(target == root or root in target.parents for root in extra):
+        return True
     return any(target == root or root in target.parents for root in allowed_roots())
+
 
 
 def resolve_python() -> str | None:

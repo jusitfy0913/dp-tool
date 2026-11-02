@@ -16,6 +16,7 @@ import {
   exportAnnotationProject,
   importAnnotationProject,
   loadAnnotationProject,
+  nativeDialog,
   saveAnnotationProject,
   scanAnnotationImages,
 } from "./api.js";
@@ -2190,50 +2191,111 @@ async function addImages() {
       setStatus("该目录下没有图片", "warn");
       return;
     }
-    pushHistory(true);
-    // 用「后端能打开的绝对路径」比较：导入进来的图存的是相对路径，
-    // 拿原始 path 去比会把同一张图再加一遍。
-    const known = new Set(state.project.images.map((image) => imageApiPath(image).toLowerCase()));
-    const usedIds = new Set(state.project.images.map((image) => image.id));
-    let added = 0;
-    for (const item of data.images) {
-      if (known.has((item.path || "").toLowerCase())) continue;
-      // 不同子目录里可能存在同名图片；id 一旦重复，草稿会串到别的图上，
-      // 导出校验也会报"图片 id 重复"，所以在入口就做成唯一。
-      const stem = item.path.split(/[\\/]/).pop().replace(/\.[^.]+$/, "");
-      let id = stem;
-      let suffix = 2;
-      while (usedIds.has(id)) {
-        id = `${stem}_${suffix}`;
-        suffix += 1;
-      }
-      usedIds.add(id);
-      state.project.images.push({
-        id,
-        path: item.path,
-        // 扫描接口给的就是绝对路径，直接当 resolved 用，前端只认这一个字段取图
-        resolved: item.path,
-        width: item.width,
-        height: item.height,
-        split: "train",
-        annotations: [],
-      });
-      added += 1;
-    }
-    if (!added) {
-      setStatus("这些图片已经在工程里了", "warn");
-      return;
-    }
-    if (state.currentIndex < 0) {
-      state.currentIndex = 0;
-      loadCurrentImage();
-    }
-    afterEdit();
-    renderCanvas();
-    setStatus(`加入 ${added} 张图片`);
+    insertImages(data.images);
   } catch (error) {
     setStatus(`扫描失败：${error.message}`, "bad");
   }
+}
+
+/**
+ * 用系统对话框一次选多张图片直接加入工程（v1.20）。
+ *
+ * 和「批量加入」的区别：那个是扫整个目录（还会递归子目录），这个是精确挑几张。
+ * 路径来自后端原生对话框，本身就是绝对路径，不需要再探测白名单。
+ */
+async function addImagesByDialog() {
+  if (!state.project) {
+    setStatus("先打开或新建一个工程", "warn");
+    return;
+  }
+  setStatus("请到系统窗口里选图片…", "warn");
+  let picked;
+  try {
+    picked = await nativeDialog({
+      kind: "files",
+      field: "annoAddFiles",
+      title: "选择要加入工程的图片",
+      initial: (el.addRoot?.value || "").trim(),
+      patterns: [".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"],
+      label: "图片",
+    });
+  } catch (error) {
+    const reason = error.payload?.detail || error.message;
+    setStatus(`系统对话框打不开（${reason}），请改用「批量加入」扫目录`, "bad");
+    return;
+  }
+  const paths = picked.paths || [];
+  if (!paths.length) {
+    setStatus("没有选择图片", "warn");
+    return;
+  }
+
+  // 尺寸要逐张问后端：画布按 width/height 做坐标换算，缺了会画到画布外面
+  setStatus(`读取 ${paths.length} 张图片的尺寸…`, "warn");
+  const items = [];
+  for (const path of paths) {
+    let width = 0;
+    let height = 0;
+    try {
+      const meta = await annotationImageMeta(path);
+      width = meta.width || 0;
+      height = meta.height || 0;
+    } catch {
+      /* 尺寸拿不到就按 0 存，画布会等到图片加载完再校正 */
+    }
+    items.push({ path, width, height });
+  }
+  insertImages(items);
+}
+
+/**
+ * 把一批图片塞进工程（两个入口共用）。
+ *
+ * 去重按「后端能打开的绝对路径」比较：导入进来的图存的是相对路径，
+ * 拿原始 path 去比会把同一张图再加一遍。
+ */
+function insertImages(items) {
+  pushHistory(true);
+  const known = new Set(state.project.images.map((image) => imageApiPath(image).toLowerCase()));
+  const usedIds = new Set(state.project.images.map((image) => image.id));
+  let added = 0;
+  for (const item of items) {
+    if (known.has((item.path || "").toLowerCase())) continue;
+    // 不同子目录里可能存在同名图片；id 一旦重复，草稿会串到别的图上，
+    // 导出校验也会报"图片 id 重复"，所以在入口就做成唯一。
+    const stem = item.path.split(/[\\/]/).pop().replace(/\.[^.]+$/, "");
+    let id = stem;
+    let suffix = 2;
+    while (usedIds.has(id)) {
+      id = `${stem}_${suffix}`;
+      suffix += 1;
+    }
+    usedIds.add(id);
+    known.add((item.path || "").toLowerCase());
+    state.project.images.push({
+      id,
+      path: item.path,
+      // 扫描接口与原生对话框给的都是绝对路径，直接当 resolved 用，
+      // 前端只认这一个字段取图
+      resolved: item.path,
+      width: item.width || 0,
+      height: item.height || 0,
+      split: "train",
+      annotations: [],
+    });
+    added += 1;
+  }
+  if (!added) {
+    setStatus("这些图片已经在工程里了", "warn");
+    return;
+  }
+  if (state.currentIndex < 0) {
+    state.currentIndex = 0;
+    loadCurrentImage();
+  }
+  afterEdit();
+  renderCanvas();
+  setStatus(`加入 ${added} 张图片`);
 }
 
 // ---------------------------------------------------------------------------
@@ -2434,11 +2496,44 @@ function dirOf(path) {
   return index > 0 ? path.slice(0, index) : path;
 }
 
+/**
+ * 用系统「另存为」框问目标路径，并写回输入框。
+ *
+ * 失败或用户取消时**不动**输入框——取消的语义是"按原来的路径存"，
+ * 把输入框清空会让人以为工程丢了。返回是否拿到了新路径。
+ */
+async function pickSaveTarget() {
+  const current = (el.path?.value || "").trim() || state.path || "";
+  try {
+    const picked = await nativeDialog({
+      kind: "save",
+      field: "annoPath",
+      title: "另存为 .tfanno 工程",
+      initial: current,
+      patterns: [".tfanno"],
+      label: "标注工程",
+      defaultextension: ".tfanno",
+    });
+    const path = (picked.paths || [])[0];
+    if (!path) return false;
+    // 用户可能没写后缀，Qt 与后端都认 .tfanno，这里补齐避免存出无后缀文件
+    el.path.value = /\.tfanno$/i.test(path) ? path : `${path}.tfanno`;
+    return true;
+  } catch (error) {
+    // 409（已有一个框）= 等用户先处理；其余（远程/无桌面）静默退回手填
+    if (error.status === 409) setStatus(error.message, "warn");
+    return false;
+  }
+}
+
 async function saveAs() {
   if (!state.project) {
     setStatus("没有可保存的工程", "bad");
     return;
   }
+  // 先弹系统「另存为」框：输入框里手打完整路径对非技术用户不友好。
+  // 框打不开（远程访问 / 无桌面会话）就退回输入框里的值，行为与 v1.19 一致。
+  await pickSaveTarget();
   const raw = (el.path?.value || "").trim();
   if (!raw) {
     setStatus("请先填另存为的 .tfanno 路径", "bad");
@@ -2675,6 +2770,7 @@ export function initAnnotate() {
   document.getElementById("annoSaveNow")?.addEventListener("click", () => saveProject({ silent: false }));
   document.getElementById("annoSaveAs")?.addEventListener("click", saveAs);
   document.getElementById("annoAddImages")?.addEventListener("click", addImages);
+  document.getElementById("annoAddFiles")?.addEventListener("click", addImagesByDialog);
   document.getElementById("annoImportPreview")?.addEventListener("click", previewImport);
   document.getElementById("annoImportApply")?.addEventListener("click", () => applyImport({ save: false }));
   document.getElementById("annoImportApplySave")?.addEventListener("click", () => applyImport({ save: true }));

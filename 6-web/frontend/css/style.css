@@ -1280,6 +1280,30 @@ code {
 }
 .modal-box h3 { margin: 0; font-size: var(--fs-lg); }
 
+/* 路径提示条：顶部居中浮一层，不打断用户在看输入框的视线。
+   替代 alert——alert 会抢焦点，点掉后还得重新找位置。 */
+.path-toast {
+  position: fixed;
+  top: 76px;
+  left: 50%;
+  z-index: 60;
+  max-width: min(720px, 90vw);
+  padding: var(--sp-2) var(--sp-3);
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--line-strong);
+  background: var(--surface-1);
+  color: var(--text);
+  font-size: var(--fs-sm);
+  box-shadow: var(--shadow-modal);
+  opacity: 0;
+  transform: translate(-50%, -8px);
+  pointer-events: none;
+  transition: opacity 160ms ease, transform 160ms ease;
+  word-break: break-all;
+}
+.path-toast.show { opacity: 1; transform: translate(-50%, 0); }
+.path-toast[data-kind="info"] { border-color: var(--cyan); }
+
 .current {
   padding: var(--sp-2) 0;
   color: var(--text-dim);

@@ -1,6 +1,6 @@
 // 入口：页签切换、环境探测、目录浏览弹窗。
 
-import { browse, getCapabilities, getHealth } from "./api.js";
+import { browse, getCapabilities, getHealth, nativeDialog } from "./api.js";
 import { initAnnotate } from "./annotate.js";
 import { initDataset } from "./dataset.js";
 import { initEngine } from "./engine.js";
@@ -32,6 +32,21 @@ function initTabs() {
 // ---------------------------------------------------------------------------
 // 环境状态
 // ---------------------------------------------------------------------------
+// 能力表缓存：原生对话框是否可用，决定「浏览」按钮点下去走系统框还是页面内浏览。
+// 缓存一份避免每次点按钮都发一次请求；刷新环境时一并更新。
+let capsCache = null;
+
+async function capabilitiesOnce() {
+  if (capsCache) return capsCache;
+  try {
+    capsCache = await getCapabilities();
+  } catch {
+    // 拿不到就按「不支持原生框」处理：宁可退到页面内浏览，也不要弹一个失败框
+    capsCache = {};
+  }
+  return capsCache;
+}
+
 async function refreshVersion() {
   const badge = document.getElementById("appVersion");
   if (!badge) return;
@@ -54,6 +69,7 @@ async function refreshEnvironment() {
 
   try {
     const caps = await getCapabilities();
+    capsCache = caps;
     const problems = [];
     if (!caps.python) problems.push("缺少训练解释器");
     if (!caps.yolo_launcher) problems.push("缺少 YOLO launcher");
@@ -79,10 +95,102 @@ async function refreshEnvironment() {
 }
 
 // ---------------------------------------------------------------------------
-// 目录浏览弹窗
-// 浏览器无法弹系统文件框，这里用受限的目录浏览补上「选路径」能力。
+// 路径选择
+//
+// 两条路：
+//   1. 原生对话框（首选）——由后端在服务端桌面弹 Windows 系统框，能选任意盘符、
+//      带该字段专属的扩展名过滤。浏览器自己做不到这件事（安全沙箱），必须绕后端。
+//   2. 页面内目录浏览（兜底/Shift）——远程访问、服务跑在无桌面会话、
+//      或用户想直接切盘符时用。能力探测失败时自动走这条。
 // ---------------------------------------------------------------------------
-const browseState = { targetId: null, mode: "dir", current: "" };
+const browseState = { targetId: null, mode: "dir", current: "", patterns: [] };
+
+/** 解析 data-patterns=".pt,.pth" → [".pt", ".pth"]；接受 pt / *.pt 写法。 */
+function splitPatterns(text) {
+  return String(text || "")
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean)
+    .map((item) => {
+      if (item.startsWith("*.")) return item.slice(1);
+      if (item.startsWith(".")) return item;
+      return `.${item}`;
+    });
+}
+
+/**
+ * 顶部提示条。
+ *
+ * 为什么不用 alert：选路径时用户正在看输入框，alert 会把焦点抢走，
+ * 点掉之后还得重新找位置；提示条不打断操作。
+ */
+function toast(message, kind = "warn") {
+  let box = document.getElementById("pathToast");
+  if (!box) {
+    box = document.createElement("div");
+    box.id = "pathToast";
+    box.className = "path-toast";
+    document.body.appendChild(box);
+  }
+  box.textContent = message;
+  box.dataset.kind = kind;
+  box.classList.add("show");
+  clearTimeout(toast.timer);
+  toast.timer = setTimeout(() => box.classList.remove("show"), 4500);
+}
+
+/**
+ * 弹原生对话框，选中就写回字段。
+ *
+ * @returns {Promise<boolean>} true=已处理（含用户取消）；false=应回退到页面内浏览
+ */
+async function pickNative(button) {
+  const kind = button.dataset.dialog;
+  if (!kind) return false;
+
+  const caps = await capabilitiesOnce();
+  if (!caps.native_dialog) return false;
+
+  const targetId = button.dataset.browse;
+  const target = targetId ? document.getElementById(targetId) : null;
+  const payload = {
+    kind,
+    field: targetId || "",
+    title: button.dataset.title || "",
+    // 字段里通常已经是上次选的文件路径，后端会取父目录作为起始位置
+    initial: (target?.value || "").trim(),
+    patterns: splitPatterns(button.dataset.patterns),
+    label: button.dataset.label || "",
+    defaultextension: button.dataset.defaultextension || "",
+  };
+
+  const label = button.textContent;
+  button.disabled = true;
+  button.textContent = "…";
+  // 首次打开子进程要一两秒，先给一句提示，免得用户以为按钮坏了
+  const hint = setTimeout(() => toast("已打开系统对话框，请到桌面窗口完成选择", "info"), 1200);
+  try {
+    const result = await nativeDialog(payload);
+    if (result.paths?.length) {
+      writeValue(targetId, result.paths[0]);
+      toast(`已选择：${result.paths[0]}`, "info");
+    }
+    // 取消是有意行为：不动字段、不报错
+    return true;
+  } catch (error) {
+    if (error.status === 409) {
+      toast(error.message, "warn");
+      return true;
+    }
+    const reason = error.payload?.detail || error.message;
+    toast(`系统对话框打不开（${reason}），已改用页面内浏览`, "warn");
+    return false;
+  } finally {
+    clearTimeout(hint);
+    button.disabled = false;
+    button.textContent = label;
+  }
+}
 
 function initBrowse() {
   const modal = document.getElementById("browseModal");
@@ -93,15 +201,25 @@ function initBrowse() {
   const btnClose = document.getElementById("browseClose");
 
   document.querySelectorAll("[data-browse]").forEach((button) => {
-    button.addEventListener("click", async () => {
-      browseState.targetId = button.dataset.browse;
-      browseState.mode = button.dataset.mode || "dir";
-      const start = document.getElementById(browseState.targetId)?.value || "";
-      modal.classList.remove("hidden");
-      btnPick.textContent = browseState.mode === "file" ? "选择文件/当前目录" : "选择当前目录";
-      await openAt(start);
+    button.addEventListener("click", async (event) => {
+      // Shift：强制页面内浏览。远程访问、无桌面会话、或想手动切盘符时用得上。
+      if (!event.shiftKey) {
+        const handled = await pickNative(button);
+        if (handled) return;
+      }
+      openModal(button);
     });
   });
+
+  function openModal(button) {
+    browseState.targetId = button.dataset.browse;
+    browseState.mode = button.dataset.dialog === "dir" || button.dataset.mode === "dir" ? "dir" : "file";
+    browseState.patterns = splitPatterns(button.dataset.patterns);
+    const start = document.getElementById(browseState.targetId)?.value || "";
+    modal.classList.remove("hidden");
+    btnPick.textContent = browseState.mode === "file" ? "选择文件/当前目录" : "选择当前目录";
+    openAt(start);
+  }
 
   /**
    * 从字段当前值开始浏览。
@@ -121,6 +239,17 @@ function initBrowse() {
     if (parent && parent !== path) await loadDir(parent);
   }
 
+  /** 没有 data-patterns 时的兜底白名单，保持与旧版本一致的行为。 */
+  const LEGACY_FILE_RE = /\.(trt|engine|onnx|json|yaml|yml|tfanno|pt|pth|txt|exe|mp4|avi|mov|mkv|m4v|flv|ts|wmv)$/i;
+
+  function matchFile(name) {
+    if (browseState.patterns.length) {
+      const lower = name.toLowerCase();
+      return browseState.patterns.some((pattern) => lower.endsWith(pattern.toLowerCase()));
+    }
+    return LEGACY_FILE_RE.test(name);
+  }
+
   /** 列目录。返回是否成功，调用方据此决定要不要退到父目录。 */
   async function loadDir(path) {
     try {
@@ -131,7 +260,7 @@ function initBrowse() {
 
       if (browseState.mode === "file") {
         data.entries
-          .filter((e) => !e.is_dir && /\.(trt|engine|onnx|json|yaml|yml|tfanno|pt|mp4|avi|mov|mkv|m4v|flv|ts|wmv)$/i.test(e.name))
+          .filter((e) => !e.is_dir && matchFile(e.name))
           .forEach((entry) => list.appendChild(makeItem(entry, btnPick)));
       }
 
@@ -154,28 +283,18 @@ function initBrowse() {
       if (entry.is_dir) {
         await loadDir(entry.path);
       } else if (browseState.mode === "file") {
-        applyValue(entry.path);
+        writeValue(browseState.targetId, entry.path);
         modal.classList.add("hidden");
       }
     });
     // 双击文件直接选中
     li.addEventListener("dblclick", () => {
       if (!entry.is_dir) {
-        applyValue(entry.path);
+        writeValue(browseState.targetId, entry.path);
         modal.classList.add("hidden");
       }
     });
     return li;
-  }
-
-  function applyValue(value) {
-    const input = document.getElementById(browseState.targetId);
-    if (!input) return;
-    input.value = value;
-    // 程序化赋值不会触发 change 事件。目标字段往往要据此做后续动作：
-    // 「输出引擎」要把选中的目录补成完整文件名，ONNX 字段要重新探测形状。
-    // 所以这里显式通知一次，让字段自己决定怎么处理。
-    input.dispatchEvent(new Event("change", { bubbles: true }));
   }
 
   btnUp.addEventListener("click", () => {
@@ -184,7 +303,7 @@ function initBrowse() {
   });
 
   btnPick.addEventListener("click", () => {
-    applyValue(browseState.current);
+    writeValue(browseState.targetId, browseState.current);
     modal.classList.add("hidden");
   });
 
@@ -193,6 +312,21 @@ function initBrowse() {
     if (event.target === modal) modal.classList.add("hidden");
   });
 }
+
+/**
+ * 写值到目标输入框并通知一次 change。
+ *
+ * 程序化赋值不会触发 change 事件。目标字段往往要据此做后续动作：
+ * 「输出引擎」要把选中的目录补成完整文件名，ONNX 字段要重新探测形状。
+ * 所以这里显式派发一次，让字段自己决定怎么处理。
+ */
+export function writeValue(targetId, value) {
+  const input = targetId ? document.getElementById(targetId) : null;
+  if (!input) return;
+  input.value = value;
+  input.dispatchEvent(new Event("change", { bubbles: true }));
+}
+
 
 // ---------------------------------------------------------------------------
 // 启动

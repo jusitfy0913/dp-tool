@@ -871,6 +871,25 @@ POST {service}/predict    multipart/form-data
 `python 6-web/backend/tools/test_annotation_import.py`（63 项），
 外加浏览器实测六种形状、撤销重做、冲突弹窗、真实 `.engine` 自动标注与三种格式导出。
 
+#### v1.20 变更点（相对 v1.19）
+
+| 项 | v1.19 | v1.20 |
+| --- | --- | --- |
+| 选路径 | 只能页面内列目录（浏览器不能弹系统框） | 后端在本机桌面弹**Windows 原生对话框**：文件 / 多选文件 / 文件夹 / 另存为 |
+| 文件过滤 | 前端写死一串正则，`.pth` 之类看不见 | 每个字段自带扩展名清单，由后端生成过滤器（含「所有文件」兜底） |
+| 起始目录 | 每次从仓库根开始钻 | 按字段记住上次选的目录，存在 `runtime/dialog_state.json` |
+| 远程访问 | 无差别 | 只有本机（127.0.0.1/::1）才弹框；远程自动回退页面内浏览 |
+| 仓库外路径 | 选完就 403 | 选中的目录自动加入**运行期放行表**（不落盘、重启失效、不递归） |
+| 并发 | — | 全局单例锁，已有框时返回 409 而不是弹出第二个 |
+| 标注加图 | 只能扫整个目录 | 新增「选图片…」多选文件直接加入；另存为改走原生保存框 |
+| 上次遗漏的入口 | `yoloModel` / `pythonPath` 没有浏览按钮 | 补齐；`dsSource` / `batchSource` / `annoImportSource` 拆成「文件」「目录」两个按钮 |
+
+新增文件：`backend/nativedialog.py`、`backend/tools/test_native_dialog.py`。
+改动文件：`backend/config.py`（运行期放行表）、`backend/app.py`（`/api/browse/dialog` +
+capabilities 的 `native_dialog`）、`frontend/js/main.js`（统一入口 + 提示条）、
+`frontend/js/api.js`、`frontend/js/annotate.js`（多选加图 / 另存为）、
+`frontend/index.html`、`frontend/css/style.css`。
+
 #### v1.19 变更点（相对 v1.18.1）
 
 | 项 | v1.18.1 | v1.19 |
@@ -913,6 +932,30 @@ POST {service}/predict    multipart/form-data
 | 中 | 撤销/重做只改数组不切视图，可能在别的图上「莫名少框」 | 快照带图片索引，索引变化时同步切图并重新解码 |
 | 中 | 同进程并发保存共用 pid 临时文件，且「读 rev → 写回」无锁 | 临时名加 uuid；按绝对路径加写锁，`touch()` 共用同一把锁 |
 | 低 | 校验器用同一个 `seen_ids` 混算图片 id 与标注 id，正常的 Qt 工程被误报重复 | 图片 id 全局去重、标注 id 逐图去重 |
+
+### 选路径：原生对话框（v1.20）
+
+页面上所有「浏览 / 目录 / 文件 / …」按钮，点下去弹的是 **Windows 系统对话框**。
+
+| 操作 | 行为 |
+| --- | --- |
+| 单击 | 按字段类型弹文件框 / 文件夹框 / 另存为框，带该字段专属的扩展名过滤 |
+| `Shift` + 单击 | 打开页面内目录浏览（远程访问、或想手动切盘符时用） |
+| 「选图片…」（标注页） | 多选文件，一次挑几张图直接加入工程 |
+| 取消 | 输入框保持原值，不当作错误 |
+| 已有框打开时再点 | 提示「已经有一个选择框打开了」，不会叠出第二个 |
+
+**浏览器永远无法自己弹系统框**（安全沙箱），所以对话框由后端在**跑服务的那台机器**的桌面上弹。
+由此带来三条必须知道的边界：
+
+| 情况 | 表现 |
+| --- | --- |
+| 从别的电脑访问这个页面 | 403，前端自动退回页面内浏览（框会弹在服务端屏幕上，等于没弹） |
+| 服务跑在无桌面会话（计划任务 / NSSM 服务） | 子进程失败，前端自动退回页面内浏览并提示原因 |
+| 选中的路径在仓库外 | 该目录自动加入**运行期放行表**，不递归、不落盘、重启失效 |
+
+要用系统框的前提：Windows + 当前解释器带 `tkinter`（conda 官方包都带）。
+`/api/capabilities` 的 `native_dialog` 字段就是这项探测结果，前端据此决定按钮走哪条路。
 
 ### 环境说明
 
@@ -1008,6 +1051,8 @@ offset1 = cursor - p_image * scale1
 | `TRTFORGE_ANOMALIB_LAUNCHER_DIR` | Anomalib launcher 目录 | `<仓库>/2-python-anomaly/launcher` |
 | `TRTFORGE_ANOMALIB_DATASET_ROOT` | Anomalib 数据集根 | `<仓库>/2-python-anomaly/anomalib-main/datasets/bottle` |
 | `TRTFORGE_BROWSE_ROOTS` | 额外允许浏览的目录，分号分隔 | 仅仓库根 |
+| `TRTFORGE_DIALOG_TIMEOUT` | 原生对话框最长等待秒数，超时按取消处理 | 300 |
+| `TRTFORGE_DIALOG_DISABLE` | 设为 `1` 关闭原生对话框，全部走页面内浏览 | 未设（启用） |
 | `TRTFORGE_MAX_UPLOAD_MB` | 上传图片上限 | 32 |
 | `TRTFORGE_ENGINE_STATS` | 引擎构建耗时统计文件（自学习估算用） | `6-web/runtime/engine_stats.json` |
 | `TRTFORGE_WEB_PORT` / `TRTFORGE_WEB_HOST` | 监听端口 / 地址 | 8060 / 127.0.0.1 |
@@ -1035,7 +1080,8 @@ offset1 = cursor - p_image * scale1
 | GET | `/api/runs/{run_id}` | 单任务状态 |
 | POST | `/api/runs/{run_id}/stop` | 停止任务 |
 | WS | `/ws/runs/{run_id}` | 事件流（训练日志 / 进度） |
-| GET | `/api/browse?path=` | 目录浏览（Web 无法弹系统选择框） |
+| GET | `/api/browse?path=` | 目录浏览（页面内选择，远程访问时的兜底） |
+| POST | `/api/browse/dialog` | **v1.20**：在服务端桌面弹原生对话框（`file` / `files` / `dir` / `save`），返回选中路径 |
 | POST | `/api/infer/yolo` | YOLO 推理 |
 | POST | `/api/infer/anomalib` | Anomalib 推理 |
 | POST | `/api/infer/batch` | **v1.16**：目录批量推理（子进程），返回 `run_id`，进度与产物走 `WS /ws/runs/{id}` |
@@ -1066,6 +1112,25 @@ offset1 = cursor - p_image * scale1
 | `rev` | int | 是 | 客户端基于的修订号；新建传 `-1` |
 | `stamp` | object | 否 | `{"mtime_ns":"...","size":123}`，识别「保存前文件被别人改过」 |
 | `force` | bool | 否 | `true` = 强制覆盖，跳过两项校验（冲突弹窗的「强制覆盖」） |
+
+`POST /api/browse/dialog` 的请求体：
+
+| 字段 | 类型 | 默认 | 说明 |
+| --- | --- | --- | --- |
+| `kind` | str | `file` | `file` 单选文件 / `files` 多选文件 / `dir` 文件夹 / `save` 另存为 |
+| `field` | str | 空 | 目标输入框 id，用来记住「这个字段上次从哪个目录开始选」 |
+| `title` | str | 空 | 对话框标题 |
+| `initial` | str | 空 | 起始路径；传文件时会自动取父目录 |
+| `patterns` | array | 空 | 扩展名清单，如 `[".pt", ".pth"]`（`.pt` / `pt` / `*.pt` 都接受） |
+| `label` | str | 空 | 扩展名组的可读描述，显示在过滤器里 |
+| `defaultextension` | str | 空 | `save` 时自动补的后缀 |
+| `must_exist` | bool | `true` | 文件夹是否必须存在 |
+
+返回：`{ok, paths[], cancelled, elapsed_ms, allowed[]}`。`paths` 为空表示用户取消（不是错误）；
+`allowed` 是本次被加入运行期放行表的目录。
+
+失败语义：非本机来源 **403**、已有对话框打开 **409**、环境不支持 **400**。三种都由前端转成
+「提示 + 回退页面内浏览」，不会让用户卡在一个点不动的按钮上。
 
 `POST /api/annotation/import` 的请求体：
 
@@ -1253,7 +1318,8 @@ offset1 = cursor - p_image * scale1
 6-web/
 ├── backend/
 │   ├── app.py            FastAPI 路由
-│   ├── config.py         路径推导、环境变量与白名单（allowed_roots / is_path_allowed）
+│   ├── config.py         路径推导、环境变量与白名单（allowed_roots / is_path_allowed / 运行期放行）
+│   ├── nativedialog.py   **v1.20**：服务端原生对话框（子进程弹框 / 单例锁 / 超时 / 按字段记目录）
 │   ├── progress.py       引擎构建阶段识别 + 耗时自学习估算（trtexec 不给真实进度）
 │   ├── runners.py        子进程管理 + TRTFORGE_JSON 事件解析 + 广播 + 进度心跳
 │   ├── infer.py          ctypes 调 DLL（结构体定义、LRU 句柄缓存、热能图渲染）
@@ -1289,6 +1355,7 @@ offset1 = cursor - p_image * scale1
 │       ├── test_val_metrics.py        **v1.17**：mAP 验收（IoU 边界 / 多类 AP / P-R 曲线 / 无 GT 容错）
 │       ├── test_pipeline_resolve.py   **v1.18**：串联 resolve 验收（延迟派生 / 产物定位 / metadata 校验 / 动态 batch）
 │       ├── test_anomaly_metrics.py    **v1.18**：异常指标验收（归一化 / AUROC 同分 / 混淆矩阵边界 / 最优阈值）
+│       ├── test_native_dialog.py      **v1.20**：原生对话框验收（扩展名归一化 / 起始目录 / 四种类型 / 单例锁 / 超时 / 放行表 / 远程 403）
 │       ├── run_all_tests.py           总入口：扫描并串行跑完所有 test_*.py（CI 共用）
 │       └── test_exit_codes.py  退出码语义化测试（exit 2/130 的补事件逻辑）
 ├── frontend/
@@ -1307,7 +1374,7 @@ offset1 = cursor - p_image * scale1
 │   │   ├── infer.js      推理控制台（模型扫描 / 参数联动 / 表格 / 直方图 / 导出）
 │   │   ├── inferbatch.js **v1.16**：目录批量 / 视频 / 摄像头（事件流、进度、结果表、canvas 叠框）
 │   │   ├── pipeline.js   **v1.17/v1.18**：全流程串联卡片（YOLO / Anomalib 双模式、阶段清单、产物表、精度卡片、历史记录）
-│   │   └── main.js       页签 / 环境状态 / 目录浏览（**v1.18.1**：字段里已是文件路径时退到父目录）
+│   │   └── main.js       页签 / 环境状态 / 路径选择（**v1.20**：原生对话框优先，Shift 或失败时回退页面内浏览）
 │   └── tests/            零依赖前端单测（node 直跑）
 │       ├── test_viewer_math.mjs  缩放锚点、坐标互逆、滚轮归一化
 │       ├── test_engine_out.mjs   **v1.18.1**：输出引擎路径规范化（目录补文件名 / 后缀识别 / 不误改）
@@ -1320,7 +1387,7 @@ offset1 = cursor - p_image * scale1
 **一条命令跑完全部后端测试**（v1.15 起，CI 与本地共用同一个入口）：
 
 ```powershell
-D:\Anaconda3\envs\dpenv\python.exe 6-web\backend\tools\run_all_tests.py      # 21 个脚本
+D:\Anaconda3\envs\dpenv\python.exe 6-web\backend\tools\run_all_tests.py      # 22 个脚本
 D:\Anaconda3\envs\dpenv\python.exe 6-web\backend\tools\run_all_tests.py transd  # 只跑名字含 transd 的
 ```
 
@@ -1364,6 +1431,9 @@ D:\Anaconda3\envs\dpenv\python.exe 6-web\backend\tools\test_pipeline_log.py
 
 # 引擎精度指标（COCO 口径 mAP，纯计算）
 D:\Anaconda3\envs\dpenv\python.exe 6-web\backend\tools\test_val_metrics.py
+
+# 原生对话框（不需要真弹窗：子进程换成假实现，用临时目录跑）
+D:\Anaconda3\envs\dpenv\python.exe 6-web\backend\tools\test_native_dialog.py
 ```
 
 2026-10-29 实测结果：`smoke_test` **13 项全通过**（能力探测、参数校验、越权拦截、
@@ -1416,6 +1486,26 @@ D:\Anaconda3\envs\dpenv\python.exe 6-web\backend\tools\test_val_metrics.py
 | 320×320 引擎构建 | 估算 53 s（当时的错误公式）→ 实际 5 分 17 秒，收尾提示「实际 5 分 17 秒，估算 53 秒」；`engine_stats.json` 记下 313.55 s，**该次实测直接推翻了「按面积平方」的假设并改成了幂律模型** |
 | 训练进度面板（3 轮 / 320px / PCB 553 张） | `epoch 3/3`、100%、已用 0:59、每轮 ≈ 0:06、剩余 0:00；最终验证那行标成 `final`（不再出现 `epoch 4/3`）；loss 与 mAP 两条曲线各 1 / 2 条折线，`stroke` 解析为 `rgb(34,211,238)`，页面无横向溢出 |
 | 参数回显 | 折叠块里的命令行与后端 `run.command` 逐字一致 |
+
+2026-11-02 原生对话框实测结果（v1.20）：
+
+| 脚本 | 结果 |
+| --- | --- |
+| `test_native_dialog.py` | **40 / 40 通过** |
+
+脚本把「弹框那一步」换成假子进程（模态框没法自动点），验证的是我们自己写的逻辑：
+扩展名归一化、起始目录取父目录、四种类型映射、单例锁、超时、子进程异常、取消不写记忆、
+临时目录清理、白名单放行/清空、接口层远程 403 与本机放行。
+
+浏览器实测（Playwright 驱动 + 真实 Windows 对话框）：
+
+| 场景 | 结果 |
+| --- | --- |
+| 点「dataset.yaml 浏览」 | 按钮变 `…` 并禁用，桌面弹出系统文件框 |
+| 在框里输入完整路径回车 | 字段被写成 `D:\test\deeplearning\dp-tool\PCB data\PCB缺陷检测\data.yaml`，提示条显示「已选择：…」 |
+| 按 Esc 取消 | 字段保持原值、按钮恢复、**不会**误开页面内浏览 |
+| `Shift` + 点「浏览」 | 页面内目录浏览正常打开（显示仓库根 15 项） |
+| 标注页「新建…」 | 弹的是**保存**框（带 `.tfanno` 默认后缀），取消后字段不动 |
 
 2026-11-02 批量 · 视频 · 摄像头实测结果（v1.16）：
 
@@ -1506,6 +1596,25 @@ $env:NVCC_PREPEND_FLAGS = "-D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH --allow-un
 
 这是设计行为。任务是后端子进程，与浏览器无关。要停就点页面「停止」，或调
 `POST /api/runs/{run_id}/stop`。
+
+**点了「浏览」没有弹窗，或者弹在别的屏幕上**
+
+对话框是**后端**在跑服务的那台机器的桌面上弹的（浏览器不能自己调系统框）。
+按顺序查：
+
+1. 页面「环境说明」里 `native_dialog` 是不是 `true`。`false` = 当前解释器没有 `tkinter`，
+   或者设了 `TRTFORGE_DIALOG_DISABLE=1`。conda 官方包都自带 `tkinter`。
+2. 是不是从别的电脑访问的页面。非本机（非 `127.0.0.1`）一律拒绝并自动退回页面内浏览。
+3. 服务是不是用计划任务 / NSSM 跑在无桌面会话里。那种模式下弹不出窗口，
+   同样自动退回页面内浏览——看页面顶部提示条的原因说明。
+4. 窗口是不是被浏览器盖住了。对话框已置顶，但如果切到了别的虚拟桌面就看不到。
+
+不想等它：按住 `Shift` 点按钮，直接用页面内目录浏览。
+
+**提示「已经有一个选择框打开了」**
+
+同一时间只允许一个系统对话框（否则分不清哪个对应哪个字段）。先到桌面把那个框
+关掉（确定或取消），再点新的；300 秒没操作会自动放弃。
 
 **改了代码但页面行为没变**
 

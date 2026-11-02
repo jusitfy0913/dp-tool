@@ -28,7 +28,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -44,6 +44,7 @@ import infer
 import inferjobs
 import labels as labels_mod
 import models as models_mod
+import nativedialog
 import onnx_fallback
 import pipeline as pipeline_mod
 import progress
@@ -52,7 +53,7 @@ from runners import manager
 
 #: 应用版本号。前端顶栏与 /api/health 都读它，方便一眼看出「页面连的是哪个后端」。
 #: 起因：改了代码但 8060 上跑的是几小时前的旧进程，排查很久才发现。
-APP_VERSION = "1.19.0"
+APP_VERSION = "1.20.0"
 
 #: 本文件所在目录（6-web/backend）。子进程脚本路径都以它为基准，
 #: 不依赖启动时的工作目录——从仓库根启动和从 backend 启动必须都能跑。
@@ -109,6 +110,8 @@ def capabilities() -> dict:
     fallback_ok, fallback_detail = onnx_fallback.available()
     data["infer_fallback"] = fallback_ok
     data["infer_fallback_detail"] = fallback_detail
+    # 原生对话框：不可用时前端自动改走页面内目录浏览，不显示一个点不动的按钮
+    data["native_dialog"] = nativedialog.available()
     return data
 
 
@@ -1745,6 +1748,85 @@ def browse(path: str = "") -> dict:
         raise HTTPException(status_code=403, detail=f"无权限读取：{target}") from exc
 
     return {"path": str(target), "parent": str(target.parent), "entries": entries}
+
+
+class NativeDialogRequest(BaseModel):
+    """原生对话框参数。
+
+    字段名与 ``nativedialog.select`` 一一对应；``field`` 是目标输入框的 id，
+    用于记住「这个字段上次从哪个目录开始选」。
+    """
+
+    kind: str = Field(default="file", description="file / files / dir / save")
+    field: str = Field(default="", description="目标输入框 id，用于记住上次目录")
+    title: str = Field(default="", description="对话框标题")
+    initial: str = Field(default="", description="起始目录或文件路径")
+    patterns: list[str] = Field(default_factory=list, description="扩展名，如 .pt / .yaml")
+    label: str = Field(default="", description="扩展名组的可读描述")
+    defaultextension: str = Field(default="", description="另存为时的默认后缀，如 .tfanno")
+    must_exist: bool = Field(default=True, description="文件夹是否存在校验")
+
+
+def _is_local_request(request: Request) -> bool:
+    """请求是否来自本机。
+
+    原生框弹在**服务端**的桌面上。远程用户点按钮时框弹在他看不见的屏幕上，
+    表现为「点了没反应」，比没有这个功能更糟。所以只服务本机来源，
+    远程一律拒绝并让前端回退到页面内浏览。
+    """
+    client = request.client
+    if client is None:
+        return False
+    host = (client.host or "").strip().lower()
+    return host in {"127.0.0.1", "::1", "localhost", "::ffff:127.0.0.1"}
+
+
+@app.post("/api/browse/dialog")
+def browse_dialog(payload: NativeDialogRequest, request: Request) -> dict:
+    """在本机桌面上弹原生文件/文件夹对话框，返回选中的绝对路径。
+
+    为什么是 POST + 同步返回：对话框是模态的，用户可能几分钟后才点确定，
+    这期间请求一直挂着。前端据此显示「请到桌面完成选择」。
+    取消不算错误——返回 ``cancelled=True`` 且不改字段。
+    """
+    if not nativedialog.available():
+        raise HTTPException(
+            status_code=400,
+            detail="当前环境不支持原生对话框，请改用页面内目录浏览",
+        )
+    if not _is_local_request(request):
+        raise HTTPException(
+            status_code=403,
+            detail="原生对话框只对本机访问可用（框会弹在服务端屏幕上），请改用页面内目录浏览",
+        )
+
+    try:
+        result = nativedialog.select(
+            payload.kind,
+            title=payload.title,
+            field=payload.field,
+            initial=payload.initial,
+            patterns=payload.patterns,
+            label=payload.label,
+            defaultextension=payload.defaultextension,
+            must_exist=payload.must_exist,
+        )
+    except nativedialog.DialogBusy as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    # 用户亲手选的路径视为可信：加入运行期放行表，否则后续接口会 403。
+    # 只放行「选中的那个目录」，不递归、不落盘，服务重启即失效。
+    granted = []
+    for item in result.get("paths") or []:
+        allowed = config.allow_path(item)
+        if allowed is not None:
+            granted.append(str(allowed))
+
+    return {"ok": True, **result, "allowed": granted}
 
 
 # ---------------------------------------------------------------------------

@@ -49,6 +49,8 @@
         <label>Python 解释器
           <div class="row">
             <input type="text" id="pythonPath" placeholder="留空则自动探测，例如 D:\Anaconda3\envs\dpenv\python.exe">
+            <button type="button" class="mini" data-browse="pythonPath" data-dialog="file"
+                    data-patterns=".exe" data-label="Python 解释器" data-title="选择 python.exe">浏览</button>
           </div>
         </label>
 
@@ -63,12 +65,17 @@
             </select>
           </label>
           <label>模型 / 权重
-            <input type="text" id="yoloModel" value="yolov8n.pt">
+            <div class="row">
+              <input type="text" id="yoloModel" value="yolov8n.pt" placeholder="模型名（yolov8n.pt）或已下载权重的绝对路径">
+              <button type="button" class="mini" data-browse="yoloModel" data-dialog="file"
+                      data-patterns=".pt,.pth" data-label="权重文件" data-title="选择预训练权重">浏览</button>
+            </div>
           </label>
           <label>dataset.yaml
             <div class="row">
               <input type="text" id="yoloData" placeholder="导出的 dataset.yaml 绝对路径">
-              <button type="button" class="mini" data-browse="yoloData">浏览</button>
+              <button type="button" class="mini" data-browse="yoloData" data-dialog="file"
+                      data-patterns=".yaml,.yml" data-label="YOLO 数据集配置" data-title="选择 dataset.yaml">浏览</button>
             </div>
           </label>
           <div class="grid2">
@@ -200,7 +207,8 @@
             <label>权重 .pt
               <div class="row">
                 <input type="text" id="expWeights" placeholder="…\weights\best.pt">
-                <button type="button" class="mini" data-browse="expWeights" data-mode="file">浏览</button>
+                <button type="button" class="mini" data-browse="expWeights" data-dialog="file"
+                        data-patterns=".pt,.pth" data-label="权重文件" data-title="选择要导出的权重">浏览</button>
                 <button type="button" class="mini" id="btnPickBest">用当前实验 best.pt</button>
               </div>
             </label>
@@ -247,7 +255,8 @@
           <label>数据集 root（Folder）
             <div class="row">
               <input type="text" id="anomRoot" placeholder="包含 train/good、test/abnormal 的目录">
-              <button type="button" class="mini" data-browse="anomRoot">浏览</button>
+              <button type="button" class="mini" data-browse="anomRoot" data-dialog="dir"
+                      data-title="选择 Anomalib 数据集根目录">浏览</button>
             </div>
           </label>
           <div class="grid2">
@@ -370,7 +379,8 @@
           <label id="pipeWeightsBox" hidden>已有权重 .pt
             <div class="row">
               <input type="text" id="pipeWeights" placeholder="…\weights\best.pt">
-              <button type="button" class="mini" data-browse="pipeWeights" data-mode="file">浏览</button>
+              <button type="button" class="mini" data-browse="pipeWeights" data-dialog="file"
+                      data-patterns=".pt,.pth" data-label="权重文件" data-title="选择已有权重">浏览</button>
               <button type="button" class="mini" id="btnPipePickBest">用当前实验 best.pt</button>
             </div>
           </label>
@@ -393,7 +403,8 @@
           <label>数据集根目录 root
             <div class="row">
               <input type="text" id="pipeAnomalyRoot" placeholder="例如 …\anomalib-main\datasets\bottle">
-              <button type="button" class="mini" data-browse="pipeAnomalyRoot" data-mode="dir">浏览</button>
+              <button type="button" class="mini" data-browse="pipeAnomalyRoot" data-dialog="dir"
+                      data-title="选择 Anomalib 数据集根目录">浏览</button>
             </div>
           </label>
 
@@ -405,7 +416,8 @@
           <label id="pipeAnomalySeedBox" hidden>已有产物目录（含 metadata.json 与 .onnx）
             <div class="row">
               <input type="text" id="pipeAnomalyArtifacts" placeholder="…\weights\lightning">
-              <button type="button" class="mini" data-browse="pipeAnomalyArtifacts" data-mode="dir">浏览</button>
+              <button type="button" class="mini" data-browse="pipeAnomalyArtifacts" data-dialog="dir"
+                      data-title="选择 Anomalib 产物目录">浏览</button>
             </div>
           </label>
 
@@ -498,13 +510,15 @@
           <label>引擎文件 .trt / .engine
             <div class="row">
               <input type="text" id="yoloEngine" placeholder="yolo 引擎路径">
-              <button type="button" class="mini" data-browse="yoloEngine" data-mode="file">浏览</button>
+              <button type="button" class="mini" data-browse="yoloEngine" data-dialog="file"
+                      data-patterns=".engine,.trt,.plan" data-label="TensorRT 引擎" data-title="选择 YOLO 引擎">浏览</button>
             </div>
           </label>
           <label>标签文件 labels_*.json
             <div class="row">
               <input type="text" id="yoloLabels" placeholder="留空则框上只显示 cls0、cls1…">
-              <button type="button" class="mini" data-browse="yoloLabels" data-mode="file">浏览</button>
+              <button type="button" class="mini" data-browse="yoloLabels" data-dialog="file"
+                      data-patterns=".json,.txt,.yaml,.yml" data-label="标签文件" data-title="选择标签文件">浏览</button>
             </div>
           </label>
           <label>任务类型
@@ -538,13 +552,15 @@
           <label>引擎文件 .trt / .engine
             <div class="row">
               <input type="text" id="anomEngine" placeholder="anomalib 引擎路径">
-              <button type="button" class="mini" data-browse="anomEngine" data-mode="file">浏览</button>
+              <button type="button" class="mini" data-browse="anomEngine" data-dialog="file"
+                      data-patterns=".engine,.trt,.plan" data-label="TensorRT 引擎" data-title="选择 Anomalib 引擎">浏览</button>
             </div>
           </label>
           <label>metadata.json
             <div class="row">
               <input type="text" id="anomMetadata" placeholder="与引擎同目录的 metadata.json">
-              <button type="button" class="mini" data-browse="anomMetadata" data-mode="file">浏览</button>
+              <button type="button" class="mini" data-browse="anomMetadata" data-dialog="file"
+                      data-patterns=".json" data-label="metadata" data-title="选择 metadata.json">浏览</button>
             </div>
           </label>
           <label>模型类型
@@ -686,7 +702,10 @@
         <label>图片目录
           <div class="row">
             <input type="text" id="batchSource" placeholder="服务端目录或单张图片，例如 D:\pcb\images">
-            <button type="button" class="mini" data-browse="batchSource" data-mode="dir">浏览</button>
+            <button type="button" class="mini" data-browse="batchSource" data-dialog="dir"
+                    data-title="选择图片目录">目录</button>
+            <button type="button" class="mini" data-browse="batchSource" data-dialog="file"
+                    data-patterns=".jpg,.jpeg,.png,.bmp" data-label="图片" data-title="选择单张图片">单张</button>
           </div>
         </label>
         <div class="grid2">
@@ -712,7 +731,8 @@
         <label>视频文件
           <div class="row">
             <input type="text" id="videoSource" placeholder="mp4 / avi / mov / mkv">
-            <button type="button" class="mini" data-browse="videoSource" data-mode="file">浏览</button>
+            <button type="button" class="mini" data-browse="videoSource" data-dialog="file"
+                    data-patterns=".mp4,.avi,.mov,.mkv,.m4v,.flv,.ts,.wmv" data-label="视频" data-title="选择视频文件">浏览</button>
           </div>
         </label>
         <div class="grid2">
@@ -809,7 +829,8 @@
         <label>ONNX 文件
           <div class="row">
             <input type="text" id="engOnnx" placeholder="YOLO 选 .transd.onnx；Anomalib 选 model.onnx">
-            <button type="button" class="mini" data-browse="engOnnx" data-mode="file">浏览</button>
+            <button type="button" class="mini" data-browse="engOnnx" data-dialog="file"
+                    data-patterns=".onnx" data-label="ONNX 模型" data-title="选择 ONNX 文件">浏览</button>
           </div>
         </label>
         <p class="hint" id="engProbe">选好文件会自动探测输入/输出形状。</p>
@@ -817,7 +838,11 @@
         <label>输出引擎
           <div class="row">
             <input type="text" id="engOut" placeholder="…\weights\best_fp16.engine（留空自动推导）">
-            <button type="button" class="mini" data-browse="engOut" data-mode="dir" title="选目录后会自动补上文件名">浏览</button>
+            <button type="button" class="mini" data-browse="engOut" data-dialog="dir"
+                    title="选目录后会自动补上文件名">目录</button>
+            <button type="button" class="mini" data-browse="engOut" data-dialog="save"
+                    data-patterns=".engine" data-defaultextension=".engine" data-label="TensorRT 引擎"
+                    title="直接给完整文件名">另存为</button>
           </div>
         </label>
         <p class="hint">这里要的是<b>完整文件路径</b>，不只是目录：浏览只能选到目录，选中后会自动补成
@@ -886,7 +911,10 @@
         <label>数据源
           <div class="row">
             <input type="text" id="dsSource" placeholder="YOLO 目录、data.yaml 或 .tfanno">
-            <button type="button" class="mini" data-browse="dsSource" data-mode="file">浏览</button>
+            <button type="button" class="mini" data-browse="dsSource" data-dialog="file"
+                    data-patterns=".yaml,.yml,.tfanno" data-label="数据源" data-title="选择 data.yaml 或 .tfanno">文件</button>
+            <button type="button" class="mini" data-browse="dsSource" data-dialog="dir"
+                    data-title="选择 YOLO 数据集根目录">目录</button>
           </div>
         </label>
 
@@ -922,7 +950,8 @@
         <label>输出目录
           <div class="row">
             <input type="text" id="dsOutput" placeholder="导出到哪里，不能放在数据源内部">
-            <button type="button" class="mini" data-browse="dsOutput" data-mode="dir">浏览</button>
+            <button type="button" class="mini" data-browse="dsOutput" data-dialog="dir"
+                    data-title="选择导出目录">浏览</button>
           </div>
         </label>
 
@@ -961,7 +990,11 @@
         <h2>工程</h2>
         <div class="anno-row">
           <input type="text" id="annoPath" placeholder=".tfanno 工程文件路径" />
-          <button type="button" class="mini" data-browse="annoPath" data-mode="file" title="浏览">…</button>
+          <button type="button" class="mini" data-browse="annoPath" data-dialog="file"
+                  data-patterns=".tfanno" data-label="标注工程" data-title="选择 .tfanno 工程">…</button>
+          <button type="button" class="mini" data-browse="annoPath" data-dialog="save"
+                  data-patterns=".tfanno" data-defaultextension=".tfanno" data-label="标注工程"
+                  title="新建工程（另存为）">新建…</button>
         </div>
         <div class="anno-row">
           <button type="button" class="primary" id="annoOpen">打开</button>
@@ -977,8 +1010,10 @@
         <div class="anno-row anno-stack">
           <input type="text" id="annoAddRoot" placeholder="图片目录" />
           <div class="anno-row">
-            <button type="button" class="mini" data-browse="annoAddRoot" title="浏览">…</button>
+            <button type="button" class="mini" data-browse="annoAddRoot" data-dialog="dir"
+                    title="选择图片所在文件夹">…</button>
             <button type="button" class="mini" id="annoAddImages">批量加入</button>
+            <button type="button" class="mini" id="annoAddFiles" title="一次选多张图片直接加入工程">选图片…</button>
           </div>
         </div>
 
@@ -988,7 +1023,11 @@
           <div class="anno-row anno-stack">
             <input type="text" id="annoImportSource" placeholder="data.yaml 或数据集根目录" />
             <div class="anno-row">
-              <button type="button" class="mini" data-browse="annoImportSource" data-mode="file" title="浏览">…</button>
+              <button type="button" class="mini" data-browse="annoImportSource" data-dialog="file"
+                      data-patterns=".yaml,.yml" data-label="YOLO 数据集配置"
+                      data-title="选择 data.yaml">文件</button>
+              <button type="button" class="mini" data-browse="annoImportSource" data-dialog="dir"
+                      data-title="选择数据集根目录">目录</button>
             </div>
           </div>
           <div class="anno-row anno-splits" id="annoImportSplits">
@@ -1098,7 +1137,8 @@
           <input type="text" id="annoExportOut" placeholder="输出目录" />
         </div>
         <div class="anno-row">
-          <button type="button" class="mini" data-browse="annoExportOut">…</button>
+          <button type="button" class="mini" data-browse="annoExportOut" data-dialog="dir"
+                  title="选择导出目录">…</button>
           <button type="button" class="mini primary" id="annoExport">导出</button>
         </div>
 
@@ -1107,11 +1147,14 @@
           <summary>预标注参数</summary>
           <div class="anno-row">
             <input type="text" id="annoAlEngine" placeholder=".engine 引擎路径" />
-            <button type="button" class="mini" data-browse="annoAlEngine" data-mode="file">…</button>
+            <button type="button" class="mini" data-browse="annoAlEngine" data-dialog="file"
+                    data-patterns=".engine,.trt,.plan" data-label="TensorRT 引擎"
+                    data-title="选择自动标注用的引擎">…</button>
           </div>
           <div class="anno-row">
             <input type="text" id="annoAlLabels" placeholder="labels_*.json（可空）" />
-            <button type="button" class="mini" data-browse="annoAlLabels" data-mode="file">…</button>
+            <button type="button" class="mini" data-browse="annoAlLabels" data-dialog="file"
+                    data-patterns=".json,.txt" data-label="标签文件" data-title="选择标签文件">…</button>
           </div>
           <div class="anno-row">
             <label class="anno-toggle">conf <input type="number" id="annoAlConf" min="0" max="1" step="0.05" value="0.25" /></label>

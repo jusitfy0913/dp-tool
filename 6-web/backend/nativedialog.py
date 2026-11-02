@@ -1,0 +1,367 @@
+# -*- coding: utf-8 -*-
+"""服务端原生文件对话框。
+
+为什么需要这个模块
+------------------
+浏览器有安全沙箱，网页**永远无法**弹 Windows 的系统文件框——这不是没实现，
+是浏览器不允许。所以路径选择要么让用户手打，要么由后端"在它自己那台机器的
+桌面上"弹框。本服务是前台脚本起的（``scripts/run_web_studio.ps1``），和浏览器
+在同一个桌面会话，因此后端弹的框用户看得见。
+
+适用范围与假设（不满足就如实降级，不假装能用）
+- 仅 Windows；``tkinter`` 可用；
+- 仅本机访问（127.0.0.1 / ::1）。远程用户点按钮时，框会弹在服务端屏幕上，
+  等于没弹——调用方必须先判断来源，否则会变成一个"点了没反应"的鬼按钮。
+
+实现要点
+--------
+1. **单独进程**：tkinter 的事件循环不能塞进 uvicorn 的线程池里。用
+   ``pythonw.exe`` 起一个短命子进程，主进程只等结果，超时直接 kill。
+2. **传参走文件**：中文、空格、引号在命令行里都是坑，payload 写临时 JSON，
+   结果也写临时 JSON，子进程 stdout 不参与通信。
+3. **单例锁**：同时弹两个模态框，用户会分不清哪个属于哪个字段。已有框打开时
+   直接报 ``DialogBusy``，由接口转成 409。
+4. **记住上次目录**：按字段名记在 ``runtime/dialog_state.json``，下次从那儿开。
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import threading
+from pathlib import Path
+
+# ``RUNTIME_DIR`` 由 config 推导，这里不强依赖 config，避免循环导入。
+_RUNTIME = Path(__file__).resolve().parents[1] / "runtime"
+STATE_FILE = _RUNTIME / "dialog_state.json"
+
+# 对话框打开后最多等这么久。用户可能去倒杯水，但也别把线程永久占着。
+TIMEOUT_SECONDS = float(os.environ.get("TRTFORGE_DIALOG_TIMEOUT", "300") or 300)
+
+KINDS = ("file", "files", "dir", "save")
+
+# 子进程脚本：只做一件事——按 payload 弹框、把结果写进 result 文件。
+# 之所以写成字符串常量而不是独立 .py 文件：独立文件一旦被误删，
+# 整条选择路径就会静默失效；内联脚本跟着模块走，少一个失败点。
+_SCRIPT = r"""
+import json, sys, tkinter as tk
+from tkinter import filedialog
+
+payload = json.load(open(sys.argv[1], encoding="utf-8"))
+result_path = sys.argv[2]
+kind = payload.get("kind") or "file"
+
+root = tk.Tk()
+root.withdraw()
+# 置顶：浏览器窗口通常占据整个屏幕，不置顶的话框会藏在后面，
+# 用户以为"点了没反应"，然后反复点击。
+try:
+    root.attributes("-topmost", True)
+    root.update()
+except Exception:
+    pass
+
+common = {"title": payload.get("title") or "选择"}
+initial = payload.get("initial") or ""
+if initial:
+    common["initialdir"] = initial
+
+filetypes = []
+for item in payload.get("filetypes") or []:
+    label, pattern = item[0], item[1]
+    filetypes.append((label, pattern))
+if not filetypes:
+    filetypes = [("所有文件", "*.*")]
+
+chosen = ""
+try:
+    if kind in ("file", "files"):
+        if kind == "file":
+            chosen = filedialog.askopenfilename(parent=root, filetypes=filetypes, **common)
+        else:
+            chosen = filedialog.askopenfilenames(parent=root, filetypes=filetypes, **common)
+    elif kind == "save":
+        chosen = filedialog.asksaveasfilename(
+            parent=root,
+            filetypes=filetypes,
+            defaultextension=payload.get("defaultextension") or "",
+            **common
+        )
+    else:
+        chosen = filedialog.askdirectory(parent=root, mustexist=bool(payload.get("must_exist", True)), **common)
+finally:
+    try:
+        root.destroy()
+    except Exception:
+        pass
+
+if isinstance(chosen, (tuple, list)):
+    paths = [p for p in chosen if p]
+elif chosen:
+    paths = [chosen]
+else:
+    paths = []
+
+with open(result_path, "w", encoding="utf-8") as handle:
+    json.dump({"paths": paths}, handle, ensure_ascii=False)
+"""
+
+_LOCK = threading.Lock()
+_TK_OK: bool | None = None
+
+
+class DialogBusy(RuntimeError):
+    """已经有一个对话框开着。"""
+
+
+def available() -> bool:
+    """当前环境能不能弹原生框。
+
+    检查三件事：平台、显式禁用开关、tkinter 是否装好。故意**不**检查
+    "有没有桌面会话"——那需要 win32 API，而真正的失败在子进程里会以
+    非零退出码暴露，届时前端自动回退，比在这里猜更可靠。
+    """
+    if os.name != "nt":
+        return False
+    if os.environ.get("TRTFORGE_DIALOG_DISABLE", "").strip().lower() in {"1", "true", "yes", "on"}:
+        return False
+    return _tkinter_available()
+
+
+def _tkinter_available() -> bool:
+    global _TK_OK
+    if _TK_OK is None:
+        try:
+            import tkinter  # noqa: F401
+            _TK_OK = True
+        except Exception:  # noqa: BLE001 - 缺 tkinter 就是不可用
+            _TK_OK = False
+    return bool(_TK_OK)
+
+
+def interpreter() -> str:
+    """挑选运行对话框脚本的解释器。
+
+    ``pythonw.exe`` 不分配控制台，弹框时不会闪一个黑窗口；没有就退回当前
+    解释器，并用 ``CREATE_NO_WINDOW`` 抑制控制台。
+    """
+    exe = Path(sys.executable)
+    if exe.name.lower() == "python.exe":
+        candidate = exe.with_name("pythonw.exe")
+        if candidate.is_file():
+            return str(candidate)
+    return str(exe)
+
+
+def build_filetypes(patterns: list[str] | None, label: str = "") -> list[list[str]]:
+    """把前端给的扩展名列表变成 tkinter 的 ``(描述, 通配)`` 列表。
+
+    输入接受 ``.pt`` / ``*.pt`` / ``pt`` 三种写法，输出统一成 ``*.pt``。
+    末尾永远补一个「所有文件」，否则用户的文件后缀不在白名单里时，
+    对话框里什么都选不到，只会以为目录是空的。
+    """
+    cleaned: list[str] = []
+    for raw in patterns or []:
+        text = str(raw or "").strip()
+        if not text:
+            continue
+        if text.startswith("*."):
+            text = text[1:]
+        elif not text.startswith("."):
+            text = "." + text
+        if text not in cleaned:
+            cleaned.append(text)
+
+    filetypes: list[list[str]] = []
+    if cleaned:
+        title = label or "支持的文件"
+        filetypes.append([f"{title} ({' '.join('*' + p for p in cleaned)})", " ".join("*" + p for p in cleaned)])
+        # 只有一个后缀时，「组合项」和「单项」内容完全一样，
+        # 再列一次会让下拉里出现两条一模一样的过滤器。
+        if len(cleaned) > 1:
+            for pattern in cleaned:
+                filetypes.append([f"{pattern[1:].upper()} 文件 (*{pattern})", f"*{pattern}"])
+    filetypes.append(["所有文件", "*.*"])
+    return filetypes
+
+
+def _load_state() -> dict:
+    try:
+        data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_state(state: dict) -> None:
+    try:
+        STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        temp = STATE_FILE.with_suffix(".tmp")
+        temp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(temp, STATE_FILE)
+    except OSError:
+        # 记不住目录不影响本次选择，静默忽略
+        pass
+
+
+def _remember(field: str, path: str) -> None:
+    if not field or not path:
+        return
+    state = _load_state()
+    folder = path if Path(path).is_dir() else str(Path(path).parent)
+    state[field] = folder
+    _save_state(state)
+
+
+def initial_dir(field: str, initial: str = "") -> str:
+    """决定对话框从哪个目录打开。
+
+    优先级：显式传入且存在 > 上次该字段选的目录 > 空（交给系统默认）。
+    显式值可能是文件路径（字段里存的是 ``xxx.engine``），要取它的父目录，
+    否则 tkinter 会忽略 initialdir 并从"文档"开始，用户又得重钻一遍。
+    """
+    text = str(initial or "").strip()
+    if text:
+        candidate = Path(text)
+        folder = candidate if candidate.is_dir() else candidate.parent
+        if folder.is_dir():
+            return str(folder)
+    remembered = str(_load_state().get(field) or "").strip()
+    if remembered and Path(remembered).is_dir():
+        return remembered
+    return ""
+
+
+def select(
+    kind: str = "file",
+    *,
+    title: str = "",
+    field: str = "",
+    initial: str = "",
+    patterns: list[str] | None = None,
+    label: str = "",
+    defaultextension: str = "",
+    must_exist: bool = True,
+) -> dict:
+    """弹一次原生对话框，返回 ``{"paths": [...], "cancelled": bool, ...}``。
+
+    调用方必须自己保证"是本机用户在选"——这个函数不做来源检查。
+    用户取消不是错误：返回空 ``paths``，调用方不要改字段、不要报错。
+    """
+    if kind not in KINDS:
+        raise ValueError(f"不支持的选择类型：{kind}")
+    if not available():
+        raise RuntimeError("当前环境不支持原生对话框")
+
+    # 单例：同时开两个框，用户分不清哪个对应哪个字段。
+    if not _LOCK.acquire(blocking=False):
+        raise DialogBusy("已经有一个选择框打开了，请先在桌面上处理它")
+    try:
+        return _run(kind, title=title, field=field, initial=initial,
+                    patterns=patterns, label=label,
+                    defaultextension=defaultextension, must_exist=must_exist)
+    finally:
+        _LOCK.release()
+
+
+def _run(kind: str, **kwargs) -> dict:
+    payload = {
+        "kind": kind,
+        "title": kwargs.get("title") or "选择路径",
+        "initial": initial_dir(kwargs.get("field", ""), kwargs.get("initial", "")),
+        "filetypes": build_filetypes(kwargs.get("patterns"), kwargs.get("label", "")),
+        "defaultextension": kwargs.get("defaultextension") or "",
+        "must_exist": kwargs.get("must_exist", True),
+    }
+
+    temp_dir = Path(tempfile.mkdtemp(prefix="tf_dialog_"))
+    request_file = temp_dir / "request.json"
+    result_file = temp_dir / "result.json"
+    request_file.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+    creationflags = 0x08000000 if os.name == "nt" else 0  # CREATE_NO_WINDOW
+    started = _now_ms()
+    try:
+        try:
+            completed = subprocess.run(
+                [interpreter(), "-c", _SCRIPT, str(request_file), str(result_file)],
+                capture_output=True,
+                timeout=TIMEOUT_SECONDS,
+                creationflags=creationflags,
+            )
+        except subprocess.TimeoutExpired:
+            return {
+                "paths": [],
+                "cancelled": True,
+                "reason": "timeout",
+                "elapsed_ms": _now_ms() - started,
+            }
+
+        elapsed = _now_ms() - started
+        if completed.returncode != 0:
+            stderr = (completed.stderr or b"").decode("utf-8", "replace")[-800:]
+            return {
+                "paths": [],
+                "cancelled": True,
+                "reason": "dialog-error",
+                "message": stderr or f"对话框进程退出码 {completed.returncode}",
+                "elapsed_ms": elapsed,
+            }
+
+        try:
+            data = json.loads(result_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {
+                "paths": [],
+                "cancelled": True,
+                "reason": "no-result",
+                "message": "对话框进程没有返回结果（可能被系统强制关闭）",
+                "elapsed_ms": elapsed,
+            }
+    finally:
+        _cleanup(temp_dir)
+
+    paths = []
+    for item in data.get("paths") or []:
+        text = str(item or "").strip()
+        if not text:
+            continue
+        # tkinter 在 Windows 上会把分隔符统一成 /（"D:/a/b"）。
+        # 存进字段后要跟 Qt 的写法保持一致，否则同一个路径在两边看起来不一样。
+        try:
+            paths.append(str(Path(text)))
+        except (OSError, ValueError):
+            paths.append(text)
+    if paths:
+        _remember(kwargs.get("field", ""), paths[0])
+    return {
+        "paths": paths,
+        "cancelled": not paths,
+        "elapsed_ms": elapsed,
+    }
+
+
+def _cleanup(folder: Path) -> None:
+    try:
+        for item in folder.iterdir():
+            item.unlink()
+        folder.rmdir()
+    except OSError:
+        pass
+
+
+def _now_ms() -> int:
+    import time
+
+    return int(time.perf_counter() * 1000)
+
+
+def reset_state() -> None:
+    """清掉记住的目录（测试用）。"""
+    try:
+        STATE_FILE.unlink()
+    except OSError:
+        pass
