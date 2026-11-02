@@ -133,6 +133,80 @@ python tf_anomalib_launcher.py --mode check-env
 
 ## 版本更新记录
 
+### v1.18 — 2026-11-02（Anomalib 异常检测一键全流程）
+
+v1.17 的串联只覆盖 YOLO。异常检测（Patchcore / PaDiM / EfficientAd）仍然是
+「训练页跑 launcher → 去目录里翻 `vN` 版本号 → 手动 trtexec → 手写脚本比对分数」，
+而且**没有任何精度量化**——阈值是 0.5 还是校准值、漏检多少张，全靠肉眼看几张热力图。
+
+这一版把 Anomalib 从训练到引擎精度报告压成一条链，并首次给出图像级 AUROC /
+漏检率 / 误报率这类可以直接写进验收单的数字。
+
+| 项目 | 老版本（v1.17） | 新版本（v1.18） | 影响 |
+| --- | --- | --- | --- |
+| 覆盖模型 | 只有 YOLO（detect/segment/pose/obb） | 新增 Anomalib `patchcore` / `padim` / `efficientad` | 异常检测也能一次点击跑完 |
+| 串联形态 | 六段（训练、导出分开） | 四段：`train_export`（训练+导出+校准）→ `probe` → `build` → `val` | 少两次模型加载，导出的一定是刚训的模型 |
+| 产物定位 | 路径在训练前就能拼出来 | `StagePlan.resolve` 在阶段执行前按 `record["artifacts"]` 延迟派生命令 | `results/<类名>/<name>/vN` 的版本号训练完才知道，不再猜 `v0` |
+| 动态 batch | probe 把 `-1` 判为非法形状 → 编译段直接失败 | 自动补 `--minShapes/--optShapes/--maxShapes`（opt=1、max=`max_batch`） | Anomalib 导出的 ONNX 本来就带动态 batch，现在能正常编译 |
+| 精度评估 | 无（YOLO 侧才有 mAP） | `tools/val_anomaly.py` 走 `anomalib_infer.dll`，出 AUROC / F1 / 漏检 / 误报 / 最优阈值 | 引擎好坏有数字，且与 DLL 判定口径严格一致 |
+
+**四段链**
+
+```
+train_export（训练 + ONNX 导出 + metadata 阈值校准）
+  → probe（校验 metadata 字段 + ONNX 形状，几十毫秒拦掉编译白跑）
+  → build（trtexec 编译 <model>_<precision>.engine）
+  → val（引擎逐张推理，出 anomaly_val_report.json / .csv）
+```
+
+**参数（`POST /api/pipeline/anomalib`，前端在串联卡片选「异常检测」后填）**
+
+| 参数 | 类型 | 默认 | 说明 | 应用场景 |
+| --- | --- | --- | --- | --- |
+| `model` | str | `patchcore` | `patchcore` / `padim` / `efficientad` | 小样本缺陷用 patchcore；快速验证用 padim；算力敏感用 efficientad |
+| `root` | str | — | Folder 数据集根目录 | 需含 `train/good`、`test/abnormal`、`test/good` |
+| `input_size` | int | 256 | 训练与导出的 H/W | 与 ONNX 的 H/W 必须一致，probe 会拦 |
+| `precision` | str | `fp16` | 引擎精度 | 验收不达标时切 `fp32` 看上限 |
+| `max_batch` | int | 8 | 动态 batch 的 `--maxShapes` 上限 | 以后要批量推时调大；只推单张时可设 1（编译更快） |
+| `skip_train` | bool | false | 跳过训练 | 反复调编译参数、复用老模型 |
+| `artifacts_dir` | str | 空 | 含 `metadata.json` 与 `.onnx` 的目录 | `skip_train=true` 时必填，填 `.../weights/lightning` |
+| `run_val` | bool | true | 是否做引擎精度验证 | 只要引擎时可关 |
+| `val_limit` | int | 0 | 每个目录最多评多少张，0=全部 | 冒烟时填 20 |
+| `calibrate_metadata` | bool | true | 用 ONNX 推理校准 `image_threshold` | 不校准会退回 0.5，异常图基本判不出来 |
+
+**指标口径（`6-web/backend/anomalymetrics.py`）**
+
+| 指标 | 算法 | 为什么这样算 |
+| --- | --- | --- |
+| image AUROC | Mann-Whitney U 秩统计，同分取平均秩 | 与阈值无关，衡量排序能力；平均秩避免「分数全相同」时虚高 |
+| TP/FP/TN/FN、P/R/F1 | `metadata.json` 的 `image_threshold` | DLL 用 `normalized = clamp01((raw-min)/(max-min))`、`>=0.5` 判异常，与 `raw >= threshold` **等价** |
+| FPR（误报率） | `FP/(FP+TN)` | 产线上「好产品被误判」的比例 |
+| FNR（漏检率） | `FN/(FN+TP)` | 产线上「坏产品被放过」的比例，通常比 FPR 更要紧 |
+| best F1 阈值 | 扫全部唯一分数 | 只作参考（会过拟合测试集），**不回写 metadata** |
+| decision_mismatch | 报告判定 vs 引擎 `is_anomaly` 不一致张数 | 非 0 说明归一化口径有偏差，必须排查 |
+
+**像素级暂不提供**：需要 ground_truth 掩码，PRO/AUPRO 成本远高于图像级；
+报告里 `pixel.available=false` 并写明原因，而不是给个空白数字。
+
+**验收（全部实测）**
+
+- 新增 `test_pipeline_resolve.py` **26/26**：延迟派生命令、派生失败短路、多产物去重、
+  `vN` 版本定位、metadata 缺阈值拦截、动态 batch 形状参数、H/W 动态拒绝。
+- 新增 `test_anomaly_metrics.py` **31/31**：归一化边界、AUROC 同分、空输入、
+  混淆矩阵阈值边界（恰好等于阈值算异常）、直方图 AUROC。
+- 回归 `run_all_tests.py`：**20 个脚本全绿**（约 28 秒）+ 前端 `test_contrast.mjs`、`node --check`。
+- 真链路（bottle 数据集，Patchcore / 256 / fp16 / 64 张）：
+  `train_export` **199.7 秒** → `probe` **0.7 秒** → `build` **1016 秒** → `val` **4.0 秒**，
+  整链 success；精度卡片 image AUROC **1.000**、F1 **1.000**、FPR **0.000**、FNR **0.000**
+  （20 张正常 / 44 张异常，`decision_mismatch=0`），产物
+  `model_fp16.engine` + `anomaly_val_report.json` / `.csv`。
+- 首轮暴露的真实缺陷：probe 把 ONNX 的动态 batch（`[-1,3,256,256]`）判成非法形状，
+  训练 199 秒后在第二段失败。修复后补了 4 条单测（含「H/W 动态仍拒绝」），
+  并用同一份产物 `skip_train` 重跑 `probe → build → val` 验证通过。
+
+细节见 `6-web/README.md` 的「异常检测一键全流程（v1.18）」与
+`docs/WORKFLOW_GUIDE.md` 的 §5.6。
+
 ### v1.17 — 2026-11-02（一键全流程串联 + 引擎精度验证）
 
 v1.16 之前的链路虽然齐了，但「跑一遍」要人守着换五个页面：训练页点开始 → 等完 →
@@ -755,6 +829,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_web_studio.ps1
 | 数据集 | 扫描 YOLO 目录 / `.tfanno`、固定哈希划分预览、导出 YOLO / COCO / VOC |
 | 标注 | 打开 / 新建 `.tfanno`、六种形状绘制（矩形/旋转矩形/多边形/线/点/关键点组）、缩放平移吸附、撤销重做、3 秒自动保存、修订号冲突弹窗、类别与属性面板、自动标注草稿层、导出 YOLO / COCO / VOC |
 | 推理演示 | 模型下拉自动发现产物、`conf`/`nms` 与 Anomalib 双阈值滑块、SVG 矢量框叠加、热能图色带、结果明细表（可排序/点行高亮）、置信度直方图、计时分解、JSON/CSV 导出；**v1.16 新增目录批量、视频与摄像头**（批量出 CSV/JSON/ZIP，视频出可内联播放的 mp4，摄像头逐帧只回 JSON 框） |
+| 全流程串联 | **v1.17 YOLO**：训练→导出→校验→编译→补标签→精度验证（mAP）；**v1.18 Anomalib**：训练+导出+校准→校验 metadata→编译→引擎精度验证（AUROC / 漏检 / 误报 / 最优阈值），支持跳过训练复用已有产物 |
 | 环境说明 | 展示后端探测到的解释器、launcher、DLL、trtexec 状态与环境变量 |
 
 从 v1.11 起，**标注全流程都可以在浏览器完成**（画、改、存、导出），不再需要 Qt 版；

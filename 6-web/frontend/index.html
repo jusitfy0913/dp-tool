@@ -325,23 +325,35 @@
         <pre class="log" id="logBox"></pre>
       </div>
 
-      <!-- 全流程串联：训练 → 导出 → 校验转置 → 编译 → 补标签 → 引擎精度验证。
+      <!-- 全流程串联：训练 → 导出 → 校验 → 编译 → 补标签 → 引擎精度验证。
            为什么不塞进上面的表单：只想训一次的人不需要看到精度、跳过训练这些选项；
-           而串联本身可能跑一两个小时，需要一块能一直盯着看的进度区。 -->
+           而串联本身可能跑一两个小时，需要一块能一直盯着看的进度区。
+           两种任务共用这张卡片：日志、产物、历史、停止逻辑完全一样，
+           只有「阶段清单」和「精度口径」不同（检测是 mAP，异常检测是 AUROC）。 -->
       <div class="card wide" id="pipeCard">
         <h2>全流程串联 <span class="badge" id="pipeBadge">未开始</span></h2>
         <p class="hint">
-          用上面「训练参数」里的 dataset.yaml / epochs / imgsz / project / name，从训练一路跑到引擎精度验证。
+          YOLO 用上面「训练参数」里的 dataset.yaml / epochs / imgsz / project / name；
+          异常检测用下面单独填的 Folder 数据集目录。
           每一段都是一个独立任务，可单独看日志；某段失败就整条停下，已完成阶段的产物照常保留。
         </p>
 
         <div class="grid2">
+          <label>任务类型
+            <select id="pipeKind">
+              <option value="yolo">YOLO 检测（mAP 验收）</option>
+              <option value="anomalib">异常检测（AUROC / 漏检 / 误报）</option>
+            </select>
+          </label>
           <label>引擎精度
             <select id="pipePrecision">
               <option value="fp16">fp16（默认，速度优先）</option>
               <option value="fp32">fp32（精度优先）</option>
             </select>
           </label>
+        </div>
+
+        <div id="pipeYoloOptions">
           <label>验证用 split
             <select id="pipeSplit">
               <option value="val">val</option>
@@ -349,20 +361,68 @@
               <option value="train">train</option>
             </select>
           </label>
-        </div>
 
-        <div class="actions">
-          <label class="check-row"><input type="checkbox" id="pipeRunVal" checked> 编译后用引擎做精度验证</label>
-          <label class="check-row"><input type="checkbox" id="pipeSkipTrain"> 跳过训练（用已有 .pt）</label>
-        </div>
-
-        <label id="pipeWeightsBox" hidden>已有权重 .pt
-          <div class="row">
-            <input type="text" id="pipeWeights" placeholder="…\weights\best.pt">
-            <button type="button" class="mini" data-browse="pipeWeights" data-mode="file">浏览</button>
-            <button type="button" class="mini" id="btnPipePickBest">用当前实验 best.pt</button>
+          <div class="actions">
+            <label class="check-row"><input type="checkbox" id="pipeRunVal" checked> 编译后用引擎做精度验证</label>
+            <label class="check-row"><input type="checkbox" id="pipeSkipTrain"> 跳过训练（用已有 .pt）</label>
           </div>
-        </label>
+
+          <label id="pipeWeightsBox" hidden>已有权重 .pt
+            <div class="row">
+              <input type="text" id="pipeWeights" placeholder="…\weights\best.pt">
+              <button type="button" class="mini" data-browse="pipeWeights" data-mode="file">浏览</button>
+              <button type="button" class="mini" id="btnPipePickBest">用当前实验 best.pt</button>
+            </div>
+          </label>
+        </div>
+
+        <div id="pipeAnomalyOptions" hidden>
+          <div class="grid2">
+            <label>模型
+              <select id="pipeAnomalyModel">
+                <option value="patchcore">PatchCore（默认，慢但准）</option>
+                <option value="padim">PaDiM（最快）</option>
+                <option value="efficientad">EfficientAd（需 imagenette）</option>
+              </select>
+            </label>
+            <label>输入尺寸
+              <input type="number" id="pipeAnomalySize" value="256" min="64" max="1024" step="32">
+            </label>
+          </div>
+
+          <label>数据集根目录 root
+            <div class="row">
+              <input type="text" id="pipeAnomalyRoot" placeholder="例如 …\anomalib-main\datasets\bottle">
+              <button type="button" class="mini" data-browse="pipeAnomalyRoot" data-mode="dir">浏览</button>
+            </div>
+          </label>
+
+          <div class="actions">
+            <label class="check-row"><input type="checkbox" id="pipeAnomalyRunVal" checked> 编译后用引擎验证（AUROC / 漏检 / 误报）</label>
+            <label class="check-row"><input type="checkbox" id="pipeAnomalySkipTrain"> 跳过训练（用已有产物目录）</label>
+          </div>
+
+          <label id="pipeAnomalySeedBox" hidden>已有产物目录（含 metadata.json 与 .onnx）
+            <div class="row">
+              <input type="text" id="pipeAnomalyArtifacts" placeholder="…\weights\lightning">
+              <button type="button" class="mini" data-browse="pipeAnomalyArtifacts" data-mode="dir">浏览</button>
+            </div>
+          </label>
+
+          <details class="run-fold" id="pipeAnomalyDirsBox">
+            <summary>目录与训练参数（默认即可）</summary>
+            <div class="grid2">
+              <label>正常训练目录 <input type="text" id="pipeAnomalyNormal" value="train/good"></label>
+              <label>异常测试目录 <input type="text" id="pipeAnomalyAbnormal" value="test/abnormal"></label>
+              <label>正常测试目录 <input type="text" id="pipeAnomalyNormalTest" value="test/good"></label>
+              <label>最大 epoch <input type="text" id="pipeAnomalyEpochs" value="auto" placeholder="auto 或数字"></label>
+            </div>
+            <p class="hint">
+              「异常测试目录」既是训练时统计异常分数的来源，也是精度验证的异常图来源；
+              正常图取自「正常测试目录」。
+            </p>
+          </details>
+        </div>
 
         <div class="actions">
           <button type="button" class="primary" id="btnPipeStart">开始全流程</button>

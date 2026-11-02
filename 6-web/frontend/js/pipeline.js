@@ -1,8 +1,10 @@
-// 全流程串联面板：训练 → 导出 → 校验转置 → 编译 → 补标签 → 引擎精度验证。
+// 全流程串联面板：训练 → 导出 → 校验 → 编译 → 补标签 → 引擎精度验证。
 //
 // 设计取舍：
-// - 参数直接复用「训练参数」表单，只额外暴露串联独有的三项（精度、跳过训练、是否验证）。
+// - 参数直接复用「训练参数」表单（YOLO），只额外暴露串联独有的几项（精度、跳过训练、是否验证）。
 //   否则用户要在两块表单里各填一遍 dataset / epochs，改了一处忘了另一处。
+// - 异常检测的目录结构与 YOLO 完全不同（Folder 数据集、metadata.json 阈值），
+//   所以它有自己的一块参数区；但阶段列表、日志、产物表、历史、停止逻辑两边共用。
 // - 轮询而不是 WebSocket：串联本身不产生日志，真正的日志在每一段的 run 里，
 //   状态是低频变化的（一段几十分钟），1 秒一次的 HTTP 比多开一条 WS 简单得多。
 // - 刷新页面后仍能看到上一次跑到哪：启动时拉一次 /api/pipeline，有进行中的就接着盯。
@@ -30,14 +32,17 @@ const CHAIN_BADGE = {
 };
 
 /// 产物键 → 展示名。顺序即表格顺序：从训练产物一路排到引擎。
+/// 两种任务共用一个列表：某一行在本次产物里不存在就不显示，不会出现空行。
 const ARTIFACT_LABELS = [
   ["run_dir", "训练目录"],
   ["pt", "最佳权重 best.pt"],
   ["onnx", "ONNX（Ultralytics 用）"],
   ["transd_onnx", "转置 ONNX（TensorRT 用）"],
   ["engine", "TensorRT 引擎"],
+  ["metadata", "metadata.json（阈值）"],
+  ["ckpt", "检查点 model.ckpt"],
   ["labels", "标签文件 labels_*.json"],
-  ["val", "验证报告 val_report.json"],
+  ["val", "验证报告"],
 ];
 
 const state = {
@@ -51,6 +56,9 @@ let dom = {};
 export function initPipeline() {
   dom = {
     badge: document.getElementById("pipeBadge"),
+    kind: document.getElementById("pipeKind"),
+    yoloOptions: document.getElementById("pipeYoloOptions"),
+    anomalyOptions: document.getElementById("pipeAnomalyOptions"),
     precision: document.getElementById("pipePrecision"),
     split: document.getElementById("pipeSplit"),
     runVal: document.getElementById("pipeRunVal"),
@@ -58,6 +66,11 @@ export function initPipeline() {
     weightsBox: document.getElementById("pipeWeightsBox"),
     weights: document.getElementById("pipeWeights"),
     btnPickBest: document.getElementById("btnPipePickBest"),
+    anomalyRunVal: document.getElementById("pipeAnomalyRunVal"),
+    anomalySkipTrain: document.getElementById("pipeAnomalySkipTrain"),
+    anomalySeedBox: document.getElementById("pipeAnomalySeedBox"),
+    anomalyArtifacts: document.getElementById("pipeAnomalyArtifacts"),
+    anomalyDirsBox: document.getElementById("pipeAnomalyDirsBox"),
     btnStart: document.getElementById("btnPipeStart"),
     btnStop: document.getElementById("btnPipeStop"),
     hint: document.getElementById("pipeHint"),
@@ -74,7 +87,9 @@ export function initPipeline() {
 
   dom.btnStart.addEventListener("click", onStart);
   dom.btnStop.addEventListener("click", onStop);
+  dom.kind.addEventListener("change", syncKind);
   dom.skipTrain.addEventListener("change", syncSkipTrain);
+  dom.anomalySkipTrain.addEventListener("change", syncSkipTrain);
   dom.btnPickBest.addEventListener("click", pickBestWeights);
   document
     .getElementById("btnPipeLogClose")
@@ -82,7 +97,7 @@ export function initPipeline() {
       dom.log.hidden = true;
     });
 
-  syncSkipTrain();
+  syncKind();
   loadHistory({ attachRunning: true });
 }
 
@@ -94,7 +109,22 @@ function value(id) {
   return el ? el.value.trim() : "";
 }
 
+/// 任务类型切换：只换参数区和按钮文案，阶段列表/产物/历史沿用同一套渲染。
+function syncKind() {
+  const kind = dom.kind.value;
+  dom.yoloOptions.hidden = kind !== "yolo";
+  dom.anomalyOptions.hidden = kind !== "anomalib";
+  dom.btnStart.textContent = kind === "anomalib" ? "开始全流程（异常检测）" : "开始全流程";
+  setHint("");
+  syncSkipTrain();
+}
+
 function syncSkipTrain() {
+  if (dom.kind.value === "anomalib") {
+    const skip = dom.anomalySkipTrain.checked;
+    dom.anomalySeedBox.hidden = !skip;
+    return;
+  }
   const skip = dom.skipTrain.checked;
   dom.weightsBox.hidden = !skip;
   if (skip && !dom.weights.value) pickBestWeights();
@@ -134,26 +164,54 @@ function buildPayload() {
   };
 }
 
+function buildAnomalyPayload() {
+  return {
+    model: value("pipeAnomalyModel") || "patchcore",
+    root: value("pipeAnomalyRoot"),
+    normal_dir: value("pipeAnomalyNormal") || "train/good",
+    abnormal_dir: value("pipeAnomalyAbnormal") || "test/abnormal",
+    normal_test_dir: value("pipeAnomalyNormalTest") || "test/good",
+    input_size: Number(value("pipeAnomalySize")) || 256,
+    max_epochs: value("pipeAnomalyEpochs") || "auto",
+    project: value("project") || "results",
+    python: value("pythonPath") || null,
+    precision: dom.precision.value,
+    skip_train: dom.anomalySkipTrain.checked,
+    artifacts_dir: dom.anomalyArtifacts.value.trim(),
+    run_val: dom.anomalyRunVal.checked,
+  };
+}
+
 async function onStart() {
-  const kind = value("trainKind");
-  if (kind !== "yolo") {
-    setHint("全流程串联目前只支持 YOLO；Anomalib 请用上面的训练表单单独训练", "bad");
-    return;
-  }
-  const payload = buildPayload();
-  if (!payload.data) {
-    setHint("请先在上面的「训练参数」里填 dataset.yaml", "bad");
-    return;
-  }
-  if (payload.skip_train && !payload.weights) {
-    setHint("勾了「跳过训练」就必须给出已有 .pt 权重", "bad");
-    return;
+  const kind = dom.kind.value;
+  const anomaly = kind === "anomalib";
+  const payload = anomaly ? buildAnomalyPayload() : buildPayload();
+
+  if (anomaly) {
+    if (payload.skip_train && !payload.artifacts_dir) {
+      setHint("勾了「跳过训练」就必须给出已有产物目录（含 metadata.json 与 .onnx）", "bad");
+      return;
+    }
+    if (!payload.skip_train && !payload.root) {
+      setHint("请填写异常检测的数据集根目录（Folder 结构，含 train/good 与 test/abnormal）", "bad");
+      return;
+    }
+  } else {
+    if (!payload.data) {
+      setHint("请先在上面的「训练参数」里填 dataset.yaml", "bad");
+      return;
+    }
+    if (payload.skip_train && !payload.weights) {
+      setHint("勾了「跳过训练」就必须给出已有 .pt 权重", "bad");
+      return;
+    }
   }
 
   dom.btnStart.disabled = true;
   setHint("正在提交…");
   try {
-    const record = await postJSON("/api/pipeline/yolo", payload);
+    const url = anomaly ? "/api/pipeline/anomalib" : "/api/pipeline/yolo";
+    const record = await postJSON(url, payload);
     state.id = record.id;
     state.record = record;
     render(record);
@@ -356,7 +414,24 @@ function renderArtifacts(record) {
     const tdAct = document.createElement("td");
     if (key === "engine") {
       tdAct.appendChild(actionButton("去推理引擎", () => {
-        setValue("yoloEngine", path);
+        // 异常检测的推理必须同时带 metadata.json（阈值在里面），
+        // 只填引擎会让 DLL 在 ai_create 阶段直接失败。
+        if (record.kind === "anomalib") {
+          setValue("inferKind", "anomalib");
+          setValue("anomEngine", path);
+          const meta = (record.artifacts || {}).metadata;
+          if (meta) setValue("anomMetadata", meta);
+        } else {
+          setValue("yoloEngine", path);
+        }
+        document.querySelector('.tab[data-tab="infer"]')?.click();
+      }));
+    } else if (key === "metadata" && record.kind === "anomalib") {
+      tdAct.appendChild(actionButton("带到推理页", () => {
+        setValue("inferKind", "anomalib");
+        setValue("anomMetadata", path);
+        const engine = (record.artifacts || {}).engine;
+        if (engine) setValue("anomEngine", engine);
         document.querySelector('.tab[data-tab="infer"]')?.click();
       }));
     } else if (key === "labels") {
@@ -377,15 +452,10 @@ function renderMetrics(record) {
   dom.metrics.hidden = !metrics;
   if (!metrics) return;
 
-  const items = [
-    ["mAP50", fmtNum(metrics.map50, 4)],
-    ["mAP50-95", fmtNum(metrics.map5095, 4)],
-    ["精确率 P", fmtNum(metrics.precision, 3)],
-    ["召回率 R", fmtNum(metrics.recall, 3)],
-    ["评估图片", metrics.num_images ?? "—"],
-    ["GT 实例", metrics.num_gts ?? "—"],
-    ["conf 阈值", fmtNum(metrics.conf, 2)],
-  ];
+  // 两条链的精度口径完全不同：检测是 mAP/P/R，异常检测是 AUROC/漏检/误报。
+  // 用同一个渲染器 + 分支，而不是写两张卡片，是因为「有没有报告、报告在哪、
+  // 怎么看历史」这些逻辑一模一样，复制一份只会让两边逐渐长得不一样。
+  const items = metrics.kind === "anomaly" ? anomalyMetricItems(metrics) : yoloMetricItems(metrics);
   items.forEach(([label, text]) => {
     const box = document.createElement("div");
     box.className = "stat";
@@ -402,6 +472,42 @@ function renderMetrics(record) {
   if (Array.isArray(metrics.per_class) && metrics.per_class.length) {
     console.table(metrics.per_class);
   }
+}
+
+function yoloMetricItems(metrics) {
+  return [
+    ["mAP50", fmtNum(metrics.map50, 4)],
+    ["mAP50-95", fmtNum(metrics.map5095, 4)],
+    ["精确率 P", fmtNum(metrics.precision, 3)],
+    ["召回率 R", fmtNum(metrics.recall, 3)],
+    ["评估图片", metrics.num_images ?? "—"],
+    ["GT 实例", metrics.num_gts ?? "—"],
+    ["conf 阈值", fmtNum(metrics.conf, 2)],
+  ];
+}
+
+function anomalyMetricItems(metrics) {
+  const image = metrics.image || {};
+  const at = image.at_metadata_threshold || {};
+  const best = image.best_f1 || {};
+  const counts = metrics.counts || {};
+  const items = [
+    ["图像 AUROC", image.auroc == null ? "无定义" : fmtNum(image.auroc, 4)],
+    ["阈值下 F1", fmtNum(at.f1, 4)],
+    ["漏检率 FNR", fmtPct(at.fnr)],
+    ["误报率 FPR", fmtPct(at.fpr)],
+    ["精确率 P", fmtNum(at.precision, 4)],
+    ["召回率 R", fmtNum(at.recall, 4)],
+    ["评估图片", metrics.num_images ?? "—"],
+    ["正常 / 异常", `${counts.normal ?? "—"} / ${counts.abnormal ?? "—"}`],
+    ["metadata 阈值", fmtNum(metrics.model?.image_threshold, 6)],
+    ["最优阈值(F1)", fmtNum(best.threshold, 6)],
+  ];
+  // 判定口径不一致时，报告里的漏检率不可信；这不是"精度差"，是"数据或阈值被改过"
+  if (image.decision_mismatch) {
+    items.push(["⚠ 判定不一致", `${image.decision_mismatch} 张`]);
+  }
+  return items;
 }
 
 // ---------------------------------------------------------------------------
@@ -539,6 +645,12 @@ function setHint(text, cls = "") {
 function fmtNum(value, digits) {
   if (value == null || Number.isNaN(Number(value))) return "—";
   return Number(value).toFixed(digits);
+}
+
+/// 0.125 → "12.5%"。漏检率/误报率写成小数没有尺度感，5% 的验收线看不出来。
+function fmtPct(value) {
+  if (value == null || Number.isNaN(Number(value))) return "—";
+  return `${(Number(value) * 100).toFixed(1)}%`;
 }
 
 /// 秒 → 人类可读。串联动辄一小时，只显示秒数没有尺度感。

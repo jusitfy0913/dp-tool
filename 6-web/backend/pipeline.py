@@ -55,9 +55,10 @@ CHAIN_CANCELLED = "cancelled"
 class StagePlan:
     """一段要执行的事情。
 
-    两种形态：给 ``command`` 就跑子进程（走 runners）；给 ``callable`` 就在
+    三种形态：给 ``command`` 就跑子进程（走 runners）；给 ``callable`` 就在
     编排线程里同步执行（用于"读 yaml 写一个 labels.json"这种毫秒级动作，
-    为它起一个进程反而更慢、日志也更碎）。
+    为它起一个进程反而更慢、日志也更碎）；给 ``resolve`` 则在阶段开始前
+    用记录里的产物派生命令（路径依赖上一段才知道的版本号时用）。
     """
 
     name: str
@@ -72,6 +73,12 @@ class StagePlan:
     callable: Callable[[], dict[str, Any]] | None = None
     report_file: str | None = None
     kind: str = ""  # 传给 runners 的任务类型名，留空按 pipeline-<name> 推导
+    #: 命令要等上一段产物确定之后才能拼出来时用（异常检测的 ONNX 落在
+    #: `results/<模型类>/<name>/vN/...`，版本号 `N` 训练完才知道，猜 `v0`
+    #: 在第二次训练时就错）。入参是整条记录，返回
+    #: `{"command": [...], "expect_file": ..., "report_file": ...}`。
+    resolve: Callable[[dict[str, Any]], dict[str, Any]] | None = None
+
 
     def run_kind(self, pipeline_id: str) -> str:
         return self.kind or f"pipeline-{self.name}"
@@ -306,6 +313,24 @@ class PipelineManager:
         self, record: dict[str, Any], stage: StagePlan, stage_state: dict[str, Any]
     ) -> tuple[bool, str | None]:
         """执行一段，返回 (是否成功, 失败原因)。"""
+        if stage.resolve is not None:
+            # 命令依赖上一段的产物（路径里有训练时才确定的版本号），
+            # 所以在这里才派生；失败就当作本段失败，不去猜路径硬跑。
+            try:
+                info = stage.resolve(record) or {}
+            except Exception as exc:  # noqa: BLE001
+                return False, f"派生 {stage.name} 命令失败：{type(exc).__name__}: {exc}"
+            # 记下实际命令行：出错时用户能直接从接口看到「到底跑的是什么」，
+            # 而不是只知道「编译失败了」。
+            stage_state["command"] = list(info.get("command") or [])
+            if info.get("expect_file") is not None:
+                stage.expect_file = (
+                    Path(info["expect_file"]) if info["expect_file"] else None
+                )
+            if info.get("report_file"):
+                stage.report_file = str(info["report_file"])
+            stage.command = list(info.get("command") or [])
+
         if stage.callable is not None:
             try:
                 detail = stage.callable() or {}
@@ -313,6 +338,11 @@ class PipelineManager:
                 return False, f"{type(exc).__name__}: {exc}"
             if detail.get("artifact"):
                 self._record_artifact(record, stage.name, detail["artifact"])
+            # 一段可能同时产出多个东西（onnx + metadata + ckpt），
+            # 后面几段的命令要读它们，只记一个就得让下游重新 glob 一遍。
+            for key, value in (detail.get("artifacts") or {}).items():
+                if value:
+                    self._record_artifact(record, key, value)
             return True, None
 
         if not stage.command:

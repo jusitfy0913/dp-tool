@@ -760,6 +760,58 @@ def _anom_handle(
     return handle
 
 
+def run_anomalib_score(
+    engine_path: str,
+    metadata_path: str,
+    image: np.ndarray,
+    model_type: str = "Auto",
+    image_threshold: float = -1.0,
+    pixel_threshold: float = -1.0,
+) -> dict:
+    """只取分数与判定，不渲染任何 PNG。
+
+    精度评估要逐张跑几千次，`run_anomalib` 每次都会编码叠加图/轮廓图/热能图/原图
+    四张 PNG 并拷贝出指针内容，一张 1080p 的图光编码就要几十毫秒，整体耗时
+    会被图片编码彻底主导（推理本身只有几毫秒）。这里只搬运三个标量。
+
+    判定用 DLL 的 `is_anomaly`：评估报告里的漏检率必须与页面上单张推理的判定
+    完全一致，自己拿 raw_score 再判一次是引入分歧的最短路径。
+    """
+    import cv2
+
+    rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    rgb = np.ascontiguousarray(rgb)
+    height, width = rgb.shape[:2]
+    stride = int(rgb.strides[0])
+    buffer = rgb.ctypes.data_as(ctypes.POINTER(ctypes.c_ubyte))
+
+    lib = _anomalib_lib
+    if lib is None:
+        raise InferError(f"anomalib_infer.dll 未加载：{_load_error or '未知原因'}")
+
+    with _anom_lock:
+        handle = _anom_handle(
+            engine_path, metadata_path, model_type, image_threshold, pixel_threshold
+        )
+        result_ptr = ctypes.POINTER(AiResult)()
+        stat = AiFrameStat()
+        code = lib.ai_infer_rgb(
+            handle, buffer, width, height, stride,
+            ctypes.byref(result_ptr), ctypes.byref(stat),
+        )
+        if code != 0:
+            raise InferError(_lib_error(lib, "ai_infer_rgb"))
+        result = result_ptr.contents
+        return {
+            "raw_score": float(result.raw_score),
+            "normalized_score": float(result.normalized_score),
+            "is_anomaly": bool(result.is_anomaly),
+            "total_ms": float(stat.total_ms),
+            "image_width": width,
+            "image_height": height,
+        }
+
+
 def run_anomalib(
     engine_path: str,
     metadata_path: str,

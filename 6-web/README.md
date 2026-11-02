@@ -303,6 +303,71 @@ train → export(.transd.onnx) → probe(形状校验) → build(.engine) → la
 启动时会把遗留的 `running` 记录标成 `cancelled`（原因「服务重启，任务已中断」）——
 不这么做，页面会对着一条永远不动的记录轮询，点「停止」还只能拿到 409。
 
+#### 异常检测一键全流程（v1.18）
+
+串联卡片的「类型」下拉新增 **异常检测（Anomalib）**。四段一条链：
+
+```
+train_export（训练 + 导出 ONNX + 校准 metadata） → probe（校验 metadata 与 ONNX 形状）
+  → build（trtexec 编译 .engine） → val（引擎级 AUROC / 漏检 / 误报）
+```
+
+| 参数 | 含义 | 默认 | 备注 |
+| --- | --- | --- | --- |
+| 模型 | `patchcore` / `padim` / `efficientad` | patchcore | 与训练页一致的三个子类 |
+| 输入尺寸 | 训练与导出的 `input_size` | 256 | 必须与 ONNX 的 H/W 一致，否则 val 前就会拦下 |
+| 数据集根目录 | Anomalib Folder 数据集（`train/good`、`test/abnormal`…） | — | 勾了「跳过训练」可留空 |
+| 跳过训练 | 直接用已有产物目录 | 不勾 | 勾上必须填「产物目录」（含 `metadata.json` 与 `.onnx`） |
+| 引擎精度 | `fp16` / `fp32` | fp16 | 与 YOLO 侧一致 |
+| 精度验证 | 是否用引擎在测试集上算指标 | 勾选 | 关掉就停在编译 |
+| 评估张数上限 | 每个目录最多多少张，0 = 全部 | 0 | 冒烟时填 20 即可 |
+
+**为什么只有四段、而且训练和导出不拆开**：Anomalib 的 launcher 在 `train-export`
+一个进程里就完成训练、ONNX 导出、`metadata.json` 阈值校准。为了阶段列表好看而拆成
+三个进程，只会多两次模型加载，并把「导出拿到的不是刚训的模型」这类错埋进编排层。
+
+**为什么产物路径要延迟派生**：产物落在 `results/<模型类名>/<name>/v<N>/weights/lightning/`，
+`<模型类名>` 是 `Patchcore` 这种类名、`v<N>` 每次训练递增。编排器在训练前根本不知道
+路径，所以 `StagePlan.resolve` 在这一段真正开始前才根据 `record["artifacts"]` 拼命令。
+硬拼 `v0` 在第二次训练时会指向老模型——老模型同样能编译、同样能出分数，错得毫无提示。
+
+**动态 batch（v1.18 的坑）**：Anomalib 的 `to_onnx` 固定
+`dynamic_axes={"input": {0: "batch_size"}}`，导出的 ONNX 输入是 `[-1, 3, H, W]`。
+最初版本的 probe 把 `-1` 当成「非法形状」直接失败，于是训练成功的模型卡在第二段。
+现在的口径是：
+
+- **batch 动态可以编**：自动补 `--minShapes=input:1x3xHxW --optShapes=input:1x3xHxW
+  --maxShapes=input:<max_batch>x3xHxW`，`opt` 取 1 与 DLL 一致
+  （`anomalib_infer_c.cpp` 固定 `setBindingDimensions(1x3xHxW)`），`max_batch` 可调（默认 8）；
+- **H/W 动态仍然拒绝**：DLL 用 metadata 里的 `input_size` 设形状，与导出时的动态范围
+  对不上会静默算错，所以要求带固定 `input_size` 重新导出。
+
+实测（bottle 数据集，Patchcore / 256 / fp16，64 张）：
+
+| 阶段 | 耗时 | 说明 |
+| --- | --- | --- |
+| train_export | ≈ 3 分 15 秒 | 44 张正常图训练 + 导出 + 校准阈值 |
+| probe | < 1 秒 | 读 metadata + ONNX 头 |
+| build | ≈ 17 分钟 | 动态 batch（1…8）让 trtexec 多搜一遍 tactic，比静态形状慢 |
+| val | ≈ 4 秒 | 引擎推理 64 张，AUROC 1.0 / F1 1.0 |
+
+**精度卡片**（`tools/val_anomaly.py` 产出的 `anomaly_val_report.json`）：
+
+| 指标 | 含义 | 口径 |
+| --- | --- | --- |
+| image AUROC | 排序能力，与阈值无关 | Mann-Whitney U 秩统计，同分取平均秩 |
+| TP/FP/TN/FN · Precision · Recall · F1 | `metadata.json` 的 `image_threshold` 下的混淆矩阵 | 与 DLL 的 `normalized_score >= 0.5` 等价 |
+| FPR（误报率） | `FP / (FP + TN)` | 正常图被判成异常的比例 |
+| FNR（漏检率） | `FN / (FN + TP)` | 异常图漏判的比例 |
+| best F1 阈值 | 扫全部唯一分数找最优 F1 | 只作参考，不会回写 metadata |
+| decision_mismatch | 报告判定与引擎判定不一致的张数 | 非 0 说明归一化口径有偏差，需排查 |
+
+**像素级暂不提供**：需要 ground_truth 掩码，PRO/AUPRO 成本远高于图像级；卡片里会写明
+「不可用」及原因，而不是给一个空白数字。
+
+**跳过训练**适合反复调编译参数：填上次的 `weights/lightning` 目录，`probe → build → val`
+照常跑，不必再等训练。
+
 
 
 ### 推理演示
@@ -858,6 +923,7 @@ offset1 = cursor - p_image * scale1
 | GET | `/api/runs/checkpoints?project=` | **v1.14**：扫描可续训的 run（读 `args.yaml` + `results.csv`，不加载 `.pt`） |
 | POST | `/api/export/yolo` | **v1.15**：把 `.pt` 导出为 ONNX，可选生成 `.transd.onnx`；返回 `run_id`，日志与产物走 `WS /ws/runs/{id}` |
 | POST | `/api/pipeline/yolo` | **v1.17**：启动「训练→导出→校验→编译→补标签→精度验证」串联，返回整条链记录（每段各有 `run_id`） |
+| POST | `/api/pipeline/anomalib` | **v1.18**：启动「训练+导出+校准 → 校验 metadata → 编译 → 引擎精度验证」串联 |
 | GET | `/api/pipeline` | **v1.17**：最近的串联记录（内存 + 磁盘历史，历史项带 `live:false`） |
 | GET | `/api/pipeline/{id}` | **v1.17**：单条串联详情（阶段状态、产物、精度报告） |
 | POST | `/api/pipeline/{id}/stop` | **v1.17**：停止整条链（只停当前那一段） |
@@ -1034,6 +1100,28 @@ offset1 = cursor - p_image * scale1
 `boxes[]` 与单张推理的 `detections` 同构（OBB 有 `angle`，pose 有 `kpts`，segment 有 `polygon`），
 前端据此在 canvas 上画框，不需要图片回流。
 
+`POST /api/pipeline/anomalib` 的字段（**v1.18**，JSON body，未列出的走默认值）：
+
+| 字段 | 类型 | 默认 | 说明 |
+| --- | --- | --- | --- |
+| `model` | str | `patchcore` | `patchcore` / `padim` / `efficientad`，其他值返回 400 |
+| `root` | str | — | Folder 数据集根目录；`skip_train=true` 时可留空 |
+| `normal_dir` / `abnormal_dir` / `normal_test_dir` | str | `train/good` / `test/abnormal` / `test/good` | 相对 `root` 的子目录 |
+| `project` | str | `results` | 相对路径按 launcher 目录解析 |
+| `name` | str | 空 → `pipe_<时间戳>` | 决定 `results/<类名>/<name>/vN` |
+| `input_size` | int | 256 | 导出 ONNX 的 H/W，probe 阶段会校验 |
+| `precision` / `workspace_mb` | str / int | `fp16` / 4096 | 编译参数 |
+| `max_batch` | int | 8 | 动态 batch 的 `--maxShapes` 上限（ONNX 的 batch 恒为动态轴） |
+| `skip_train` / `artifacts_dir` | bool / str | false / 空 | 跳过训练时 `artifacts_dir` 必须是含 `metadata.json` 与 `.onnx` 的目录 |
+| `run_val` / `val_limit` | bool / int | true / 0 | `val_limit=0` 表示全部图片 |
+| `val_normal_dir` / `val_abnormal_dir` | str | 空 | 留空按 `root` + 子目录推 |
+| `calibrate_metadata` / `calib_limit` | bool / int | true / 64 | 训练时用 ONNX 推理校准阈值 |
+| `max_epochs` / `train_batch_size` / `eval_batch_size` / `num_workers` | 混合 | `auto` / 4 / 4 / 0 | 透传给 launcher |
+| `val_split_ratio` | float | 0.2 | 只对需要 normal-only 训练集的模型生效 |
+
+**产物键**：`run_dir` / `metadata` / `onnx` / `ckpt`（probe 段记录）、`build`（引擎）、
+`val`（`anomaly_val_report.json`）；`metrics` 直接是报告内容，前端据此渲染精度卡片。
+
 
 
 ## 代码结构
@@ -1053,12 +1141,14 @@ offset1 = cursor - p_image * scale1
 │   ├── dataset.py        数据集扫描 / 固定哈希划分 / YOLO·COCO·VOC 导出
 │   ├── annotation.py     `.tfanno` 读写与规范化（2 点矩形 / 关键点单对象 / rev 乐观锁）
 │   ├── autolabel.py      自动标注双通道编排（本地引擎 + 可选外部 HTTP 服务）+ 草稿清洗
-│   ├── pipeline.py       **v1.17**：串联编排（阶段状态机 / 停止 / 重启遗留清理 / 磁盘持久化）
+│   ├── pipeline.py       **v1.17**：串联编排（阶段状态机 / 停止 / 重启遗留清理 / 磁盘持久化 / `resolve` 延迟派生命令）
+│   ├── anomalymetrics.py **v1.18**：异常检测指标（AUROC 秩统计 / 阈值混淆矩阵 / F1 最优阈值 / 直方图 AUROC）
 │   ├── valmetrics.py     **v1.17**：COCO 口径 mAP 计算（IoU 0.50:0.95 全点插值，带边界容差）
 │   └── tools/
 │       ├── abi_probe.cpp       打印 C 侧结构体布局，用于和 Python 对齐比对
 │       ├── infer_batch.py      **v1.16**：目录批量推理 CLI（YOLO / Anomalib，事件走 TRTFORGE_JSON）
 │       ├── infer_video.py      **v1.16**：视频推理 CLI（编码器探测 / 抽帧步长 / 逐帧明细）
+│       ├── val_anomaly.py      **v1.18**：异常检测引擎级评估 CLI（AUROC / 漏检 / 误报，出 JSON + CSV）
 │       ├── smoke_test.py       端到端冒烟测试（HTTP + WebSocket + 真实子进程）
 │       ├── test_dataset_workbench.py  数据集工作台验收（划分 / 导出 / 错误路径）
 │       ├── test_infer_params.py       推理控制台验收（阈值 / 标签 / 配色 / LRU / 扫描 / 热能图）
@@ -1072,6 +1162,8 @@ offset1 = cursor - p_image * scale1
 │       ├── test_pipeline_stages.py    **v1.17**：串联状态机验收（全成功 / 中途失败 / 停止 / 重启遗留 / 产物去重）
 │       ├── test_pipeline_log.py       **v1.17**：阶段日志接口验收（尾部截断 / 长行 / 路径穿越 / 404）
 │       ├── test_val_metrics.py        **v1.17**：mAP 验收（IoU 边界 / 多类 AP / P-R 曲线 / 无 GT 容错）
+│       ├── test_pipeline_resolve.py   **v1.18**：串联 resolve 验收（延迟派生 / 产物定位 / metadata 校验 / 动态 batch）
+│       ├── test_anomaly_metrics.py    **v1.18**：异常指标验收（归一化 / AUROC 同分 / 混淆矩阵边界 / 最优阈值）
 │       ├── run_all_tests.py           总入口：扫描并串行跑完所有 test_*.py（CI 共用）
 │       └── test_exit_codes.py  退出码语义化测试（exit 2/130 的补事件逻辑）
 ├── frontend/
@@ -1089,7 +1181,7 @@ offset1 = cursor - p_image * scale1
 │   │   ├── annotate.js   标注工作台（Canvas 2D 六形状 / 缩放平移 / 吸附 / 撤销重做 / 自动保存 / 草稿层 / 导出）
 │   │   ├── infer.js      推理控制台（模型扫描 / 参数联动 / 表格 / 直方图 / 导出）
 │   │   ├── inferbatch.js **v1.16**：目录批量 / 视频 / 摄像头（事件流、进度、结果表、canvas 叠框）
-│   │   ├── pipeline.js   **v1.17**：全流程串联卡片（阶段清单 / 产物表 / 精度卡片 / 历史记录）
+│   │   ├── pipeline.js   **v1.17/v1.18**：全流程串联卡片（YOLO / Anomalib 双模式、阶段清单、产物表、精度卡片、历史记录）
 │   │   └── main.js       页签 / 环境状态 / 目录浏览
 │   └── tests/            零依赖前端单测（node 直跑）
 │       ├── test_viewer_math.mjs  缩放锚点、坐标互逆、滚轮归一化
@@ -1102,7 +1194,7 @@ offset1 = cursor - p_image * scale1
 **一条命令跑完全部后端测试**（v1.15 起，CI 与本地共用同一个入口）：
 
 ```powershell
-D:\Anaconda3\envs\dpenv\python.exe 6-web\backend\tools\run_all_tests.py      # 18 个脚本
+D:\Anaconda3\envs\dpenv\python.exe 6-web\backend\tools\run_all_tests.py      # 20 个脚本
 D:\Anaconda3\envs\dpenv\python.exe 6-web\backend\tools\run_all_tests.py transd  # 只跑名字含 transd 的
 ```
 

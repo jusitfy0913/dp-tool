@@ -20,6 +20,7 @@ import contextlib
 import json
 import mimetypes
 import os
+import re
 import shlex
 import sys
 import tempfile
@@ -50,7 +51,7 @@ from runners import manager
 
 #: 应用版本号。前端顶栏与 /api/health 都读它，方便一眼看出「页面连的是哪个后端」。
 #: 起因：改了代码但 8060 上跑的是几小时前的旧进程，排查很久才发现。
-APP_VERSION = "1.17.0"
+APP_VERSION = "1.18.0"
 
 #: 本文件所在目录（6-web/backend）。子进程脚本路径都以它为基准，
 #: 不依赖启动时的工作目录——从仓库根启动和从 backend 启动必须都能跑。
@@ -300,24 +301,18 @@ def train_yolo(request: YoloTrainRequest) -> dict:
     return run.snapshot()
 
 
-@app.post("/api/train/anomalib")
-def train_anomalib(request: AnomalibTrainRequest) -> dict:
-    """启动 Anomalib 训练并导出。"""
-    if not config.ANOMALIB_LAUNCHER.is_file():
-        raise HTTPException(
-            status_code=500, detail=f"找不到 launcher：{config.ANOMALIB_LAUNCHER}"
-        )
+def build_anomalib_train_command(request: "AnomalibTrainRequest", python: str) -> list[str]:
+    """拼 Anomalib 训练 + 导出命令行。
 
-    root = Path(request.root)
-    if not root.is_dir():
-        raise HTTPException(status_code=400, detail=f"数据集根目录不存在：{request.root}")
-
-    python = _resolve_python(request.python)
+    抽成纯函数的原因与 `build_train_command` 一样：全流程串联要复用同一份拼装逻辑。
+    两处各写一份的后果是「页面上打开的两个校准目录，串联时被悄悄丢掉」——
+    阈值校准结果与手工训练的不一样，而日志里一切正常。
+    """
     command = [
         python, str(config.ANOMALIB_LAUNCHER),
         "--mode", "train-export",
         "--model", request.model,
-        "--root", str(root),
+        "--root", str(Path(request.root).expanduser()),
         "--normal-dir", request.normal_dir,
         "--abnormal-dir", request.abnormal_dir,
         "--normal-test-dir", request.normal_test_dir,
@@ -339,6 +334,23 @@ def train_anomalib(request: AnomalibTrainRequest) -> dict:
         command += ["--calib-normal-dir", request.calib_normal_dir.strip()]
     if request.calib_abnormal_dir.strip():
         command += ["--calib-abnormal-dir", request.calib_abnormal_dir.strip()]
+    return command
+
+
+@app.post("/api/train/anomalib")
+def train_anomalib(request: AnomalibTrainRequest) -> dict:
+    """启动 Anomalib 训练并导出。"""
+    if not config.ANOMALIB_LAUNCHER.is_file():
+        raise HTTPException(
+            status_code=500, detail=f"找不到 launcher：{config.ANOMALIB_LAUNCHER}"
+        )
+
+    root = Path(request.root)
+    if not root.is_dir():
+        raise HTTPException(status_code=400, detail=f"数据集根目录不存在：{request.root}")
+
+    python = _resolve_python(request.python)
+    command = build_anomalib_train_command(request, python)
 
     try:
         run = manager.create("anomalib-train", command, str(config.ANOMALIB_LAUNCHER_DIR))
@@ -1056,6 +1068,442 @@ def pipeline_yolo(request: PipelineYoloRequest) -> dict:
         },
     )
     return pipeline
+
+
+# ---------------------------------------------------------------------------
+# 全流程串联（Anomalib 异常检测）
+# ---------------------------------------------------------------------------
+class AnomalibPipelineRequest(BaseModel):
+    """异常检测的一键全流程参数。
+
+    与 `AnomalibTrainRequest` 分开的理由和 YOLO 那边一样：串联多了精度、跳过训练、
+    验证目录这几项，塞进训练表单会让「只想训一次」的人看到一堆用不到的字段。
+    """
+
+    model: str = Field(default="patchcore", description="patchcore / padim / efficientad")
+    root: str = Field(default="", description="Folder 数据集根目录；skip_train 时可留空")
+    normal_dir: str = "train/good"
+    abnormal_dir: str = "test/abnormal"
+    normal_test_dir: str = "test/good"
+    project: str = Field(default="results", description="相对路径按 launcher 目录解析")
+    name: str = Field(default="", description="留空自动生成 pipe_<时间戳>")
+    input_size: int = Field(default=256, ge=64, le=1024)
+    max_epochs: str = "auto"
+    train_batch_size: int = Field(default=4, ge=1)
+    eval_batch_size: int = Field(default=4, ge=1)
+    num_workers: int = Field(default=0, ge=0)
+    val_split_ratio: float = Field(default=0.2, ge=0.0, le=0.9)
+    calibrate_metadata: bool = True
+    calib_limit: int = Field(default=64, ge=1, le=1024)
+    imagenet_dir: str = ""
+    calib_normal_dir: str = ""
+    calib_abnormal_dir: str = ""
+
+    precision: str = Field(default="fp16", description="引擎精度 fp16 / fp32")
+    workspace_mb: int = Field(default=4096, ge=256, le=65536)
+    max_batch: int = Field(
+        default=8,
+        ge=1,
+        le=64,
+        description="导出 ONNX 的 batch 恒为动态轴，编译时 maxShapes 的上限批次",
+    )
+
+    skip_train: bool = Field(default=False, description="跳过训练，直接用已有产物目录")
+    artifacts_dir: str = Field(
+        default="", description="skip_train 时给出包含 metadata.json 与 .onnx 的目录"
+    )
+
+    run_val: bool = Field(default=True)
+    val_limit: int = Field(default=0, ge=0, description="每个类别最多评估多少张，0 = 全部")
+    val_normal_dir: str = Field(default="", description="留空则用 root/normal_test_dir")
+    val_abnormal_dir: str = Field(default="", description="留空则用 root/abnormal_dir")
+
+    python: str | None = Field(default=None, description="覆盖训练解释器")
+
+
+def _is_number(value: Any) -> bool:
+    """排除 bool：`True` 也是 int，当成阈值会静默变成 1.0。"""
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _anomaly_project_root(project: str) -> Path:
+    """Anomalib 的 `--project` 是相对 launcher 目录解析的（launcher 的 cwd 就是那里）。"""
+    root = Path(project).expanduser()
+    if not root.is_absolute():
+        root = config.ANOMALIB_LAUNCHER_DIR / root
+    return root.resolve()
+
+
+def _anomaly_version_number(directory: Path) -> int:
+    """`v3` → 3；不是版本目录返回 -1。"""
+    match = re.match(r"^v(\d+)$", directory.name)
+    return int(match.group(1)) if match else -1
+
+
+def _anomaly_artifacts_in(directory: Path) -> dict[str, Any]:
+    """从一个 `weights/lightning` 目录里收齐产物。"""
+    metadata = directory / "metadata.json"
+    if not metadata.is_file():
+        raise ValueError(f"目录里没有 metadata.json：{directory}")
+    onnx_files = sorted(directory.glob("*.onnx"), key=lambda path: path.stat().st_mtime)
+    if not onnx_files:
+        raise ValueError(f"目录里没有 .onnx：{directory}")
+    ckpt = directory / "model.ckpt"
+    return {
+        "run_dir": str(directory),
+        "metadata": str(metadata),
+        "onnx": str(onnx_files[-1]),
+        "ckpt": str(ckpt) if ckpt.is_file() else "",
+    }
+
+
+def _locate_anomaly_artifacts(project_root: Path, name: str) -> dict[str, Any]:
+    """在 `<project>/<模型类名>/<name>/v<N>/weights/lightning` 里找产物。
+
+    为什么用 glob 而不是拼路径：中间那层目录名是 Anomalib 的模型类名
+    （`Patchcore` / `EfficientAd` / ...），版本目录 `vN` 每次训练递增。
+    硬拼 `<project>/<name>/v0` 在第二次训练时就会指向上一次的旧模型——
+    旧模型同样能编译、同样能出分数，错得毫无提示。
+    """
+    if not name:
+        raise ValueError("训练名称为空，无法定位产物目录")
+    candidates: list[tuple[int, float, Path]] = []
+    if project_root.is_dir():
+        for model_dir in project_root.iterdir():
+            if not model_dir.is_dir():
+                continue
+            run_root = model_dir / name
+            if not run_root.is_dir():
+                continue
+            for version_dir in run_root.iterdir():
+                lightning = version_dir / "weights" / "lightning"
+                metadata = lightning / "metadata.json"
+                if version_dir.is_dir() and metadata.is_file():
+                    candidates.append(
+                        (_anomaly_version_number(version_dir), metadata.stat().st_mtime, lightning)
+                    )
+    if not candidates:
+        raise ValueError(
+            f"没有在 {project_root} 下找到 {name} 的 metadata.json（应位于 "
+            f"<模型类名>/{name}/v<N>/weights/lightning/）。训练是否真的导出了 ONNX？"
+        )
+    # 先按版本号，再按修改时间：同一版本号被覆盖时取最新那份
+    version, _, lightning_dir = max(candidates, key=lambda item: (item[0], item[1]))
+    artifacts = _anomaly_artifacts_in(lightning_dir)
+    artifacts["version"] = f"v{version}" if version >= 0 else lightning_dir.parent.name
+    return artifacts
+
+
+def _probe_anomaly_metadata(artifacts: dict[str, Any]) -> dict[str, Any]:
+    """编译前确认 metadata.json 与 ONNX 能撑起推理和精度评估。
+
+    DLL 在缺 `image_threshold` / `pixel_threshold` 时会在 `ai_create` 阶段直接
+    失败（`anomalib_infer_c.cpp:633`），但那时引擎已经编译完、几分钟白等。
+    这里提前拦：既省时间，也避免「编译成功 = 可以推理」的误解。
+    """
+    metadata_path = Path(artifacts["metadata"])
+    onnx_path = Path(artifacts["onnx"])
+    try:
+        raw = json.loads(metadata_path.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"metadata.json 无法解析：{exc}") from exc
+
+    missing = [
+        key for key in ("image_threshold", "pixel_threshold") if not _is_number(raw.get(key))
+    ]
+    if missing:
+        raise ValueError(
+            f"metadata.json 缺字段 {missing}（anomalib_infer.dll 会拒绝加载），"
+            "请重新导出，或打开阈值校准后重跑。"
+        )
+
+    probe = _probe_onnx(onnx_path)
+    if probe.get("error"):
+        raise ValueError(f"ONNX 无法解析：{probe['error']}")
+    shape = probe.get("input_shape") or []
+    # Anomalib 的 `to_onnx` 固定把 batch 导成动态轴（`dynamic_axes={"input": {0: ...}}`），
+    # 所以 batch 维度读出来是符号维度 → `_probe_onnx` 记为 -1。这是**预期**的：
+    # trtexec 只要给出 min/opt/max 就能编译动态 batch，DLL 侧也会
+    # `setBindingDimensions(1x3xHxW)`（anomalib_infer_c.cpp:701）。
+    # 真正不能接受的是 H/W 动态——DLL 拿 metadata 里的 input_size 去设形状，
+    # 与导出时的动态范围对不上就会静默算错。
+    if len(shape) != 4 or any(not isinstance(dim, int) or dim <= 0 for dim in shape[1:]):
+        raise ValueError(
+            f"ONNX 输入形状 {shape} 不是 4 维 NCHW，或高/宽是动态的。"
+            "请带固定 input_size（如 256）重新导出后再编译。"
+        )
+    dynamic_batch = not isinstance(shape[0], int) or shape[0] <= 0
+    resolved_shape = [1, *shape[1:]] if dynamic_batch else list(shape)
+
+    recorded = {
+        key: value
+        for key, value in artifacts.items()
+        if key in ("run_dir", "metadata", "onnx", "ckpt") and value
+    }
+    return {
+        "artifact": str(metadata_path),
+        "artifacts": recorded,
+        "image_threshold": float(raw["image_threshold"]),
+        "pixel_threshold": float(raw["pixel_threshold"]),
+        "input_shape": resolved_shape,
+        "input_name": probe.get("input_name") or "input",
+        "dynamic_batch": dynamic_batch,
+        "output_contract": str(raw.get("output_contract", "")),
+    }
+
+
+def _anomaly_engine_path(onnx_path: Path, precision: str) -> Path:
+    """引擎与 ONNX 同目录同名 + 精度后缀，和 YOLO 侧的约定一致。"""
+    tag = "fp16" if precision == "fp16" else "fp32"
+    return onnx_path.with_name(f"{onnx_path.stem}_{tag}.engine")
+
+
+def _anomaly_shape_args(probe: dict[str, Any], max_batch: int) -> list[str]:
+    """给动态 batch 的 ONNX 补 trtexec 的 min/opt/max 形状参数。
+
+    `optShapes` 取 batch=1：DLL 每次只推一张图（`anomalib_infer_c.cpp:701`
+    固定 `setBindingDimensions(1x3xHxW)`），tactic 按 batch 1 调优才是实际
+    推理最快的选择；`maxShapes` 留出余量给以后批量调用。静态 batch 的
+    ONNX 不需要这些参数，直接返回空列表。
+    """
+    shape = probe.get("input_shape") or []
+    if len(shape) != 4:
+        return []
+    batch = shape[0] if isinstance(shape[0], int) and shape[0] > 0 else 1
+    if all(isinstance(dim, int) and dim > 0 for dim in shape):
+        return []
+    name = probe.get("input_name") or "input"
+    hw = "x".join(str(int(dim)) for dim in shape[1:])
+
+    def spec(value: int) -> str:
+        return f"{value}x{hw}"
+
+    return [
+        f"--minShapes={name}:{spec(1)}",
+        f"--optShapes={name}:{spec(batch)}",
+        f"--maxShapes={name}:{spec(max(max_batch, batch))}",
+    ]
+
+
+@app.post("/api/pipeline/anomalib")
+def pipeline_anomalib(request: AnomalibPipelineRequest) -> dict:
+    """一键跑完「训练+导出 → 校验 metadata → 编译 → 引擎精度验证」。
+
+    刻意只有四段：Anomalib 的 launcher 在 `train-export` 一个进程里就把
+    训练、ONNX 导出、`metadata.json` 阈值校准做完了。为了阶段列表好看而
+    拆成三个进程，只会多两次模型加载，并把「导出拿到的不是刚训的模型」
+    这类错埋进编排层。
+    """
+    if not config.ANOMALIB_LAUNCHER.is_file():
+        raise HTTPException(
+            status_code=500, detail=f"找不到 launcher：{config.ANOMALIB_LAUNCHER}"
+        )
+    if request.model not in ("patchcore", "padim", "efficientad"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"model 只能是 patchcore / padim / efficientad，实际 {request.model}",
+        )
+    if request.precision not in ("fp16", "fp32"):
+        raise HTTPException(status_code=400, detail="precision 只能是 fp16 / fp32")
+
+    python = _resolve_python(request.python)
+    trtexec = config.resolve_trtexec()
+    if not trtexec:
+        raise HTTPException(
+            status_code=500,
+            detail="找不到 trtexec.exe（设置 TRTFORGE_TRTEXEC 或确认 CUDA\\bin 下有它）",
+        )
+
+    name = request.name.strip() or f"pipe_{time.strftime('%Y%m%d_%H%M%S')}"
+    project_root = _anomaly_project_root(request.project)
+
+    root: Path | None = None
+    if request.root.strip():
+        root = Path(request.root).expanduser()
+        if not root.is_dir():
+            raise HTTPException(status_code=400, detail=f"数据集根目录不存在：{request.root}")
+
+    # 跳过训练时必须是「已经能拿到 metadata.json 与 .onnx」的目录：
+    # 让用户自己挑目录，比让后端去猜上一次训练的版本号可靠。
+    seeded: dict[str, Any] = {}
+    if request.skip_train:
+        if not request.artifacts_dir.strip():
+            raise HTTPException(
+                status_code=400,
+                detail="跳过训练时必须给出产物目录（包含 metadata.json 与 .onnx）",
+            )
+        seed_dir = Path(request.artifacts_dir).expanduser()
+        if not seed_dir.is_dir():
+            raise HTTPException(
+                status_code=400, detail=f"产物目录不存在：{request.artifacts_dir}"
+            )
+        try:
+            seeded = _anomaly_artifacts_in(seed_dir)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    else:
+        if root is None:
+            raise HTTPException(status_code=400, detail="没有跳过训练时必须给出数据集根目录")
+        for label, sub in (
+            ("正常训练目录", request.normal_dir),
+            ("异常测试目录", request.abnormal_dir),
+        ):
+            target = root / sub
+            if not target.is_dir():
+                raise HTTPException(status_code=400, detail=f"{label}不存在：{target}")
+
+    # 精度验证的图从哪来：优先显式目录，其次按 root 下的标准子目录推
+    val_normal: Path | None = None
+    val_abnormal: Path | None = None
+    if request.run_val:
+        if request.val_normal_dir.strip():
+            val_normal = Path(request.val_normal_dir).expanduser()
+        elif root is not None and (root / request.normal_test_dir).is_dir():
+            val_normal = root / request.normal_test_dir
+        if request.val_abnormal_dir.strip():
+            val_abnormal = Path(request.val_abnormal_dir).expanduser()
+        elif root is not None and (root / request.abnormal_dir).is_dir():
+            val_abnormal = root / request.abnormal_dir
+        if val_normal is None and val_abnormal is None:
+            raise HTTPException(
+                status_code=400,
+                detail="精度验证需要至少一个测试目录：请填「正常测试目录」或「异常测试目录」",
+            )
+
+    stages: list[pipeline_mod.StagePlan] = []
+
+    if not request.skip_train:
+        train_request = AnomalibTrainRequest(
+            model=request.model,
+            root=str(root),
+            normal_dir=request.normal_dir,
+            abnormal_dir=request.abnormal_dir,
+            normal_test_dir=request.normal_test_dir,
+            project=request.project,
+            name=name,
+            input_size=request.input_size,
+            max_epochs=request.max_epochs,
+            train_batch_size=request.train_batch_size,
+            eval_batch_size=request.eval_batch_size,
+            num_workers=request.num_workers,
+            val_split_ratio=request.val_split_ratio,
+            calibrate_metadata=request.calibrate_metadata,
+            calib_limit=request.calib_limit,
+            imagenet_dir=request.imagenet_dir,
+            calib_normal_dir=request.calib_normal_dir,
+            calib_abnormal_dir=request.calib_abnormal_dir,
+        )
+        stages.append(
+            pipeline_mod.StagePlan(
+                name="train_export",
+                label="训练 + 导出 ONNX + 校准 metadata",
+                command=build_anomalib_train_command(train_request, python),
+                cwd=str(config.ANOMALIB_LAUNCHER_DIR),
+                # 产物落在哪个 vN 目录训练完才知道，不在这里预言；
+                # 下一段 probe 找不到会直接失败并说明找过哪里。
+                meta={"model": request.model, "input_size": request.input_size},
+            )
+        )
+
+    def probe_artifacts() -> dict[str, Any]:
+        if seeded:
+            return _probe_anomaly_metadata(seeded)
+        return _probe_anomaly_metadata(_locate_anomaly_artifacts(project_root, name))
+
+    stages.append(
+        pipeline_mod.StagePlan(
+            name="probe",
+            label="校验 metadata 与 ONNX 形状",
+            callable=probe_artifacts,
+        )
+    )
+
+    def resolve_build(record: dict[str, Any]) -> dict[str, Any]:
+        onnx_path = Path(record["artifacts"]["onnx"])
+        engine_path = _anomaly_engine_path(onnx_path, request.precision)
+        # 这里重新探一次 ONNX：probe 阶段算出的形状/输入名只留在该段返回值里，
+        # 没有进 `record["artifacts"]`（那里只存路径）。读 ONNX 头只需几十毫秒，
+        # 比为了传三个值去改持久化结构划算。
+        probe = _probe_onnx(onnx_path)
+        if probe.get("error"):
+            raise ValueError(f"ONNX 无法解析：{probe['error']}")
+        command = [
+            trtexec,
+            f"--onnx={onnx_path}",
+            f"--saveEngine={engine_path}",
+        ]
+        if request.precision == "fp16":
+            command.append("--fp16")
+        command.append(f"--workspace={request.workspace_mb}")
+        command += _anomaly_shape_args(probe, request.max_batch)
+        return {"command": command, "expect_file": engine_path}
+
+    stages.append(
+        pipeline_mod.StagePlan(
+            name="build",
+            label=f"编译引擎（{request.precision}）",
+            cwd=str(config.REPO_ROOT),
+            resolve=resolve_build,
+            meta={"precision": request.precision, "input_size": request.input_size},
+        )
+    )
+
+    if request.run_val:
+
+        def resolve_val(record: dict[str, Any]) -> dict[str, Any]:
+            onnx_path = Path(record["artifacts"]["onnx"])
+            metadata_path = Path(record["artifacts"]["metadata"])
+            engine_path = _anomaly_engine_path(onnx_path, request.precision)
+            report_dir = (
+                Path(record["artifacts"].get("run_dir") or metadata_path.parent) / "val"
+            )
+            command = [
+                python,
+                str(BACKEND_DIR / "tools" / "val_anomaly.py"),
+                "--engine", str(engine_path),
+                "--metadata", str(metadata_path),
+                "--out", str(report_dir),
+                "--limit", str(request.val_limit),
+            ]
+            if val_normal is not None:
+                command += ["--normal-dir", str(val_normal)]
+            if val_abnormal is not None:
+                command += ["--abnormal-dir", str(val_abnormal)]
+            report = report_dir / "anomaly_val_report.json"
+            return {"command": command, "expect_file": report, "report_file": report}
+
+        stages.append(
+            pipeline_mod.StagePlan(
+                name="val",
+                label="引擎精度验证（AUROC / 漏检 / 误报）",
+                cwd=str(BACKEND_DIR),
+                resolve=resolve_val,
+                meta={
+                    "normal_dir": str(val_normal) if val_normal else "",
+                    "abnormal_dir": str(val_abnormal) if val_abnormal else "",
+                },
+            )
+        )
+
+    artifacts: dict[str, Any] = {"project": str(project_root)}
+    if seeded:
+        artifacts.update({key: value for key, value in seeded.items() if value})
+
+    return pipeline_manager.create(
+        kind="anomalib",
+        title=f"{name}（{request.model} / {request.precision}）",
+        stages=stages,
+        artifacts=artifacts,
+        meta={
+            "root": str(root) if root is not None else "",
+            "name": name,
+            "project": request.project,
+            "model": request.model,
+            "precision": request.precision,
+            "skip_train": request.skip_train,
+            "run_val": request.run_val,
+        },
+    )
 
 
 @app.get("/api/pipeline")

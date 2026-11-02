@@ -402,6 +402,11 @@ python tf_yolo_launcher.py --mode export --model runs\trtforge\my_yolo\weights\b
 
 **注意**：导出的 ONNX **已内置 anomalib 后处理**（输出 `pred_score` / `pred_label` / `anomaly_map` / `pred_mask`，值域 0~1）。因此 metadata 里的 `normalization` 是 `none`，DLL 不会再做第二遍 ImageNet 归一化。
 
+**batch 是动态轴（v1.18 起必须知道）**：Anomalib 的 `to_onnx` 固定
+`dynamic_axes={"input": {0: "batch_size"}}`，所以用 `onnxruntime` 读到的输入形状是
+`[-1, 3, 256, 256]`，**这是正常的**。编译时必须给 `--minShapes/--optShapes/--maxShapes`
+（见 5.1 的 Anomalib 命令），Web 串联会自动补。只有 H/W 动态才需要重新导出。
+
 ---
 
 ## 5. 编译 TensorRT 引擎
@@ -614,6 +619,97 @@ POST /api/pipeline/{id}/stop       # 停止整条链
 验证：`python 6-web\backend\tools\test_pipeline_stages.py`（50 项，用假 run 管理器跑完
 整条状态机：全成功 / 中途失败 / 可执行段 / 停止 / 报告收集 / 重启遗留 / 产物去重），
 `python 6-web\backend\tools\test_pipeline_log.py`（9 项，日志尾部截断与路径穿越）。
+
+### 5.6 Anomalib 一键全流程串联（v1.18）
+
+串联卡片的「类型」下拉选 **异常检测（Anomalib）**，走的是另一条四段链：
+
+```
+train_export（训练 + 导出 ONNX + 校准 metadata）
+  → probe（校验 metadata 字段 + ONNX 形状）
+  → build（trtexec 编译 model_<precision>.engine）
+  → val（引擎逐张推理，出 anomaly_val_report.json / .csv）
+```
+
+**为什么训练和导出不拆开**：Anomalib 的 launcher 在 `train-export` 一个进程里就把
+训练、ONNX 导出、`metadata.json` 阈值校准做完了。为了阶段列表好看拆成三个进程，
+只会多两次模型加载，并把「导出拿到的不是刚训的模型」这类错埋进编排层。
+
+**产物路径延迟派生（v1.18 编排层的新机制）**：异常检测的产物落在
+`results/<模型类名>/<name>/v<N>/weights/lightning/`，其中 `<模型类名>` 是 `Patchcore`
+这种类名、`v<N>` 每训一次递增——**训练开始前根本不知道路径**。所以 `StagePlan.resolve`
+在这一段真正开始前才根据 `record["artifacts"]` 拼命令与产物路径。
+硬拼 `v0` 的后果是第二次训练会拿上一次的旧模型去编译：旧模型同样能编译、同样能出分数，
+错得毫无提示。
+
+**动态 batch（本版踩过的坑）**：Anomalib 的 `to_onnx` 固定
+`dynamic_axes={"input": {0: "batch_size"}}`，导出的输入是 `[-1, 3, H, W]`。
+第一版 probe 把 `-1` 当成非法形状直接失败，于是训练 200 秒后在第二段报
+`ONNX 输入形状 [-1, 3, 256, 256] 不是静态 4 维 NCHW`。现在的处理：
+
+| 情况 | 处理 |
+| --- | --- |
+| batch 动态（`[-1, 3, H, W]`） | 自动补 `--minShapes=input:1x3xHxW --optShapes=input:1x3xHxW --maxShapes=input:<max_batch>x3xHxW`；opt 取 1 与 DLL 的 `setBindingDimensions(1x3xHxW)` 一致 |
+| H/W 动态 | **拒绝编译**：DLL 用 metadata 的 `input_size` 设形状，与导出范围对不上会静默算错，要求带固定 `input_size` 重新导出 |
+| 全静态 | 不传 shape 参数 |
+
+**参数**（与页面控件一一对应，接口字段见 `6-web/README.md`）：
+
+| 控件 | 说明 | 默认 |
+| --- | --- | --- |
+| 模型 | `patchcore` / `padim` / `efficientad` | patchcore |
+| 输入尺寸 | 训练与导出的 H/W，必须与 ONNX 一致 | 256 |
+| 数据集根目录 | Folder 数据集（`train/good`、`test/abnormal`、`test/good`） | — |
+| 跳过训练 | 勾上后必须给「产物目录」（含 `metadata.json` 与 `.onnx`） | 不勾 |
+| 引擎精度 | `fp16` / `fp32` | fp16 |
+| 精度验证 | 关掉就停在编译 | 勾选 |
+| 评估张数上限 | 每个目录最多多少张，0 = 全部 | 0 |
+
+**精度卡片口径**（`6-web/backend/anomalymetrics.py` + `tools/val_anomaly.py`）：
+
+| 指标 | 算法 | 备注 |
+| --- | --- | --- |
+| image AUROC | Mann-Whitney U 秩统计，同分取平均秩 | 与阈值无关 |
+| TP/FP/TN/FN、P/R/F1 | `metadata.json` 的 `image_threshold` | 与 DLL 的 `normalized_score >= 0.5` **数学等价**（`clamp01((raw-min)/(max-min))`） |
+| FPR / FNR | `FP/(FP+TN)` / `FN/(FN+TP)` | 产线最关心的误报率与漏检率 |
+| best F1 阈值 | 扫全部唯一分数 | 只作参考，**不回写 metadata**（会过拟合测试集） |
+| decision_mismatch | 报告判定 vs 引擎 `is_anomaly` | 非 0 说明归一化口径有偏差，必须排查 |
+
+像素级（PRO/AUPRO）暂不提供：需要 ground_truth 掩码，成本远高于图像级；
+报告里 `pixel.available=false` 并写明原因。
+
+**实测（bottle，Patchcore / 256 / fp16 / 20 正常 + 44 异常）**
+
+| 阶段 | 耗时 |
+| --- | --- |
+| train_export | 199.7 秒 |
+| probe | 0.7 秒 |
+| build | 1016 秒（动态 batch 1…8，比静态形状慢） |
+| val | 4.0 秒 |
+
+结果：image AUROC **1.000**、F1 **1.000**、FPR **0.000**、FNR **0.000**、`decision_mismatch=0`。
+
+接口：
+
+```powershell
+# 跳过训练，直接用已有的 weights/lightning 目录重跑 probe → build → val
+curl -X POST http://127.0.0.1:8060/api/pipeline/anomalib -H "Content-Type: application/json" -d '{
+  "model": "patchcore", "root": "D:/datasets/bottle",
+  "project": "results", "name": "pipe_anomaly",
+  "input_size": 256, "precision": "fp16", "max_batch": 8,
+  "skip_train": true,
+  "artifacts_dir": "D:/dp-tool/2-python-anomaly/launcher/results/Patchcore/pipe_anomaly/v0/weights/lightning",
+  "run_val": true, "val_limit": 0
+}'
+```
+
+`GET /api/pipeline/{id}` 的 `metrics` 直接就是 `anomaly_val_report.json` 的内容；
+阶段清单、日志、停止接口与 YOLO 侧完全共用，不另做一套。
+
+验证：`python 6-web\backend\tools\test_pipeline_resolve.py`（26 项：延迟派生、派生失败短路、
+多产物去重、`vN` 定位、metadata 缺阈值拦截、动态 batch 形状参数、H/W 动态拒绝）、
+`python 6-web\backend\tools\test_anomaly_metrics.py`（31 项：归一化边界、AUROC 同分、
+空输入、混淆矩阵阈值边界、直方图 AUROC）。
 
 
 
