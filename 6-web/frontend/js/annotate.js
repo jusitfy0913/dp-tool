@@ -12,6 +12,7 @@ import {
   annotationImageMeta,
   annotationImageUrl,
   autoLabel,
+  browse,
   exportAnnotationProject,
   loadAnnotationProject,
   saveAnnotationProject,
@@ -369,11 +370,36 @@ function adoptProject(data, path) {
   else renderCanvas();
 }
 
+/**
+ * 把「只给了目录」的工程路径补成 `<目录名>.tfanno`。
+ *
+ * 浏览弹窗受浏览器限制只能选目录，选中后 `annoPath` 里是个目录；
+ * 直接点「新建」会被后端以「扩展名必须是 .tfanno」拒绝，用户不知道该怎么改名。
+ * 这里只在**确认它是已存在的目录**时才改写，避免把用户手写的半截文件名猜错。
+ */
+async function resolveProjectPath(raw) {
+  if (!raw || /\.tfanno$/i.test(raw)) return { path: raw, renamed: false };
+  const dir = raw.replace(/[\\/]+$/, "");
+  try {
+    await browse(dir); // 是目录才会成功；是文件/不存在都会抛错
+  } catch {
+    return { path: raw, renamed: false };
+  }
+  const name = dir.split(/[\\/]/).pop() || "project";
+  const sep = dir.includes("\\") ? "\\" : "/";
+  return { path: `${dir}${sep}${name}.tfanno`, renamed: true };
+}
+
 async function createProject() {
-  const path = (el.path?.value || "").trim();
-  if (!path) {
+  const raw = (el.path?.value || "").trim();
+  if (!raw) {
     setStatus("请先填写要创建的 .tfanno 路径", "bad");
     return;
+  }
+  const { path, renamed } = await resolveProjectPath(raw);
+  if (el.path) el.path.value = path;
+  if (renamed) {
+    setStatus(`「浏览」只能选目录，已按目录名补成文件名：${path.split(/[\\/]/).pop()}（可手工改）`, "warn");
   }
   // 1) 先把手上的修改落盘：切工程不能顺手带走当前工程的未保存内容。
   await flushSave();

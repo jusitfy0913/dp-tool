@@ -52,6 +52,9 @@ jobs:
       - name: 查看器几何
         run: node 6-web/frontend/tests/test_viewer_math.mjs
 
+      - name: 输出引擎文件名
+        run: node 6-web/frontend/tests/test_engine_out.mjs
+
       - name: 语法检查（所有前端模块）
         shell: pwsh
         run: |

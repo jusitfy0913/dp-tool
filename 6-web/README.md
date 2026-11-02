@@ -541,6 +541,29 @@ job.json                     # 本次参数与耗时，便于复现
 3. 选精度（fp16 省显存，推荐）、workspace，需要变分辨率时勾「动态 shape」并填 min/opt/max。
 4. 点「开始构建」，日志实时滚动，状态徽标从「构建中」变为「已完成/失败」。
 
+#### 「输出引擎」要的是完整文件路径，不是目录（v1.18.1）
+
+浏览器没有系统文件对话框，「浏览」只能选到**目录**。早先选中目录后字段里只有
+`D:\test\deeplearning\dp-tool` 这样的目录，提交时被后端以
+「输出文件名需以 .engine / .trt / .plan 结尾」拒绝，用户卡在这一步。
+
+现在的规则（`frontend/js/engine.js` 的 `normalizeEngineOut`，纯函数有单测）：
+
+| 输入 | 结果 | 说明 |
+| --- | --- | --- |
+| 留空 | 自动推导 `<onnx名>_<精度>.engine` | 与后端推导完全一致，推荐 |
+| 目录（浏览选中） | `目录\<onnx名>_<精度>.engine` | 选中目录后立刻补全，并提示补成了什么名字 |
+| 已带 `.engine/.trt/.plan` | 原样保留 | 手工改的名字不会被覆盖 |
+| `.onnx` 路径 | 换成 `<名>_<精度>.engine` | 贴错成 onnx 路径也能救回来 |
+| 只有裸名字（无路径成分） | 原样保留 | 不擅自猜目录，交后端报明确错误 |
+
+文件名也可以直接在输入框里改（例如 `dp-tool\pcb960_fp16.engine`）；
+规范化在 `change` / `blur` 和「开始构建」提交前各做一次，改完不离开输入框直接点也能生效。
+
+另外修掉了「浏览」弹窗的两个卡点：字段里已经是文件路径时再点「浏览」，现在会退到
+父目录（以前 `/api/browse` 直接 404，弹窗只剩一句「无法读取」）；浏览选中后
+会补发一次 `change`，让 ONNX 字段立刻重新探测形状。
+
 选错文件不会白等：输出形状是 `[1, 4+类别数, 候选框数]` 的「未转置」YOLO 模型，
 提示会变红，后端也会直接返回 400 拒绝构建。
 
@@ -662,6 +685,9 @@ job.json                     # 本次参数与耗时，便于复现
 
 1. 切到「标注」页签。顶部填工程路径（`.tfanno`），点「打开」。
    文件不存在时后端返回空白骨架，前端进入「新建」流程，点「新建」即按当前路径落盘。
+   **路径要写到文件名**（浏览器没有系统文件对话框，「浏览」只能选目录）：
+   如果只选了目录，点「新建」会按目录名补成 `<目录名>.tfanno`，
+   状态栏会写明补成了什么名字，想换名字直接改输入框即可。
 2. 左侧是图片列表（显示每张图的标注数与未保存标记）；右上角「添加图片」可扫描目录批量加入。
 3. 中栏画布选工具（快捷键见下），左键画，`Esc` 取消，`Enter` 结束多边形 / 关键点。
 4. 右栏选类别；选中对象后属性面板可改标签、描述、分组、集合、置信度、难例、标记、属性。
@@ -1176,15 +1202,16 @@ offset1 = cursor - p_image * scale1
 │   │   ├── overlay.js    检出框 SVG 叠加层：逆缩放标签、低分淡出、行高亮联动
 │   │   ├── train.js      训练页（进度面板 + ETA + 每轮指标表 + 内联 SVG 曲线 + 参数回显）
 │   │   ├── export.js     导出 ONNX 面板（权重选择 / 任务参数 / 产物表 / 一键送去编译）
-│   │   ├── engine.js     引擎构建页（阶段清单 + 估算进度 + 日志流 + 探测预警）
+│   │   ├── engine.js     引擎构建页（阶段清单 + 估算进度 + 日志流 + 探测预警 + **v1.18.1** 输出路径规范化）
 │   │   ├── dataset.js    数据集页（扫描预览 + 导出）
 │   │   ├── annotate.js   标注工作台（Canvas 2D 六形状 / 缩放平移 / 吸附 / 撤销重做 / 自动保存 / 草稿层 / 导出）
 │   │   ├── infer.js      推理控制台（模型扫描 / 参数联动 / 表格 / 直方图 / 导出）
 │   │   ├── inferbatch.js **v1.16**：目录批量 / 视频 / 摄像头（事件流、进度、结果表、canvas 叠框）
 │   │   ├── pipeline.js   **v1.17/v1.18**：全流程串联卡片（YOLO / Anomalib 双模式、阶段清单、产物表、精度卡片、历史记录）
-│   │   └── main.js       页签 / 环境状态 / 目录浏览
+│   │   └── main.js       页签 / 环境状态 / 目录浏览（**v1.18.1**：字段里已是文件路径时退到父目录）
 │   └── tests/            零依赖前端单测（node 直跑）
 │       ├── test_viewer_math.mjs  缩放锚点、坐标互逆、滚轮归一化
+│       ├── test_engine_out.mjs   **v1.18.1**：输出引擎路径规范化（目录补文件名 / 后缀识别 / 不误改）
 │       └── test_contrast.mjs     设计令牌对比度核算（WCAG AA）
 └── runtime/              上传临时文件与任务日志（已 gitignore）
 ```
@@ -1202,7 +1229,7 @@ D:\Anaconda3\envs\dpenv\python.exe 6-web\backend\tools\run_all_tests.py transd  
 任一脚本退出码非 0 即整体失败。**不需要 GPU / DLL / torch**，约 30 秒。
 
 CI 在 `.github/workflows/tests.yml`：Windows + Python 3.11 跑上面这条，另起一个
-Node 20 job 跑两个前端单测 + 所有 `js/*.js` 的 `node --check`。
+Node 20 job 跑三个前端单测 + 所有 `js/*.js` 的 `node --check`。
 
 单个脚本也可以独立跑：
 
@@ -1221,6 +1248,7 @@ D:\Anaconda3\envs\dpenv\python.exe 6-web\backend\tools\test_annotation_project.p
 
 # 前端单测（不需要服务，有 node 就行）
 node 6-web\frontend\tests\test_viewer_math.mjs
+node 6-web\frontend\tests\test_engine_out.mjs
 node 6-web\frontend\tests\test_contrast.mjs
 
 # 引擎构建进度与耗时估算（不需要服务、不需要 trtexec；有真实日志时自动回放全量）

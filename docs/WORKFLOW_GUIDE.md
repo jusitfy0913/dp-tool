@@ -191,11 +191,14 @@ python 6-web\backend\tools\test_dataset_workbench.py
 
 ### 2.6 前端单测（零依赖，只需 node）
 
-前端是零构建的，所以单测也不装任何框架，直接 `node` 跑。这两项不需要启动服务：
+前端是零构建的，所以单测也不装任何框架，直接 `node` 跑。这三项不需要启动服务：
 
 ```powershell
 node 6-web\frontend\tests\test_viewer_math.mjs
 # 期望：✓ 全部通过：37 条断言
+
+node 6-web\frontend\tests\test_engine_out.mjs
+# 期望：通过：17 项断言
 
 node 6-web\frontend\tests\test_contrast.mjs
 # 期望：✓ 全部通过：23 项
@@ -204,6 +207,7 @@ node 6-web\frontend\tests\test_contrast.mjs
 | 脚本 | 守住什么 |
 | --- | --- |
 | `test_viewer_math.mjs` | 滚轮缩放必须锚定光标（连续缩放 8 次后漂移 ≤ 0.5px）、屏幕与图像坐标互逆、滚轮增量按 `deltaMode` 归一化 |
+| `test_engine_out.mjs` | 「输出引擎」路径规范化：只给目录时补成 `目录\<onnx名>_<精度>.engine`、已带 `.engine/.trt/.plan` 不许改、留空保持自动推导、贴错成 `.onnx` 能救回来 |
 | `test_contrast.mjs` | 从 `style.css` 读设计令牌按 WCAG 公式核算，正文与面板底色不低于 4.5:1，网格/扫描线不透明度 ≤ 0.05 |
 
 改配色的正确流程：改令牌 → 跑 `test_contrast` → 不达标就再调，别靠眼睛判断。
@@ -518,10 +522,21 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_web_studio.ps1
 | 操作 | 说明 |
 | --- | --- |
 | 选 ONNX | 选完自动调 `/api/engine/probe` 显示输入/输出形状与体积；未转置的 YOLO 会标红 |
-| 输出引擎 | 留空自动推导为 `<onnx名>_fp16.engine` |
+| 输出引擎 | 留空自动推导为 `<onnx名>_fp16.engine`；「浏览」只能选到目录，选中后自动补成 `目录\<onnx名>_<精度>.engine` |
 | 精度 | `fp16` 省显存（推荐）/ `fp32` |
 | 动态 shape | 勾选后填 min/opt/max，如 `1x3x960x960` |
 | workspace | 默认 4096 MB |
+
+> **「输出引擎」要写文件名，不是目录。**
+> 浏览器没有系统文件对话框，「浏览」只能选目录。只填目录会被后端以
+> 「输出文件名需以 .engine / .trt / .plan 结尾」拒绝（v1.18.1 之前的常见卡点）。
+> 现在的规则：留空 → 自动推导；选中目录 → 自动补全文件名；已带 `.engine/.trt/.plan`
+> → 原样保留；填成 `.onnx` 路径 → 换成 `<名>_<精度>.engine`。
+> 文件名随时可以在输入框里手工改。逻辑见 `6-web/frontend/js/engine.js`
+> 的 `normalizeEngineOut`，有单测 `tests/test_engine_out.mjs`（17 项）。
+>
+> 「标注」页新建 `.tfanno` 工程同理：选中目录后点「新建」会按目录名补成
+> `<目录名>.tfanno`，状态栏会写明改成了什么名字。
 
 点「开始构建」后：
 

@@ -99,10 +99,29 @@ function initBrowse() {
       const start = document.getElementById(browseState.targetId)?.value || "";
       modal.classList.remove("hidden");
       btnPick.textContent = browseState.mode === "file" ? "选择文件/当前目录" : "选择当前目录";
-      await loadDir(start);
+      await openAt(start);
     });
   });
 
+  /**
+   * 从字段当前值开始浏览。
+   *
+   * 字段里可能已经是文件路径（选过一次之后再点「浏览」很常见），
+   * 直接把它交给 /api/browse 会 404，弹窗里只剩一句「无法读取」，用户以为坏了。
+   * 先按目录试一次，失败就退到父目录再试。
+   */
+  async function openAt(start) {
+    const path = (start || "").trim();
+    if (!path) {
+      await loadDir("");
+      return;
+    }
+    if (await loadDir(path)) return;
+    const parent = path.replace(/[\\/][^\\/]+[\\/]?$/, "");
+    if (parent && parent !== path) await loadDir(parent);
+  }
+
+  /** 列目录。返回是否成功，调用方据此决定要不要退到父目录。 */
   async function loadDir(path) {
     try {
       const data = await browse(path);
@@ -119,9 +138,11 @@ function initBrowse() {
       data.entries
         .filter((e) => e.is_dir)
         .forEach((entry) => list.appendChild(makeItem(entry, btnPick)));
+      return true;
     } catch (error) {
       current.textContent = `无法读取：${error.message}`;
       list.innerHTML = "";
+      return false;
     }
   }
 
@@ -149,7 +170,12 @@ function initBrowse() {
 
   function applyValue(value) {
     const input = document.getElementById(browseState.targetId);
-    if (input) input.value = value;
+    if (!input) return;
+    input.value = value;
+    // 程序化赋值不会触发 change 事件。目标字段往往要据此做后续动作：
+    // 「输出引擎」要把选中的目录补成完整文件名，ONNX 字段要重新探测形状。
+    // 所以这里显式通知一次，让字段自己决定怎么处理。
+    input.dispatchEvent(new Event("change", { bubbles: true }));
   }
 
   btnUp.addEventListener("click", () => {

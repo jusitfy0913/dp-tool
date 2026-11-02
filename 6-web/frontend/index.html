@@ -816,10 +816,12 @@
 
         <label>输出引擎
           <div class="row">
-            <input type="text" id="engOut" placeholder="留空自动推导为 &lt;onnx名&gt;_fp16.engine">
-            <button type="button" class="mini" data-browse="engOut" data-mode="dir">浏览</button>
+            <input type="text" id="engOut" placeholder="…\weights\best_fp16.engine（留空自动推导）">
+            <button type="button" class="mini" data-browse="engOut" data-mode="dir" title="选目录后会自动补上文件名">浏览</button>
           </div>
         </label>
+        <p class="hint">这里要的是<b>完整文件路径</b>，不只是目录：浏览只能选到目录，选中后会自动补成
+          <code>&lt;onnx名&gt;_&lt;精度&gt;.engine</code>；文件名可以直接在输入框里改，留空则按同样规则自动推导。</p>
 
         <div class="grid2">
           <label>精度

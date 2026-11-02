@@ -31,6 +31,49 @@ const STAGES = [
   { id: "done", label: "完成" },
 ];
 
+// ---------------------------------------------------------------------------
+// 纯函数：输出引擎文件名推导（导出给 tests/test_engine_out.mjs，不依赖 DOM）
+// ---------------------------------------------------------------------------
+const ENGINE_SUFFIXES = /\.(engine|trt|plan)$/i;
+
+/**
+ * 由 ONNX 路径推导默认引擎文件名 `<onnx名>_<精度>.engine`。
+ *
+ * 必须与后端 build_engine 的默认推导一致，否则「留空自动推导」和
+ * 「浏览目录后自动补名」会给出两个不同的文件名，用户会以为选错了。
+ */
+export function engineOutName(onnxPath, tag) {
+  if (!onnxPath) return "";
+  const base = onnxPath.replace(/^.*[\\/]/, "").replace(/\.onnx$/i, "");
+  if (!base) return "";
+  return `${base}_${tag}.engine`;
+}
+
+/**
+ * 把「输出引擎」输入框的值规范成完整文件路径。
+ *
+ * 为什么需要它：浏览弹窗受浏览器限制只能选目录，选中后字段里只有一个目录
+ * （例如 `D:\test\deeplearning\dp-tool`），后端会以
+ * 「输出文件名需以 .engine / .trt / .plan 结尾」拒绝，用户卡在这里。
+ * 这里把目录补成 `目录\<onnx名>_<精度>.engine`，让「选目录」也能直接构建。
+ *
+ * 规则：
+ * - 空值：返回空字符串，保持「留空自动推导」的语义；
+ * - 已带 .engine / .trt / .plan：原样返回（用户手工改名时不干扰）；
+ * - .onnx 结尾：换后缀（贴错成 onnx 路径也能救回来）；
+ * - 其它（视为目录）：补上推导出的文件名；没有路径成分时不猜，交后端报错。
+ */
+export function normalizeEngineOut(value, onnxPath, tag) {
+  const raw = (value || "").trim();
+  if (!raw) return "";
+  if (ENGINE_SUFFIXES.test(raw)) return raw;
+  if (/\.onnx$/i.test(raw)) return raw.replace(/\.onnx$/i, `_${tag}.engine`);
+  const dir = raw.replace(/[\\/]+$/, "");
+  if (!/[\\/]/.test(dir)) return raw;
+  const sep = dir.includes("\\") ? "\\" : "/";
+  return `${dir}${sep}${engineOutName(onnxPath, tag) || `model_${tag}.engine`}`;
+}
+
 export function initEngine() {
   const form = document.getElementById("engineForm");
   const onnxInput = document.getElementById("engOnnx");
@@ -87,7 +130,7 @@ export function initEngine() {
   function autoName(path) {
     if (!path) return "留空自动推导为 <onnx名>_fp16.engine";
     const tag = precision.value === "fp16" ? "fp16" : "fp32";
-    return `${path.replace(/\.onnx$/i, "")}_${tag}.engine`;
+    return engineOutName(path, tag) || "留空自动推导为 <onnx名>_fp16.engine";
   }
 
   function fmtShape(shape) {
@@ -240,6 +283,24 @@ export function initEngine() {
     if (!outInput.value.trim()) outInput.placeholder = autoName(onnxInput.value.trim());
   });
 
+  // 输出引擎可能是「浏览」塞进来的纯目录，提交前必须补成文件名，
+  // 否则后端只会回一句「输出文件名需以 .engine / .trt / .plan 结尾」。
+  // 浏览弹窗选中目录时走 change（main.js 里补发），手工输入后离开走 blur。
+  function normalizeOut(announce) {
+    const before = outInput.value.trim();
+    if (!before) return;
+    const tag = precision.value === "fp16" ? "fp16" : "fp32";
+    const after = normalizeEngineOut(before, onnxInput.value.trim(), tag);
+    if (!after || after === before) return;
+    outInput.value = after;
+    if (announce) {
+      setHint(`输出引擎已补全为 ${after.split(/[\\/]/).pop()}，文件名可手工改；留空则自动推导`);
+    }
+  }
+
+  outInput.addEventListener("change", () => normalizeOut(true));
+  outInput.addEventListener("blur", () => normalizeOut(false));
+
   dynamic.addEventListener("change", () => {
     shapeGroup.classList.toggle("hidden", !dynamic.checked);
   });
@@ -270,6 +331,13 @@ export function initEngine() {
     if (body.dynamic && !(body.min_shape && body.opt_shape && body.max_shape)) {
       setHint("启用动态 shape 时必须同时填 min / opt / max", true);
       return;
+    }
+
+    // 再兜一次规范化：用户可能改完没离开输入框就直接点「开始构建」，
+    // 那种情况下 blur/change 还没跑，目录会原样送到后端被拒。
+    if (body.engine) {
+      body.engine = normalizeEngineOut(body.engine, body.onnx, body.precision === "fp16" ? "fp16" : "fp32");
+      outInput.value = body.engine;
     }
 
     setHint("");
