@@ -183,6 +183,16 @@ python tf_anomalib_launcher.py --mode check-env
 
 细节见 `6-web/README.md` 的 v1.15 小节与 `docs/WORKFLOW_GUIDE.md` 的 §4.1.1。
 
+**配套的流程改进（同一批完成）**
+
+- **测试有了单一入口和 CI**：新增 `6-web/backend/tools/run_all_tests.py`（扫描目录自动收录
+  `test_*.py`，以后新增脚本不用改流水线）+ `.github/workflows/tests.yml`（Windows + py3.11
+  跑后端 12 个脚本，Node 20 跑两个前端单测并逐个 `node --check`）。以前 444 项断言全靠人肉跑，
+  `--simplify true` 那类错误正是这么漏出去的。
+- **openspec 清零**：6 个已完成变更全部归档，`openspec/specs/` 补上 `web-studio`、
+  `web-training-console`、`yolo-training-platform`、`annotation-dataset-workbench`、
+  `anomalib-trt-inference`、`project-layout`，`openspec validate --specs` 11/11 通过。
+
 ### v1.14 — 2026-11-01（训练前体检：数据集概览、增强预览、断点续训）
 
 上一版解决了「训练中看得见」，这一版解决「开跑前看得见」。三个功能都指向同一类返工：

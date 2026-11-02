@@ -1,0 +1,3 @@
+# 工具链改动：不修改任何能力规格。
+# 不写这一行的话 `openspec validate` 会报 "Change must have at least one delta"。
+skip_specs: true

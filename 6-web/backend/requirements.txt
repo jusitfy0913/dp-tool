@@ -11,3 +11,6 @@ python-multipart>=0.0.9
 numpy>=1.24,<3
 onnxruntime>=1.16
 opencv-python>=4.8,<4.12
+# 导出链路需要：onnx 用于生成 .transd.onnx（v1.15），Pillow 用于数据集概览读图像头
+onnx>=1.14
+pillow>=9.0

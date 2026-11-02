@@ -863,6 +863,9 @@ offset1 = cursor - p_image * scale1
 │       ├── test_infer_params.py       推理控制台验收（阈值 / 标签 / 配色 / LRU / 扫描 / 热能图）
 │       ├── test_annotation_project.py 标注工程验收（往返 / 冲突 / 回退 / 导出回读）
 │       ├── test_engine_progress.py    构建进度与耗时估算验收（真实日志回放 + 自学习）
+│       ├── test_transd_onnx.py        .transd.onnx 转置验收（四任务头 / 输出重排 / 通道校验）
+│       ├── test_export_request.py     导出命令拼装验收（开关透传 / 非法参数提前拒绝）
+│       ├── run_all_tests.py           总入口：扫描并串行跑完所有 test_*.py（CI 共用）
 │       └── test_exit_codes.py  退出码语义化测试（exit 2/130 的补事件逻辑）
 ├── frontend/
 │   ├── index.html        单页，六个页签
@@ -873,6 +876,7 @@ offset1 = cursor - p_image * scale1
 │   │   ├── viewer.js     图像查看器：光标锚点缩放 / 拖动平移 / 多窗口容器 / 透明度
 │   │   ├── overlay.js    检出框 SVG 叠加层：逆缩放标签、低分淡出、行高亮联动
 │   │   ├── train.js      训练页（进度面板 + ETA + 每轮指标表 + 内联 SVG 曲线 + 参数回显）
+│   │   ├── export.js     导出 ONNX 面板（权重选择 / 任务参数 / 产物表 / 一键送去编译）
 │   │   ├── engine.js     引擎构建页（阶段清单 + 估算进度 + 日志流 + 探测预警）
 │   │   ├── dataset.js    数据集页（扫描预览 + 导出）
 │   │   ├── annotate.js   标注工作台（Canvas 2D 六形状 / 缩放平移 / 吸附 / 撤销重做 / 自动保存 / 草稿层 / 导出）
@@ -885,6 +889,21 @@ offset1 = cursor - p_image * scale1
 ```
 
 ## 验证
+
+**一条命令跑完全部后端测试**（v1.15 起，CI 与本地共用同一个入口）：
+
+```powershell
+D:\Anaconda3\envs\dpenv\python.exe 6-web\backend\tools\run_all_tests.py      # 12 个脚本
+D:\Anaconda3\envs\dpenv\python.exe 6-web\backend\tools\run_all_tests.py transd  # 只跑名字含 transd 的
+```
+
+它会扫描目录自动收录 `test_*.py`（以后新增脚本不用改 CI），逐条打印耗时与通过数，
+任一脚本退出码非 0 即整体失败。**不需要 GPU / DLL / torch**，约 30 秒。
+
+CI 在 `.github/workflows/tests.yml`：Windows + Python 3.11 跑上面这条，另起一个
+Node 20 job 跑两个前端单测 + 所有 `js/*.js` 的 `node --check`。
+
+单个脚本也可以独立跑：
 
 ```powershell
 # 服务已启动后

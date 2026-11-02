@@ -1,0 +1,13 @@
+feat(web): 训练页新增导出 ONNX，修通四任务头的 .transd.onnx（v1.15）
+
+- 新增 POST /api/export/yolo + 前端导出面板：选权重（可一键取当前实验 best.pt）、
+  imgsz/opset/dynamic/half/simplify，可选生成 .transd.onnx；结果表「去编译引擎」
+  自动切页、填路径并触发形状探测
+- launcher 重写转置逻辑：按形状识别预测头（不再取 graph.node[-1]）、转置前按任务
+  校验通道数、segment 把 proto 提到 binding 1（对齐 C++ 的 V8Seg 约定）
+- mode_export 以权重自带 task 为准，不一致时发 task_overridden；转置失败只报
+  TRANSD_FAILED 并保留已导出的原始 ONNX
+- 新增 test_transd_onnx.py(17) 与 test_export_request.py(24)；回归 12 个后端脚本
+  444 项断言 + 2 个前端测试全绿
+- 四任务头实测：detect/segment/pose/obb 各自 导出 -> transd -> trtexec -> DLL 推理通过
+- 文档：readme v1.15、6-web/README、WORKFLOW_GUIDE §4.1.1；openspec tasks 6.2 补齐

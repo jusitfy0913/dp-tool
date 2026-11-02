@@ -1,0 +1,61 @@
+name: tests
+
+# 为什么要有 CI：
+# 后端 12 个脚本、444 项断言，全靠人肉跑。改一行代码忘了跑某个脚本，
+# 问题要到用户点开页面才暴露（v1.15 的 `--simplify true` 就是这么漏出去的）。
+# 这里只跑「不需要 GPU / DLL / torch」的纯逻辑测试，约 30 秒。
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  backend:
+    name: 后端测试（Windows / py3.11）
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # requirements 只含轻量依赖（fastapi/numpy/opencv/onnxruntime），
+      # 不装 torch：所有测试都用假引擎桩，不碰真实推理。
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r 6-web/backend/requirements.txt
+          pip install onnx pillow
+
+      - name: 跑全部后端测试
+        env:
+          PYTHONIOENCODING: utf-8
+        run: python 6-web/backend/tools/run_all_tests.py
+
+  frontend:
+    name: 前端单元测试（Node 20）
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      # 前端测试是纯函数（对比度计算、查看器几何），不需要浏览器
+      - name: 对比度护栏
+        run: node 6-web/frontend/tests/test_contrast.mjs
+
+      - name: 查看器几何
+        run: node 6-web/frontend/tests/test_viewer_math.mjs
+
+      - name: 语法检查（所有前端模块）
+        shell: pwsh
+        run: |
+          Get-ChildItem 6-web/frontend/js/*.js | ForEach-Object {
+            node --check $_.FullName
+            if ($LASTEXITCODE -ne 0) { throw "语法错误：$($_.Name)" }
+          }
