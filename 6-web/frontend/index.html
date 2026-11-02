@@ -1138,6 +1138,11 @@
           <button type="button" class="mini" id="annoAcceptAll">全部接受</button>
           <button type="button" class="mini" id="annoRejectAll">全部丢弃</button>
         </div>
+        <div class="anno-row">
+          <button type="button" class="mini accent" id="annoAcceptOne" title="接受当前草稿 (A)">接受当前 A</button>
+          <button type="button" class="mini" id="annoRejectOne" title="丢弃当前草稿 (D)">丢弃当前 D</button>
+        </div>
+        <p class="anno-hint">A 接受 / D 丢弃 / 空格 下一张（未选中时按置信度从高到低处理）</p>
         <ul class="anno-draftlist" id="annoDraftList"></ul>
 
         <h2>属性</h2>
@@ -1164,6 +1169,12 @@
         <details class="anno-autolabel" id="annoAutoLabelBox">
           <summary>预标注参数</summary>
           <div class="anno-row">
+            <select id="annoAlEnginePick" title="从训练产物里选引擎（只列 YOLO）">
+              <option value="">— 从训练产物选择 —</option>
+            </select>
+            <button type="button" class="mini" id="annoAlRefresh" title="重新扫描训练产物">↻</button>
+          </div>
+          <div class="anno-row">
             <input type="text" id="annoAlEngine" placeholder=".engine 引擎路径" />
             <button type="button" class="mini" data-browse="annoAlEngine" data-dialog="file"
                     data-patterns=".engine,.trt,.plan" data-label="TensorRT 引擎"
@@ -1181,9 +1192,21 @@
           <div class="anno-row">
             <input type="text" id="annoAlService" placeholder="外部标注服务地址（可空），如 http://127.0.0.1:8500" />
           </div>
+          <div class="anno-row">
+            <label class="anno-toggle" title="跳过已有正式标注或已有草稿的图片">
+              <input type="checkbox" id="annoBatchSkipDone" checked />跳过已标注/已有草稿
+            </label>
+          </div>
+          <div class="anno-row">
+            <button type="button" class="mini accent" id="annoBatchLabel" title="整个工程跑一遍，结果进草稿池">批量预标注</button>
+            <button type="button" class="mini" id="annoBatchStop" disabled>停止</button>
+          </div>
+          <div class="anno-progress hidden" id="annoBatchProgress"><div></div></div>
+          <p class="anno-hint" id="annoBatchHint"></p>
           <p class="anno-hint">
             主通道用自有引擎，总是可用；填了服务地址会先试外部通道（SAM / 文字提示），
-            不可达时自动回退并提示。
+            不可达时自动回退并提示。草稿存在工程旁的 <code>*.drafts.json</code>，
+            不会写进 <code>.tfanno</code>，刷新页面也不会丢。
           </p>
         </details>
       </aside>

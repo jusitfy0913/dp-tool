@@ -14,11 +14,18 @@ import {
   autoLabel,
   browse,
   exportAnnotationProject,
+  getBatchAutoLabel,
   importAnnotationProject,
+  listBatchAutoLabel,
+  listModels,
+  loadAnnotationDrafts,
   loadAnnotationProject,
   nativeDialog,
+  saveAnnotationDrafts,
   saveAnnotationProject,
   scanAnnotationImages,
+  startBatchAutoLabel,
+  stopBatchAutoLabel,
 } from "./api.js";
 import {
   clampScale,
@@ -36,6 +43,26 @@ import {
 const HISTORY_LIMIT = 50;
 /** 自动保存防抖间隔（毫秒）。改慢会丢更多编辑，改快会把磁盘打满。 */
 const SAVE_DEBOUNCE = 3000;
+/** 草稿落盘防抖：草稿比工程小得多，且审核是连续操作，短一点手感更好。 */
+const DRAFTS_SAVE_DEBOUNCE = 800;
+/**
+ * 草稿置信度分档。
+ *
+ * 阈值不是拍脑袋：`0.70` 是 Ultralytics 默认 val 的置信度基准之上，
+ * 现场审核时"基本不用看"的那一档；`0.40` 以下基本是模型在猜，需要人逐条看。
+ * 两侧都取闭区间上界，避免 0.7 / 0.4 正好落在缝里。
+ */
+const DRAFT_TIER_HIGH = 0.7;
+const DRAFT_TIER_MID = 0.4;
+const DRAFT_TIER_COLORS = {
+  // 与 style.css 的 --ok / --amber / --danger 取同一组值：
+  // 列表用 CSS、画布用 JS，两边数值不同的话同一批草稿会有两种"绿"，看着像 bug。
+  high: [52, 211, 153],
+  mid: [251, 191, 36],
+  low: [248, 113, 113],
+  unknown: [251, 191, 36],
+};
+const DRAFT_TIER_TEXT = { high: "高", mid: "中", low: "低", unknown: "?" };
 /** 顶点手柄的屏幕半径（像素）。固定屏幕尺寸，缩放时不变。 */
 const HANDLE_RADIUS = 5;
 /** 命中测试的容差（屏幕像素）。太小点不中，太大容易误选。 */
@@ -118,6 +145,22 @@ const state = {
   conflict: null,
   /** 最近一次「导入 YOLO 数据集」的预览报告；有值才允许点导入，避免参数改了还按旧结果落盘。 */
   importReport: null,
+  /**
+   * 草稿脏图集合：只有这些图片的草稿会被提交。
+   *
+   * 为什么要按图记脏：批量预标注在后台直接写旁挂文件，如果前端每次
+   * 都"整份覆盖"，就会把批量刚写进去的其他图片清空。
+   */
+  draftDirty: new Map(),
+  draftSeq: 0,
+  draftSaveTimer: 0,
+  draftSaveTask: null,
+  /** 批量预标注任务快照（后端任务表的镜像，用于进度条与停止按钮）。 */
+  batchJob: null,
+  /** 批量任务的轮询定时器 id。 */
+  batchTimer: 0,
+  /** 训练产物是否已经拉过（懒加载：不展开预标注参数就不扫目录）。 */
+  engineLoaded: false,
 };
 
 const el = {};
@@ -164,6 +207,118 @@ function currentDrafts() {
   if (!image) return [];
   if (!state.drafts.has(image.id)) state.drafts.set(image.id, []);
   return state.drafts.get(image.id);
+}
+
+// ---------------------------------------------------------------------------
+// 草稿置信度分档
+// ---------------------------------------------------------------------------
+/**
+ * 草稿置信度档位。
+ *
+ * `score < 0` 是"通道没给置信度"（外部服务常见），单独一档：
+ * 把它算成低置信度会让整批红框看起来像"模型全在猜"，反而让人不敢信绿框。
+ */
+function draftTier(score) {
+  const value = Number(score);
+  if (!Number.isFinite(value) || value < 0) return "unknown";
+  if (value >= DRAFT_TIER_HIGH) return "high";
+  if (value >= DRAFT_TIER_MID) return "mid";
+  return "low";
+}
+
+function draftTierColor(score) {
+  return DRAFT_TIER_COLORS[draftTier(score)];
+}
+
+function draftTierText(score) {
+  return DRAFT_TIER_TEXT[draftTier(score)];
+}
+
+/** 草稿列表项的颜色类名，CSS 与画布共用同一套分档。 */
+function draftTierClass(score) {
+  return `tier-${draftTier(score)}`;
+}
+
+// ---------------------------------------------------------------------------
+// 草稿落盘：旁挂 `<工程名>.drafts.json`
+// ---------------------------------------------------------------------------
+/** 标记某张图片的草稿变了。只提交这些图片，避免整份覆盖清掉批量任务刚写的内容。 */
+function markDraftsDirty(imageId) {
+  const id = imageId || currentImage()?.id || "";
+  if (!id) return;
+  state.draftSeq += 1;
+  state.draftDirty.set(id, state.draftSeq);
+  scheduleDraftSave();
+}
+
+function scheduleDraftSave() {
+  if (!state.path) return;
+  if (state.draftSaveTimer) clearTimeout(state.draftSaveTimer);
+  state.draftSaveTimer = window.setTimeout(() => {
+    state.draftSaveTimer = 0;
+    flushDraftChanges();
+  }, DRAFTS_SAVE_DEBOUNCE);
+}
+
+/**
+ * 把脏图写回旁挂文件。
+ *
+ * 请求按顺序串起来（`draftSaveTask` 链）：两次增量写如果并发，后发出的可能先到，
+ * 磁盘上就会留下一份旧内容。链式执行最坏只是多一次往返。
+ */
+function flushDraftChanges({ silent = true } = {}) {
+  const run = () => doFlushDrafts({ silent });
+  const task = (state.draftSaveTask || Promise.resolve()).then(run, run);
+  state.draftSaveTask = task;
+  task.then(
+    () => {
+      if (state.draftSaveTask === task) state.draftSaveTask = null;
+    },
+    () => {
+      if (state.draftSaveTask === task) state.draftSaveTask = null;
+    },
+  );
+  return task;
+}
+
+async function doFlushDrafts({ silent }) {
+  if (!state.path || state.draftDirty.size === 0) return;
+  const path = state.path;
+  // 快照脏集合：提交期间用户可能又改了某张图，那批改动必须留到下一轮
+  const entries = [...state.draftDirty.entries()];
+  const images = {};
+  for (const [imageId] of entries) images[imageId] = state.drafts.get(imageId) || [];
+  try {
+    const result = await saveAnnotationDrafts({ path, images });
+    if (path !== state.path) return; // 期间切了工程：这次结果只对旧工程有意义
+    for (const [imageId, seq] of entries) {
+      if (state.draftDirty.get(imageId) === seq) state.draftDirty.delete(imageId);
+    }
+    if (!silent) setStatus(`草稿已保存（共 ${result.count ?? 0} 条）`, "ok");
+  } catch (error) {
+    setStatus(`草稿保存失败：${error.message}`, "bad");
+  }
+}
+
+/** 打开工程后把旁挂草稿读回内存。失败不阻塞工程本身。 */
+async function loadDraftsFromDisk() {
+  state.drafts.clear();
+  state.draftDirty.clear();
+  if (!state.path) return;
+  const path = state.path;
+  try {
+    const data = await loadAnnotationDrafts(path);
+    if (path !== state.path) return;
+    for (const [imageId, drafts] of Object.entries(data.drafts || {})) {
+      if (!Array.isArray(drafts) || !drafts.length) continue;
+      state.drafts.set(imageId, drafts.map((draft) => ({ ...draft, _draft: true })));
+    }
+    if (data.warnings?.length) {
+      setStatus(`草稿文件有问题：${data.warnings[0]}`, "warn");
+    }
+  } catch (error) {
+    setStatus(`读取草稿失败：${error.message}`, "warn");
+  }
 }
 
 function classById(id) {
@@ -343,16 +498,17 @@ async function openProject(path, { discard = false } = {}) {
     }
   }
   await flushSave();
+  await flushDraftChanges({ silent: true });
   try {
     const data = await loadAnnotationProject(path);
-    adoptProject(data, path);
+    await adoptProject(data, path);
     setStatus(data.exists ? `已打开 rev=${data.meta.rev}` : "工程不存在，可点「新建」开始", data.exists ? "" : "warn");
   } catch (error) {
     setStatus(`打开失败：${error.message}`, "bad");
   }
 }
 
-function adoptProject(data, path) {
+async function adoptProject(data, path) {
   state.path = data.path || path;
   state.exists = Boolean(data.exists);
   state.project = data.project;
@@ -361,12 +517,18 @@ function adoptProject(data, path) {
   state.undo.length = 0;
   state.redo.length = 0;
   state.drafts.clear();
+  state.draftDirty.clear();
   state.hidden.clear();
   state.selectedId = "";
   state.pending = [];
   state.viewValid = false;
   state.currentIndex = state.project.images.length ? 0 : -1;
   if (el.path) el.path.value = state.path;
+
+  // 草稿来自旁挂文件：刷新/重开工程必须能把"还没审的候选"接回来，
+  // 否则批量预标注跑一次、F5 一下，几百个框就白跑了。
+  await loadDraftsFromDisk();
+  resumeBatchJob();
 
   updateHistoryButtons();
   renderAll();
@@ -407,6 +569,7 @@ async function createProject() {
   }
   // 1) 先把手上的修改落盘：切工程不能顺手带走当前工程的未保存内容。
   await flushSave();
+  await flushDraftChanges({ silent: true });
   if (state.dirty) {
     setStatus("当前工程还有未保存的修改，新建已取消", "bad");
     return;
@@ -447,7 +610,15 @@ async function createProject() {
     state.selectedId = "";
     state.undo.length = 0;
     state.redo.length = 0;
+    state.drafts.clear();
+    state.draftDirty.clear();
     if (el.path) el.path.value = state.path;
+    // 同名旁挂草稿属于"旧工程"：新工程里既没有那些图片，留着只会污染草稿池
+    try {
+      await saveAnnotationDrafts({ path: state.path, images: {}, replace: true });
+    } catch {
+      /* 清草稿失败不影响新建本身，下一次保存草稿会覆盖它 */
+    }
     updateHistoryButtons();
     renderAll();
     renderCanvas();
@@ -731,7 +902,10 @@ function drawLabel(ctx, obj, anchor, color, dashed = false) {
   if (!state.opts.showLabels) return;
   const name = obj.label || classById(obj.class_id).name;
   const score = Number(obj.score);
-  const text = state.opts.showScore && score >= 0 ? `${name} ${score.toFixed(2)}` : name;
+  let text = state.opts.showScore && score >= 0 ? `${name} ${score.toFixed(2)}` : name;
+  // 草稿标签带档位字：真机上绿/黄/红的观感会受图片底色影响，
+  // 有"高/中/低"三个字兜底，色弱用户也能一眼分辨。
+  if (obj._draft) text = `${text} · ${draftTierText(score)}`;
   ctx.save();
   ctx.font = "12px ui-monospace, SFMono-Regular, Consolas, monospace";
   const metrics = ctx.measureText(text);
@@ -756,7 +930,9 @@ function drawLabel(ctx, obj, anchor, color, dashed = false) {
 
 function drawShape(ctx, obj, options = {}) {
   const { draft = false, selected = false } = options;
-  const baseColor = draft ? [255, 196, 60] : classById(obj.class_id).color;
+  // 草稿按置信度分档取色：绿=可放心过、黄=看一下、红=重点看。
+  // 鼠标悬停/选中靠虚线 + 线宽区分，不靠颜色，避免和分档语义打架。
+  const baseColor = draft ? draftTierColor(obj.score) : classById(obj.class_id).color;
   const color = rgb(baseColor);
   const points = obj.points || [];
   const alpha = state.opts.fillAlpha;
@@ -1633,6 +1809,7 @@ function removeObject(id) {
   if (draftIndex >= 0) {
     drafts.splice(draftIndex, 1);
     if (state.selectedId === id) state.selectedId = "";
+    markDraftsDirty(image.id);
     return true;
   }
   return false;
@@ -1694,6 +1871,7 @@ function acceptDraft(id) {
   obj.class_id = cls.id;
   image.annotations.push(obj);
   state.selectedId = obj.id;
+  markDraftsDirty(image.id);
   afterEdit();
   renderCanvas();
   setStatus(`已接受草稿（类别：${cls.name}）`);
@@ -1705,6 +1883,61 @@ function rejectDraft(id) {
   renderAll();
   renderCanvas();
   setStatus("已丢弃草稿");
+}
+
+/**
+ * 审核快捷键作用的目标草稿。
+ *
+ * 有选中就处理选中的；没选中就取**置信度最高**的一条——这符合人的直觉：
+ * 先过最可信的一批，把注意力留给真正需要看的低分框。
+ * `score < 0`（通道没给置信度）排在最后，但不被排除。
+ */
+function draftTarget() {
+  const drafts = currentDrafts();
+  if (!drafts.length) return null;
+  const selected = drafts.find((draft) => draft.id === state.selectedId);
+  if (selected) return selected;
+  let best = drafts[0];
+  for (const draft of drafts) {
+    if (Number(draft.score) > Number(best.score)) best = draft;
+  }
+  return best;
+}
+
+/** 接受后自动选中下一条，`A` 连按就是一路上报，不用回头点鼠标。 */
+function acceptCurrentDraft() {
+  const target = draftTarget();
+  if (!target) {
+    setStatus("当前图片没有草稿，按空格去下一张", "warn");
+    return;
+  }
+  acceptDraft(target.id);
+  const rest = currentDrafts();
+  state.selectedId = rest.length ? draftTarget()?.id || "" : "";
+  renderAll();
+  renderCanvas();
+}
+
+function rejectCurrentDraft() {
+  const target = draftTarget();
+  if (!target) {
+    setStatus("当前图片没有草稿，按空格去下一张", "warn");
+    return;
+  }
+  rejectDraft(target.id);
+  state.selectedId = "";
+  renderAll();
+  renderCanvas();
+}
+
+/** 空格：下一张。最后一张给提示但不循环——循环会让人以为"还没看完"。 */
+async function nextImage() {
+  if (!state.project || state.currentIndex < 0) return;
+  if (state.currentIndex + 1 >= state.project.images.length) {
+    setStatus("已是最后一张", "warn");
+    return;
+  }
+  await switchImage(state.currentIndex + 1);
 }
 
 function acceptAllDrafts() {
@@ -1721,19 +1954,44 @@ function acceptAllDrafts() {
     image.annotations.push(obj);
   }
   state.selectedId = "";
+  markDraftsDirty(image.id);
   afterEdit();
   renderCanvas();
   setStatus(`已接受 ${count} 个草稿`);
 }
 
 function rejectAllDrafts() {
+  const image = currentImage();
   const drafts = currentDrafts();
-  if (!drafts.length) return;
+  if (!image || !drafts.length) return;
   const count = drafts.length;
   drafts.length = 0;
+  markDraftsDirty(image.id);
   renderAll();
   renderCanvas();
   setStatus(`已丢弃 ${count} 个草稿`);
+}
+
+/** 当前预标注参数（单张与批量共用，避免两处各读一遍控件）。 */
+function autoLabelOptions() {
+  return {
+    task: state.project?.task || "detect",
+    engine: (el.alEngine?.value || "").trim(),
+    labels: (el.alLabels?.value || "").trim(),
+    conf: Number(el.alConf?.value || 0.25),
+    nms: Number(el.alNms?.value || 0.45),
+    service: (el.alService?.value || "").trim(),
+  };
+}
+
+function requireEngine() {
+  const options = autoLabelOptions();
+  if (!options.engine) {
+    el.autoLabelBox?.setAttribute("open", "");
+    setStatus("请先选一个引擎：展开「预标注参数」，从训练产物下拉里选，或手工填 .engine 路径", "bad");
+    return null;
+  }
+  return options;
 }
 
 async function runAutoLabel() {
@@ -1742,25 +2000,22 @@ async function runAutoLabel() {
     setStatus("先选一张图片", "bad");
     return;
   }
-  const engine = (el.alEngine?.value || "").trim();
-  if (!engine) {
-    el.autoLabelBox?.setAttribute("open", "");
-    setStatus("请先填预标注用的 .engine 路径", "bad");
-    return;
-  }
+  const options = requireEngine();
+  if (!options) return;
   setStatus("预标注中…", "warn");
   try {
     const result = await autoLabel({
       image: imageApiPath(image),
-      task: state.project.task || "detect",
-      engine,
-      labels: (el.alLabels?.value || "").trim(),
-      conf: Number(el.alConf?.value || 0.25),
-      nms: Number(el.alNms?.value || 0.45),
-      service: (el.alService?.value || "").trim(),
+      task: options.task,
+      engine: options.engine,
+      labels: options.labels,
+      conf: options.conf,
+      nms: options.nms,
+      service: options.service,
     });
     const drafts = result.drafts || [];
     state.drafts.set(image.id, drafts);
+    markDraftsDirty(image.id);
     const bits = [`${drafts.length} 个草稿（通道：${result.channel}）`];
     if (result.warnings?.length) bits.push(result.warnings.join("；"));
     setStatus(bits.join(" · "), result.external_error || !drafts.length ? "warn" : "ok");
@@ -1768,6 +2023,218 @@ async function runAutoLabel() {
     renderCanvas();
   } catch (error) {
     setStatus(`预标注失败：${error.message}`, "bad");
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 训练产物下拉（闭环：训练完直接选，不用去文件框里翻）
+// ---------------------------------------------------------------------------
+async function refreshEngineOptions({ manual = false } = {}) {
+  if (!el.alEnginePick) return;
+  if (manual) setStatus("正在扫描训练产物…", "warn");
+  try {
+    const data = await listModels();
+    const entries = (data.entries || []).filter((item) => item.kind === "yolo");
+    state.engineLoaded = true;
+    el.alEnginePick.replaceChildren();
+    const placeholder = document.createElement("option");
+    placeholder.value = "";
+    placeholder.textContent = entries.length ? "— 从训练产物选择 —" : "— 没有扫到 YOLO 引擎 —";
+    el.alEnginePick.appendChild(placeholder);
+    for (const entry of entries) {
+      const option = document.createElement("option");
+      option.value = entry.path;
+      const size = (Number(entry.size || 0) / (1024 * 1024)).toFixed(1);
+      // "未转置"要标出来：拿 Ultralytics 原始布局的 onnx 编出来的引擎，
+      // 解码会越界，跑出来是一堆离谱的框。
+      const warn = entry.transposed ? "" : " ⚠ 未转置";
+      option.textContent = `${entry.label} · ${size}MB · ${entry.task}${warn}`;
+      option.dataset.labels = entry.labels || "";
+      el.alEnginePick.appendChild(option);
+    }
+    // 当前输入的引擎如果正好在列表里，让下拉也停在它上面（看起来才一致）
+    const current = (el.alEngine?.value || "").trim();
+    if (current && entries.some((entry) => entry.path === current)) {
+      el.alEnginePick.value = current;
+    }
+    if (manual) {
+      setStatus(
+        entries.length ? `已载入 ${entries.length} 个 YOLO 引擎` : "没有扫到 YOLO 引擎，可手工填路径",
+        entries.length ? "ok" : "warn",
+      );
+    }
+    const roots = (data.roots || []).filter((root) => root.kind === "yolo" && !root.ok);
+    if (!entries.length && roots.length) {
+      setStatus(`训练产物目录不可用：${roots[0].reason || roots[0].path}`, "warn");
+    }
+  } catch (error) {
+    setStatus(`扫描训练产物失败：${error.message}`, "bad");
+  }
+}
+
+function applyEngineOption() {
+  const path = (el.alEnginePick?.value || "").trim();
+  if (!path) return;
+  if (el.alEngine) el.alEngine.value = path;
+  // 标签文件跟着引擎走：同一个 run 目录下的 labels_*.json 才是这套类别的权威；
+  // 但用户手填过的标签文件不覆盖，避免把外部标注服务的配置冲掉。
+  const labels = el.alEnginePick.selectedOptions?.[0]?.dataset?.labels || "";
+  if (labels && el.alLabels && !(el.alLabels.value || "").trim()) el.alLabels.value = labels;
+  setStatus(`已选引擎：${path}`, "ok");
+}
+
+// ---------------------------------------------------------------------------
+// 批量预标注：整个工程跑一遍，结果进草稿池
+// ---------------------------------------------------------------------------
+function renderBatchProgress() {
+  const job = state.batchJob;
+  if (!el.batchProgress) return;
+  const bar = el.batchProgress.firstElementChild;
+  if (!job) {
+    el.batchProgress.classList.add("hidden");
+    if (bar) bar.style.width = "0%";
+    if (el.batchHint) el.batchHint.textContent = "";
+    if (el.batchStop) el.batchStop.disabled = true;
+    return;
+  }
+  el.batchProgress.classList.remove("hidden");
+  const ratio = job.total ? Math.round((job.done / job.total) * 100) : 0;
+  if (bar) bar.style.width = `${Math.min(100, ratio)}%`;
+  el.batchProgress.classList.toggle("done", job.status !== "running");
+  if (el.batchStop) el.batchStop.disabled = job.status !== "running";
+  if (el.batchHint) {
+    const parts = [];
+    parts.push(`${job.status === "running" ? (job.stopping ? "停止中" : "处理中") : job.status === "done" ? "已完成" : job.status === "stopped" ? "已停止" : "失败"} ${job.done}/${job.total}`);
+    if (job.current) parts.push(`当前：${job.current}`);
+    parts.push(`草稿 ${job.drafts}`);
+    if (job.failed) parts.push(`失败 ${job.failed}`);
+    if (job.empty) parts.push(`无结果 ${job.empty}`);
+    if (job.error) parts.push(job.error);
+    el.batchHint.textContent = parts.join(" · ");
+    el.batchHint.className = `anno-hint ${job.failed || job.status === "failed" ? "warn" : ""}`;
+  }
+}
+
+async function runBatchAutoLabel() {
+  if (!state.project || !state.path) {
+    setStatus("先打开一个工程", "bad");
+    return;
+  }
+  if (!state.project.images.length) {
+    setStatus("工程里还没有图片", "bad");
+    return;
+  }
+  if (state.batchJob?.status === "running") {
+    setStatus("上一批还在跑，先停止或等它结束", "warn");
+    return;
+  }
+  const options = requireEngine();
+  if (!options) return;
+
+  // 先把工程与草稿落盘：后端会读旁挂草稿判断"哪些图已有草稿"，
+  // 内存里刚改的东西不先写下去，scope=pending 就会重复跑。
+  await flushSave();
+  await flushDraftChanges({ silent: true });
+
+  const images = state.project.images.map((image) => ({
+    id: image.id,
+    path: imageApiPath(image),
+    annotated: (image.annotations || []).length > 0,
+  }));
+  setStatus(`正在启动批量预标注（${images.length} 张）…`, "warn");
+  try {
+    const result = await startBatchAutoLabel({
+      path: state.path,
+      images,
+      task: options.task,
+      engine: options.engine,
+      labels: options.labels,
+      conf: options.conf,
+      nms: options.nms,
+      service: options.service,
+      scope: el.batchSkipDone?.checked ? "pending" : "all",
+    });
+    state.batchJob = result.job;
+    const skipped = Number(result.skipped || 0);
+    setStatus(
+      `批量预标注已启动：${result.total} 张${skipped ? `，跳过 ${skipped} 张` : ""}`,
+      "ok",
+    );
+    renderBatchProgress();
+    scheduleBatchPoll();
+  } catch (error) {
+    state.batchJob = null;
+    renderBatchProgress();
+    setStatus(`批量预标注启动失败：${error.message}`, "bad");
+  }
+}
+
+function scheduleBatchPoll() {
+  if (state.batchTimer) clearTimeout(state.batchTimer);
+  state.batchTimer = window.setTimeout(pollBatchJob, 700);
+}
+
+async function pollBatchJob() {
+  const job = state.batchJob;
+  if (!job?.id) return;
+  state.batchTimer = 0;
+  try {
+    const result = await getBatchAutoLabel(job.id);
+    state.batchJob = result.job;
+  } catch (error) {
+    state.batchJob = { ...job, status: "failed", error: error.message };
+    renderBatchProgress();
+    setStatus(`批量预标注状态查询失败：${error.message}`, "bad");
+    return;
+  }
+  renderBatchProgress();
+  if (state.batchJob.status === "running") {
+    scheduleBatchPoll();
+    return;
+  }
+  // 结束后读回草稿：批量结果是**后端直接写盘**的，前端内存里的那份不含新图片。
+  await loadDraftsFromDisk();
+  const job2 = state.batchJob;
+  const bits = [`批量预标注结束：${job2.done}/${job2.total} 张，共 ${job2.drafts} 个草稿`];
+  if (job2.failed) bits.push(`失败 ${job2.failed} 张`);
+  setStatus(bits.join(" · "), job2.failed ? "warn" : "ok");
+  renderAll();
+  renderCanvas();
+}
+
+async function stopBatchRun() {
+  const job = state.batchJob;
+  if (!job?.id || job.status !== "running") return;
+  setStatus("正在停止批量预标注（当前这张跑完就停）…", "warn");
+  try {
+    const result = await stopBatchAutoLabel(job.id);
+    state.batchJob = result.job;
+    renderBatchProgress();
+  } catch (error) {
+    setStatus(`停止失败：${error.message}`, "bad");
+  }
+}
+
+/**
+ * 刷新页面后接回"还在跑的那一批"。
+ *
+ * 任务在服务端进程里，刷新浏览器不会让它停；不接回来的话进度条凭空消失，
+ * 用户会以为任务挂了，再点一次就是两批并发跑同一个引擎。
+ */
+async function resumeBatchJob() {
+  if (state.batchJob?.status === "running") return;
+  try {
+    const data = await listBatchAutoLabel();
+    const running = (data.jobs || []).find(
+      (job) => job.status === "running" && job.project === state.path,
+    );
+    if (!running) return;
+    state.batchJob = running;
+    renderBatchProgress();
+    scheduleBatchPoll();
+    setStatus("检测到后台批量预标注仍在运行，已接上进度", "warn");
+  } catch {
+    /* 拿不到任务列表不影响标注本身 */
   }
 }
 
@@ -1858,10 +2325,17 @@ function renderDraftList() {
 
   drafts.forEach((draft, index) => {
     const li = document.createElement("li");
+    li.classList.add(draftTierClass(draft.score));
     if (draft.id === state.selectedId) li.classList.add("active");
+    const score = Number(draft.score);
+    const badge = document.createElement("span");
+    badge.className = `tier-badge ${draftTierClass(draft.score)}`;
+    badge.textContent = draftTierText(draft.score);
+    badge.title = score >= 0
+      ? `置信度 ${score.toFixed(3)}（高 ≥ ${DRAFT_TIER_HIGH}，中 ≥ ${DRAFT_TIER_MID}）`
+      : "该通道没有返回置信度";
     const name = document.createElement("span");
     name.className = "name";
-    const score = Number(draft.score);
     name.textContent = `#${index + 1} ${draft.label || classById(draft.class_id).name}${
       score >= 0 ? ` ${score.toFixed(2)}` : ""
     }`;
@@ -1870,7 +2344,7 @@ function renderDraftList() {
     ok.type = "button";
     ok.className = "mini";
     ok.textContent = "✓";
-    ok.title = "接受";
+    ok.title = "接受 (A)";
     ok.addEventListener("click", (event) => {
       event.stopPropagation();
       acceptDraft(draft.id);
@@ -1879,12 +2353,12 @@ function renderDraftList() {
     no.type = "button";
     no.className = "mini danger";
     no.textContent = "×";
-    no.title = "丢弃";
+    no.title = "丢弃 (D)";
     no.addEventListener("click", (event) => {
       event.stopPropagation();
       rejectDraft(draft.id);
     });
-    li.append(name, ok, no);
+    li.append(badge, name, ok, no);
     li.addEventListener("click", () => {
       state.selectedId = draft.id;
       renderAll();
@@ -2713,6 +3187,24 @@ function onKeyDown(event) {
     return;
   }
   const lower = event.key.toLowerCase();
+  // 审核快捷键：A 接受 / D 丢弃 / 空格下一张。
+  // 放在工具快捷键之前，且都 preventDefault——空格默认会滚页面，
+  // 连按几下画布就"跑没了"，用户会以为图丢了。
+  if (event.key === " " || event.code === "Space") {
+    event.preventDefault();
+    nextImage();
+    return;
+  }
+  if (lower === "a") {
+    event.preventDefault();
+    acceptCurrentDraft();
+    return;
+  }
+  if (lower === "d") {
+    event.preventDefault();
+    rejectCurrentDraft();
+    return;
+  }
   if (lower === "f") {
     fitView();
     renderCanvas();
@@ -2751,6 +3243,8 @@ export function initAnnotate() {
     exportOut: document.getElementById("annoExportOut"),
     autoLabelBox: document.getElementById("annoAutoLabelBox"),
     alEngine: document.getElementById("annoAlEngine"),
+    alEnginePick: document.getElementById("annoAlEnginePick"),
+    alRefresh: document.getElementById("annoAlRefresh"),
     alLabels: document.getElementById("annoAlLabels"),
     alConf: document.getElementById("annoAlConf"),
     alNms: document.getElementById("annoAlNms"),
@@ -2763,6 +3257,13 @@ export function initAnnotate() {
     importReport: document.getElementById("annoImportReport"),
     importApply: document.getElementById("annoImportApply"),
     importApplySave: document.getElementById("annoImportApplySave"),
+    batchLabel: document.getElementById("annoBatchLabel"),
+    batchStop: document.getElementById("annoBatchStop"),
+    batchSkipDone: document.getElementById("annoBatchSkipDone"),
+    batchProgress: document.getElementById("annoBatchProgress"),
+    batchHint: document.getElementById("annoBatchHint"),
+    acceptOne: document.getElementById("annoAcceptOne"),
+    rejectOne: document.getElementById("annoRejectOne"),
   });
 
   document.getElementById("annoOpen")?.addEventListener("click", () => openProject((el.path.value || "").trim()));
@@ -2802,6 +3303,16 @@ export function initAnnotate() {
   document.getElementById("annoClassAdd")?.addEventListener("click", addClass);
   document.getElementById("annoAcceptAll")?.addEventListener("click", acceptAllDrafts);
   document.getElementById("annoRejectAll")?.addEventListener("click", rejectAllDrafts);
+  el.acceptOne?.addEventListener("click", acceptCurrentDraft);
+  el.rejectOne?.addEventListener("click", rejectCurrentDraft);
+  el.batchLabel?.addEventListener("click", runBatchAutoLabel);
+  el.batchStop?.addEventListener("click", stopBatchRun);
+  el.alRefresh?.addEventListener("click", () => refreshEngineOptions({ manual: true }));
+  el.alEnginePick?.addEventListener("change", applyEngineOption);
+  // 训练产物扫描是懒加载：不展开预标注参数就不去扫盘（大工程的 runs/ 树很深）。
+  el.autoLabelBox?.addEventListener("toggle", () => {
+    if (el.autoLabelBox.open && !state.engineLoaded) refreshEngineOptions();
+  });
 
   document.getElementById("annoConflictReload")?.addEventListener("click", async () => {
     el.conflictModal?.classList.add("hidden");
@@ -2898,10 +3409,13 @@ export function initAnnotate() {
     observer.observe(el.stage);
   }
   window.addEventListener("beforeunload", (event) => {
-    if (state.dirty) {
+    // 草稿有 800ms 防抖窗口，也算"未保存"：预标注跑了几百个框，
+    // 因为刷新丢掉比丢一张手工框更让人崩溃。
+    if (state.dirty || state.draftDirty.size) {
       event.preventDefault();
-      event.returnValue = "有未保存的标注，确定离开？";
+      event.returnValue = "有未保存的标注或草稿，确定离开？";
     }
+    flushDraftChanges({ silent: true });
   });
 
   // 只读调试钩子：浏览器级 e2e 测试需要断言内部状态（工具、拖拽阶段、点数），
@@ -2924,6 +3438,25 @@ export function initAnnotate() {
     })),
     history: state.undo.length,
     redo: state.redo.length,
+    // 预标注相关：草稿池、分档、批量进度。e2e 要断言"草稿确实落盘/确实分档"，
+    // 否则只能靠截图看颜色，改个阈值就得重新校准像素。
+    drafts: currentDrafts().map((draft) => ({
+      id: draft.id,
+      score: Number(draft.score),
+      tier: draftTier(draft.score),
+      label: draft.label || "",
+    })),
+    draftDirty: [...state.draftDirty.keys()],
+    draftTotal: [...state.drafts.values()].reduce((sum, list) => sum + list.length, 0),
+    batch: state.batchJob
+      ? {
+          id: state.batchJob.id,
+          status: state.batchJob.status,
+          done: state.batchJob.done,
+          total: state.batchJob.total,
+          drafts: state.batchJob.drafts,
+        }
+      : null,
   });
 
   resizeCanvas();

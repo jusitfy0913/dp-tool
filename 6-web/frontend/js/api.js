@@ -128,3 +128,36 @@ export function importAnnotationProject(payload) {
 export function autoLabel(payload) {
   return postJSON("/api/annotation/autolabel", payload);
 }
+
+// ---------------------------------------------------------------------------
+// 预标注草稿（旁挂 `<工程名>.drafts.json`）与批量预标注
+// ---------------------------------------------------------------------------
+export function loadAnnotationDrafts(path) {
+  return getJSON(`/api/annotation/drafts?${query({ path })}`);
+}
+
+export function saveAnnotationDrafts(payload) {
+  // 默认增量：payload.images 只带被改过的图片，其余图片的草稿由后端保留。
+  return postJSON("/api/annotation/drafts", payload);
+}
+
+export function startBatchAutoLabel(payload) {
+  return postJSON("/api/annotation/autolabel/batch", payload);
+}
+
+export function getBatchAutoLabel(jobId) {
+  return getJSON(`/api/annotation/autolabel/batch/${encodeURIComponent(jobId)}`);
+}
+
+export function listBatchAutoLabel() {
+  return getJSON("/api/annotation/autolabel/batch");
+}
+
+export function stopBatchAutoLabel(jobId) {
+  return postJSON(`/api/annotation/autolabel/batch/${encodeURIComponent(jobId)}/stop`, {});
+}
+
+/** 训练产物扫描结果（推理页与标注页共用）。 */
+export function listModels() {
+  return getJSON("/api/models");
+}

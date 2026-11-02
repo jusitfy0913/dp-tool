@@ -34,9 +34,11 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 import annotation
+import annotation_drafts
 import annotationimport
 import augpreview
 import autolabel
+import autolabeljobs
 import checkpoints
 import config
 import dataset
@@ -53,7 +55,7 @@ from runners import manager
 
 #: 应用版本号。前端顶栏与 /api/health 都读它，方便一眼看出「页面连的是哪个后端」。
 #: 起因：改了代码但 8060 上跑的是几小时前的旧进程，排查很久才发现。
-APP_VERSION = "1.22.0"
+APP_VERSION = "1.23.0"
 
 #: 本文件所在目录（6-web/backend）。子进程脚本路径都以它为基准，
 #: 不依赖启动时的工作目录——从仓库根启动和从 backend 启动必须都能跑。
@@ -2480,6 +2482,39 @@ class AnnotationAutoLabelRequest(BaseModel):
     timeout: float = Field(default=20.0, ge=1.0, le=300.0)
 
 
+class AnnotationDraftsRequest(BaseModel):
+    """写旁挂草稿。
+
+    ``images`` 是**增量**语义：只覆盖传进来的图片，其余图片在磁盘上的草稿保持不变。
+    这是刻意的——前端自动保存只会带上被改过的那几张图，批量任务又可能同时在写，
+    整份替换会把对方刚写的内容抹掉。
+    """
+
+    path: str = Field(..., description=".tfanno 工程路径（草稿写在其旁的 *.drafts.json）")
+    images: dict[str, list] = Field(default_factory=dict, description="图片 id → 草稿数组")
+    replace: bool = Field(default=False, description="true 时整份替换（用于清空全部草稿）")
+
+
+class AnnotationAutoLabelBatchRequest(BaseModel):
+    """整工程批量预标注。
+
+    ``images`` 由前端按当前内存工程整理（含 ``annotated`` 标记），
+    过滤与白名单校验在服务端做：前端不该成为"哪些图片允许跑"的判据。
+    """
+
+    path: str = Field(..., description=".tfanno 工程路径，草稿写入其旁挂文件")
+    images: list[dict] = Field(..., description="[{id, path, annotated?}] 待处理图片")
+    task: str = Field(default="detect")
+    engine: str = Field(..., description=".engine 路径")
+    labels: str = Field(default="", description="labels_*.json 路径")
+    conf: float = Field(default=0.25, ge=0.0, le=1.0)
+    nms: float = Field(default=0.45, ge=0.0, le=1.0)
+    service: str = Field(default="")
+    timeout: float = Field(default=20.0, ge=1.0, le=300.0)
+    scope: str = Field(default="all", description="all 全部 / pending 跳过已标注或已有草稿")
+    limit: int = Field(default=20000, ge=1, le=50000, description="单批图片上限")
+
+
 def _ensure_allowed_path(path: str) -> Path:
     """把路径解析成绝对路径并做白名单校验，返回解析结果。
 
@@ -2759,6 +2794,179 @@ def annotation_autolabel(request: AnnotationAutoLabelRequest) -> dict:
         raise HTTPException(status_code=503, detail=f"推理失败：{exc}") from exc
     except OSError as exc:
         raise HTTPException(status_code=400, detail=f"预标注失败：{exc}") from exc
+
+
+# ---------------------------------------------------------------------------
+# 草稿旁挂持久化
+# ---------------------------------------------------------------------------
+def _drafts_target(path: str) -> Path:
+    """校验草稿归属的工程路径。
+
+    只接受 `.tfanno`：草稿路径是从工程路径推导出来的，允许任意路径等于让
+    这个接口变成"往磁盘任意位置写 JSON"的入口。
+    """
+    target = _ensure_allowed_path(path)
+    if target.suffix.lower() != ".tfanno":
+        raise HTTPException(status_code=400, detail="草稿只跟随 .tfanno 工程文件")
+    return target
+
+
+@app.get("/api/annotation/drafts")
+def annotation_load_drafts(path: str) -> dict:
+    """读取预标注草稿（`<工程名>.drafts.json`）。
+
+    文件不存在返回空草稿池而不是 404：前端打开老工程时会无条件拉一次，
+    没有草稿是正常状态，不该在控制台刷一片红。
+    """
+    target = _drafts_target(path)
+    try:
+        images, meta = annotation_drafts.load(target)
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"读取草稿失败：{exc}") from exc
+    return {
+        "ok": True,
+        "project": str(target),
+        "drafts_path": meta.pop("path", ""),
+        # 字段名用 drafts 而不是 images：`meta.image_count` 是图片张数，
+        # 这里装的是「图片 id → 草稿数组」，同名会读错。
+        "drafts": images,
+        **meta,
+    }
+
+
+@app.post("/api/annotation/drafts")
+def annotation_save_drafts(request: AnnotationDraftsRequest) -> dict:
+    """写草稿（默认增量，`replace=true` 整份替换）。"""
+    target = _drafts_target(request.path)
+    try:
+        if request.replace:
+            meta = annotation_drafts.save(target, request.images)
+        else:
+            meta = annotation_drafts.merge(target, request.images)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"写入草稿失败：{exc}") from exc
+    return {"ok": True, "project": str(target), "drafts_path": meta.pop("path", ""), **meta}
+
+
+# ---------------------------------------------------------------------------
+# 批量预标注
+# ---------------------------------------------------------------------------
+def _batch_select_images(
+    request: AnnotationAutoLabelBatchRequest,
+    known_drafts: dict,
+) -> tuple[list[dict], int, list[str]]:
+    """把请求里的图片清单过滤成"真正要跑的"。
+
+    返回 ``(items, skipped, reasons)``。跳过原因要带回去：用户看到"跳过 12 张"
+    却不知道为什么，第一反应是程序坏了。
+    """
+    items: list[dict] = []
+    skipped = 0
+    reasons: list[str] = []
+    seen: set[str] = set()
+
+    for raw in request.images:
+        if len(items) >= request.limit:
+            reasons.append(f"超过单批上限 {request.limit} 张，其余图片未处理")
+            break
+        if not isinstance(raw, dict):
+            skipped += 1
+            continue
+        image_id = str(raw.get("id") or "").strip()
+        image_path = str(raw.get("path") or "").strip()
+        if not image_id or not image_path:
+            skipped += 1
+            continue
+        if image_id in seen:
+            skipped += 1
+            continue
+        seen.add(image_id)
+
+        if request.scope == "pending" and (raw.get("annotated") or known_drafts.get(image_id)):
+            skipped += 1
+            continue
+
+        try:
+            resolved = _ensure_allowed_path(image_path)
+        except HTTPException as exc:
+            skipped += 1
+            if len(reasons) < 10:
+                reasons.append(f"{image_id}：{exc.detail}")
+            continue
+        if not resolved.is_file():
+            skipped += 1
+            if len(reasons) < 10:
+                reasons.append(f"{image_id}：图片不存在（{resolved}）")
+            continue
+        items.append({"id": image_id, "path": str(resolved)})
+
+    return items, skipped, reasons
+
+
+@app.post("/api/annotation/autolabel/batch")
+def annotation_autolabel_batch(request: AnnotationAutoLabelBatchRequest) -> dict:
+    """启动整工程批量预标注，返回任务快照；进度经 `GET .../batch/{job_id}` 轮询。
+
+    结果直接写进旁挂草稿文件，**不经过响应体**：几百张图的草稿走 HTTP 传一遍
+    既慢又容易在超时处丢一半，写盘还能让"中途崩溃"最多损失当前这一张。
+    """
+    target = _drafts_target(request.path)
+    engine = _ensure_allowed_path(request.engine)
+    if not engine.is_file():
+        raise HTTPException(status_code=404, detail=f"引擎不存在：{engine}")
+
+    labels_path = ""
+    if request.labels.strip():
+        labels_path = str(_ensure_allowed_path(request.labels))
+
+    known_drafts, _meta = annotation_drafts.load(target)
+    items, skipped, reasons = _batch_select_images(request, known_drafts)
+    if not items:
+        detail = "没有需要处理的图片"
+        if reasons:
+            detail += "：" + "；".join(reasons[:5])
+        raise HTTPException(status_code=400, detail=detail)
+
+    options = {
+        "task": request.task,
+        "engine": str(engine),
+        "labels": labels_path,
+        "conf": request.conf,
+        "nms": request.nms,
+        "service": request.service.strip(),
+        "timeout": request.timeout,
+        "scope": request.scope,
+    }
+    try:
+        job = autolabeljobs.start(str(target), items, options)
+    except autolabeljobs.BatchError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return {"ok": True, "job": job, "total": job["total"], "skipped": skipped, "reasons": reasons}
+
+
+@app.get("/api/annotation/autolabel/batch")
+def annotation_autolabel_batch_list(limit: int = autolabeljobs.MAX_JOBS) -> dict:
+    """最近的批量任务列表：刷新页面后前端靠它找回"刚才那批跑到哪了"。"""
+    return {"ok": True, "jobs": autolabeljobs.recent(max(1, min(int(limit), autolabeljobs.MAX_JOBS)))}
+
+
+@app.get("/api/annotation/autolabel/batch/{job_id}")
+def annotation_autolabel_batch_status(job_id: str) -> dict:
+    job = autolabeljobs.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"未知批量任务：{job_id}（服务可能重启过）")
+    return {"ok": True, "job": job}
+
+
+@app.post("/api/annotation/autolabel/batch/{job_id}/stop")
+def annotation_autolabel_batch_stop(job_id: str) -> dict:
+    job = autolabeljobs.stop(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"未知批量任务：{job_id}")
+    return {"ok": True, "job": job}
 
 
 

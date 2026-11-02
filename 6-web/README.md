@@ -867,7 +867,10 @@ YOLO → `.tfanno` 映射：
 | `T` | 点 | `Esc` | 取消绘制 / 取消选中 |
 | `K` | 关键点组 | `F` | 适配窗口 |
 | `Shift+拖动` | 正交约束（水平 / 垂直） | `Alt+拖动` | 临时关闭吸附 |
-| `Ctrl+点击顶点` | 删除该顶点（少于 3 点自动删对象） | 点中边中点手柄拖动 | 插入 / 移动顶点 |
+| `A` | **接受当前草稿**（v1.23） | `D` | **丢弃当前草稿**（v1.23） |
+| `空格` | **下一张图片**（v1.23，不循环） | `Ctrl+点击顶点` | 删除该顶点（少于 3 点自动删对象） |
+
+拖动边中点手柄可以插入 / 移动顶点。
 
 撤销栈深度 50，新编辑清空重做栈。拖动但没移动（只是点了一下手柄）**不会**污染撤销栈。
 
@@ -943,6 +946,159 @@ POST {service}/predict    multipart/form-data
 - **类别自动补全**：草稿的 `label` 在工程里没有对应类别时，接受动作会按名字建类别
   （同名则复用），不会出现越界的 `class_id`。
 
+#### 批量预标注：整个工程跑一遍，人只做审核（v1.23）
+
+单张「预标注」只解决一张图，工程里 600 张就得点 600 次。v1.23 把这件事变成**一次点击**：
+后台把工程里每张图都推一遍，结果全部进草稿池，人只需要按 `A` / `D` 过一遍。
+
+| 入口 | 位置 | 说明 |
+| --- | --- | --- |
+| 「批量预标注」 | 预标注参数区（展开「预标注」后） | 用当前参数把**整个工程**跑一遍 |
+| 「停止」 | 同一行 | 跑完**当前这张**才退出，已出的草稿不丢 |
+| 「跳过已标注/已有草稿」 | 复选框，默认勾选 | 断点续跑：只补还没人看过的图 |
+| 进度条 + 提示行 | 按钮下方 | `已完成 6/6 · 草稿 18`，运行中显示当前图片名 |
+
+参数与单张预标注完全共用（同一套 `autoLabelOptions()`，避免两处各读一遍控件出错）：
+
+| 参数 | 默认 | 说明 |
+| --- | --- | --- |
+| `engine` | 空 | `.engine` 路径。可以从「训练产物」下拉直接选（见下节），也可以手工填 |
+| `labels` | 空 | `labels_*.json`；从下拉选引擎时**自动带上**同目录的标签文件 |
+| `conf` | 0.25 | 低于它的框直接不出，批量场景建议 `0.3` 以上 |
+| `nms` | 0.45 | 与推理页一致，进入引擎句柄缓存键 |
+| `service` | 空 | 外部标注服务；空 = 只走本地引擎 |
+| `timeout` | 20 | 单张外部服务超时（秒） |
+| `scope` | `pending` | 勾选「跳过已标注」时为 `pending`，否则 `all` |
+
+**为什么是线程不是子进程**
+
+推理页那条「跑任务」链路是 **子进程 + stdout**（`RunManager`），适合"跑几分钟的训练"。
+批量预标注的活是"同一进程里反复调同一个引擎"：每张图起一个 Python 进程要重挂 DLL、
+反序列化引擎，光启动就几秒，600 张等于十几分钟纯等待。`infer.run_yolo()` 内部本来
+就按引擎缓存句柄并用锁串行化，所以这里用**守护线程 + 内存任务表 + 轮询**。
+
+代价写在明处：服务重启后**任务进度**会丢（在内存里），但**草稿不会**——
+每张图处理完立刻原子写进旁挂文件，崩了最多丢当前这一张。
+
+**单张失败不中断**：某张图推理抛错时记进 `failures[]`（含图片 id 与错误文本）继续下一张，
+最终汇总 `failed`。整批失败只可能是参数错（引擎不存在、白名单越界），启动时就直接 400。
+
+**和「全部接受」的区别**：批量预标注只负责**产出草稿**，一张正式标注都不会写，
+所以跑错引擎不用慌——草稿全丢弃即可，工程文件一个字节没变。
+
+#### 草稿旁挂落盘：`<工程名>.drafts.json`（v1.23）
+
+老版本草稿只活在前端内存里：刷新页面 = 全部蒸发，批量预标注也就没法用
+（跑完 600 张草稿，手一抖刷新就白跑）。
+
+为什么**不**塞进 `.tfanno` 的独立字段：`.tfanno` 是 Qt 版也在读写的文件，
+Qt 保存时按自己的结构整体重写，会把这些"不认识"的键丢掉。**旁挂文件**才是安全的位置。
+
+```
+D:\data\pcb.tfanno            ← 正式标注，Qt 与 Web 双向兼容，内容与老版本完全一致
+D:\data\pcb.drafts.json       ← 草稿池，Web 独占；Qt 打开 pcb.tfanno 时根本看不到它
+```
+
+```json
+{
+  "version": 1,
+  "project": "pcb.tfanno",
+  "updated_ns": "1762083000000000000",
+  "count": 18,
+  "images": {
+    "01_missing_hole_01": [
+      {
+        "id": "draft_high01", "class_id": 0, "label": "missing_hole",
+        "description": "", "group_id": 0, "shape_type": "rectangle",
+        "points": [[40.0, 60.0], [180.0, 200.0]],
+        "rotation": 0.0, "keypoint_visibility": [],
+        "score": 0.91, "_draft": true
+      }
+    ]
+  }
+}
+```
+
+| 设计点 | 做法 | 为什么 |
+| --- | --- | --- |
+| 按图片 id 分组 | `images[<image_id>] = [草稿...]` | 前端只改了一张图时就只提交这张，别的图不会被清空 |
+| 原子写 | 写临时文件 → `os.replace()` | 写一半崩了不会留下半个 JSON，把草稿池读挂 |
+| 路径级互斥 | 模块级 `threading.Lock`（按路径） | 批量任务的线程和 HTTP 保存请求会同时写同一个文件 |
+| 脏数据 | `annotation.normalize_object` 逐条清洗，坏条目跳过并计数 | 一个坏框不该让整个草稿池打不开 |
+| 文件损坏 | 非法 JSON → 返回空池 + `exists=true` + 警告，接口不报 500 | 用户还有正式标注，不能被一个草稿文件卡住 |
+
+接口（全部走 `_ensure_allowed_path` 白名单，越界 403）：
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| GET | `/api/annotation/drafts?path=` | 读旁挂草稿，返回 `images` / `count` / `exists` / `warnings` |
+| POST | `/api/annotation/drafts` | `images` 增量合并（只覆盖给出的图）；`replace=true` 整份替换 |
+| POST | `/api/annotation/autolabel/batch` | 启动批量任务，返回 `job_id` + 启动瞬间快照 |
+| GET | `/api/annotation/autolabel/batch` | 最近任务列表（刷新页面后能找回进度） |
+| GET | `/api/annotation/autolabel/batch/{job_id}` | 单个任务进度快照 |
+| POST | `/api/annotation/autolabel/batch/{job_id}/stop` | 请求停止（当前图片跑完后退出） |
+
+`POST /api/annotation/drafts` 请求体：
+
+| 字段 | 类型 | 默认 | 说明 |
+| --- | --- | --- | --- |
+| `path` | str | 必填 | `.tfanno` 路径；旁挂文件路径由它推导（`foo.tfanno` → `foo.drafts.json`） |
+| `images` | object | `{}` | `{图片id: [草稿...]}`，**只覆盖出现的图片** |
+| `replace` | bool | `false` | `true` = 整份替换（清掉未出现的图片），新建工程时用 |
+
+`POST /api/annotation/autolabel/batch` 请求体：
+
+| 字段 | 类型 | 默认 | 说明 |
+| --- | --- | --- | --- |
+| `path` | str | 必填 | `.tfanno` 路径 |
+| `engine` | str | 必填 | `.engine` 路径 |
+| `labels` | str | 空 | `labels_*.json` |
+| `task` | str | 工程 `task` | `detect` / `segment` / `pose` / `obb` |
+| `conf` / `nms` | float | 0.25 / 0.45 | 同单张预标注 |
+| `service` | str | 空 | 外部服务地址 |
+| `timeout` | float | 20.0 | 单张超时 |
+| `scope` | str | `pending` | `pending` 跳过已有标注/草稿的图；`all` 全跑 |
+| `images` | array | 空 | 只跑指定图片 id（白名单用法）；空 = 工程内全部 |
+
+任务快照字段：`status`（`running`/`done`/`stopped`/`failed`）、`done`、`total`、
+`pending`、`failed`、`drafts`、`empty`、`current`、`elapsed_ms`、`failures[]`、
+`warnings[]`、`saved_images[]`。
+
+#### 审核效率：`A` / `D` / 空格 + 置信度分档（v1.23）
+
+| 键 | 作用 | 细节 |
+| --- | --- | --- |
+| `A` | 接受当前草稿 | 没选中任何草稿时取**置信度最高**的一条；接受后自动选中下一条，`A` 可以一路按 |
+| `D` | 丢弃当前草稿 | 同一套「当前」规则；其余草稿不受影响 |
+| `空格` | 下一张图片 | 最后一张给提示，**不循环**——循环会让人以为"还没看完" |
+
+按钮入口同步存在（「接受当前 A」/「丢弃当前 D」），快捷键不至于成为隐藏功能。
+焦点在文本框 / 数字框 / 下拉框里时三个键**都不生效**，不会边填 `conf` 边把草稿吃掉。
+
+草稿按置信度分三档着色（画布边框 + 标签底、右侧列表左色条 + 徽标同色）：
+
+| 档位 | 条件 | 颜色 | 徽标 |
+| --- | --- | --- | --- |
+| 高 | `score >= 0.70` | 绿 `#34d399` | `高` |
+| 中 | `0.40 <= score < 0.70` | 黄 `#fbbf24` | `中` |
+| 低 | `0 < score < 0.40` | 红 `#f87171` | `低` |
+| 未知 | `score < 0`（通道不给置信度） | 灰 `#8a9cb3` | `?` |
+
+「未知」单独一档是关键：外部服务不返回 `score` 时若按 `0` 处理，会被染成红色，
+用户以为"这条很差"，其实只是**没有分数**。
+
+#### 训练产物下拉：闭环最后一段（v1.23）
+
+训练完的 `.engine` 以前要自己去 `1-python-yolo/launcher/runs/...` 一层层翻，
+现在预标注参数区直接给一个下拉，数据来自 `/api/models`：
+
+- **懒加载**：展开「预标注」参数时才扫盘（`runs/` 树很深），另有 `↻` 手动重扫。
+- **只列 YOLO**：`kind="yolo"` 才进列表（Anomalib 的异常检测引擎不吃框）。
+- **带警示**：名称后跟 `· 8.5MB · detect`，**未转置**的引擎标 `⚠ 未转置`——
+  拿没转置的 ONNX 编出来的引擎，DLL 不报错但会返回 `confidence=957` 这类垃圾框。
+- **标签跟随**：选中引擎时，同 run 目录下的 `labels_*.json` 自动回填（用户已手填的不覆盖）。
+- **不封死手工路径**：扫不到引擎、或用的是仓库外的引擎时，路径输入框照常可用。
+
 #### 导出
 
 「导出」会把**内存中的当前工程**（含未保存修改）交给 `dataset.py` 的同一套
@@ -953,6 +1109,38 @@ POST {service}/predict    multipart/form-data
 | YOLO | `train/val/test` 张数 | 全任务 |
 | COCO | `images` / `annotations` / `empty` 条数 | 不支持 OBB |
 | VOC | `images` 张数 | 仅 `detect` |
+
+#### v1.23 变更点（相对 v1.22）
+
+| 项 | v1.22 | v1.23 | 影响 |
+| --- | --- | --- | --- |
+| 预标注粒度 | 只能一张一张点「预标注」 | 「批量预标注」把整个工程跑一遍 | 600 张的工程从 600 次点击变成 1 次 |
+| 草稿生命周期 | 只在前端内存，刷新即蒸发 | 旁挂 `<工程名>.drafts.json`，按图增量原子落盘 | 刷新、重启浏览器、服务重启都不丢 |
+| 草稿与工程文件 | —— | 草稿**永不**写进 `.tfanno` | Qt 版打开同一工程看不到任何草稿，双向兼容不变 |
+| 引擎选择 | 手工翻 `runs/` 目录填路径 | 下拉直接列 `/api/models` 里的 YOLO 引擎，标「⚠ 未转置」 | 选错引擎（没转置）这个坑在选的时候就看得见 |
+| 审核 | 鼠标点「接受 / 拒绝」 | `A` 接受、`D` 丢弃、`空格` 下一张（按钮仍在） | 一遍过完，手不用离开键盘 |
+| 置信度可读性 | 草稿统一一种颜色 | 高绿 / 中黄 / 低红 / 未知灰，画布与列表同色 + 徽标 | 低分框一眼挑出来重点看 |
+| 批量进度 | —— | 进度条 + `已完成 6/6 · 草稿 18` + 当前图片 + 停止 | 长工程知道跑到哪了，也能中断 |
+| 断点续跑 | —— | 「跳过已标注/已有草稿」 | 补标新图不用重跑全工程 |
+
+新增文件：`backend/annotation_drafts.py`、`backend/autolabeljobs.py`、
+`backend/tools/test_annotation_drafts.py`（52 项）、`backend/tools/test_autolabel_batch.py`（42 项）。
+改动文件：`backend/app.py`（6 个接口）、`frontend/js/api.js`、`frontend/js/annotate.js`
+（分档着色 / 脏标记落盘 / 批量轮询 / 审核快捷键 / 引擎下拉）、`frontend/index.html`、
+`frontend/css/style.css`。
+
+验收（本机实测）：
+
+- 后端：`test_annotation_drafts.py` **52/52**、`test_autolabel_batch.py` **42/42**，
+  `run_all_tests.py` **26 个脚本全绿**。
+- 浏览器：真实 `pcb/detect_v1/weights/best.transd_fp16.engine` 跑 6 张图 →
+  `6/6 张，共 18 个草稿`，`elapsed_ms≈525`（引擎已在内存里，省掉的就是进程启动）；
+  草稿写入 `anno_keys.drafts.json`（18 条，每张 3 条，score 0.75~0.88）。
+- `A`：草稿 4 → 3、正式标注 12 → 13、侧栏自动选中下一条；`D`：4 → 3 后变 2；
+  `空格`：`01_missing_hole_01` → `01_missing_hole_02`。
+- 分档着色用画布像素取样验证：高 `rgb(52,211,153)`、中 `rgb(251,191,36)`、
+  低 `rgb(248,113,113)` 与设计令牌完全一致。
+- 刷新页面后重开同一工程：13 条正式标注 + 2 条剩余草稿原样回来（`A`/`D` 的结果已落盘）。
 
 #### v1.9 变更点（相对 v1.8）
 
@@ -1202,6 +1390,12 @@ offset1 = cursor - p_image * scale1
 | POST | `/api/annotation/import` | **v1.19**：把 YOLO 数据集（`data.yaml` + `labels/*.txt`）导入工程；`dry_run` 只出报告 |
 | POST | `/api/annotation/export` | 把**内存中**的工程导出 YOLO / COCO / VOC |
 | POST | `/api/annotation/autolabel` | 本地引擎（必要时 + 外部服务）生成草稿，返回 `shapes` / `warnings` |
+| GET | `/api/annotation/drafts?path=` | **v1.23**：读旁挂草稿 `foo.drafts.json` |
+| POST | `/api/annotation/drafts` | **v1.23**：按图片增量写草稿；`replace=true` 整份替换 |
+| POST | `/api/annotation/autolabel/batch` | **v1.23**：启动整工程批量预标注，返回 `job_id` |
+| GET | `/api/annotation/autolabel/batch` | **v1.23**：最近批量任务列表（刷新后找回进度） |
+| GET | `/api/annotation/autolabel/batch/{job_id}` | **v1.23**：批量任务进度快照 |
+| POST | `/api/annotation/autolabel/batch/{job_id}/stop` | **v1.23**：请求停止批量任务 |
 
 `POST /api/annotation/project` 的请求体：
 
@@ -1431,6 +1625,8 @@ offset1 = cursor - p_image * scale1
 │   ├── annotation.py     `.tfanno` 读写与规范化（2 点矩形 / 关键点单对象 / rev 乐观锁 / 相对路径解析）
 │   ├── annotationimport.py **v1.19**：YOLO 数据集导入（data.yaml 解析 / 坐标清洗 / 类别合并 / 去重 / 导入报告）
 │   ├── autolabel.py      自动标注双通道编排（本地引擎 + 可选外部 HTTP 服务）+ 草稿清洗
+│   ├── annotation_drafts.py **v1.23**：草稿旁挂落盘（`foo.drafts.json` / 按图增量合并 / 原子写 / 路径级锁）
+│   ├── autolabeljobs.py  **v1.23**：整工程批量预标注后台任务（守护线程 / 内存任务表 / 逐图落盘 / 停止 / 快照）
 │   ├── pipeline.py       **v1.17**：串联编排（阶段状态机 / 停止 / 重启遗留清理 / 磁盘持久化 / `resolve` 延迟派生命令）
 │   ├── anomalymetrics.py **v1.18**：异常检测指标（AUROC 秩统计 / 阈值混淆矩阵 / F1 最优阈值 / 直方图 AUROC）
 │   ├── valmetrics.py     **v1.17**：COCO 口径 mAP 计算（IoU 0.50:0.95 全点插值，带边界容差）
@@ -1457,6 +1653,8 @@ offset1 = cursor - p_image * scale1
 │       ├── test_anomaly_metrics.py    **v1.18**：异常指标验收（归一化 / AUROC 同分 / 混淆矩阵边界 / 最优阈值）
 │       ├── test_native_dialog.py      **v1.20**：原生对话框验收（扩展名归一化 / 起始目录 / 四种类型 / 单例锁 / 超时 / 放行表 / 远程 403）
 │       ├── test_metadata_readout.py   **v1.21**：metadata 推荐值回显验收（字段解析 / BOM / 坏 JSON / 0.0 阈值 / 403 / 400 / 不建引擎句柄）
+│       ├── test_annotation_drafts.py  **v1.23**：草稿旁挂验收（往返 / 增量合并 / 坏数据跳过 / 原子写 / 并发写不互相清空）
+│       ├── test_autolabel_batch.py    **v1.23**：批量任务验收（生命周期 / pending 跳过 / 单张失败不中断 / 停止 / 空清单）
 │       ├── run_all_tests.py           总入口：扫描并串行跑完所有 test_*.py（CI 共用）
 │       └── test_exit_codes.py  退出码语义化测试（exit 2/130 的补事件逻辑）
 ├── frontend/
@@ -1471,7 +1669,7 @@ offset1 = cursor - p_image * scale1
 │   │   ├── export.js     导出 ONNX 面板（权重选择 / 任务参数 / 产物表 / 一键送去编译）
 │   │   ├── engine.js     引擎构建页（阶段清单 + 估算进度 + 日志流 + 探测预警 + **v1.18.1** 输出路径规范化）
 │   │   ├── dataset.js    数据集页（扫描预览 + 导出）
-│   │   ├── annotate.js   标注工作台（Canvas 2D 六形状 / 缩放平移 / 吸附 / 撤销重做 / 自动保存 / 草稿层 / 导出 / **v1.19** 导入 YOLO 与另存为）
+│   │   ├── annotate.js   标注工作台（Canvas 2D 六形状 / 缩放平移 / 吸附 / 撤销重做 / 自动保存 / 草稿层 / 导出 / **v1.19** 导入 YOLO 与另存为 / **v1.23** 批量预标注 + 草稿落盘 + `A`/`D`/空格审核 + 置信度分档）
 │   │   ├── infer.js      推理控制台（模型扫描 / 参数联动 / 表格 / 直方图 / 导出）
 │   │   ├── inferbatch.js **v1.16**：目录批量 / 视频 / 摄像头（事件流、进度、结果表、canvas 叠框）
 │   │   ├── pipeline.js   **v1.17/v1.18**：全流程串联卡片（YOLO / Anomalib 双模式、阶段清单、产物表、精度卡片、历史记录）
@@ -1488,7 +1686,7 @@ offset1 = cursor - p_image * scale1
 **一条命令跑完全部后端测试**（v1.15 起，CI 与本地共用同一个入口）：
 
 ```powershell
-D:\Anaconda3\envs\dpenv\python.exe 6-web\backend\tools\run_all_tests.py      # 23 个脚本
+D:\Anaconda3\envs\dpenv\python.exe 6-web\backend\tools\run_all_tests.py      # 26 个脚本
 D:\Anaconda3\envs\dpenv\python.exe 6-web\backend\tools\run_all_tests.py transd  # 只跑名字含 transd 的
 ```
 
@@ -1541,6 +1739,12 @@ D:\Anaconda3\envs\dpenv\python.exe 6-web\backend\tools\test_metadata_readout.py
 
 # 像素级诊断（纯 numpy：合成异常图，不需要 GPU / DLL / 掩码）
 D:\Anaconda3\envs\dpenv\python.exe 6-web\backend\tools\test_anomaly_pixel.py
+
+# 草稿旁挂落盘（不需要服务：临时目录里跑往返 / 增量 / 坏数据）
+D:\Anaconda3\envs\dpenv\python.exe 6-web\backend\tools\test_annotation_drafts.py
+
+# 批量预标注任务（不需要 DLL：推理换成假实现，验证生命周期与落盘）
+D:\Anaconda3\envs\dpenv\python.exe 6-web\backend\tools\test_autolabel_batch.py
 ```
 
 2026-10-29 实测结果：`smoke_test` **13 项全通过**（能力探测、参数校验、越权拦截、
@@ -1561,6 +1765,8 @@ D:\Anaconda3\envs\dpenv\python.exe 6-web\backend\tools\test_anomaly_pixel.py
 | `test_dataset_workbench.py` | 20 / 20 通过 |
 | `test_exit_codes.py` | 6 / 6 通过 |
 | `test_onnx_fallback.py` | 36 / 36 通过 |
+| `test_annotation_drafts.py` | **52 / 52 通过**（v1.23） |
+| `test_autolabel_batch.py` | **42 / 42 通过**（v1.23） |
 
 真实产物联调（浏览器 Playwright 驱动）：
 

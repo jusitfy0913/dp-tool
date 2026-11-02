@@ -1883,6 +1883,50 @@ input[type="range"]:disabled { cursor: not-allowed; }
   border: 1px solid rgba(255, 255, 255, .28);
 }
 
+/* ---- 草稿置信度分档 ----
+   与画布同一套颜色：绿=可放心过、黄=看一眼、红=重点看、?=通道没给分数。
+   左侧色条比"整行染色"克制：整行染色会让按钮和文字一起变色，反而更难读。 */
+.anno-draftlist li.tier-high { box-shadow: inset 3px 0 0 var(--ok); }
+.anno-draftlist li.tier-mid { box-shadow: inset 3px 0 0 var(--amber); }
+.anno-draftlist li.tier-low { box-shadow: inset 3px 0 0 var(--danger); }
+.anno-draftlist li.tier-unknown { box-shadow: inset 3px 0 0 var(--text-dim); }
+/* 选中态的青色左条优先：否则选中的低分草稿看起来像"没选中" */
+.anno-draftlist li.active { box-shadow: inset 3px 0 0 var(--cyan); }
+.tier-badge {
+  flex: 0 0 auto;
+  width: 18px;
+  text-align: center;
+  font-size: var(--fs-2xs);
+  font-family: var(--font-mono);
+  border-radius: 4px;
+  border: 1px solid var(--line);
+  color: var(--text-dim);
+  line-height: 16px;
+}
+.tier-badge.tier-high { color: var(--ok); border-color: var(--ok-a40); background: var(--ok-a12); }
+.tier-badge.tier-mid { color: var(--amber); border-color: var(--amber-a40); background: var(--amber-a12); }
+.tier-badge.tier-low { color: var(--danger); border-color: var(--danger-a40); background: var(--danger-a12); }
+.tier-badge.tier-unknown { color: var(--text-dim); }
+
+/* ---- 批量预标注进度 ---- */
+.anno-progress {
+  height: 6px;
+  border-radius: 999px;
+  background: var(--surface-3);
+  border: 1px solid var(--line);
+  overflow: hidden;
+}
+.anno-progress > div {
+  height: 100%;
+  width: 0;
+  background: linear-gradient(90deg, var(--cyan), var(--teal));
+  transition: width var(--dur-fast) var(--ease);
+}
+.anno-progress.done > div { background: var(--ok); }
+.anno-progress.hidden { display: none; }
+/* 引擎下拉要占满宽度：训练产物路径长，88px 只能显示一个箭头 */
+#annoAlEnginePick { flex: 1 1 auto; min-width: 0; }
+
 /* ---- 工具条 ---- */
 .anno-center {
   display: flex;
