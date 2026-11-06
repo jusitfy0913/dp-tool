@@ -130,6 +130,16 @@ set(TRTFORGE_BIN_DIR "${CMAKE_CURRENT_SOURCE_DIR}/bin")
 add_subdirectory("${TRTFORGE_REPO_ROOT}/3-cpp-tensorrt/yolo_infer" "${CMAKE_BINARY_DIR}/yolo_infer")
 add_subdirectory("${TRTFORGE_REPO_ROOT}/3-cpp-tensorrt/anomalib_infer" "${CMAKE_BINARY_DIR}/anomalib_infer")
 
+# onnx_infer 只在网页端使用，桌面端默认不把它写进 VS 解决方案：
+# 它需要 ONNX Runtime 头文件，而 ONNX Runtime 的版本与打包要跟网页端保持一致，
+# 让桌面方案的配置去依赖它只会制造两份口径。需要一起调试时打开此开关。
+option(TRTFORGE_BUILD_ONNX_INFER
+    "Build onnx_infer inside TRTForge solution (needs ONNX Runtime headers)"
+    OFF)
+if(TRTFORGE_BUILD_ONNX_INFER)
+    add_subdirectory("${TRTFORGE_REPO_ROOT}/3-cpp-tensorrt/onnx_infer" "${CMAKE_BINARY_DIR}/onnx_infer")
+endif()
+
 if(TRTFORGE_BUILD_OCR_INFER)
     add_subdirectory("${TRTFORGE_REPO_ROOT}/ocr/ocr_infer" "${CMAKE_BINARY_DIR}/ocr_infer")
 else()

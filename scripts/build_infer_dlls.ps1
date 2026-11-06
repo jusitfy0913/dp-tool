@@ -10,14 +10,20 @@
 #   powershell -NoProfile -ExecutionPolicy Bypass -File scripts\build_infer_dlls.ps1
 #   powershell ... -File scripts\build_infer_dlls.ps1 -OpenCvDir E:\thirdparty\opencv
 #   powershell ... -File scripts\build_infer_dlls.ps1 -Targets yolo_infer
+#   powershell ... -File scripts\build_infer_dlls.ps1 -OnnxRuntimeRoot E:\thirdparty\onnxruntime
 #   powershell ... -File scripts\build_infer_dlls.ps1 -Clean
 #
-# 产物：<repo>\4-qt-studio\bin\yolo_infer.dll、anomalib_infer.dll
+# 产物：<repo>\4-qt-studio\bin\yolo_infer.dll、anomalib_infer.dll、onnx_infer.dll
+#
+# onnx_infer 是纯 CXX 目标，只需要 ONNX Runtime 头文件与 DLL：
+#   先跑 scripts\fetch_onnxruntime.ps1 下载到 3-cpp-tensorrt\onnx_infer\third_party\onnxruntime。
+# 缺头文件时它的 CMakeLists 会跳过该目标并打印提示，不影响另外两个库。
 
 param(
     [string]$OpenCvDir = "",
     [string]$CudaDir = "",
-    [ValidateSet("all", "yolo_infer", "anomalib_infer")]
+    [string]$OnnxRuntimeRoot = "",
+    [ValidateSet("all", "yolo_infer", "anomalib_infer", "onnx_infer")]
     [string]$Targets = "all",
     [string]$Configuration = "Release",
     [switch]$Clean
@@ -78,6 +84,13 @@ if (-not $CudaDir -and (Test-Path "C:\Program Files\NVIDIA GPU Computing Toolkit
     $CudaDir = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v11.8"
 }
 
+# ONNX Runtime 头文件目录：不传就用 onnx_infer 子工程里的 third_party 默认值。
+# 传了就提前校验，避免编译到一半才报找不到头文件。
+if (-not $OnnxRuntimeRoot) { $OnnxRuntimeRoot = $env:ONNXRUNTIME_ROOT }
+if ($OnnxRuntimeRoot -and -not (Test-Path (Join-Path $OnnxRuntimeRoot "include\onnxruntime_c_api.h"))) {
+    throw "OnnxRuntimeRoot 下找不到 include\onnxruntime_c_api.h：$OnnxRuntimeRoot"
+}
+
 $CMake = Find-CMake
 $VsInstall = Find-Msvc
 
@@ -93,6 +106,7 @@ Write-Host "  cmake     : $CMake"
 Write-Host "  visual std: $VsInstall"
 Write-Host "  opencv    : $OpenCvDir (版本 $opencvVersion)"
 Write-Host "  cuda      : $(if ($CudaDir) { $CudaDir } else { '(未设置)' })"
+Write-Host "  ort       : $(if ($OnnxRuntimeRoot) { $OnnxRuntimeRoot } else { '(用子工程 third_party 默认值)' })"
 Write-Host "  targets   : $Targets / $Configuration"
 Write-Host ""
 
@@ -108,7 +122,7 @@ if ($Clean -and (Test-Path $BuildRoot)) {
 }
 
 $targetsToBuild = switch ($Targets) {
-    "all" { @("yolo_infer", "anomalib_infer") }
+    "all" { @("yolo_infer", "anomalib_infer", "onnx_infer") }
     default { @($Targets) }
 }
 
@@ -153,6 +167,7 @@ foreach ($target in $targetsToBuild) {
         "-DTRTFORGE_BIN_DIR=$BinDir"
     )
     if ($CudaDir) { $configureArgs += "-DCUDA_TOOLKIT_ROOT_DIR=$CudaDir" }
+    if ($OnnxRuntimeRoot) { $configureArgs += "-DONNXRUNTIME_ROOT=$OnnxRuntimeRoot" }
 
     & $CMake @configureArgs
     if ($LASTEXITCODE -ne 0) {
@@ -173,7 +188,7 @@ foreach ($target in $targetsToBuild) {
 Write-Host ""
 Write-Host "==== 结果 ===="
 $produced = @()
-foreach ($name in @("yolo_infer", "anomalib_infer")) {
+foreach ($name in @("yolo_infer", "anomalib_infer", "onnx_infer")) {
     $dll = Join-Path $BinDir "$name.dll"
     if (Test-Path $dll) {
         $item = Get-Item $dll

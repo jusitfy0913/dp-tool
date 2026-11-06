@@ -64,6 +64,8 @@ target_compile_definitions(yolo_infer PRIVATE YOLO_INFER_EXPORTS)
 target_include_directories(yolo_infer
     PUBLIC  ${CMAKE_CURRENT_SOURCE_DIR}/include
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
+            # raw_dump.hpp 与 anomalib_infer 共用，避免三个库各写一份落盘格式
+            ${CMAKE_CURRENT_SOURCE_DIR}/../anomalib_infer/src
             ${TRT_INCLUDE}
             ${OpenCV_INCLUDE_DIRS}
 )

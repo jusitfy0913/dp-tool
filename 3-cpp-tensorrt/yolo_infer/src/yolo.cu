@@ -17,6 +17,7 @@
  */
 #include "infer.hpp"
 #include "yolo.hpp"
+#include "raw_dump.hpp"
 
 #include <opencv2/core.hpp>
 #include <opencv2/dnn.hpp>
@@ -846,6 +847,50 @@ class InferImpl : public Infer {
     if (!trt_->forward(bindings, stream)) {
       INFO("Failed to tensorRT forward.");
       return {};
+    }
+
+    // ---------------------------------------------------------------------
+    // 诊断导出（TRTFORGE_RAW_DUMP）：把喂给引擎的输入张量与后处理前的
+    // 输出张量拷回主机落盘，供 tools/compare_raw_tensors.py 与 ONNX 侧对齐。
+    // 未设置环境变量时整段被跳过，正常推理路径不变。
+    // ---------------------------------------------------------------------
+    unsigned dump_run = 0;
+    if (oi::dump::enabled()) {
+      dump_run = oi::dump::begin_run();
+
+      // 只为导出等一次 GPU；正常路径不在这里引入同步点
+      checkRuntime(cudaStreamSynchronize(stream_));
+
+      const size_t input_numel = static_cast<size_t>(network_input_width_) *
+                                 network_input_height_ * 3;
+      std::vector<float> input_host(input_numel * num_image);
+      checkRuntime(cudaMemcpy(input_host.data(), input_buffer_.gpu(),
+                              input_host.size() * sizeof(float), cudaMemcpyDeviceToHost));
+      std::vector<int64_t> input_shape{num_image, 3, network_input_height_,
+                                       network_input_width_};
+      oi::dump::write(dump_run, "yolo_infer", "input", 0, "images", input_shape,
+                      input_host.data(), input_host.size(), "float32", "TensorRT");
+
+      const size_t bbox_numel = static_cast<size_t>(bbox_head_dims_[1]) *
+                                bbox_head_dims_[2] * num_image;
+      std::vector<float> bbox_host(bbox_numel);
+      checkRuntime(cudaMemcpy(bbox_host.data(), bbox_output_device,
+                              bbox_numel * sizeof(float), cudaMemcpyDeviceToHost));
+      std::vector<int64_t> bbox_shape{num_image, bbox_head_dims_[1], bbox_head_dims_[2]};
+      oi::dump::write(dump_run, "yolo_infer", "output", 0, "output0", bbox_shape,
+                      bbox_host.data(), bbox_host.size(), "float32", "TensorRT");
+
+      if (has_segment_) {
+        const size_t seg_numel = static_cast<size_t>(segment_head_dims_[1]) *
+                                 segment_head_dims_[2] * segment_head_dims_[3] * num_image;
+        std::vector<float> seg_host(seg_numel);
+        checkRuntime(cudaMemcpy(seg_host.data(), segment_predict_.gpu(),
+                                seg_numel * sizeof(float), cudaMemcpyDeviceToHost));
+        std::vector<int64_t> seg_shape{num_image, segment_head_dims_[1],
+                                       segment_head_dims_[2], segment_head_dims_[3]};
+        oi::dump::write(dump_run, "yolo_infer", "output", 1, "output1", seg_shape,
+                        seg_host.data(), seg_host.size(), "float32", "TensorRT");
+      }
     }
 
     for (int ib = 0; ib < num_image; ++ib) {

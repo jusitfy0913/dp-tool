@@ -8,6 +8,9 @@
 #include <opencv2/dnn.hpp>
 #include <opencv2/imgproc.hpp>
 
+#include "anomalib_post.hpp"
+#include "raw_dump.hpp"
+
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -113,17 +116,8 @@ void convertInt32ToFloat(const void* src, float* dst, int64_t count)
     }
 }
 
-float clamp01(float v)
-{
-    return std::max(0.0f, std::min(1.0f, v));
-}
-
-float normalizeWithRange(float value, float threshold, float minVal, float maxVal)
-{
-    const float denom = maxVal - minVal;
-    if (std::abs(denom) < 1.0e-6f) return clamp01(value);
-    return clamp01(((value - threshold) / denom) + 0.5f);
-}
+using anomalib_post::clamp01;
+using anomalib_post::normalizeWithRange;
 
 std::filesystem::path utf8Path(const char* path)
 {
@@ -379,6 +373,21 @@ public:
         }
         cv::Mat blob = cv::dnn::blobFromImage(resized);
         TensorBuffer& input = buffers_[inputBinding_];
+
+        // 诊断导出：blob 此刻还在 CPU 上，是「喂给引擎的输入」，直接落盘最省事。
+        // 开关关闭时 dumpRun 为 0，下面两处判断都被跳过。
+        unsigned dumpRun = 0;
+        if (oi::dump::enabled()) {
+            dumpRun = oi::dump::begin_run();
+            // blobFromImage 返回 4D Mat，rows/cols 是 -1；必须用 size[] 取真实维度
+            std::vector<int64_t> inputShape{
+                static_cast<int64_t>(blob.size[0]), static_cast<int64_t>(blob.size[1]),
+                static_cast<int64_t>(blob.size[2]), static_cast<int64_t>(blob.size[3])};
+            oi::dump::write(dumpRun, "anomalib_infer", "input", 0, "input", inputShape,
+                            blob.ptr<float>(), static_cast<size_t>(blob.total()),
+                            "float32", "TensorRT");
+        }
+
         cudaError_t cerr = cudaMemcpyAsync(input.device, blob.ptr<float>(), input.bytes, cudaMemcpyHostToDevice, stream_);
         if (cerr != cudaSuccess) {
             setError(std::string("输入拷贝到 GPU 失败: ") + cudaGetErrorString(cerr));
@@ -426,6 +435,19 @@ public:
         if (outputs.empty()) {
             setError("engine 没有输出 tensor");
             return false;
+        }
+
+        // 诊断导出：这里所有输出都已转成 float32 并回到主机内存，
+        // 且还在选 score/map 之前，正是「后处理前的输出」。
+        if (dumpRun) {
+            for (size_t i = 0; i < outputs.size(); ++i) {
+                const Dims& d = outputs[i]->dims;
+                std::vector<int64_t> shape(d.d, d.d + (d.nbDims > 0 ? d.nbDims : 0));
+                oi::dump::write(dumpRun, "anomalib_infer", "output", i,
+                                outputs[i]->name.c_str(), shape, outputs[i]->host.data(),
+                                static_cast<size_t>(outputs[i]->elemCount), "float32",
+                                "TensorRT");
+            }
         }
 
         TensorBuffer* mapOutput = nullptr;
@@ -476,46 +498,26 @@ public:
             rawScore = static_cast<float>(maxValue);
         }
 
-        cv::Mat normalizedMap = ((rawMap - meta_.pixelThreshold) / (meta_.mapMax - meta_.mapMin)) + 0.5f;
-        cv::threshold(normalizedMap, normalizedMap, 1.0, 1.0, cv::THRESH_TRUNC);
-        cv::threshold(normalizedMap, normalizedMap, 0.0, 0.0, cv::THRESH_TOZERO);
-        cv::Mat normalizedMapCompact = normalizedMap.isContinuous() ? normalizedMap : normalizedMap.clone();
+        anomalib_post::RenderConfig renderConfig;
+        renderConfig.imageThreshold = meta_.imageThreshold;
+        renderConfig.pixelThreshold = meta_.pixelThreshold;
+        renderConfig.mapMin = meta_.mapMin;
+        renderConfig.mapMax = meta_.mapMax;
+        renderConfig.scoreMin = meta_.scoreMin;
+        renderConfig.scoreMax = meta_.scoreMax;
+        const anomalib_post::RenderOutput rendered =
+            anomalib_post::render(rgbMat, rawMap, rawScore, renderConfig);
+
+        cv::Mat normalizedMapCompact = rendered.normalized_map.isContinuous()
+            ? rendered.normalized_map
+            : rendered.normalized_map.clone();
         const auto* mapPtr = reinterpret_cast<const float*>(normalizedMapCompact.data);
         normalizedMap_.assign(mapPtr, mapPtr + normalizedMapCompact.total());
 
-        cv::Mat displayMap;
-        cv::resize(normalizedMap, displayMap, cv::Size(width, height), 0, 0, cv::INTER_LINEAR);
-        cv::Mat map8u;
-        displayMap.convertTo(map8u, CV_8UC1, 255.0);
-        cv::Mat heatBgr;
-        cv::applyColorMap(map8u, heatBgr, cv::COLORMAP_JET);
-
-        cv::Mat originalBgr;
-        cv::cvtColor(rgbMat, originalBgr, cv::COLOR_RGB2BGR);
-        cv::Mat overlayBgr;
-        cv::addWeighted(heatBgr, 0.45, originalBgr, 0.55, 0, overlayBgr);
-
-        cv::Mat mask;
-        cv::threshold(displayMap, mask, 0.5, 255.0, cv::THRESH_BINARY);
-        mask.convertTo(mask, CV_8UC1);
-        cv::Mat maskOverlayBgr = originalBgr.clone();
-        std::vector<std::vector<cv::Point>> contours;
-        cv::findContours(mask, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
-        if (!contours.empty()) {
-            cv::drawContours(maskOverlayBgr, contours, -1, cv::Scalar(0, 0, 255), 2, cv::LINE_AA);
-        }
-
-        const float normalizedScore = normalizeWithRange(rawScore, meta_.imageThreshold, meta_.scoreMin, meta_.scoreMax);
-        const bool isAnomaly = normalizedScore >= 0.5f;
-        const std::string status = std::string("score ") + formatScore(normalizedScore) + (isAnomaly ? "  NG" : "  OK");
-        const cv::Scalar statusColor = isAnomaly ? cv::Scalar(0, 0, 255) : cv::Scalar(0, 220, 0);
-        cv::putText(overlayBgr, status, cv::Point(10, 26), cv::FONT_HERSHEY_SIMPLEX, 0.7, statusColor, 2);
-        cv::putText(maskOverlayBgr, status, cv::Point(10, 26), cv::FONT_HERSHEY_SIMPLEX, 0.7, statusColor, 2);
-
-        cv::Mat overlayRgb;
-        cv::Mat maskRgb;
-        cv::cvtColor(overlayBgr, overlayRgb, cv::COLOR_BGR2RGB);
-        cv::cvtColor(maskOverlayBgr, maskRgb, cv::COLOR_BGR2RGB);
+        const cv::Mat& overlayRgb = rendered.overlay_rgb;
+        const cv::Mat& maskRgb = rendered.mask_rgb;
+        const float normalizedScore = rendered.normalized_score;
+        const bool isAnomaly = rendered.is_anomaly;
 
         assignMatBytes(rgbMat, sourceRgb_);
         assignMatBytes(overlayRgb, overlayRgb_);
@@ -559,15 +561,6 @@ private:
     {
         const auto end = std::chrono::steady_clock::now();
         return std::chrono::duration<double, std::milli>(end - start).count();
-    }
-
-    static std::string formatScore(float score)
-    {
-        std::ostringstream oss;
-        oss.setf(std::ios::fixed);
-        oss.precision(3);
-        oss << score;
-        return oss.str();
     }
 
     static void assignMatBytes(const cv::Mat& mat, std::vector<unsigned char>& out)
