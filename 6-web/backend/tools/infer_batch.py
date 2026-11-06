@@ -38,6 +38,8 @@ import config  # noqa: E402
 import infer  # noqa: E402
 import inferjobs  # noqa: E402
 import labels as labels_mod  # noqa: E402
+import ocr_infer  # noqa: E402
+import ocr_models  # noqa: E402
 import onnx_fallback  # noqa: E402
 
 
@@ -56,32 +58,77 @@ class EngineRunner:
     def __init__(self, args: argparse.Namespace, classes: list[str]) -> None:
         self.kind = args.kind
         self.classes = classes
+        if self.kind == "ocr":
+            try:
+                ocr_models.preflight(args.det_dir, args.rec_dir, args.textline_dir)
+            except ocr_models.OcrModelError as exc:
+                raise RuntimeError(str(exc)) from exc
+            ocr_state = ocr_infer.status()
+            if not ocr_state["ok"]:
+                raise RuntimeError(ocr_state["detail"] or "ocr_infer.dll 不可用")
+            self.use_dll = True
+            self.backend = "ocr_infer.dll"
+            self.onnx_path = ""
+            return
+
         status = infer.status()
+        is_onnx = infer.is_onnx_model(args.engine)
 
         if self.kind == "yolo":
-            self.use_dll = status.yolo_ok
+            self.use_dll = status.onnx_ok if is_onnx else status.yolo_ok
             self.onnx_path = ""
             if not self.use_dll:
-                self.onnx_path, reason = onnx_fallback.resolve_onnx_path(args.engine, "")
-                if self.onnx_path is None:
-                    raise RuntimeError(
-                        f"yolo_infer.dll 不可用（{status.detail or '未知原因'}），且无法降级：{reason}"
-                    )
-            self.backend = "yolo_infer.dll" if self.use_dll else "onnxruntime"
+                if is_onnx:
+                    # 直接给了 .onnx，只是在 Python 兜底里跑，不报错
+                    if not Path(args.engine).is_file():
+                        raise RuntimeError(f"ONNX 模型不存在：{args.engine}")
+                    self.onnx_path = args.engine
+                else:
+                    self.onnx_path, reason = onnx_fallback.resolve_onnx_path(args.engine, "")
+                    if self.onnx_path is None:
+                        raise RuntimeError(
+                            f"yolo_infer.dll 不可用（{status.detail or '未知原因'}），且无法降级：{reason}"
+                        )
+            if self.use_dll:
+                self.backend = "onnx_infer.dll" if is_onnx else "yolo_infer.dll"
+            else:
+                self.backend = "onnxruntime"
         else:
-            self.use_dll = status.anomalib_ok
+            self.use_dll = status.onnx_ok if is_onnx else status.anomalib_ok
             self.onnx_path = ""
             if not self.use_dll:
-                self.onnx_path, reason = onnx_fallback.resolve_onnx_path(args.engine, args.metadata)
-                if self.onnx_path is None:
-                    raise RuntimeError(
-                        f"anomalib_infer.dll 不可用（{status.detail or '未知原因'}），且无法降级：{reason}"
-                    )
+                if is_onnx:
+                    if not Path(args.engine).is_file():
+                        raise RuntimeError(f"ONNX 模型不存在：{args.engine}")
+                    self.onnx_path = args.engine
+                else:
+                    self.onnx_path, reason = onnx_fallback.resolve_onnx_path(args.engine, args.metadata)
+                    if self.onnx_path is None:
+                        raise RuntimeError(
+                            f"anomalib_infer.dll 不可用（{status.detail or '未知原因'}），且无法降级：{reason}"
+                        )
             if not Path(args.metadata).is_file():
                 raise RuntimeError(f"metadata.json 不存在：{args.metadata}")
-            self.backend = "anomalib_infer.dll" if self.use_dll else "onnxruntime"
+            if self.use_dll:
+                self.backend = "onnx_infer.dll" if is_onnx else "anomalib_infer.dll"
+            else:
+                self.backend = "onnxruntime"
 
     def run(self, args: argparse.Namespace, array) -> dict:
+        if self.kind == "ocr":
+            return ocr_infer.run(array, {
+                "det_dir": args.det_dir,
+                "rec_dir": args.rec_dir,
+                "textline_dir": args.textline_dir,
+                "device": args.device,
+                "enable_mkldnn": 0 if args.no_mkldnn else 1,
+                "cpu_threads": args.cpu_threads,
+                "rec_batch_size": args.rec_batch_size,
+                "det_thresh": args.det_thresh,
+                "det_box_thresh": args.det_box_thresh,
+                "det_unclip_ratio": args.det_unclip_ratio,
+                "rec_score_thresh": args.rec_score_thresh,
+            })
         if self.kind == "yolo":
             if self.use_dll:
                 return infer.run_yolo(args.engine, args.task, array, conf=args.conf, nms=args.nms)
@@ -112,8 +159,19 @@ class EngineRunner:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="目录批量推理（YOLO / Anomalib）")
-    parser.add_argument("--kind", choices=("yolo", "anomalib"), default="yolo")
-    parser.add_argument("--engine", required=True, help=".engine / .trt / .onnx")
+    parser.add_argument("--kind", choices=("yolo", "anomalib", "ocr"), default="yolo")
+    parser.add_argument("--engine", default="", help=".engine / .trt / .onnx；OCR 不需要")
+    parser.add_argument("--det-dir", default="", help="OCR 检测模型目录")
+    parser.add_argument("--rec-dir", default="", help="OCR 识别模型目录")
+    parser.add_argument("--textline-dir", default="", help="OCR 文本行方向模型目录")
+    parser.add_argument("--device", default="cpu", choices=("cpu", "gpu:0"))
+    parser.add_argument("--cpu-threads", type=int, default=8)
+    parser.add_argument("--rec-batch-size", type=int, default=6)
+    parser.add_argument("--det-thresh", type=float, default=0.3)
+    parser.add_argument("--det-box-thresh", type=float, default=0.6)
+    parser.add_argument("--det-unclip-ratio", type=float, default=1.5)
+    parser.add_argument("--rec-score-thresh", type=float, default=0.0)
+    parser.add_argument("--no-mkldnn", action="store_true")
     parser.add_argument("--task", default="detect", choices=("detect", "segment", "pose", "obb"))
     parser.add_argument("--labels", default="", help="labels_*.json；留空则用 cls{id}")
     parser.add_argument("--conf", type=float, default=0.25)
@@ -136,6 +194,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 YOLO_COLUMNS = ["index", "file", "count", "top_class", "max_conf", "elapsed_ms", "output", "error"]
+OCR_COLUMNS = ["index", "file", "count", "text", "avg_score", "elapsed_ms", "output", "error"]
 ANOMALIB_COLUMNS = [
     "index", "file", "raw_score", "normalized_score", "is_anomaly",
     "image_threshold", "elapsed_ms", "output", "error",
@@ -202,9 +261,34 @@ def _error_record(index: int, file: Path, message: str) -> dict:
     }
 
 
+def _ocr_record(index: int, file: Path, result: dict, elapsed_ms: float, output: str) -> dict:
+    lines = result.get("lines") or []
+    scores = [float(item.get("score") or 0.0) for item in lines]
+    text = "\n".join(str(item.get("text") or "") for item in lines)
+    return {
+        "index": index,
+        "file": str(file),
+        "count": int(result.get("count") or len(lines)),
+        "text": text,
+        "avg_score": (sum(scores) / len(scores)) if scores else 0.0,
+        "elapsed_ms": elapsed_ms,
+        "output": output,
+        "error": "",
+        "lines": lines,
+        "src_w": result.get("src_w"),
+        "src_h": result.get("src_h"),
+        "backend": result.get("backend"),
+    }
+
+
 def _flush(job: Path, args: argparse.Namespace, records: list[dict], extra: dict) -> tuple[Path, Path]:
     """把结果写成 JSON + CSV，返回 (json 路径, csv 路径)。"""
-    columns = YOLO_COLUMNS if args.kind == "yolo" else ANOMALIB_COLUMNS
+    if args.kind == "yolo":
+        columns = YOLO_COLUMNS
+    elif args.kind == "ocr":
+        columns = OCR_COLUMNS
+    else:
+        columns = ANOMALIB_COLUMNS
     rows = [
         record if not args.no_full_json
         else {k: v for k, v in record.items() if k != "boxes"}
@@ -222,6 +306,8 @@ def _flush(job: Path, args: argparse.Namespace, records: list[dict], extra: dict
         "files": rows,
     })
     csv_path = inferjobs.write_csv(job / "results.csv", columns, records)
+    if args.kind == "ocr":
+        inferjobs.write_csv(job / "ocr_summary.csv", columns, records)
     return json_path, csv_path
 
 
@@ -236,6 +322,10 @@ def main(argv: list[str] | None = None) -> int:
         )
     except (OSError, FileNotFoundError) as exc:
         emit({"type": "error", "code": "SOURCE_INVALID", "message": str(exc)})
+        return 1
+
+    if args.kind != "ocr" and not str(args.engine or "").strip():
+        emit({"type": "error", "code": "ENGINE_UNAVAILABLE", "message": "缺少引擎路径"})
         return 1
 
     if not images:
@@ -301,7 +391,21 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 elapsed_ms = (time.perf_counter() - file_started) * 1000.0
                 relative = f"annotated/{out_name}"
-                if args.kind == "yolo":
+                if args.kind == "ocr":
+                    out_name = f"{file.stem}.ocr.json"
+                    relative = f"ocr/{out_name}"
+                    (job / "ocr").mkdir(parents=True, exist_ok=True)
+                    inferjobs.write_json(job / "ocr" / out_name, {
+                        "file": str(file),
+                        "backend": result.get("backend"),
+                        "count": result.get("count"),
+                        "lines": result.get("lines") or [],
+                        "timing": result.get("timing"),
+                        "src_w": result.get("src_w"),
+                        "src_h": result.get("src_h"),
+                    })
+                    record = _ocr_record(index, file, result, elapsed_ms, relative)
+                elif args.kind == "yolo":
                     canvas = infer.render_yolo(array, result.get("boxes") or [], result.get("class_colors"))
                     (job / "annotated" / out_name).write_bytes(
                         infer.encode_image(canvas, ".jpg", args.jpeg_quality)
@@ -353,6 +457,11 @@ def main(argv: list[str] | None = None) -> int:
             "backend": runner.backend,
             "class_histogram": class_counter,
         })
+        if args.kind == "ocr":
+            annotated = sorted((job / "ocr").glob("*.ocr.json"))
+            summary = job / "ocr_summary.csv"
+            if summary.is_file():
+                annotated.append(summary)
         if not args.no_zip:
             zip_path = inferjobs.make_zip(
                 job / "annotated.zip",

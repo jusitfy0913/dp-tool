@@ -11,7 +11,16 @@
 //     实时推理会让拖动滑块变成卡顿，而且每次都要重建引擎句柄。
 //   · 结果表、分布图、导出三者都从同一份 `lastResult` 生成，不会出现"导出的和看到的不一样"。
 
-import { anomalyMetadataInfo, getJSON, postForm } from "./api.js";
+import { anomalyMetadataInfo, getJSON, postForm, postJSON } from "./api.js";
+import {
+  bindOcrPicks,
+  buildOcrOverlay,
+  highlightOcr,
+  loadOcrModels,
+  ocrCsv,
+  ocrPlainText,
+  renderOcrTable,
+} from "./ocr.js";
 import { applyOverlayScale, buildOverlay, setOverlayHighlight } from "./overlay.js";
 import { createViewerStrip } from "./viewer.js";
 
@@ -44,7 +53,10 @@ export function initInfer() {
     kind: document.getElementById("inferKind"),
     yoloGroup: document.getElementById("inferYoloGroup"),
     anomGroup: document.getElementById("inferAnomGroup"),
+    ocrGroup: document.getElementById("inferOcrGroup"),
+    artifactGroup: document.getElementById("inferArtifactGroup"),
     btnInfer: document.getElementById("btnInfer"),
+    btnWorkerRestart: document.getElementById("btnWorkerRestart"),
     hint: document.getElementById("inferHint"),
     rebuildHint: document.getElementById("inferRebuildHint"),
     badge: document.getElementById("inferBadge"),
@@ -55,6 +67,8 @@ export function initInfer() {
     modelSelect: document.getElementById("inferModelSelect"),
     modelHint: document.getElementById("inferModelHint"),
     btnRefreshModels: document.getElementById("btnRefreshModels"),
+    weight: document.getElementById("inferWeight"),
+    weightHint: document.getElementById("inferWeightHint"),
 
     timing: document.getElementById("inferTiming"),
     timingBar: document.getElementById("timingBar"),
@@ -93,12 +107,27 @@ export function initInfer() {
   });
 
   bindSliders();
+  bindOcrPicks();
   dom.kind.addEventListener("change", syncKind);
   dom.form.addEventListener("submit", onSubmit);
+  dom.btnWorkerRestart?.addEventListener("click", restartWorker);
   dom.file.addEventListener("change", onFileChange);
   dom.useMetaThresh.addEventListener("change", syncThresholdControls);
   dom.modelSelect.addEventListener("change", onModelChange);
-  dom.btnRefreshModels.addEventListener("click", () => loadModels(true));
+  dom.btnRefreshModels.addEventListener("click", () => {
+    loadModels(true);
+    loadOcrModels();
+  });
+  // 切换权重格式只换路径，不重扫目录：引擎与 ONNX 都在同一条产物里
+  dom.weight?.addEventListener("change", onWeightChange);
+  // 手动改路径后让权重格式跟随后缀，避免界面显示和实际后端不一致
+  for (const id of ["yoloEngine", "anomEngine"]) {
+    document.getElementById(id)?.addEventListener("change", (event) => {
+      const isOnnx = String(event.target.value || "").toLowerCase().endsWith(".onnx");
+      if (dom.weight) dom.weight.value = isOnnx ? "onnx" : "engine";
+      updateWeightHint();
+    });
+  }
 
   // metadata 路径一改就重读推荐值：手动输入走 change（失焦提交），
   // 点「浏览」选文件走 writeValue() 也会派发 change，两条路都能覆盖。
@@ -116,6 +145,8 @@ export function initInfer() {
 
   document.getElementById("btnExportJson").addEventListener("click", exportJson);
   document.getElementById("btnExportCsv").addEventListener("click", exportCsv);
+  document.getElementById("btnCopyOcr")?.addEventListener("click", copyOcrText);
+  document.getElementById("btnExportTxt")?.addEventListener("click", exportTxt);
 
   // 标签尺寸随倍率反向缩放，保证屏幕字号恒定
   dom.mount.addEventListener("viewer-zoom", (event) => {
@@ -124,7 +155,7 @@ export function initInfer() {
   });
 
   // 参数一改就点亮"会重建引擎"提示，让用户知道慢在哪
-  for (const id of ["inferConf", "inferNms", "anomImageThr", "anomPixelThr"]) {
+  for (const id of ["inferConf", "inferNms", "anomImageThr", "anomPixelThr", "ocrDetThresh", "ocrBoxThresh", "ocrDet", "ocrRec", "ocrTextline", "ocrDevice"]) {
     const el = document.getElementById(id);
     if (el) el.addEventListener("change", markParamsDirty);
   }
@@ -133,6 +164,7 @@ export function initInfer() {
   syncThresholdControls();
   refreshMetaThresholds();
   loadModels(false);
+  loadOcrModels();
 }
 
 // ---------------------------------------------------------------------------
@@ -174,6 +206,8 @@ function bindSliders() {
   bindSlider("anomImageThr", "anomImageThrRange");
   bindSlider("anomPixelThr", "anomPixelThrRange");
   bindSlider("anomOverlayOpacity", "anomOverlayOpacityRange");
+  bindSlider("ocrDetThresh", "ocrDetThreshRange");
+  bindSlider("ocrBoxThresh", "ocrBoxThreshRange");
 }
 
 /** "沿用 metadata 默认值"开关：关掉后才允许编辑两个阈值。 */
@@ -340,6 +374,10 @@ function currentParamKey() {
   const parts = [dom.kind.value];
   if (dom.kind.value === "yolo") {
     parts.push(value("yoloEngine"), value("inferTask"), value("inferConf"), value("inferNms"));
+  } else if (dom.kind.value === "ocr") {
+    parts.push(value("ocrDet"), value("ocrRec"), value("ocrTextline"), value("ocrDevice"));
+    parts.push(value("ocrThreads"), value("ocrBatch"), value("ocrDetThresh"), value("ocrBoxThresh"));
+    parts.push(value("ocrUnclip"), value("ocrRecScore"), document.getElementById("ocrMkldnn")?.checked ? "1" : "0");
   } else {
     parts.push(value("anomEngine"), value("anomMetadata"), value("anomModelType"));
     parts.push(dom.useMetaThresh.checked ? "meta" : `${value("anomImageThr")}|${value("anomPixelThr")}`);
@@ -388,7 +426,8 @@ function renderModelOptions(data) {
       option.value = item.path;
       const size = (item.size / (1024 * 1024)).toFixed(1);
       const warn = item.kind === "yolo" && !item.transposed ? " ⚠ 未转置" : "";
-      option.textContent = `${item.label} · ${size}MB${warn}`;
+      const onnxTag = item.onnx ? " · ONNX" : "";
+      option.textContent = `${item.label} · ${size}MB${onnxTag}${warn}`;
       group.appendChild(option);
     }
     select.appendChild(group);
@@ -407,22 +446,77 @@ function renderModelOptions(data) {
   dom.modelHint.textContent = parts.join(" ");
 }
 
+/** 当前下拉选中的训练产物条目（手工输入时不指向任何条目）。 */
+function currentModel() {
+  return models.find((entry) => entry.path === dom.modelSelect.value) || null;
+}
+
+/** 该条目在当前权重格式下应该填哪个文件。 */
+function modelPathFor(item) {
+  if (!item) return "";
+  if (dom.weight && dom.weight.value === "onnx" && item.onnx) return item.onnx;
+  return item.path;
+}
+
+/** ONNX 选项只在条目真的有同名 .onnx 时可选，避免选了却填不出路径。 */
+function syncWeightOptions(item) {
+  if (!dom.weight) return;
+  const option = dom.weight.querySelector('option[value="onnx"]');
+  if (option) option.disabled = !item || !item.onnx;
+  if (dom.weight.value === "onnx" && (!item || !item.onnx)) {
+    dom.weight.value = "engine";
+  }
+  updateWeightHint();
+}
+
+function updateWeightHint() {
+  if (!dom.weightHint) return;
+  const item = currentModel();
+  const onnx = dom.weight && dom.weight.value === "onnx";
+  if (onnx) {
+    dom.weightHint.textContent = item && item.onnx
+      ? `将使用 ${fileName(item.onnx)}，后端为 onnx_infer.dll（不可用时退回 Python onnxruntime）。`
+      : "ONNX 走 onnx_infer 动态库；当前产物没有同名 .onnx 时该选项不可选。";
+  } else {
+    dom.weightHint.textContent = "TensorRT 引擎走 yolo_infer / anomalib_infer 动态库。";
+  }
+}
+
+function onWeightChange() {
+  const item = currentModel();
+  if (!item) {
+    updateWeightHint();
+    return;
+  }
+  applyModelToForm(item);
+}
+
 function onModelChange() {
-  const path = dom.modelSelect.value;
-  const item = models.find((entry) => entry.path === path);
-  if (!item) return;
+  const item = currentModel();
+  if (!item) {
+    updateWeightHint();
+    return;
+  }
 
   dom.kind.value = item.kind === "anomalib" ? "anomalib" : "yolo";
   syncKind();
+  syncWeightOptions(item);
+  applyModelToForm(item);
+}
+
+/** 把条目内容填进表单：路径按当前权重格式取引擎或 ONNX，其余字段两份共用。 */
+function applyModelToForm(item) {
+  const chosen = modelPathFor(item);
+  const isOnnx = chosen.toLowerCase().endsWith(".onnx");
 
   if (item.kind === "yolo") {
-    setValue("yoloEngine", item.path);
+    setValue("yoloEngine", chosen);
     setValue("yoloLabels", item.labels || "");
     if (item.task && ["detect", "segment", "pose", "obb"].includes(item.task)) {
       setValue("inferTask", item.task);
     }
   } else {
-    setValue("anomEngine", item.path);
+    setValue("anomEngine", chosen);
     // 优先用校准过的 metadata：它是按现场数据重新标定过阈值的版本
     setValue("anomMetadata", item.metadata_calibrated || item.metadata || "");
     if (item.model_type) {
@@ -434,14 +528,17 @@ function onModelChange() {
   }
 
   // 未转置的引擎会让 DLL 解码越界，产出的框是垃圾值。必须提前拦。
-  if (item.kind === "yolo" && !item.transposed) {
+  // 走 ONNX 时这条警告不适用：ONNX 侧按实际输出布局自适应解析。
+  if (item.kind === "yolo" && !isOnnx && !item.transposed) {
     dom.modelHint.textContent =
       `⚠ ${item.name} 对应的 ONNX 是未转置的（${item.onnx ? fileName(item.onnx) : "无"}）。`
       + "用它编译的引擎解码会越界，结果不可信。请改用 *_fp16.engine 中对应 .transd.onnx 的那个。";
     dom.modelHint.classList.add("hint-warn");
   } else {
     dom.modelHint.classList.remove("hint-warn");
-    dom.modelHint.textContent = `已填入 ${item.name}${item.labels ? "（含标签文件）" : ""}`;
+    dom.modelHint.textContent = isOnnx
+      ? `已填入 ${fileName(chosen)}（ONNX，走 onnx_infer.dll）`
+      : `已填入 ${item.name}${item.labels ? "（含标签文件）" : ""}`;
   }
   markParamsDirty();
 }
@@ -460,12 +557,18 @@ function normalizeModelType(raw) {
 // ---------------------------------------------------------------------------
 
 function syncKind() {
-  const isYolo = dom.kind.value === "yolo";
+  const kind = dom.kind.value;
+  const isYolo = kind === "yolo";
+  const isOcr = kind === "ocr";
   dom.yoloGroup.classList.toggle("hidden", !isYolo);
-  dom.anomGroup.classList.toggle("hidden", isYolo);
-  lastKind = isYolo ? "yolo" : "anomalib";
-  viewers.viewer("result").setTitle(isYolo ? "检出结果" : "异常叠加");
-  if (isYolo) {
+  dom.anomGroup.classList.toggle("hidden", kind !== "anomalib");
+  dom.ocrGroup?.classList.toggle("hidden", !isOcr);
+  dom.artifactGroup?.classList.toggle("hidden", isOcr);
+  lastKind = kind;
+  viewers.viewer("result").setTitle(isOcr ? "文字位置" : isYolo ? "检出结果" : "异常叠加");
+  document.getElementById("btnCopyOcr")?.classList.toggle("hidden", !isOcr);
+  document.getElementById("btnExportTxt")?.classList.toggle("hidden", !isOcr);
+  if (isYolo || isOcr) {
     // YOLO 永远不产出热能图与轮廓图，直接标记为"无内容"并关掉，
     // 免得用户点开一个永远空着的窗口
     viewers.setAvailable("heatmap", false);
@@ -475,7 +578,7 @@ function syncKind() {
   }
   // 切到 Anomalib 时不预先开放这两个窗口：等真有图了再开放，
   // 由 renderAnomalib 决定，避免"点开了却是空的"
-  if (!isYolo) refreshMetaThresholds();
+  if (kind === "anomalib") refreshMetaThresholds();
   markParamsDirty();
 }
 
@@ -500,19 +603,23 @@ function onFileChange() {
 
 async function onSubmit(event) {
   event.preventDefault();
-  const isYolo = dom.kind.value === "yolo";
+  const kind = dom.kind.value;
   const file = dom.file.files?.[0];
 
   if (!file) {
     setHint("请先选择一张图片");
     return;
   }
-  if (isYolo && !value("yoloEngine")) {
+  if (kind === "yolo" && !value("yoloEngine")) {
     setHint("请填写 YOLO 引擎路径");
     return;
   }
-  if (!isYolo && (!value("anomEngine") || !value("anomMetadata"))) {
+  if (kind === "anomalib" && (!value("anomEngine") || !value("anomMetadata"))) {
     setHint("请填写引擎与 metadata.json 路径");
+    return;
+  }
+  if (kind === "ocr" && (!value("ocrDet") || !value("ocrRec"))) {
+    setHint("请选择检测模型和识别模型");
     return;
   }
 
@@ -521,14 +628,29 @@ async function onSubmit(event) {
 
   setHint("");
   dom.btnInfer.disabled = true;
-  setBadge(cached ? "推理中（命中缓存）…" : "推理中（重建引擎）…", "run");
+  if (kind === "ocr") setBadge("OCR 推理中（CPU 单张约 10 秒以上）…", "run");
+  else setBadge(cached ? "推理中（命中缓存）…" : "推理中（重建引擎）…", "run");
   dom.metrics.replaceChildren();
 
   const form = new FormData();
   form.append("image", file);
 
   let url;
-  if (isYolo) {
+  if (kind === "ocr") {
+    url = "/api/infer/ocr";
+    form.append("det_dir", value("ocrDet"));
+    form.append("rec_dir", value("ocrRec"));
+    const textline = value("ocrTextline");
+    if (textline) form.append("textline_ori_dir", textline);
+    form.append("device", value("ocrDevice") || "cpu");
+    form.append("enable_mkldnn", document.getElementById("ocrMkldnn")?.checked ? "1" : "0");
+    form.append("cpu_threads", value("ocrThreads") || "8");
+    form.append("rec_batch_size", value("ocrBatch") || "6");
+    form.append("det_thresh", value("ocrDetThresh") || "0.3");
+    form.append("det_box_thresh", value("ocrBoxThresh") || "0.6");
+    form.append("det_unclip_ratio", value("ocrUnclip") || "1.5");
+    form.append("rec_score_thresh", value("ocrRecScore") || "0");
+  } else if (kind === "yolo") {
     url = "/api/infer/yolo";
     form.append("engine", value("yoloEngine"));
     form.append("task", value("inferTask"));
@@ -553,19 +675,40 @@ async function onSubmit(event) {
   try {
     const result = await postForm(url, form);
     lastResult = result;
-    lastKind = isYolo ? "yolo" : "anomalib";
+    lastKind = kind;
     lastParamKey = paramKey;
     // 完成后按"当前参数 vs 上次参数"重算提示，而不是简单地隐藏。
     // 不能只 hide：点按钮会让数字框失焦并触发一次 change，事件顺序不同就会把提示重新点亮，
     // 这里统一收敛到 markParamsDirty 里的同一套判断，结果与事件顺序无关。
     markParamsDirty();
-    renderResult(result, isYolo, performance.now() - started);
+    renderResult(result, kind, performance.now() - started);
     setBadge("完成", "done");
   } catch (error) {
     setHint(error.message);
     setBadge("失败", "fail");
+    // 503/504 来自推理进程崩溃、超时或熔断：给一个手动重启入口
+    if (error.status === 503 || error.status === 504) dom.btnWorkerRestart?.classList.remove("hidden");
   } finally {
     dom.btnInfer.disabled = false;
+  }
+}
+
+async function restartWorker() {
+  const button = dom.btnWorkerRestart;
+  button.disabled = true;
+  setHint("正在重启推理进程，首次加载引擎需要几秒…");
+  try {
+    const state = await postJSON("/api/infer/worker/restart", {});
+    if (state.state === "running") {
+      setHint("推理进程已重启，可以重新推理");
+      button.classList.add("hidden");
+    } else {
+      setHint(`推理进程重启失败：${state.last_error || state.state}`);
+    }
+  } catch (error) {
+    setHint(`推理进程重启失败：${error.message}`);
+  } finally {
+    button.disabled = false;
   }
 }
 
@@ -573,18 +716,24 @@ async function onSubmit(event) {
 // 结果渲染
 // ---------------------------------------------------------------------------
 
-function renderResult(result, isYolo, roundTripMs) {
+function renderResult(result, kind, roundTripMs) {
   if (result.warning) setMetric("降级提示", result.warning);
 
-  if (isYolo) renderYolo(result);
+  if (kind === "yolo") renderYolo(result);
+  else if (kind === "ocr") renderOcr(result);
   else renderAnomalib(result);
 
   renderTiming(result.timing, roundTripMs);
   dom.toolbar.classList.remove("hidden");
 
-  if (isYolo) {
+  if (kind === "yolo") {
     renderTable(result.boxes || []);
     renderHistogram(result.boxes || []);
+    dom.detail.classList.remove("hidden");
+  } else if (kind === "ocr") {
+    renderOcrHead();
+    renderOcrTable(dom.boxRows, result.lines || [], highlightIndex, pickOcrLine);
+    renderHistogram((result.lines || []).map((line) => ({ confidence: line.score })));
     dom.detail.classList.remove("hidden");
   } else {
     // 异常检测没有"检出框"，明细表换成阈值与分数说明，避免留一张空表
@@ -912,7 +1061,53 @@ function renderHistogram(boxes) {
 // 叠加层
 // ---------------------------------------------------------------------------
 
+function renderOcr(result) {
+  if (sourceObjectUrl) viewers.viewer("result").setImage(sourceObjectUrl);
+  viewers.setAvailable("result", true);
+  viewers.setAvailable("heatmap", false);
+  viewers.setAvailable("mask", false);
+  setMetric("后端", result.backend || "ocr_infer.dll");
+  setMetric("设备", `${result.device || ""} / ${result.run_mode || ""}`);
+  setMetric("行数", result.count ?? (result.lines || []).length);
+  setMetric("总耗时", `${Number(result.timing?.total_ms || 0).toFixed(0)} ms`);
+  highlightIndex = -1;
+  rebuildOverlay();
+}
+
+function renderOcrHead() {
+  dom.boxHead.replaceChildren();
+  const row = document.createElement("tr");
+  for (const label of ["#", "文字", "置信度", "角度"]) {
+    const th = document.createElement("th");
+    th.textContent = label;
+    row.appendChild(th);
+  }
+  dom.boxHead.appendChild(row);
+}
+
+function pickOcrLine(index) {
+  highlightIndex = highlightIndex === index ? -1 : index;
+  highlightOcr(overlaySvg, highlightIndex);
+  renderOcrTable(dom.boxRows, lastResult?.lines || [], highlightIndex, pickOcrLine);
+}
+
 function rebuildOverlay() {
+  if (lastKind === "ocr" && lastResult) {
+    const viewer = viewers.viewer("result");
+    if (!viewer) return;
+    overlaySvg = buildOcrOverlay({
+      lines: lastResult.lines || [],
+      width: lastResult.src_w || lastResult.image_width || 1,
+      height: lastResult.src_h || lastResult.image_height || 1,
+      showBoxes: document.getElementById("optShowBoxes")?.checked !== false,
+      showLabels: document.getElementById("optShowLabels")?.checked !== false,
+      highlight: highlightIndex,
+      onPick: pickOcrLine,
+    });
+    applyOverlayScale(overlaySvg, overlayScale);
+    viewer.setOverlay(overlaySvg);
+    return;
+  }
   if (lastKind !== "yolo" || !lastResult) {
     const viewer = viewers.viewer("result");
     if (viewer) viewer.setOverlay(null);
@@ -969,7 +1164,8 @@ function exportJson() {
       height: lastResult.image_height,
     },
     timing: lastResult.timing,
-    count: lastResult.count ?? (lastResult.boxes || []).length,
+    count: lastResult.count ?? (lastResult.boxes || lastResult.lines || []).length,
+    lines: lastResult.lines || [],
     class_names: lastResult.class_names || [],
     boxes: lastResult.boxes || [],
     thresholds: lastResult.thresholds || null,
@@ -979,7 +1175,31 @@ function exportJson() {
   download(`infer_${stamp()}.json`, JSON.stringify(payload, null, 2), "application/json");
 }
 
+function copyOcrText() {
+  const text = ocrPlainText(lastResult?.lines || []);
+  if (!text) {
+    setHint("没有可复制的文字");
+    return;
+  }
+  navigator.clipboard?.writeText(text).then(
+    () => setHint("已复制全部文字"),
+    () => setHint("复制失败，请改用导出 TXT"),
+  );
+}
+
+function exportTxt() {
+  if (lastKind !== "ocr" || !lastResult) {
+    setHint("TXT 导出仅适用于 OCR 结果");
+    return;
+  }
+  download(`ocr_${stamp()}.txt`, ocrPlainText(lastResult.lines || []), "text/plain");
+}
+
 function exportCsv() {
+  if (lastKind === "ocr" && lastResult) {
+    download(`ocr_${stamp()}.csv`, ocrCsv(lastResult.lines || []), "text/csv");
+    return;
+  }
   if (!lastResult || lastKind !== "yolo") {
     setHint("CSV 导出仅适用于检出结果");
     return;

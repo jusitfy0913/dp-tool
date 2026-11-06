@@ -24,7 +24,7 @@ from typing import Any, Dict, Iterable, List, Optional
 
 JSON_PREFIX = "TRTFORGE_JSON "
 SUPPORTED_TASKS = {"detect", "segment", "pose", "obb"}
-SUPPORTED_MODES = {"check-env", "probe-model", "train", "val", "export"}
+SUPPORTED_MODES = {"check-env", "probe-model", "train", "val", "export", "warm"}
 PLOT_FILES = {
     "BoxF1_curve": ["BoxF1_curve.png", "F1_curve.png"],
     "BoxPR_curve": ["BoxPR_curve.png", "PR_curve.png"],
@@ -45,6 +45,49 @@ def emit(event: Dict[str, Any]) -> None:
 def emit_error(code: str, message: str, **extra: Any) -> None:
     payload = {"type": "error", "code": code, "message": message}
     payload.update(extra)
+    emit(payload)
+
+
+# ---------------------------------------------------------------------------
+# 启动阶段计时
+# ---------------------------------------------------------------------------
+# 训练启动慢时，日志里只有 Ultralytics 自己的输出，用户看不出「在等解释器、
+# 等导入、等权重，还是在扫数据集」。这里在关键节点各发一条 phase 事件：
+#   elapsed_ms 是从本脚本加载起算的总耗时，step_ms 是距上一阶段的耗时。
+# 两个都给：既回答「一共等多久」，也回答「慢在哪一段」。
+# 用 perf_counter 而不是 time.time，避免系统时钟调整导致出现负耗时。
+_T0 = time.perf_counter()
+_last_phase_at = _T0
+#: warm 进程收到真实任务的时间点。非 None 表示「本次 main 是复用预热进程在跑」，
+#: 阶段时钟要从这一刻重新开始，否则会把自己预热等待的时间算进训练启动耗时里。
+_TASK_T0: Optional[float] = None
+
+
+def reset_phase_clock() -> bool:
+    """把阶段时钟归零，返回本次是否为预热进程复用。"""
+    global _T0, _last_phase_at, _TASK_T0
+    warm_hit = _TASK_T0 is not None
+    _T0 = time.perf_counter()
+    _last_phase_at = _T0
+    _TASK_T0 = None
+    return warm_hit
+
+
+def emit_phase(phase: str, label: str, **extra: Any) -> None:
+    """报告一个启动阶段的耗时（TRTFORGE_JSON phase 事件）。"""
+    global _last_phase_at
+    now = time.perf_counter()
+    payload: Dict[str, Any] = {
+        "type": "phase",
+        "phase": phase,
+        "label": label,
+        "pid": os.getpid(),
+        "python": sys.executable,
+        "elapsed_ms": int((now - _T0) * 1000),
+        "step_ms": int((now - _last_phase_at) * 1000),
+    }
+    payload.update(extra)
+    _last_phase_at = now
     emit(payload)
 
 
@@ -671,6 +714,9 @@ def build_train_kwargs(args: argparse.Namespace) -> Dict[str, Any]:
         "resume": str(Path(args.resume_from).resolve()) if args.resume_from else args.resume,
         "plots": args.plots,
         "verbose": True,
+        # 微调写回同一个实验目录时必须置 True，否则 Ultralytics 会静默生成 exp2/exp3，
+        # 用户以为覆盖了原实验，实际多出几个目录谁也不知道哪个是新的。
+        "exist_ok": True if getattr(args, "exist_ok", False) else None,
         # 增强参数：默认值与 Ultralytics 默认一致，只有用户显式指定才会改变行为
         "hsv_h": args.hsv_h,
         "hsv_s": args.hsv_s,
@@ -709,8 +755,14 @@ def build_train_kwargs(args: argparse.Namespace) -> Dict[str, Any]:
 def add_train_callbacks(model: Any, args: argparse.Namespace) -> None:
     last_gpu_emit = [0.0]
 
+    def on_pretrain_routine_end(trainer: Any) -> None:
+        # Ultralytics 在这之前已扫完数据集、做完 AMP 检查、建好优化器，
+        # 之后才进入真正的训练循环。这是「启动」与「训练」的分界线。
+        emit_phase("data", "数据集与优化器就绪")
+
     def on_train_start(trainer: Any) -> None:
         total = int(getattr(getattr(trainer, "args", object()), "epochs", 0) or 0)
+        emit_phase("train_start", "开始训练", total=total)
         emit({"type": "event", "name": "train_start", "ts": time.time(), "total": total})
         emit_gpu_status()
 
@@ -755,6 +807,7 @@ def add_train_callbacks(model: Any, args: argparse.Namespace) -> None:
             emit_plot_artifacts(save_dir)
         emit({"type": "event", "name": "train_finished", "ts": time.time()})
 
+    model.add_callback("on_pretrain_routine_end", on_pretrain_routine_end)
     model.add_callback("on_train_start", on_train_start)
     model.add_callback("on_train_batch_end", on_train_batch_end)
     model.add_callback("on_fit_epoch_end", on_fit_epoch_end)
@@ -826,7 +879,11 @@ def mode_check_env(_: argparse.Namespace) -> int:
 def load_yolo(model_path: str) -> Any:
     add_ultralytics_source_path()
     YOLO = ensure_import("ultralytics").YOLO
-    return YOLO(model_path)
+    # import ultralytics 会连带 import torch，是启动耗时的大头之一
+    emit_phase("deps", "训练依赖已导入", module="ultralytics")
+    model = YOLO(model_path)
+    emit_phase("model", "权重已加载", weights=str(model_path))
+    return model
 
 
 def mode_probe_model(args: argparse.Namespace) -> int:
@@ -860,6 +917,20 @@ def mode_train(args: argparse.Namespace) -> int:
         model_path = args.model or default_model_for_task(args.task)
     model = load_yolo(model_path)
     add_train_callbacks(model, args)
+    # 微调：起点是自己训好的 best.pt，参数按表单走（优化器与轮次重置）。
+    # 单独发一条事件而不是只打普通日志，Web 端才能把「这次接着谁的权重」显示成结构化信息。
+    if args.init_mode == "finetune":
+        names = getattr(model, "names", None)
+        emit(
+            {
+                "type": "event",
+                "name": "finetune_from",
+                "weights": model_path,
+                "classes": list(names.values()) if isinstance(names, dict) else [],
+                "exist_ok": bool(args.exist_ok),
+            }
+        )
+        print(f"微调模式：从 {model_path} 继续训练（优化器与轮次重置）", flush=True)
     emit({"type": "event", "name": "launcher_train", "task": args.task, "model": model_path})
     results = model.train(**build_train_kwargs(args))
     save_dir = getattr(getattr(model, "trainer", None), "save_dir", None)
@@ -1017,6 +1088,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="最后 N 个 epoch 关闭 mosaic，默认 10；小缺陷场景建议加大",
     )
     parser.add_argument("--plots", action=argparse.BooleanOptionalAction, default=True)
+    # 微调写回同一实验目录：默认 False 与 Ultralytics 一致，只有后端显式要求时才置 True。
+    parser.add_argument("--exist-ok", action=argparse.BooleanOptionalAction, default=False)
+    # 起点语义。preset=官方预训练/新实验；finetune=用自己的 best.pt 微调（参数按表单）；
+    # resume=断点续训（走 --resume-from，参数以检查点为准）。
+    parser.add_argument("--init-mode", choices=["preset", "finetune", "resume"], default="preset")
     parser.add_argument("--overlap-mask", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--mask-ratio", type=int, default=4)
     parser.add_argument("--pose-loss", type=float, default=12.0)
@@ -1039,9 +1115,57 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def mode_warm(_: argparse.Namespace) -> int:
+    """常驻预热进程：先把重依赖导入好，等后端通过 stdin 下发一次任务。
+
+    为什么只服务一个任务就退出：
+    - torch / Ultralytics 有大量进程级全局状态（CUDA 上下文、随机源、默认配置）；
+    - 复用同一进程跑第二个任务，上一个任务的设置可能悄悄影响下一个，而日志上看不出来；
+    - 只服务一个任务，「停止」仍然等价于 terminate 整个进程，语义与现在一致。
+
+    预热只负责 import，不在预热期加载模型对象：训练会改写模型与 trainer 状态，
+    把一份「已经练过」的对象交给下一个任务，比省下几百毫秒风险大得多。
+    """
+    global _TASK_T0
+    add_ultralytics_source_path()
+    ensure_import("torch")
+    ensure_import("ultralytics")
+    emit(
+        {
+            "type": "event",
+            "name": "warm_ready",
+            "pid": os.getpid(),
+            "elapsed_ms": int((time.perf_counter() - _T0) * 1000),
+        }
+    )
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            emit_error("BAD_WARM_COMMAND", f"预热进程收到非法指令：{line[:200]}")
+            return 2
+        argv = payload.get("argv") if isinstance(payload, dict) else None
+        if not isinstance(argv, list) or not argv:
+            emit_error("BAD_WARM_COMMAND", "预热指令缺少 argv 列表")
+            return 2
+        # 哨兵：告诉 main() 这是复用预热进程，阶段时钟要从「收到任务」开始算
+        _TASK_T0 = time.perf_counter()
+        return main([str(item) for item in argv])
+    # stdin 被关闭 = 后端主动回收，静默退出即可
+    return 0
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     os.environ.setdefault("PYTHONIOENCODING", "utf-8")
     os.environ.setdefault("PYTHONUNBUFFERED", "1")
+    # 第一条 phase 必须尽早发：Web 端靠它确认「进程真的起来了」，
+    # 否则点击后这段时间界面完全空白，看起来像卡住。
+    warm_hit = reset_phase_clock()
+    emit_phase("boot", "python 进程已启动", warm=warm_hit)
+
     args = build_parser().parse_args(argv)
     try:
         if args.mode == "check-env":
@@ -1054,6 +1178,8 @@ def main(argv: Optional[list[str]] = None) -> int:
             return mode_val(args)
         if args.mode == "export":
             return mode_export(args)
+        if args.mode == "warm":
+            return mode_warm(args)
         emit_error("ARGUMENT_ERROR", f"未知 mode：{args.mode}")
         return 2
     except KeyboardInterrupt:

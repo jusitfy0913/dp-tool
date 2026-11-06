@@ -14,3 +14,8 @@ opencv-python>=4.8,<4.12
 # 导出链路需要：onnx 用于生成 .transd.onnx（v1.15），Pillow 用于数据集概览读图像头
 onnx>=1.14
 pillow>=9.0
+# v1.24 文本提示通道：GroundingDINO 的 BERT 分词表（bert_base_uncased_tokenizer.json）
+# 只用来做 tokenize，不引入 transformers / torch；缺包时 textlabel 会给出 pip 提示
+tokenizers>=0.15
+# OCR 模型的 inference.yml（识别字典可能上万行）
+PyYAML>=6.0

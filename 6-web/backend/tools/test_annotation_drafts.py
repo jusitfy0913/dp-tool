@@ -290,6 +290,179 @@ def test_api(tmp: Path) -> None:
     check("接口：白名单外被拒 403", blocked.status_code == 403, f"{blocked.status_code} {blocked.text[:200]}")
 
 
+# ---------------------------------------------------------------------------
+# 7. 审核状态（v2）
+# ---------------------------------------------------------------------------
+def test_review(tmp: Path) -> None:
+    root = tmp / "review"
+    root.mkdir()
+    project_path = root / "r.tfanno"
+    write_project(project_path)
+    target = annotation_drafts.drafts_path(project_path)
+
+    # 7.1 v1 文件（没有 review 块）能读，审核状态视为全部未审核
+    target.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "images": {"img_a": [make_draft(0.7)]},
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    images, meta = annotation_drafts.load(project_path)
+    check("v1→v2：旧文件能读出草稿", "img_a" in images, str(sorted(images)))
+    check("v1→v2：旧文件审核为空", meta.get("review") == {}, str(meta.get("review")))
+    check("v1→v2：旧文件 reviewed=0", meta.get("reviewed") == 0, str(meta.get("reviewed")))
+
+    # 7.2 标记已审核：写在同一个文件里，草稿不丢
+    annotation_drafts.mark_reviewed(project_path, "img_a")
+    images, meta = annotation_drafts.load(project_path)
+    check("审核：标为已审核后 review 里有该图", "img_a" in (meta.get("review") or {}), str(meta.get("review")))
+    check("审核：reviewed 计数跟上", meta.get("reviewed") == 1, str(meta.get("reviewed")))
+    check("审核：草稿没有被顺手清掉", "img_a" in images, str(sorted(images)))
+    raw = json.loads(target.read_text(encoding="utf-8"))
+    check("审核：文件版本升到 v2", raw.get("version") == 2, str(raw.get("version")))
+    check("审核：根结构里有 review 块", isinstance(raw.get("review"), dict), str(type(raw.get("review"))))
+    check(
+        "审核：记录带时间戳",
+        str((raw.get("review") or {}).get("img_a", {}).get("at_ns", "")).isdigit(),
+        str((raw.get("review") or {}).get("img_a")),
+    )
+
+    # 7.3 增量合并：review 只覆盖传入的图片 id
+    annotation_drafts.merge(project_path, review={"img_b": {"state": "checked"}})
+    _images, meta = annotation_drafts.load(project_path)
+    check("审核：增量合并保留原有条目", {"img_a", "img_b"} <= set(meta.get("review") or {}), str(meta.get("review")))
+
+    # 7.4 unchecked 表示删除
+    annotation_drafts.unmark_reviewed(project_path, "img_a")
+    _images, meta = annotation_drafts.load(project_path)
+    check("审核：unchecked 会删掉该条目", "img_a" not in (meta.get("review") or {}), str(meta.get("review")))
+    check("审核：另一个条目还在", "img_b" in (meta.get("review") or {}), str(meta.get("review")))
+
+    # 7.5 只传 review 时草稿不动（K 键的专用路径）
+    annotation_drafts.mark_reviewed(project_path, "img_a")
+    annotation_drafts.merge(project_path, review={"img_a": {"state": "checked"}})
+    images, _meta = annotation_drafts.load(project_path)
+    check("审核：只提交 review 不会清空草稿", "img_a" in images, str(sorted(images)))
+
+    # 7.6 clear 默认保留审核
+    annotation_drafts.clear(project_path)
+    images, meta = annotation_drafts.load(project_path)
+    check("审核：clear 之后草稿清空", images == {}, str(sorted(images)))
+    check("审核：clear 之后审核保留", "img_a" in (meta.get("review") or {}), str(meta.get("review")))
+    check("审核：clear 之后 reviewed 保持（img_a + img_b）", meta.get("reviewed") == 2, str(meta.get("reviewed")))
+
+    # 7.7 clear(replace) 才连审核一起清
+    annotation_drafts.clear(project_path, include_review=True)
+    _images, meta = annotation_drafts.load(project_path)
+    check("审核：include_review 时审核一起清", (meta.get("review") or {}) == {}, str(meta.get("review")))
+    check("审核：include_review 时文件被删", not target.exists())
+
+
+def test_review_bad_data(tmp: Path) -> None:
+    root = tmp / "review-bad"
+    root.mkdir()
+    project_path = root / "rb.tfanno"
+    write_project(project_path)
+    target = annotation_drafts.drafts_path(project_path)
+
+    target.write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "images": {"img": [make_draft(0.5)]},
+                "review": {
+                    "good": {"state": "checked", "at_ns": "1700000000000000000"},
+                    "string_state": "checked",
+                    "unknown_state": {"state": "wat"},
+                    "not_object": 3,
+                    "": {"state": "checked"},
+                    "cancelled": {"state": "unchecked"},
+                },
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    _images, meta = annotation_drafts.load(project_path)
+    review = meta.get("review") or {}
+    check("坏审核：正常条目保留", "good" in review, str(review))
+    check("坏审核：字符串写法被接受", "string_state" in review, str(review))
+    check("坏审核：不认识的状态被跳过", "unknown_state" not in review, str(review))
+    check("坏审核：非对象条目被跳过", "not_object" not in review, str(review))
+    check("坏审核：空图片 id 被跳过", "" not in review, str(review))
+    check("坏审核：unchecked 读时视为没有", "cancelled" not in review, str(review))
+    check("坏审核：有警告", any("审核" in text for text in meta.get("warnings", [])), str(meta.get("warnings")))
+
+    # review 整体不是对象
+    target.write_text(json.dumps({"images": {}, "review": [1, 2]}), encoding="utf-8")
+    _images, meta = annotation_drafts.load(project_path)
+    check("坏审核：review 是数组时按空处理", (meta.get("review") or {}) == {}, str(meta.get("review")))
+
+    # 非法状态值要报错而不是静默
+    try:
+        annotation_drafts.set_review(project_path, "x", "whatever")
+        check("坏审核：非法状态被拒绝", False, "没有抛错")
+    except ValueError:
+        check("坏审核：非法状态被拒绝", True)
+    try:
+        annotation_drafts.set_review(project_path, "", "checked")
+        check("坏审核：空图片 id 被拒绝", False, "没有抛错")
+    except ValueError:
+        check("坏审核：空图片 id 被拒绝", True)
+
+
+def test_review_api(tmp: Path) -> None:
+    try:
+        from fastapi.testclient import TestClient
+    except ImportError as exc:
+        check(f"审核接口：跳过（未安装 httpx：{exc}）", True)
+        return
+
+    import app as web_app
+
+    os.environ["TRTFORGE_BROWSE_ROOTS"] = str(tmp) + os.pathsep + str(web_app.config.REPO_ROOT)
+    client = TestClient(web_app.app)
+
+    root = tmp / "review-api"
+    root.mkdir()
+    project_path = root / "ra.tfanno"
+    write_project(project_path)
+
+    marked = client.post(
+        "/api/annotation/drafts/review",
+        json={"path": str(project_path), "review": {"img_a": {"state": "checked"}}},
+    )
+    check("审核接口：标记 200", marked.status_code == 200, marked.text[:200])
+    check("审核接口：返回 reviewed=1", marked.json().get("reviewed") == 1, marked.text[:200])
+
+    loaded = client.get("/api/annotation/drafts", params={"path": str(project_path)}).json()
+    check("审核接口：读回 review", "img_a" in (loaded.get("review") or {}), loaded.get("review"))
+
+    empty_review = client.post(
+        "/api/annotation/drafts/review",
+        json={"path": str(project_path), "review": {}},
+    )
+    check("审核接口：空 review 被拒 400", empty_review.status_code == 400, empty_review.text[:200])
+
+    # 通过草稿接口也能写 review（一次请求同时写草稿与状态）
+    both = client.post(
+        "/api/annotation/drafts",
+        json={
+            "path": str(project_path),
+            "images": {"img_b": [make_draft(0.42)]},
+            "review": {"img_b": {"state": "checked"}},
+        },
+    )
+    check("审核接口：草稿与审核一次写入 200", both.status_code == 200, both.text[:200])
+    body = both.json()
+    check("审核接口：一次写入后 count=1", body.get("count") == 1, both.text[:200])
+    check("审核接口：一次写入后 reviewed=2", body.get("reviewed") == 2, both.text[:200])
+
+
 def main() -> int:
     with tempfile.TemporaryDirectory(prefix="anno-drafts-") as temp:
         tmp = Path(temp)
@@ -299,6 +472,9 @@ def main() -> int:
         test_bad_data(tmp)
         test_atomic(tmp)
         test_api(tmp)
+        test_review(tmp)
+        test_review_bad_data(tmp)
+        test_review_api(tmp)
 
     print(f"\n通过 {len(PASSED)} 项，失败 {len(FAILED)} 项")
     if FAILED:

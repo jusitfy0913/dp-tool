@@ -125,7 +125,18 @@ function readSettings() {
 
   return {
     kind,
-    engine: anomalib ? value("anomEngine") : value("yoloEngine"),
+    engine: kind === "ocr" ? "" : (anomalib ? value("anomEngine") : value("yoloEngine")),
+    det_dir: kind === "ocr" ? value("ocrDet") : "",
+    rec_dir: kind === "ocr" ? value("ocrRec") : "",
+    textline_ori_dir: kind === "ocr" ? value("ocrTextline") : "",
+    device: value("ocrDevice") || "cpu",
+    enable_mkldnn: $("ocrMkldnn")?.checked ? 1 : 0,
+    cpu_threads: num("ocrThreads", 8),
+    rec_batch_size: num("ocrBatch", 6),
+    det_thresh: num("ocrDetThresh", 0.3),
+    det_box_thresh: num("ocrBoxThresh", 0.6),
+    det_unclip_ratio: num("ocrUnclip", 1.5),
+    rec_score_thresh: num("ocrRecScore", 0),
     labels: anomalib ? "" : value("yoloLabels"),
     task: value("inferTask") || "detect",
     conf: num("inferConf", 0.25),
@@ -139,6 +150,13 @@ function readSettings() {
 }
 
 function requireEngine(settings) {
+  if (settings.kind === "ocr") {
+    if (!settings.det_dir || !settings.rec_dir) {
+      setHint("请先在上方选择检测模型和识别模型", true);
+      return false;
+    }
+    return true;
+  }
   if (!settings.engine) {
     setHint("请先在上方选择引擎文件（.engine / .trt / .onnx）", true);
     return false;
@@ -343,6 +361,17 @@ function bindDir() {
       const run = await postJSON("/api/infer/batch", {
         kind: settings.kind,
         engine: settings.engine,
+        det_dir: settings.det_dir,
+        rec_dir: settings.rec_dir,
+        textline_ori_dir: settings.textline_ori_dir,
+        device: settings.device,
+        enable_mkldnn: settings.enable_mkldnn,
+        cpu_threads: settings.cpu_threads,
+        rec_batch_size: settings.rec_batch_size,
+        det_thresh: settings.det_thresh,
+        det_box_thresh: settings.det_box_thresh,
+        det_unclip_ratio: settings.det_unclip_ratio,
+        rec_score_thresh: settings.rec_score_thresh,
         task: settings.task,
         labels: settings.labels,
         conf: settings.conf,
@@ -387,6 +416,10 @@ function bindVideo() {
   $("btnVideoStart")?.addEventListener("click", async () => {
     const settings = readSettings();
     if (!requireEngine(settings)) return;
+    if (settings.kind === "ocr") {
+      setHint("OCR 不支持视频推理：单张约 10 秒以上，请改用目录批量", true);
+      return;
+    }
     if (settings.kind !== "yolo") {
       setHint("视频推理当前只支持 YOLO；Anomalib 请用目录批量", true);
       return;
@@ -454,6 +487,10 @@ function bindCamera() {
 async function startCamera() {
   const settings = readSettings();
   if (!requireEngine(settings)) return;
+  if (settings.kind === "ocr") {
+    setHint("OCR 不支持摄像头：单张约 10 秒以上，请改用目录批量", true);
+    return;
+  }
   if (settings.kind !== "yolo") {
     setHint("摄像头只支持 YOLO；Anomalib 请用目录批量", true);
     return;
@@ -732,5 +769,20 @@ export function initInferBatch() {
   bindDir();
   bindVideo();
   bindCamera();
+  document.getElementById("inferKind")?.addEventListener("change", syncRealtimeForOcr);
+  syncRealtimeForOcr();
   switchMode("dir");
+}
+
+function syncRealtimeForOcr() {
+  const ocr = value("inferKind") === "ocr";
+  document.querySelectorAll("#batchModes .mode-tab").forEach((tab) => {
+    const blocked = ocr && tab.dataset.mode !== "dir";
+    tab.disabled = blocked;
+    tab.title = blocked ? "OCR 单张约 10 秒以上，不支持实时推理" : "";
+  });
+  if (ocr && state.mode !== "dir") {
+    switchMode("dir");
+    setHint("OCR 不支持视频和摄像头，已切回目录批量", true);
+  }
 }

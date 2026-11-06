@@ -40,6 +40,9 @@ STATE_FILE = _RUNTIME / "dialog_state.json"
 
 # 对话框打开后最多等这么久。用户可能去倒杯水，但也别把线程永久占着。
 TIMEOUT_SECONDS = float(os.environ.get("TRTFORGE_DIALOG_TIMEOUT", "300") or 300)
+# 子进程起来后这么久还看不到自己的窗口，就认定「没弹出来」，立刻结束。
+# 以前会干等 300 秒，网页按钮一直停在「…」。
+SHOW_DEADLINE_SECONDS = float(os.environ.get("TRTFORGE_DIALOG_SHOW_DEADLINE", "12") or 12)
 
 KINDS = ("file", "files", "dir", "save")
 
@@ -47,17 +50,97 @@ KINDS = ("file", "files", "dir", "save")
 # 之所以写成字符串常量而不是独立 .py 文件：独立文件一旦被误删，
 # 整条选择路径就会静默失效；内联脚本跟着模块走，少一个失败点。
 _SCRIPT = r"""
-import json, sys, tkinter as tk
+import json, os, sys, threading, time, tkinter as tk
 from tkinter import filedialog
 
 payload = json.load(open(sys.argv[1], encoding="utf-8"))
 result_path = sys.argv[2]
 kind = payload.get("kind") or "file"
+cancel_path = str(payload.get("cancel") or "")
+show_deadline = float(payload.get("show_deadline") or 12)
+stop = {"v": False}
+shown = {"ok": False}
+
+def write_result(paths, reason=""):
+    body = {"paths": paths}
+    if reason:
+        body["reason"] = reason
+    try:
+        with open(result_path, "w", encoding="utf-8") as handle:
+            json.dump(body, handle, ensure_ascii=False)
+    except Exception:
+        pass
+
+def bail(reason):
+    write_result([], reason)
+    os._exit(0)
+
+def own_windows():
+    # 只认本进程自己的可见窗口。隐藏的根窗口不算，避免「根窗口在、选择框没有」。
+    try:
+        import ctypes
+        from ctypes import wintypes
+    except Exception:
+        return []
+    user32 = ctypes.windll.user32
+    pid = os.getpid()
+    found = []
+
+    @ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+    def visit(hwnd, _lparam):
+        if not user32.IsWindowVisible(hwnd):
+            return True
+        got = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(got))
+        if got.value == pid:
+            found.append(int(hwnd))
+        return True
+
+    user32.EnumWindows(visit, 0)
+    return found
+
+def lift(hwnd):
+    # 浏览器经常占着前台。不把输入队列接上的话，Windows 会拒绝把选择框拉到最前，
+    # 框其实开了，人却看不见，按钮就一直灰着。
+    try:
+        import ctypes
+        user32 = ctypes.windll.user32
+        kernel32 = ctypes.windll.kernel32
+        fg = user32.GetForegroundWindow()
+        fg_tid = user32.GetWindowThreadProcessId(fg, None) if fg else 0
+        my_tid = kernel32.GetCurrentThreadId()
+        attached = False
+        if fg_tid and fg_tid != my_tid:
+            attached = bool(user32.AttachThreadInput(my_tid, fg_tid, True))
+        user32.ShowWindow(hwnd, 9)
+        user32.SetWindowPos(hwnd, -1, 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0040)
+        user32.SetForegroundWindow(hwnd)
+        if attached:
+            user32.AttachThreadInput(my_tid, fg_tid, False)
+    except Exception:
+        pass
+
+def guard():
+    started = time.time()
+    lift_until = 0.0
+    while not stop["v"]:
+        if cancel_path and os.path.exists(cancel_path):
+            bail("cancelled")
+        hwnds = own_windows()
+        if hwnds:
+            if not shown["ok"]:
+                shown["ok"] = True
+                lift_until = time.time() + 2.0
+            if time.time() < lift_until:
+                lift(hwnds[0])
+        elif not shown["ok"] and time.time() - started > show_deadline:
+            bail("dialog-not-shown")
+        time.sleep(0.25)
+
+threading.Thread(target=guard, daemon=True).start()
 
 root = tk.Tk()
 root.withdraw()
-# 置顶：浏览器窗口通常占据整个屏幕，不置顶的话框会藏在后面，
-# 用户以为"点了没反应"，然后反复点击。
 try:
     root.attributes("-topmost", True)
     root.update()
@@ -93,6 +176,7 @@ try:
     else:
         chosen = filedialog.askdirectory(parent=root, mustexist=bool(payload.get("must_exist", True)), **common)
 finally:
+    stop["v"] = True
     try:
         root.destroy()
     except Exception:
@@ -105,9 +189,12 @@ elif chosen:
 else:
     paths = []
 
-with open(result_path, "w", encoding="utf-8") as handle:
-    json.dump({"paths": paths}, handle, ensure_ascii=False)
+write_result(paths)
 """
+
+# 当前正在等的那个取消标记。另一个请求（网页上的「取消」）往这里写文件，
+# 子进程看到文件就自己退出。没有进行中的对话框时是 None。
+_ACTIVE_CANCEL: dict[str, Path | None] = {"path": None}
 
 _LOCK = threading.Lock()
 _TK_OK: bool | None = None
@@ -235,6 +322,18 @@ def initial_dir(field: str, initial: str = "") -> str:
     return ""
 
 
+def request_cancel() -> bool:
+    """请当前对话框自己结束。没有正在打开的框时返回 False。"""
+    path = _ACTIVE_CANCEL.get("path")
+    if path is None:
+        return False
+    try:
+        path.write_text("cancel", encoding="utf-8")
+        return True
+    except OSError:
+        return False
+
+
 def select(
     kind: str = "file",
     *,
@@ -268,6 +367,10 @@ def select(
 
 
 def _run(kind: str, **kwargs) -> dict:
+    temp_dir = Path(tempfile.mkdtemp(prefix="tf_dialog_"))
+    request_file = temp_dir / "request.json"
+    result_file = temp_dir / "result.json"
+    cancel_file = temp_dir / "cancel.flag"
     payload = {
         "kind": kind,
         "title": kwargs.get("title") or "选择路径",
@@ -275,15 +378,14 @@ def _run(kind: str, **kwargs) -> dict:
         "filetypes": build_filetypes(kwargs.get("patterns"), kwargs.get("label", "")),
         "defaultextension": kwargs.get("defaultextension") or "",
         "must_exist": kwargs.get("must_exist", True),
+        "cancel": str(cancel_file),
+        "show_deadline": SHOW_DEADLINE_SECONDS,
     }
-
-    temp_dir = Path(tempfile.mkdtemp(prefix="tf_dialog_"))
-    request_file = temp_dir / "request.json"
-    result_file = temp_dir / "result.json"
     request_file.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
 
     creationflags = 0x08000000 if os.name == "nt" else 0  # CREATE_NO_WINDOW
     started = _now_ms()
+    _ACTIVE_CANCEL["path"] = cancel_file
     try:
         try:
             completed = subprocess.run(
@@ -322,6 +424,8 @@ def _run(kind: str, **kwargs) -> dict:
                 "elapsed_ms": elapsed,
             }
     finally:
+        if _ACTIVE_CANCEL.get("path") == cancel_file:
+            _ACTIVE_CANCEL["path"] = None
         _cleanup(temp_dir)
 
     paths = []
@@ -337,11 +441,17 @@ def _run(kind: str, **kwargs) -> dict:
             paths.append(text)
     if paths:
         _remember(kwargs.get("field", ""), paths[0])
-    return {
+    result = {
         "paths": paths,
         "cancelled": not paths,
         "elapsed_ms": elapsed,
     }
+    # 子进程主动结束时会带原因：没弹出窗口、用户在网页上点了取消。
+    # 不带原因的空路径才是用户在系统框里点了取消。
+    reason = str(data.get("reason") or "").strip()
+    if reason:
+        result["reason"] = reason
+    return result
 
 
 def _cleanup(folder: Path) -> None:

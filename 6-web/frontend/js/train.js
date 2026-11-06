@@ -1,8 +1,15 @@
 // 训练页：表单 → 启动任务 → 事件流渲染。
 // 只做展示与参数收集，参数语义完全沿用 launcher，不在前端做业务判断。
 
-import { getJSON, postJSON, stopRun } from "./api.js";
+import { getJSON, listRuns, postJSON, stopRun } from "./api.js";
+import { createLogActions } from "./logs.js";
 import { connectRunEvents } from "./ws.js";
+
+//: 训练页能接管的任务类型。
+//: 自检（check-env）也算：它虽然短，但会把控制台变成只读，
+//: 刷新后不接管的话按钮状态会自相矛盾（能点「检测环境」却不能点「停止」）。
+const TRAIN_KINDS = new Set(["yolo-train", "anomalib-train", "yolo-check-env", "anomalib-check-env"]);
+
 
 const state = {
   runId: null,
@@ -22,6 +29,12 @@ const precheck = {
   previewSeed: null,
   resumeFrom: "",
   resumeLabel: "",
+  // 微调起点（自己的 best.pt）。与 resumeFrom 互斥：
+  //   resumeFrom = last.pt，恢复优化器与轮次，参数以检查点为准；
+  //   finetuneFrom = best.pt，只载入权重，参数按表单，写回原实验目录。
+  finetuneFrom: "",
+  finetuneLabel: "",
+  finetuneSource: null,
 };
 
 /// 进度与曲线状态。
@@ -41,6 +54,10 @@ const progress = {
   losses: [], // 总 loss 序列，供曲线
   lossSource: "", // "训练" 或 "验证"，用于曲线标题
   metrics: {}, // {指标名: [值...]}，供曲线
+  // 启动阶段：spawned / boot / deps / model / data / train_start
+  // 每一项 {phase, label, elapsed_ms, step_ms, warm}
+  phases: [],
+  warmHit: false,
 };
 
 //: 表格只留最近这么多轮，避免长时间训练把 DOM 撑大
@@ -49,6 +66,11 @@ const MAX_TABLE_ROWS = 20;
 const MAX_CHART_POINTS = 300;
 
 let dom = {};
+//: 日志出口（复制 / 打开日志文件）。在 initTrain 里创建，其它函数直接用。
+let logActions = null;
+//: 最近一次已结束的训练 run。刷新页面后控制台是空的，但磁盘上那份日志还在，
+//: 「打开日志文件」应该指向它，而不是一直灰着。
+let lastFinishedRunId = null;
 
 export function initTrain() {
   dom = {
@@ -103,14 +125,29 @@ export function initTrain() {
     previewAug: document.getElementById("previewAug"),
     previewAugCap: document.getElementById("previewAugCap"),
     previewApplied: document.getElementById("previewApplied"),
-    // 断点续训
+    // 断点续训 / 微调
     btnScanRuns: document.getElementById("btnScanRuns"),
     btnClearResume: document.getElementById("btnClearResume"),
     resumeHint: document.getElementById("resumeHint"),
     resumeActive: document.getElementById("resumeActive"),
     resumeTableBox: document.getElementById("resumeTableBox"),
     resumeRows: document.getElementById("resumeRows"),
+    // 启动清单 + 预热状态
+    startupSteps: document.getElementById("startupSteps"),
+    startupSummary: document.getElementById("startupSummary"),
+    warmBadge: document.getElementById("warmBadge"),
+    // 日志出口
+    btnCopyLog: document.getElementById("btnCopyLog"),
+    btnOpenLog: document.getElementById("btnOpenLog"),
   };
+
+  logActions = createLogActions({
+    copyBtn: dom.btnCopyLog,
+    openBtn: dom.btnOpenLog,
+    // innerText 而不是 textContent：面板里每行是一个 <div>，textContent 会把它们连成一行
+    getText: () => dom.logBox.innerText || "",
+    getRunId: () => state.runId || lastFinishedRunId,
+  });
 
   dom.kind.addEventListener("change", syncKind);
   dom.form.addEventListener("submit", onSubmit);
@@ -159,6 +196,78 @@ export function initTrain() {
 
   syncKind();
   setDefaultRunName();
+  refreshWarmStatus(true);
+
+  // 刷新后自动接续：任务活在后端，页面只是窗口。不接的话用户会看到
+  // 「未开始」+ 可点的「开始训练」，点下去就是第二个训练进程（抢同一块显卡）。
+  document.addEventListener("trtf:attach-run", (event) => {
+    const run = event.detail?.run;
+    if (run) attachRunningRun(run);
+  });
+  attachIfRunning();
+}
+
+/**
+ * 拉一次任务列表，有训练类任务在跑就接管。
+ *
+ * 失败静默：拿不到列表只说明后端暂时不可达，顶栏的「运行中」条会另外报出来，
+ * 这里再弹一次提示只会重复打扰。
+ */
+async function attachIfRunning() {
+  try {
+    const data = await listRuns();
+    const runs = data?.runs || [];
+    const run = runs.find((item) => item.status === "running" && TRAIN_KINDS.has(item.kind));
+    if (run) {
+      attachRunningRun(run);
+      return;
+    }
+    // 没有在跑的任务时，把「最近一次训练」的日志留着可查：
+    // 刷新页面想复盘的，往往就是刚刚失败的那一次，而内存里的 run 已经结束了。
+    const last = runs.find((item) => TRAIN_KINDS.has(item.kind));
+    if (last) {
+      lastFinishedRunId = last.run_id;
+      logActions?.sync();
+      dom.btnOpenLog.title = `最近一次任务 ${last.run_id} 的完整日志（${last.status}）`;
+    }
+  } catch {
+    /* 由顶栏条负责报「后端未连接」 */
+  }
+}
+
+/**
+ * 接管一个正在跑的任务：恢复按钮、进度时钟，并从后端补发全部日志。
+ *
+ * 已结束的任务不接管：那时的事件流已经关闭，接上去也只会停在最后一帧，
+ * 还不如让用户从「历史训练」里重新拿结果。
+ */
+function attachRunningRun(run) {
+  if (!run || !TRAIN_KINDS.has(run.kind)) return false;
+  // 已经在接一个任务了：不要用顶栏点来的另一个任务把控制台顶掉，
+  // 否则「停止」按钮会指向用户没在看的那个 run。
+  if (state.streamRunId) return false;
+
+  state.runId = run.run_id;
+  state.artifacts = [];
+  resetRunView();
+  logActions?.sync();
+  setBadge("运行中", "run");
+  dom.btnTrain.disabled = true;
+  dom.btnCheckEnv.disabled = true;
+  dom.btnStop.disabled = false;
+  if (Array.isArray(run.command) && run.command.length) {
+    dom.commandBox.hidden = false;
+    dom.command.textContent = run.command.join(" ");
+  }
+  appendLog(
+    `已接续正在运行的任务 ${run.run_id}（${run.kind}，已运行 ${Math.round(Number(run.elapsed) || 0)} 秒）`,
+    "ok",
+  );
+  appendLog("正在从后端补发日志；进度会接着往下走，不用重新点开始。");
+  // 时钟从任务真实的开始时间接着数，而不是从 0 重新开始
+  startProgressView(run.elapsed);
+  openStream(run.run_id);
+  return true;
 }
 
 /** 生成带时间戳的默认实验名，避免多次训练覆盖同一目录。 */
@@ -195,6 +304,8 @@ function syncKind() {
   } else if (!dom.runName.value || dom.runName.value === "latest") {
     setDefaultRunName();
   }
+  // 预热状态是分任务类型的：切到 Anomalib 时 yolo 的「预热就绪」不适用
+  refreshWarmStatus(false);
 }
 
 function formValue(id) {
@@ -214,7 +325,20 @@ function buildYoloPayload() {
     project: formValue("project") || "runs/trtforge",
     name: formValue("runName") || "exp",
     python: formValue("pythonPath") || null,
+    // 起点语义：微调 = 只载入 best.pt 的权重，优化器与轮次重置（参数按表单）。
+    // 与断点续训互斥，续训另有 resume_from 字段。
+    init_mode: precheck.finetuneFrom ? "finetune" : "preset",
   };
+
+  // 学习率：留空表示「不填」，由后端决定（微调兜底 0.001，新训用 Ultralytics 默认 0.01）。
+  const lr0 = formValue("yoloLr0").trim();
+  if (lr0 !== "") {
+    const value = Number(lr0);
+    if (Number.isNaN(value) || value < 0) {
+      throw new Error(`初始学习率 lr0 不是合法数字：${lr0}`);
+    }
+    payload.lr0 = value;
+  }
 
   // 增强参数：留空就不传，后端也不会拼进命令行，最终用 Ultralytics 默认值。
   // 这样「不填」与「升级前」行为完全一致，不会因为表单多了一堆字段而悄悄改变训练结果。
@@ -280,6 +404,7 @@ async function onSubmit(event) {
   setHint("");
   dom.btnTrain.disabled = true;
   resetRunView();
+  dom.btnTrain.textContent = "正在启动…";
   appendLog("正在启动任务…", "ok");
 
   try {
@@ -290,12 +415,35 @@ async function onSubmit(event) {
       payload.resume_from = precheck.resumeFrom;
       appendLog(`续训模式：从 ${precheck.resumeFrom} 继续，epochs 等参数以检查点记录为准`, "warn");
     }
+    if (isYolo && precheck.finetuneFrom) {
+      // 微调前先验一遍：任务头不一致要拦住，类别/尺寸差异要提前说，
+      // 否则等训练跑完才发现一半权重没生效就太晚了。
+      const check = await postJSON("/api/train/yolo/finetune-check", {
+        weights: precheck.finetuneFrom,
+        data: payload.data,
+        task: payload.task,
+        imgsz: payload.imgsz,
+      });
+      if (!check.ok) {
+        throw new Error((check.blockers || []).join("；") || "微调检查未通过");
+      }
+      for (const warning of check.warnings || []) {
+        appendLog(`微调提醒：${warning}`, "warn");
+      }
+      const source = check.source || {};
+      appendLog(
+        `微调模式：从 ${source.name || payload.model} 的 best.pt 继续` +
+          `（已完成 ${source.epochs_done ?? "?"} 轮，最佳 mAP50-95 ${source.best_map ?? "—"}）`,
+        "ok",
+      );
+    }
     const url = isYolo ? "/api/train/yolo" : "/api/train/anomalib";
     const run = await postJSON(url, payload);
     state.runId = run.run_id;
+    logActions?.sync();
     setBadge("运行中", "run");
     dom.btnStop.disabled = false;
-    appendLog(`任务已启动：${run.run_id}`, "ok");
+    appendLog(`任务已启动：${run.run_id}${run.warm ? "（热启动）" : ""}`, "ok");
     appendLog(`命令：${run.command.join(" ")}`);
     // 参数回显：折叠块里放完整命令行，用户能确认自己填的参数真的传进去了
     dom.commandBox.hidden = false;
@@ -306,7 +454,11 @@ async function onSubmit(event) {
     setHint(error.message);
     appendLog(`启动失败：${error.message}`, "err");
     dom.btnTrain.disabled = false;
+    refreshTrainButton();
     setBadge("启动失败", "fail");
+    // 409 = 机器上已经有任务在跑。此时最有用的是直接接管它，
+    // 而不是让用户盯着「请先停止它」自己去找那个停止按钮在哪。
+    if (error.status === 409) attachIfRunning();
   }
 }
 
@@ -322,6 +474,9 @@ function openStream(runId) {
       dom.btnCheckEnv.disabled = false;
       dom.btnStop.disabled = true;
       stopProgressTimer();
+      refreshTrainButton();
+      // 任务结束意味着预热池已经补了一个新进程，把状态刷新一下
+      refreshWarmStatus(false);
       const ok = (payload.exit ?? 0) === 0;
       // 主动停止不是失败：Windows 上 terminate() 的退出码是 1，
       // 只能靠后端标好的 status 判断。以前这里只看退出码，
@@ -361,6 +516,7 @@ export function focusRun(runId) {
   if (state.streamRunId && state.streamRunId !== runId) return false;
   resetRunView();
   state.runId = runId;
+  logActions?.sync();
   setBadge("查看日志", "run");
   openStream(runId);
   return true;
@@ -395,6 +551,7 @@ async function onCheckEnv() {
   try {
     const run = await postJSON(`/api/train/${kind}/check-env?python=${encodeURIComponent(python || "")}`, {});
     state.runId = run.run_id;
+    logActions?.sync();
     // 自检没有 epoch 概念，但「已用时间」仍然有意义（加载 torch/CUDA 可能要几十秒）
     startProgressView();
     setStage("环境检测", "run");
@@ -525,6 +682,24 @@ function handleEvent(event) {
       }
       break;
     }
+    case "phase": {
+      // 启动阶段：前端把每一项累加成清单，train_start 时折算总耗时。
+      // 不写进日志（日志要留给训练本身），只在进度面板里展示。
+      progress.phases.push({
+        phase: event.phase || "unknown",
+        label: event.label || event.phase || "未知阶段",
+        elapsed_ms: Number(event.elapsed_ms ?? 0),
+        step_ms: Number(event.step_ms ?? 0),
+        warm: Boolean(event.warm),
+      });
+      if (event.warm) progress.warmHit = true;
+      renderStartupSteps();
+      renderStartupSummary();
+      if (event.phase && event.phase !== "spawned") {
+        setStage(`启动中：${event.label || event.phase}`, "run");
+      }
+      break;
+    }
     case "event": {
       // Qt 版对这种"里程碑"事件没有分支，这里降级成一行日志，避免 JSON 刷屏
       const name = event.name || "事件";
@@ -535,6 +710,16 @@ function handleEvent(event) {
       if (event.max_epochs != null) extra.push(`max_epochs=${event.max_epochs}`);
       if (event.weights) extra.push(`weights=${event.weights}`);
       appendLog(`» ${name}${extra.length ? "  " + extra.join(" ") : ""}`);
+      if (name === "train_start") {
+        // 启动阶段到此结束，按钮文案恢复成「当前模式」对应的样子
+        setStage("训练中", "run");
+        refreshTrainButton();
+        renderStartupSummary();
+      }
+      if (name === "warm_ready") {
+        // 预热进程就绪只对「下一次点击」有意义，不改变当前任务状态
+        renderWarmStatus({ enabled: true, kinds: [{ kind: dom.kind.value, state: "ready" }] });
+      }
       break;
     }
     case "error": {
@@ -618,6 +803,94 @@ function setStage(text, cls = "") {
   dom.stage.className = cls ? `badge ${cls}` : "badge";
 }
 
+// ---------------------------------------------------------------------------
+// 启动清单与预热状态
+// ---------------------------------------------------------------------------
+// 点下「开始训练」到真正开训之间有几段固定开销（起进程 / 导入依赖 / 载权重 /
+// 扫数据集）。以前这段只显示「运行中」，用户无法判断是在正常加载还是卡死了。
+// 现在每完成一段就追加一行，并在 train_start 时折叠成一句总耗时。
+
+const PHASE_ORDER = ["spawned", "boot", "deps", "model", "data", "train_start"];
+
+function renderStartupSteps() {
+  if (!dom.startupSteps) return;
+  if (!progress.phases.length) {
+    dom.startupSteps.hidden = true;
+    return;
+  }
+  dom.startupSteps.hidden = false;
+  dom.startupSteps.innerHTML = "";
+  const seen = new Map(progress.phases.map((item) => [item.phase, item]));
+  for (const phase of PHASE_ORDER) {
+    const item = seen.get(phase);
+    // 只画已经发生的阶段：没到的阶段画成灰色会让「进度」看着像假的
+    if (!item) continue;
+    const li = document.createElement("li");
+    if (item.warm) li.classList.add("is-warm");
+    const name = document.createElement("span");
+    name.className = "step-name";
+    name.textContent = item.label || phase;
+    const cost = document.createElement("span");
+    cost.className = "step-cost";
+    // spawned 是「进程刚起来」的标记，没有可测量的耗时
+    cost.textContent = item.phase === "spawned" || !item.step_ms
+      ? ""
+      : `${(item.step_ms / 1000).toFixed(2)}s`;
+    li.append(name, cost);
+    dom.startupSteps.appendChild(li);
+  }
+}
+
+function renderStartupSummary() {
+  if (!dom.startupSummary) return;
+  const start = progress.phases.find((item) => item.phase === "train_start");
+  if (!start) {
+    dom.startupSummary.hidden = true;
+    return;
+  }
+  const total = (start.elapsed_ms / 1000).toFixed(2);
+  const parts = progress.phases
+    .filter((item) => item.phase !== "spawned" && item.phase !== "train_start" && item.step_ms)
+    .map((item) => `${item.label} ${(item.step_ms / 1000).toFixed(2)}s`);
+  dom.startupSummary.hidden = false;
+  dom.startupSummary.textContent =
+    `启动用时 ${total} 秒` +
+    (progress.warmHit ? "（命中热启动，已跳过依赖导入）" : "") +
+    (parts.length ? `：${parts.join(" / ")}` : "");
+}
+
+async function refreshWarmStatus(prewarm = false) {
+  try {
+    if (prewarm) await postJSON("/api/warm/prewarm", {});
+    const status = await getJSON("/api/warm/status");
+    renderWarmStatus(status);
+  } catch {
+    if (dom.warmBadge) dom.warmBadge.hidden = true;
+  }
+}
+
+function renderWarmStatus(status) {
+  const badge = dom.warmBadge;
+  if (!badge) return;
+  if (!status || !status.enabled) {
+    badge.hidden = true;
+    return;
+  }
+  const kind = dom.kind.value === "yolo" ? "yolo" : "anomalib";
+  const item = (status.kinds || []).find((entry) => entry.kind === kind);
+  badge.hidden = false;
+  if (!item || item.state === "idle") {
+    badge.textContent = "预热未运行";
+    badge.className = "badge warn";
+  } else if (item.state === "warming") {
+    badge.textContent = "预热中…";
+    badge.className = "badge run";
+  } else {
+    badge.textContent = "预热就绪";
+    badge.className = "badge done";
+  }
+}
+
 function renderEpochText() {
   const total = progress.total || "-";
   const epoch = progress.epoch || "-";
@@ -666,18 +939,24 @@ function renderElapsed(freeze = false) {
   dom.etaText.textContent = `预计剩余 ${fmtClock(remain)}`;
 }
 
-function startProgressView() {
+function startProgressView(elapsed = 0) {
   stopProgressTimer();
   progress.total = 0;
   progress.epoch = 0;
-  progress.startedAt = Date.now();
+  // 接续已跑了一段时间的任务时，把起点往前挪：否则「已用」会从 0 重新数，
+  // 和顶栏条上的时长对不上，用户会以为接错了任务。
+  progress.startedAt = Date.now() - Math.max(0, Number(elapsed) || 0) * 1000;
   progress.lastEpochAt = 0;
   progress.epochDeltas = [];
   progress.pct = 0;
   progress.timer = setInterval(() => renderElapsed(false), 1000);
-  setStage("运行中", "run");
+  // 「正在启动」而不是「运行中」：此时训练循环还没开始，
+  // 显示「运行中」会让人以为已经在训练了，其实在加载依赖。
+  setStage("正在启动", "run");
   renderEpochText();
   renderElapsed();
+  renderStartupSteps();
+  renderStartupSummary();
 }
 
 function stopProgressTimer() {
@@ -928,6 +1207,8 @@ function appendLog(text, cls = "") {
     dom.logBox.removeChild(dom.logBox.firstElementChild);
   }
   dom.logBox.scrollTop = dom.logBox.scrollHeight;
+  // 只要有一行内容，「复制」就该可点。这里不重复读 innerText（很贵）
+  logActions?.markText();
 }
 
 function setMetric(name, value) {
@@ -977,7 +1258,17 @@ function resetRunView() {
   progress.losses = [];
   progress.metrics = {};
   progress.lossSource = "";
+  progress.phases = [];
+  progress.warmHit = false;
   setStage("待启动");
+  if (dom.startupSteps) {
+    dom.startupSteps.hidden = true;
+    dom.startupSteps.innerHTML = "";
+  }
+  if (dom.startupSummary) {
+    dom.startupSummary.hidden = true;
+    dom.startupSummary.textContent = "";
+  }
   dom.epochText.textContent = "epoch -/-";
   dom.pctText.textContent = "0.0%";
   dom.elapsedText.textContent = "已用 0:00";
@@ -1259,16 +1550,34 @@ function renderRuns(data) {
     weightCell.textContent = item.last_pt ? `${item.last_pt_mb} MB` : "缺失";
     tr.appendChild(weightCell);
 
+    const bestCell = document.createElement("td");
+    bestCell.className = "num";
+    bestCell.textContent = item.best_pt ? `${item.best_pt_mb} MB` : "缺失";
+    tr.appendChild(bestCell);
+
     const actionCell = document.createElement("td");
-    const button = document.createElement("button");
-    button.type = "button";
-    button.className = "mini";
-    button.textContent = "继续训练";
-    button.disabled = !item.resumable;
-    if (item.blocked_reason) button.title = item.blocked_reason;
-    button.addEventListener("click", () => applyResume(item));
-    actionCell.appendChild(button);
-    if (item.blocked_reason) {
+    // 两个入口语义不同，按钮必须分开：
+    //   继续训练（last.pt）= 恢复优化器与轮次，参数以检查点为准；
+    //   用它微调（best.pt）= 只载入权重，优化器与轮次重置，参数按表单。
+    const resumeButton = document.createElement("button");
+    resumeButton.type = "button";
+    resumeButton.className = "mini";
+    resumeButton.textContent = "继续训练";
+    resumeButton.disabled = !item.resumable;
+    if (item.blocked_reason) resumeButton.title = item.blocked_reason;
+    resumeButton.addEventListener("click", () => applyResume(item));
+
+    const finetuneButton = document.createElement("button");
+    finetuneButton.type = "button";
+    finetuneButton.className = "mini";
+    finetuneButton.style.marginLeft = "4px";
+    finetuneButton.textContent = "用它微调";
+    finetuneButton.disabled = !item.finetunable;
+    if (item.finetune_blocked_reason) finetuneButton.title = item.finetune_blocked_reason;
+    finetuneButton.addEventListener("click", () => applyFinetune(item));
+
+    actionCell.append(resumeButton, finetuneButton);
+    if (item.blocked_reason && !item.resumable) {
       const why = document.createElement("div");
       why.className = "row-sub";
       why.textContent = item.blocked_reason;
@@ -1280,10 +1589,29 @@ function renderRuns(data) {
   }
 }
 
+/** 主按钮文案由当前模式决定，避免任务结束后被写死成「开始训练」。 */
+function refreshTrainButton() {
+  if (precheck.finetuneFrom) {
+    dom.btnTrain.textContent = "微调训练（从 best.pt）";
+  } else if (precheck.resumeFrom) {
+    const epochs = precheck.resumeEpochs;
+    dom.btnTrain.textContent = epochs
+      ? `继续训练（从第 ${epochs} 轮）`
+      : "继续训练";
+  } else {
+    dom.btnTrain.textContent = "开始训练";
+  }
+}
+
 /** 选中一条历史：回填表单并把主按钮改成「继续训练」。 */
 function applyResume(item) {
   precheck.resumeFrom = item.last_pt;
   precheck.resumeLabel = `${item.name}（第 ${item.epochs_done} 轮后）`;
+  precheck.resumeEpochs = item.epochs_done;
+  // 续训与微调互斥：否则两个起点会同时拼进命令行
+  precheck.finetuneFrom = "";
+  precheck.finetuneLabel = "";
+  precheck.finetuneSource = null;
   precheck.previewIndex = 0;
 
   document.getElementById("yoloData").value = item.data;
@@ -1303,18 +1631,73 @@ function applyResume(item) {
     `已选择续训点：${precheck.resumeLabel} → ${item.last_pt}。` +
     "epochs / 优化器等参数以该检查点内记录的为准，表单上改这些不会生效。";
   dom.btnClearResume.hidden = false;
-  dom.btnTrain.textContent = `继续训练（从第 ${item.epochs_done} 轮）`;
-  setHint("已进入续训模式；只想改参数重新练的话，点「取消续训」");
+  refreshTrainButton();
+  setHint("已进入续训模式；只想改参数重新练的话，点「取消续训/微调」");
   appendLog(`已选择续训点：${item.last_pt}`, "ok");
+}
+
+/** 选中一条历史：用它训练好的 best.pt 当起点做微调（参数按表单生效）。 */
+function applyFinetune(item) {
+  if (!item.best_pt) return;
+  precheck.finetuneFrom = item.best_pt;
+  precheck.finetuneLabel = item.name;
+  precheck.finetuneSource = item;
+  precheck.resumeFrom = "";
+  precheck.resumeLabel = "";
+  precheck.resumeEpochs = undefined;
+  precheck.previewIndex = 0;
+
+  if (item.data) document.getElementById("yoloData").value = item.data;
+  document.getElementById("yoloModel").value = item.best_pt;
+  if (item.task) document.getElementById("yoloTask").value = item.task;
+  if (item.imgsz) document.getElementById("yoloImgsz").value = String(item.imgsz);
+
+  // 写回同一实验目录（后端也会按 weights 路径再推导一次，避免前端状态过期）
+  const runDir = item.run_dir.replace(/[\\/]+$/, "");
+  const cut = Math.max(runDir.lastIndexOf("\\"), runDir.lastIndexOf("/"));
+  if (cut > 0) {
+    dom.project.value = runDir.slice(0, cut);
+    dom.runName.value = runDir.slice(cut + 1);
+  }
+
+  // 保守超参：微调不是重新训练。学习率与轮次按「小步修正」给，
+  // mosaic 降下来避免小缺陷被拼图抹掉。每一项都写进日志，用户能看到改了什么。
+  const preset = {};
+  if (item.epochs_done && item.epochs_done > 0) preset.yoloEpochs = "30";
+  preset.yoloLr0 = "0.001";
+  preset.augMosaic = "0.3";
+  preset.augCloseMosaic = "15";
+  const applied = [];
+  for (const [id, value] of Object.entries(preset)) {
+    const el = document.getElementById(id);
+    if (el && el.value !== value) {
+      el.value = value;
+      applied.push(`${id}=${value}`);
+    }
+  }
+
+  dom.resumeActive.hidden = false;
+  dom.resumeActive.textContent =
+    `已选择微调起点：${item.name} 的 best.pt → ${item.best_pt}。` +
+    "优化器与轮次重置，表单参数生效；结果写回原实验目录，旧结果会先备份到 _prev/。";
+  dom.btnClearResume.hidden = false;
+  refreshTrainButton();
+  setHint("已进入微调模式；提交前会先检查类别与任务头是否兼容");
+  appendLog(`已选择微调起点：${item.best_pt}`, "ok");
+  if (applied.length) appendLog(`已套用小步微调参数：${applied.join(", ")}`, "ok");
 }
 
 function clearResume() {
   precheck.resumeFrom = "";
   precheck.resumeLabel = "";
+  precheck.resumeEpochs = undefined;
+  precheck.finetuneFrom = "";
+  precheck.finetuneLabel = "";
+  precheck.finetuneSource = null;
   dom.resumeActive.hidden = true;
   dom.resumeActive.textContent = "";
   dom.btnClearResume.hidden = true;
-  dom.btnTrain.textContent = "开始训练";
+  refreshTrainButton();
   setHint("");
-  appendLog("已取消续训，下次提交按普通训练处理", "warn");
+  appendLog("已取消续训/微调，下次提交按普通训练处理", "warn");
 }

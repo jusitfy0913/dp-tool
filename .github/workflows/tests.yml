@@ -1,9 +1,9 @@
 name: tests
 
 # 为什么要有 CI：
-# 后端 23 个脚本、891 项断言，全靠人肉跑。改一行代码忘了跑某个脚本，
+# 后端 29 个脚本、约 1220 项断言，全靠人肉跑。改一行代码忘了跑某个脚本，
 # 问题要到用户点开页面才暴露（v1.15 的 `--simplify true` 就是这么漏出去的）。
-# 这里只跑「不需要 GPU / DLL / torch」的纯逻辑测试，约 32 秒。
+# 这里只跑「不需要 GPU / DLL / torch / 真实权重」的纯逻辑测试，约 47 秒。
 # 新增脚本会被 run_all_tests.py 自动收录，不需要改本文件。
 
 on:
@@ -55,6 +55,15 @@ jobs:
 
       - name: 输出引擎文件名
         run: node 6-web/frontend/tests/test_engine_out.mjs
+
+      - name: 分栏比例换算
+        run: node 6-web/frontend/tests/test_splitpanes.mjs
+
+      - name: 运行中任务条
+        run: node 6-web/frontend/tests/test_runsbar.mjs
+
+      - name: 日志出口与事件去重
+        run: node 6-web/frontend/tests/test_log_actions.mjs
 
       - name: 语法检查（所有前端模块）
         shell: pwsh

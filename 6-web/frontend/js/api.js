@@ -65,7 +65,9 @@ export function getHealth() {
 }
 
 export function listRuns() {
-  return getJSON("/api/runs");
+  // 只要最近 20 条：顶栏每 3 秒拉一次，不截断的话服务跑久了会白白搬一堆旧 run
+  // （每条还带完整命令行）。正在跑的任务一定是最新的那几条。
+  return getJSON("/api/runs?limit=20");
 }
 
 export function stopRun(runId) {
@@ -80,7 +82,13 @@ export function browse(path) {
 export function nativeDialog(payload) {
   // 服务端在本机桌面弹系统文件框。**同步返回**：请求会一直挂到用户点确定或取消，
   // 调用方不能当成普通快速请求——要提示「请到桌面完成选择」。
+  // 窗口没出现时，服务端会在十几秒内带回 reason=dialog-not-shown，不要干等五分钟。
   return postJSON("/api/browse/dialog", payload);
+}
+
+/** 关掉当前正在等的系统选择窗，让按钮从「取消」恢复成「浏览」。 */
+export function cancelNativeDialog() {
+  return postJSON("/api/browse/cancel", {});
 }
 
 // ---------------------------------------------------------------------------
@@ -139,6 +147,43 @@ export function loadAnnotationDrafts(path) {
 export function saveAnnotationDrafts(payload) {
   // 默认增量：payload.images 只带被改过的图片，其余图片的草稿由后端保留。
   return postJSON("/api/annotation/drafts", payload);
+}
+
+/**
+ * 只写审核状态（`K` / `Shift+K`）。
+ *
+ * 单独一个入口而不是复用 saveAnnotationDrafts：审核是连按的高频操作，
+ * 带上草稿会与防抖自动保存互相覆盖（两个请求都在写同一份文件）。
+ */
+export function saveAnnotationReview(payload) {
+  return postJSON("/api/annotation/drafts/review", payload);
+}
+
+/** 点 / 框提示式预标注（SAM）。 */
+export function promptLabel(payload) {
+  return postJSON("/api/annotation/prompt-label", payload);
+}
+
+/** 文本提示预标注（GroundingDINO，可选 SAM 细化）。 */
+export function textLabel(payload) {
+  return postJSON("/api/annotation/text-label", payload);
+}
+
+/** 内置模型仓库：清单 + 本地状态 + 进行中的下载任务。 */
+export function listModelzoo() {
+  return getJSON("/api/modelzoo");
+}
+
+export function downloadModel(id) {
+  return postJSON("/api/modelzoo/download", { id });
+}
+
+export function getModelDownload(jobId) {
+  return getJSON(`/api/modelzoo/download/${encodeURIComponent(jobId)}`);
+}
+
+export function cancelModelDownload(jobId) {
+  return postJSON(`/api/modelzoo/download/${encodeURIComponent(jobId)}/cancel`, {});
 }
 
 export function startBatchAutoLabel(payload) {

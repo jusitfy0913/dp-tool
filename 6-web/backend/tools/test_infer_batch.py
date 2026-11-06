@@ -351,7 +351,40 @@ def main() -> int:
             413, "超大单帧被拒",
         )
 
-        # ---- 9. 产物下载接口 --------------------------------------------------
+        # ---- 9. OCR 目录批量的参数与拒绝 ------------------------------------------
+        det = config.REPO_ROOT / "9-python-paddleOCR" / "model" / "legacy_v4" / "ch_PP-OCRv4_det_infer"
+        rec = config.REPO_ROOT / "9-python-paddleOCR" / "model" / "legacy_v4" / "ch_PP-OCRv4_rec_infer"
+        if det.is_dir() and rec.is_dir():
+            ocr_request = app.BatchInferRequest(
+                kind="ocr", det_dir=str(det), rec_dir=str(rec), source=str(images),
+            )
+            ocr_cmd = app.build_batch_command(ocr_request, sys.executable, root / "ocr-job")
+            check("OCR 批量传入检测目录", "--det-dir" in ocr_cmd and str(det) in ocr_cmd)
+            check("OCR 批量传入识别目录", "--rec-dir" in ocr_cmd and str(rec) in ocr_cmd)
+        code, events = run_batch([
+            "--kind", "ocr",
+            "--det-dir", str(root / "missing-det"),
+            "--rec-dir", str(root / "missing-rec"),
+            "--source", str(images),
+            "--output", str(root / "job-ocr"),
+        ])
+        check("OCR 模型目录不存在时失败", code == 1, str(code))
+        check(
+            "OCR 预检失败记为引擎不可用",
+            any(e.get("code") == "ENGINE_UNAVAILABLE" for e in events),
+            str(events[-1:]),
+        )
+        expect_http(
+            lambda: app.build_video_command(
+                app.VideoInferRequest(kind="ocr", engine=str(engine), source=str(images / "a.png")),
+                sys.executable,
+                root / "out.mp4",
+            ),
+            400,
+            "视频拒绝 OCR",
+        )
+
+        # ---- 10. 产物下载接口 -------------------------------------------------
         infer_root = config.RUNTIME_DIR / "infer"
         infer_root.mkdir(parents=True, exist_ok=True)
         artifact = infer_root / "test-artifact.txt"

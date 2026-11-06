@@ -230,6 +230,40 @@ def test_failures(tmp: Path) -> None:
     )
 
 
+def test_reason_and_cancel(tmp: Path) -> None:
+    """子进程带回的 reason 必须原样交给前端，否则「没弹出窗口」会被当成用户取消。"""
+    nativedialog.STATE_FILE = tmp / "state.json"
+    original = nativedialog.subprocess.run
+
+    def run_with_reason(args, **kwargs):
+        result_path = Path(args[-1])
+        result_path.write_text(
+            json.dumps({"paths": [], "reason": "dialog-not-shown"}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        return subprocess.CompletedProcess(args, 0, b"", b"")
+
+    nativedialog.subprocess.run = run_with_reason
+    try:
+        got = nativedialog.select("file", field="reason")
+    finally:
+        nativedialog.subprocess.run = original
+    check(
+        "没弹出窗口：reason 传回调用方",
+        got.get("cancelled") is True and got.get("reason") == "dialog-not-shown",
+        json.dumps(got, ensure_ascii=False),
+    )
+
+    flag = tmp / "cancel.flag"
+    nativedialog._ACTIVE_CANCEL["path"] = flag
+    try:
+        ok = nativedialog.request_cancel()
+    finally:
+        nativedialog._ACTIVE_CANCEL["path"] = None
+    check("取消：没有进行中的框时不写文件", nativedialog.request_cancel() is False)
+    check("取消：进行中时写出标记", ok and flag.read_text(encoding="utf-8") == "cancel", str(ok))
+
+
 def test_remember(tmp: Path) -> None:
     nativedialog.STATE_FILE = tmp / "state.json"
     nativedialog.reset_state()
@@ -330,6 +364,19 @@ def test_api(tmp: Path) -> None:
         )
         check("接口：放行后图片接口不再 403", config.is_path_allowed(picked))
         config.clear_runtime_allowed()
+
+        webapp.nativedialog._ACTIVE_CANCEL["path"] = tmp / "api-cancel.flag"
+        webapp._is_local_request = lambda request: True
+        try:
+            cancelled = client.post("/api/browse/cancel")
+        finally:
+            webapp.nativedialog._ACTIVE_CANCEL["path"] = None
+            webapp._is_local_request = original_local
+        check(
+            "接口：取消会写出标记",
+            cancelled.status_code == 200 and (tmp / "api-cancel.flag").is_file(),
+            cancelled.text[:300],
+        )
     finally:
         if prior_roots:
             os.environ["TRTFORGE_BROWSE_ROOTS"] = prior_roots
@@ -349,6 +396,7 @@ def main() -> int:
         test_normalize(tmp)
         test_single_flight(tmp)
         test_failures(tmp)
+        test_reason_and_cancel(tmp)
         test_remember(tmp)
         test_allowlist(tmp)
         test_api(tmp)

@@ -416,6 +416,7 @@ def run(
     """
     import cv2
     import infer  # 延迟导入：让不装 DLL 的环境也能 import 本模块做单测
+    import inferproxy
 
     warnings: list[str] = []
     external_error: dict | None = None
@@ -445,7 +446,9 @@ def run(
     if image is None:
         raise AutoLabelError(f"图片无法解码：{image_path}", "bad-response")
 
-    result = infer.run_yolo(engine_path=engine, task=annotation.task_to_str(task), image=image, conf=conf, nms=nms)
+    result = inferproxy.run_yolo(
+        engine_path=engine, task=annotation.task_to_str(task), image=image, conf=conf, nms=nms, source=image_path
+    )
     if labels_path:
         loaded = labels_mod.load_labels(labels_path)
         if loaded["ok"]:

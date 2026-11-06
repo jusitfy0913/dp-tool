@@ -1,4 +1,4 @@
-﻿<!DOCTYPE html>
+<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
@@ -17,9 +17,14 @@
       <p class="sub">缺陷检测 · 训练与推理 <span class="ver" id="appVersion" title="后端版本号（来自 /api/health）">v1.12.0</span></p>
     </div>
   </div>
-  <div class="status" id="envStatus">
-    <span class="dot" id="envDot"></span>
-    <span id="envText">检测环境…</span>
+  <!-- 全局「运行中任务」条 + 环境状态，一起贴右。
+       条本身是刷新/切页都不会丢的停止入口，兼任后端心跳（见 js/runsbar.js）。 -->
+  <div class="topbar-right">
+    <div class="runs" id="runsBar" hidden></div>
+    <div class="status" id="envStatus">
+      <span class="dot" id="envDot"></span>
+      <span id="envText">检测环境…</span>
+    </div>
   </div>
 </header>
 
@@ -83,6 +88,9 @@
             <label>imgsz <input type="number" id="yoloImgsz" value="640" min="32" step="32"></label>
             <label>batch <input type="text" id="yoloBatch" value="16"></label>
             <label>device <input type="text" id="yoloDevice" value="0"></label>
+            <!-- lr0 留空 = 用 Ultralytics 默认（0.01）。微调时会自动填 0.001 这种小步长：
+                 微调是「在已训练权重上小步修正」，沿用新训的学习率会把已有能力冲掉。 -->
+            <label>初始学习率 lr0 <input type="number" id="yoloLr0" step="0.0001" min="0" placeholder="留空 = 0.01"></label>
           </div>
 
           <!-- 数据增强：留空 = 用 Ultralytics 默认，行为与升级前完全一致 -->
@@ -165,17 +173,19 @@
             <ul class="warnlist" id="previewApplied" hidden></ul>
           </details>
 
-          <!-- 断点续训：显式挑一个 last.pt，不再让 Ultralytics 去猜「最近一次 run」 -->
+          <!-- 分段续训/微调：两种起点语义不同，界面必须分开说清楚 -->
           <details class="augbox" id="resumeBox">
-            <summary>断点续训（从 last.pt 接着训）</summary>
+            <summary>历史训练（继续训练 / 微调）</summary>
             <p class="hint">
-              扫描历史训练目录，挑一次从它的 <code>last.pt</code> 继续。
-              <b>续训时 epochs / 优化器等参数以检查点里记录的为准</b>，表单上改了也不生效——
-              这是 Ultralytics 的固有语义，界面上必须说清楚。
+              扫描历史训练目录后可以选择两种起点：<br>
+              <b>继续训练（last.pt）</b>：恢复优化器与轮次，epochs 等参数以检查点为准；<br>
+              <b>微调（best.pt）</b>：只载入权重，优化器与轮次重置，表单参数生效，
+              结果写回同一个实验目录（旧的 args.yaml / results.csv / weights 会先备份到
+              <code>_prev/&lt;时间戳&gt;/</code>）。
             </p>
             <div class="actions">
               <button type="button" class="mini" id="btnScanRuns">扫描历史训练</button>
-              <button type="button" class="mini" id="btnClearResume" hidden>取消续训</button>
+              <button type="button" class="mini" id="btnClearResume" hidden>取消续训/微调</button>
               <span class="hint" id="resumeHint"></span>
             </div>
             <p class="resume-active" id="resumeActive" hidden></p>
@@ -187,6 +197,7 @@
                     <th class="num">已完成</th>
                     <th class="num">最佳 mAP50-95</th>
                     <th class="num">last.pt</th>
+                    <th class="num">best.pt</th>
                     <th>操作</th>
                   </tr>
                 </thead>
@@ -282,7 +293,15 @@
       </form>
 
       <div class="card grow">
-        <h2>训练日志 <span class="badge" id="runBadge">未开始</span></h2>
+        <h2>训练日志 <span class="badge" id="runBadge">未开始</span>
+          <span class="badge" id="warmBadge" hidden>预热检查中</span>
+          <!-- 日志出口：复制当前面板文本 / 打开磁盘上那份完整日志。
+               面板只留最近若干行，出问题要贴给别人看的是全文。 -->
+          <span class="log-actions">
+            <button type="button" class="ghost mini" id="btnCopyLog" disabled>复制</button>
+            <button type="button" class="ghost mini" id="btnOpenLog" disabled>日志文件</button>
+          </span>
+        </h2>
 
         <!-- 进度面板：
              epoch / pct 来自后端 progress 与 epoch_summary 事件（真实值）；
@@ -298,6 +317,10 @@
             <span id="trainSpeed">每轮 —</span>
           </div>
           <div class="progress"><div class="bar" id="progressBar"></div></div>
+          <!-- 启动清单：点下按钮到真正开训之间的每一步都在这里显示，
+               否则这段时间界面只有「运行中」，看起来像卡死。 -->
+          <ul class="startup-steps" id="startupSteps" hidden></ul>
+          <p class="startup-summary" id="startupSummary" hidden></p>
         </div>
 
         <div class="metrics" id="metrics"></div>
@@ -488,13 +511,14 @@
           <select id="inferKind">
             <option value="yolo">YOLO（需 .trt 引擎）</option>
             <option value="anomalib">Anomalib（需 .trt + metadata.json）</option>
+            <option value="ocr">OCR 文字识别（ocr_infer.dll）</option>
           </select>
         </label>
 
         <!-- 训练产物下拉：扫描 runs/ 与 results/ 里的引擎。
              选完自动填引擎、标签、metadata 与任务类型；不满意可以直接改下面的输入框，
              手工输入始终有效，下拉只是省事，不是必经之路。 -->
-        <div class="group">
+        <div class="group" id="inferArtifactGroup">
           <label>训练产物
             <div class="row">
               <select id="inferModelSelect">
@@ -504,14 +528,24 @@
             </div>
           </label>
           <p class="hint" id="inferModelHint">从训练产物里选一个引擎可自动填好配套文件。</p>
+
+          <!-- 同一份产物通常既有 .engine 也有 .onnx。切换权重格式只是换一条后端，
+               参数、标签、metadata 全部不变，因此放在模型下拉旁边而不是单独一页。 -->
+          <label>权重格式
+            <select id="inferWeight">
+              <option value="engine">TensorRT 引擎（.engine / .trt）</option>
+              <option value="onnx">ONNX（onnx_infer.dll）</option>
+            </select>
+          </label>
+          <p class="hint" id="inferWeightHint">ONNX 走 onnx_infer 动态库；不可用时自动退回 Python onnxruntime。</p>
         </div>
 
         <div class="group" id="inferYoloGroup">
-          <label>引擎文件 .trt / .engine
+          <label>模型文件 .engine / .trt / .onnx
             <div class="row">
-              <input type="text" id="yoloEngine" placeholder="yolo 引擎路径">
+              <input type="text" id="yoloEngine" placeholder="yolo 引擎或 .onnx 路径">
               <button type="button" class="mini" data-browse="yoloEngine" data-dialog="file"
-                      data-patterns=".engine,.trt,.plan" data-label="TensorRT 引擎" data-title="选择 YOLO 引擎">浏览</button>
+                      data-patterns=".engine,.trt,.plan,.onnx" data-label="模型文件" data-title="选择 YOLO 模型">浏览</button>
             </div>
           </label>
           <label>标签文件 labels_*.json
@@ -549,11 +583,11 @@
         </div>
 
         <div class="group hidden" id="inferAnomGroup">
-          <label>引擎文件 .trt / .engine
+          <label>模型文件 .engine / .trt / .onnx
             <div class="row">
-              <input type="text" id="anomEngine" placeholder="anomalib 引擎路径">
+              <input type="text" id="anomEngine" placeholder="anomalib 引擎或 .onnx 路径">
               <button type="button" class="mini" data-browse="anomEngine" data-dialog="file"
-                      data-patterns=".engine,.trt,.plan" data-label="TensorRT 引擎" data-title="选择 Anomalib 引擎">浏览</button>
+                      data-patterns=".engine,.trt,.plan,.onnx" data-label="模型文件" data-title="选择 Anomalib 模型">浏览</button>
             </div>
           </label>
           <label>metadata.json
@@ -627,6 +661,73 @@
           </div>
         </div>
 
+        <div class="group hidden" id="inferOcrGroup">
+          <p class="hint">检测、识别和方向分类都在 ocr_infer.dll 里完成。灰色项是当前飞桨版本加载不了的模型。</p>
+          <label>检测模型
+            <select id="ocrDetPick"></select>
+            <div class="row">
+              <input type="text" id="ocrDet" placeholder="检测模型目录">
+              <button type="button" class="mini" data-browse="ocrDet" data-dialog="dir" data-title="选择检测模型目录">浏览</button>
+            </div>
+          </label>
+          <label>识别模型
+            <select id="ocrRecPick"></select>
+            <div class="row">
+              <input type="text" id="ocrRec" placeholder="识别模型目录">
+              <button type="button" class="mini" data-browse="ocrRec" data-dialog="dir" data-title="选择识别模型目录">浏览</button>
+            </div>
+          </label>
+          <label>文本行方向（可选）
+            <select id="ocrTextlinePick"></select>
+            <div class="row">
+              <input type="text" id="ocrTextline" placeholder="留空则不启用">
+              <button type="button" class="mini" data-browse="ocrTextline" data-dialog="dir" data-title="选择方向模型目录">浏览</button>
+            </div>
+          </label>
+          <p class="hint" id="ocrModelHint">模型来自 OCR 模型目录。</p>
+          <div class="row">
+            <label>设备
+              <select id="ocrDevice">
+                <option value="cpu">CPU（MKLDNN）</option>
+                <option value="gpu:0">GPU 0</option>
+              </select>
+            </label>
+            <label>线程
+              <input type="number" id="ocrThreads" value="8" min="1" max="64" step="1">
+            </label>
+            <label>识别 batch
+              <input type="number" id="ocrBatch" value="6" min="1" max="64" step="1">
+            </label>
+          </div>
+          <label class="check-row">
+            <input type="checkbox" id="ocrMkldnn" checked>
+            <span>CPU 下启用 MKLDNN（关掉会慢很多）</span>
+          </label>
+          <div class="param" data-param="ocrDetThresh">
+            <div class="param-head">
+              <span class="param-name">检测阈值 det_thresh</span>
+              <input type="number" id="ocrDetThresh" value="0.3" step="0.01" min="0" max="1">
+            </div>
+            <input type="range" id="ocrDetThreshRange" value="0.3" step="0.01" min="0" max="1">
+          </div>
+          <div class="param" data-param="ocrBoxThresh">
+            <div class="param-head">
+              <span class="param-name">框阈值 det_box_thresh</span>
+              <input type="number" id="ocrBoxThresh" value="0.6" step="0.01" min="0" max="1">
+            </div>
+            <input type="range" id="ocrBoxThreshRange" value="0.6" step="0.01" min="0" max="1">
+          </div>
+          <details>
+            <summary>高级参数</summary>
+            <label>unclip 扩张
+              <input type="number" id="ocrUnclip" value="1.5" step="0.1" min="0.5" max="5">
+            </label>
+            <label>识别分数下限
+              <input type="number" id="ocrRecScore" value="0" step="0.01" min="0" max="1">
+            </label>
+          </details>
+        </div>
+
         <label>图片
           <input type="file" id="inferImage" accept=".jpg,.jpeg,.png,.bmp">
         </label>
@@ -639,6 +740,7 @@
 
         <div class="actions">
           <button type="submit" class="primary" id="btnInfer">开始推理</button>
+          <button type="button" class="hidden" id="btnWorkerRestart" title="推理进程反复崩溃被暂停时，点这里手动重启">重启推理进程</button>
         </div>
         <p class="hint" id="inferHint"></p>
       </form>
@@ -661,6 +763,8 @@
           <span class="toolbar-spacer"></span>
           <button type="button" class="mini" id="btnExportJson">导出 JSON</button>
           <button type="button" class="mini" id="btnExportCsv">导出 CSV</button>
+          <button type="button" class="mini hidden" id="btnCopyOcr">复制全部文字</button>
+          <button type="button" class="mini hidden" id="btnExportTxt">导出 TXT</button>
         </div>
 
         <!-- 像素阈值参考线：热能图是连续色阶，光看数字不知道"阈值落在颜色的哪个位置"。
@@ -901,7 +1005,12 @@
       </form>
 
       <div class="card grow">
-        <h2>构建日志 <span class="badge" id="engineBadge">未开始</span></h2>
+        <h2>构建日志 <span class="badge" id="engineBadge">未开始</span>
+          <span class="log-actions">
+            <button type="button" class="ghost mini" id="btnCopyBuildLog" disabled>复制</button>
+            <button type="button" class="ghost mini" id="btnOpenBuildLog" disabled>日志文件</button>
+          </span>
+        </h2>
 
         <!-- 进度面板。百分比是**估算**：trtexec 在 tactic 选择阶段一行日志都不打
              （实测 960×960 空白 473 秒），拿不到真实进度。口径见 backend/progress.py。 -->
@@ -1083,11 +1192,11 @@
           <div class="anno-group" role="group" aria-label="绘制工具">
             <button type="button" class="mini tool active" data-tool="select" title="选择 (V)">选择</button>
             <button type="button" class="mini tool" data-tool="rectangle" title="矩形 (R)">矩形</button>
-            <button type="button" class="mini tool" data-tool="rotated_rect" title="旋转矩形 (O)">旋转框</button>
+            <button type="button" class="mini tool" data-tool="rotated_rect" title="旋转矩形 (O)。画完后拖上方圆点旋转">旋转框</button>
             <button type="button" class="mini tool" data-tool="polygon" title="多边形 (P)">多边形</button>
             <button type="button" class="mini tool" data-tool="line" title="线段 (L)">线段</button>
             <button type="button" class="mini tool" data-tool="point" title="点 (T)">点</button>
-            <button type="button" class="mini tool" data-tool="keypoints" title="关键点组 (K)">关键点</button>
+            <button type="button" class="mini tool" data-tool="keypoints" title="关键点组 (G)">关键点</button>
           </div>
           <div class="anno-group">
             <button type="button" class="mini" id="annoUndo" title="撤销 (Ctrl+Z)">撤销</button>
@@ -1133,6 +1242,22 @@
           <button type="button" class="mini" id="annoClassAdd">加</button>
         </div>
 
+        <h2>标注框 <span class="anno-count" id="annoBoxCount">0</span></h2>
+        <p class="anno-hint">当前图片的框。点一行，图上对应的框会高亮。</p>
+        <div class="anno-boxtable-wrap">
+          <table class="anno-boxtable" id="annoBoxTable">
+            <thead>
+              <tr>
+                <th>#</th>
+                <th>类别</th>
+                <th>形状</th>
+                <th>位置</th>
+              </tr>
+            </thead>
+            <tbody id="annoBoxBody"></tbody>
+          </table>
+        </div>
+
         <h2>预标注草稿 <span class="anno-count" id="annoDraftCount">0</span></h2>
         <div class="anno-row">
           <button type="button" class="mini" id="annoAcceptAll">全部接受</button>
@@ -1144,6 +1269,13 @@
         </div>
         <p class="anno-hint">A 接受 / D 丢弃 / 空格 下一张（未选中时按置信度从高到低处理）</p>
         <ul class="anno-draftlist" id="annoDraftList"></ul>
+
+        <h2>审核 <span class="anno-count" id="annoReviewCount">0/0</span></h2>
+        <div class="anno-row">
+          <button type="button" class="mini accent" id="annoMarkReviewed" title="标为已审核并跳到下一张未审核 (K)">已审核 K</button>
+          <button type="button" class="mini" id="annoUnmarkReviewed" title="取消当前图片的审核状态 (Shift+K)">取消审核</button>
+        </div>
+        <p class="anno-hint">K 标为已审核并跳下一张未审核；Shift+K 取消。状态存在 <code>*.drafts.json</code> 里，刷新不丢。</p>
 
         <h2>属性</h2>
         <div class="anno-props" id="annoProps">
@@ -1168,45 +1300,100 @@
         <!-- 预标注参数（折叠）：放在右栏内部，展开时右栏自己滚动，画布高度不受影响 -->
         <details class="anno-autolabel" id="annoAutoLabelBox">
           <summary>预标注参数</summary>
-          <div class="anno-row">
-            <select id="annoAlEnginePick" title="从训练产物里选引擎（只列 YOLO）">
-              <option value="">— 从训练产物选择 —</option>
-            </select>
-            <button type="button" class="mini" id="annoAlRefresh" title="重新扫描训练产物">↻</button>
+          <div class="anno-row anno-stack">
+            <label class="anno-field">通道
+              <select id="annoAlChannel" title="选择预标注走哪条通道">
+                <option value="engine">自有引擎（.engine）</option>
+                <option value="prompt">点 / 框提示（SAM）</option>
+                <option value="text">文本提示（GroundingDINO）</option>
+              </select>
+            </label>
           </div>
-          <div class="anno-row">
-            <input type="text" id="annoAlEngine" placeholder=".engine 引擎路径" />
-            <button type="button" class="mini" data-browse="annoAlEngine" data-dialog="file"
-                    data-patterns=".engine,.trt,.plan" data-label="TensorRT 引擎"
-                    data-title="选择自动标注用的引擎">…</button>
+
+          <!-- 引擎通道 -->
+          <div class="anno-channel" id="annoChEngine">
+            <div class="anno-row">
+              <select id="annoAlEnginePick" title="从训练产物里选引擎（只列 YOLO）">
+                <option value="">— 从训练产物选择 —</option>
+              </select>
+              <button type="button" class="mini" id="annoAlRefresh" title="重新扫描训练产物">↻</button>
+            </div>
+            <div class="anno-row">
+              <input type="text" id="annoAlEngine" placeholder=".engine 引擎路径" />
+              <button type="button" class="mini" data-browse="annoAlEngine" data-dialog="file"
+                      data-patterns=".engine,.trt,.plan" data-label="TensorRT 引擎"
+                      data-title="选择自动标注用的引擎">…</button>
+            </div>
+            <div class="anno-row">
+              <input type="text" id="annoAlLabels" placeholder="labels_*.json（可空）" />
+              <button type="button" class="mini" data-browse="annoAlLabels" data-dialog="file"
+                      data-patterns=".json,.txt" data-label="标签文件" data-title="选择标签文件">…</button>
+            </div>
+            <div class="anno-row">
+              <label class="anno-toggle">conf <input type="number" id="annoAlConf" min="0" max="1" step="0.05" value="0.25" /></label>
+              <label class="anno-toggle">nms <input type="number" id="annoAlNms" min="0" max="1" step="0.05" value="0.45" /></label>
+            </div>
+            <div class="anno-row">
+              <input type="text" id="annoAlService" placeholder="外部标注服务地址（可空），如 http://127.0.0.1:8500" />
+            </div>
           </div>
-          <div class="anno-row">
-            <input type="text" id="annoAlLabels" placeholder="labels_*.json（可空）" />
-            <button type="button" class="mini" data-browse="annoAlLabels" data-dialog="file"
-                    data-patterns=".json,.txt" data-label="标签文件" data-title="选择标签文件">…</button>
+
+          <!-- 提示通道：点/框 与 文本共用掩码精细度与细化开关 -->
+          <div class="anno-channel hidden" id="annoChPrompt">
+            <p class="anno-hint">
+              画布上左键点一下 = 正点（要这里），<code>Shift+左键</code> = 负点（不要这里），
+              按住拖 = 框。<code>Enter</code> 执行，<code>Esc</code> 清空。
+            </p>
+            <div class="anno-row">
+              <button type="button" class="mini" id="annoPromptClear">清空提示</button>
+              <button type="button" class="mini accent" id="annoPromptRun">执行（Enter）</button>
+            </div>
+            <div class="anno-row">
+              <label class="anno-field">掩码精细度 ε
+                <input type="number" id="annoAlEpsilon" min="0" max="0.05" step="0.0005" value="0.001" />
+              </label>
+            </div>
           </div>
-          <div class="anno-row">
-            <label class="anno-toggle">conf <input type="number" id="annoAlConf" min="0" max="1" step="0.05" value="0.25" /></label>
-            <label class="anno-toggle">nms <input type="number" id="annoAlNms" min="0" max="1" step="0.05" value="0.45" /></label>
+
+          <div class="anno-channel hidden" id="annoChText">
+            <div class="anno-row anno-stack">
+              <input type="text" id="annoAlPrompt" placeholder="文本提示，如 missing hole" />
+            </div>
+            <div class="anno-row">
+              <label class="anno-toggle">框阈值 <input type="number" id="annoAlBoxThr" min="0" max="1" step="0.05" value="0.3" /></label>
+              <label class="anno-toggle">文本阈值 <input type="number" id="annoAlTextThr" min="0" max="1" step="0.05" value="0.25" /></label>
+            </div>
           </div>
+
           <div class="anno-row">
-            <input type="text" id="annoAlService" placeholder="外部标注服务地址（可空），如 http://127.0.0.1:8500" />
-          </div>
-          <div class="anno-row">
-            <label class="anno-toggle" title="跳过已有正式标注或已有草稿的图片">
-              <input type="checkbox" id="annoBatchSkipDone" checked />跳过已标注/已有草稿
+            <label class="anno-toggle" title="文本/引擎通道检出框后再用 SAM 出多边形">
+              <input type="checkbox" id="annoAlRefine" />细化为多边形（需 SAM）
             </label>
           </div>
           <div class="anno-row">
-            <button type="button" class="mini accent" id="annoBatchLabel" title="整个工程跑一遍，结果进草稿池">批量预标注</button>
+            <label class="anno-toggle" title="批量时跳过已有正式标注、草稿或已审核的图片">
+              <input type="checkbox" id="annoBatchSkipDone" checked />跳过已标注/已审核
+            </label>
+          </div>
+          <div class="anno-row">
+            <button type="button" class="mini accent" id="annoBatchLabel" title="按当前通道整个工程跑一遍，结果进草稿池">批量预标注</button>
             <button type="button" class="mini" id="annoBatchStop" disabled>停止</button>
           </div>
           <div class="anno-progress hidden" id="annoBatchProgress"><div></div></div>
           <p class="anno-hint" id="annoBatchHint"></p>
           <p class="anno-hint">
-            主通道用自有引擎，总是可用；填了服务地址会先试外部通道（SAM / 文字提示），
-            不可达时自动回退并提示。草稿存在工程旁的 <code>*.drafts.json</code>，
+            引擎通道用自训 <code>.engine</code>，总是可用；点框与文本通道用内置预训练模型，
+            不训练也能出草稿。草稿与审核状态存在工程旁的 <code>*.drafts.json</code>，
             不会写进 <code>.tfanno</code>，刷新页面也不会丢。
+          </p>
+        </details>
+
+        <!-- 模型仓库：提示通道的权重从这里下载 -->
+        <details class="anno-autolabel" id="annoModelBox">
+          <summary>模型仓库 <span class="anno-count" id="annoModelCount">—</span></summary>
+          <ul class="anno-modellist" id="annoModelList"></ul>
+          <p class="anno-hint" id="annoModelHint">
+            只下载清单里的权重；下载支持断点续传，取消会清掉半成品。
           </p>
         </details>
       </aside>

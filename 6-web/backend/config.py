@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import os
 import threading
+import time
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -27,7 +28,9 @@ _WEB_ROOT = Path(__file__).resolve().parents[1]
 REPO_ROOT = Path(os.environ.get("TRTFORGE_REPO_ROOT", "").strip() or _WEB_ROOT.parent).resolve()
 
 WEB_ROOT = _WEB_ROOT
-FRONTEND_DIR = WEB_ROOT / "frontend"
+# 安装包把网页文件放在安装目录的 frontend\，不跟编译后的程序挤在一起。
+_frontend_env = os.environ.get("TRTFORGE_FRONTEND_DIR", "").strip()
+FRONTEND_DIR = Path(_frontend_env).resolve() if _frontend_env else (WEB_ROOT / "frontend")
 RUNTIME_DIR = WEB_ROOT / "runtime"
 UPLOAD_DIR = RUNTIME_DIR / "uploads"
 LOG_DIR = RUNTIME_DIR / "logs"
@@ -74,6 +77,10 @@ _DLL_DIR_CANDIDATES = [
 ]
 
 DLL_DIRS: list[Path] = [d for d in (Path(p) for p in _DLL_DIR_CANDIDATES if p) if d.is_dir()]
+# 安装包把 OpenCV / CUDA / TensorRT 和推理 DLL 放在同一个 bin。
+# 开发机上这些库也可能已经复制到 4-qt-studio/bin，一并加入搜索路径。
+if BIN_DIR.is_dir() and BIN_DIR not in DLL_DIRS:
+    DLL_DIRS.insert(0, BIN_DIR)
 
 # ---------------------------------------------------------------------------
 # Python 解释器（训练用）
@@ -81,6 +88,10 @@ DLL_DIRS: list[Path] = [d for d in (Path(p) for p in _DLL_DIR_CANDIDATES if p) i
 # 训练解释器与「运行本服务的解释器」是两件事：服务可能跑在任意 Python 上，
 # 而训练需要装了 torch/ultralytics/anomalib 的那个环境。
 PYTHON_EXE = os.environ.get("TRTFORGE_PYTHON", "").strip()
+
+#: 解释器解析结果缓存：(path|None, 缓存时间戳)。见 resolve_python()
+_PYTHON_CACHE: tuple[str | None, float] | None = None
+PYTHON_CACHE_SECONDS = 30.0
 
 TRAIN_EVENT_PREFIX = "TRTFORGE_JSON "
 
@@ -92,6 +103,36 @@ MAX_UPLOAD_BYTES = int(os.environ.get("TRTFORGE_MAX_UPLOAD_MB", "32")) * 1024 * 
 
 # 保留的最近日志行数（WebSocket 断线重连时补发）
 EVENT_BUFFER_SIZE = 2000
+
+# ---------------------------------------------------------------------------
+# 常驻预热进程（训练启动提速）
+# ---------------------------------------------------------------------------
+# 训练 launcher 每次冷启动都要重新 import torch / ultralytics / anomalib，
+# 实测 YOLO 约 1.3 秒、Anomalib 约 5.7 秒。预热进程在服务空闲时先把导入做掉，
+# 点击训练时直接复用。
+#   TRTFORGE_WARM=0        关闭（内存受限或排障时用）
+#   TRTFORGE_WARM_KINDS    只预热哪几类，默认两类都预热
+#   TRTFORGE_WARM_IDLE_SECONDS  空闲多久回收，默认 30 分钟
+WARM_ENABLED = os.environ.get("TRTFORGE_WARM", "1").strip().lower() not in {"0", "false", "no", "off"}
+WARM_KINDS = tuple(
+    item.strip()
+    for item in os.environ.get("TRTFORGE_WARM_KINDS", "yolo,anomalib").split(",")
+    if item.strip()
+)
+WARM_IDLE_SECONDS = int(os.environ.get("TRTFORGE_WARM_IDLE_SECONDS", "1800"))
+
+
+def tool_command(python: str, script_name: str) -> list[str]:
+    """拼一条「运行仓库里的 tools 脚本」的命令。
+
+    开发时是 ``python tools/xxx.py``。安装包里没有这些 .py，
+    启动脚本会设置 ``TRTFORGE_TOOL_EXE``，改由编译后的程序执行同一功能。
+    环境变量没设时，命令和以前完全一样。
+    """
+    tool_exe = os.environ.get("TRTFORGE_TOOL_EXE", "").strip()
+    if tool_exe:
+        return [str(Path(tool_exe)), "--tool", Path(script_name).stem]
+    return [python, str(Path(__file__).resolve().parent / "tools" / script_name)]
 
 
 def ensure_dirs() -> None:
@@ -176,25 +217,43 @@ def resolve_python() -> str | None:
     2. 当前服务自身解释器（若它已装 torch，直接用）
     3. 常见 conda 环境
     找不到返回 None。
+
+    结果缓存 30 秒：每次点训练都起一个子进程 `python -c "import torch"` 去探测
+    要白等 1~2 秒，而这个结果在用户不换环境时不会变。缓存时间短到改配置后
+    很快生效，又长到连点训练不会重复付这笔钱。
     """
+    global _PYTHON_CACHE
+    now = time.time()
+    cached = _PYTHON_CACHE
+    if cached is not None and now - cached[1] < PYTHON_CACHE_SECONDS:
+        return cached[0]
+
     import sys
 
+    resolved: str | None = None
     if PYTHON_EXE and Path(PYTHON_EXE).is_file():
-        return PYTHON_EXE
-
+        resolved = PYTHON_EXE
     # 服务自身解释器能用就用，避免用户额外配置
-    if _has_training_deps(sys.executable):
-        return sys.executable
+    elif _has_training_deps(sys.executable):
+        resolved = sys.executable
+    else:
+        # 常见位置兜底
+        for candidate in (
+            Path(r"D:\Anaconda3\envs\dpenv\python.exe"),
+            Path(r"D:\Anaconda3\envs\pytorch\python.exe"),
+        ):
+            if candidate.is_file() and _has_training_deps(str(candidate)):
+                resolved = str(candidate)
+                break
 
-    # 常见位置兜底
-    for candidate in (
-        Path(r"D:\Anaconda3\envs\dpenv\python.exe"),
-        Path(r"D:\Anaconda3\envs\pytorch\python.exe"),
-    ):
-        if candidate.is_file() and _has_training_deps(str(candidate)):
-            return str(candidate)
+    _PYTHON_CACHE = (resolved, now)
+    return resolved
 
-    return None
+
+def invalidate_python_cache() -> None:
+    """清掉解释器缓存（测试或用户改了环境后用）。"""
+    global _PYTHON_CACHE
+    _PYTHON_CACHE = None
 
 
 def _has_training_deps(python_exe: str) -> bool:
@@ -274,6 +333,8 @@ def capabilities() -> dict:
         "bin_dir": str(BIN_DIR),
         "yolo_dll": (BIN_DIR / "yolo_infer.dll").is_file(),
         "anomalib_dll": (BIN_DIR / "anomalib_infer.dll").is_file(),
+        "onnx_dll": (BIN_DIR / "onnx_infer.dll").is_file(),
+        "onnxruntime_dll": (BIN_DIR / "onnxruntime.dll").is_file(),
         "dll_dirs": [str(d) for d in DLL_DIRS],
         "trtexec": trtexec,
         "engine_build": trtexec is not None,

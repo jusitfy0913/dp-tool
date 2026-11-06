@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -228,9 +229,13 @@ def test_api_fallback() -> None:
         return
     image_bytes = png.tobytes()
 
-    original_status = infer.status
-    original_yolo = infer.run_yolo
-    original_anom = infer.run_anomalib
+    import inferproxy
+
+    # 路由经 inferproxy 取状态、调推理，模拟「DLL 缺失」要替换这一层
+    original_status = inferproxy.status
+    original_yolo = inferproxy.run_yolo
+    original_anom = inferproxy.run_anomalib
+    original_isolation = os.environ.get("TRTFORGE_INFER_ISOLATION")
 
     def broken_status():
         return infer.BackendStatus(
@@ -240,9 +245,11 @@ def test_api_fallback() -> None:
     def boom(*_args, **_kwargs):
         raise AssertionError("降级时不应调用 DLL 路径")
 
-    infer.status = broken_status
-    infer.run_yolo = boom
-    infer.run_anomalib = boom
+    # 降级路径与推理进程无关，用直通模式免得 TestClient 启动时拉起真实工作进程
+    os.environ["TRTFORGE_INFER_ISOLATION"] = "0"
+    inferproxy.status = broken_status
+    inferproxy.run_yolo = boom
+    inferproxy.run_anomalib = boom
     try:
         with TestClient(backend_app.app) as client:
             # 4a. YOLO：给 .onnx，应走降级并成功
@@ -295,9 +302,13 @@ def test_api_fallback() -> None:
             else:
                 print("  [SKIP] 没有 anomalib 模型")
     finally:
-        infer.status = original_status
-        infer.run_yolo = original_yolo
-        infer.run_anomalib = original_anom
+        inferproxy.status = original_status
+        inferproxy.run_yolo = original_yolo
+        inferproxy.run_anomalib = original_anom
+        if original_isolation is None:
+            os.environ.pop("TRTFORGE_INFER_ISOLATION", None)
+        else:
+            os.environ["TRTFORGE_INFER_ISOLATION"] = original_isolation
 
 
 def main() -> int:

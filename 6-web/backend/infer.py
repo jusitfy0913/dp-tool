@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import base64
 import ctypes
 import os
 import threading
@@ -127,6 +128,23 @@ class AiFrameStat(ctypes.Structure):
     ]
 
 
+class OiInfo(ctypes.Structure):
+    """对应 onnx_infer_c.h 的 oi_info。
+
+    只用来在状态接口里显示「这次跑在 CUDA 还是 CPU」，不参与推理。
+    """
+
+    _fields_ = [
+        ("provider", ctypes.c_char * 32),
+        ("ort_version", ctypes.c_char * 32),
+        ("task", ctypes.c_int),
+        ("input_w", ctypes.c_int),
+        ("input_h", ctypes.c_int),
+        ("num_classes", ctypes.c_int),
+        ("num_keypoints", ctypes.c_int),
+    ]
+
+
 # 任务枚举，与 yi_task 一致
 TASK_DETECT = 0
 TASK_SEGMENT = 1
@@ -153,6 +171,11 @@ class BackendStatus:
     anomalib_ok: bool
     dll_dirs: list[str]
     detail: str = ""
+    # ONNX 动态库是可选后端：缺失时 .onnx 仍可退回 Python 兜底，
+    # 所以它的失败原因与主 DLL 分开记录，不能让页面误以为整个推理不可用。
+    onnx_ok: bool = False
+    onnx_detail: str = ""
+    onnx_provider: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -161,7 +184,10 @@ class BackendStatus:
 _load_lock = threading.Lock()
 _yolo_lib: ctypes.WinDLL | None = None
 _anomalib_lib: ctypes.WinDLL | None = None
+_onnx_lib: ctypes.WinDLL | None = None
 _load_error: str = ""
+_onnx_load_error: str = ""
+_onnx_provider: str = ""
 _dll_handles: list = []
 
 
@@ -240,20 +266,74 @@ def _bind_anomalib(lib: ctypes.WinDLL) -> None:
     lib.ai_last_error.argtypes = []
 
 
+def _bind_onnx(lib: ctypes.WinDLL) -> None:
+    """声明 onnx_infer 的函数签名。
+
+    结构体直接复用 YiBox / AiResult / YiFrameStat：
+    onnx_infer_c.h 与两个既有头文件是逐字段对齐的 ABI 约定，
+    在这里再写一份只会在某次加字段时悄悄错位。
+    """
+    lib.oi_create_yolo.restype = ctypes.c_void_p
+    lib.oi_create_yolo.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_float, ctypes.c_float]
+
+    lib.oi_infer_yolo.restype = ctypes.c_int
+    lib.oi_infer_yolo.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_ubyte),
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.POINTER(ctypes.POINTER(YiBox)),
+        ctypes.POINTER(ctypes.c_int),
+        ctypes.POINTER(YiFrameStat),
+    ]
+
+    lib.oi_create_anomalib.restype = ctypes.c_void_p
+    lib.oi_create_anomalib.argtypes = [
+        ctypes.c_char_p,
+        ctypes.c_char_p,
+        ctypes.c_char_p,
+        ctypes.c_float,
+        ctypes.c_float,
+    ]
+
+    lib.oi_infer_anomalib.restype = ctypes.c_int
+    lib.oi_infer_anomalib.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_ubyte),
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.POINTER(ctypes.POINTER(AiResult)),
+        ctypes.POINTER(AiFrameStat),
+    ]
+
+    lib.oi_get_info.restype = ctypes.c_int
+    lib.oi_get_info.argtypes = [ctypes.c_void_p, ctypes.POINTER(OiInfo)]
+
+    lib.oi_destroy.restype = None
+    lib.oi_destroy.argtypes = [ctypes.c_void_p]
+
+    lib.oi_last_error.restype = ctypes.c_char_p
+    lib.oi_last_error.argtypes = []
+
+
 def load_libraries() -> BackendStatus:
     """加载两个推理库，返回可用状态。
 
     加载失败不抛异常：Web 服务必须能起来，把问题在页面上说明。
     """
-    global _yolo_lib, _anomalib_lib, _load_error
+    global _yolo_lib, _anomalib_lib, _onnx_lib, _load_error, _onnx_load_error
 
     with _load_lock:
         _prepare_dll_search_path()
 
         yolo_path = BIN_DIR / "yolo_infer.dll"
         anom_path = BIN_DIR / "anomalib_infer.dll"
+        onnx_path = BIN_DIR / "onnx_infer.dll"
 
         errors: list[str] = []
+        onnx_errors: list[str] = []
 
         if _yolo_lib is None:
             if yolo_path.is_file():
@@ -277,25 +357,66 @@ def load_libraries() -> BackendStatus:
             else:
                 errors.append(f"缺少文件：{anom_path}")
 
+        # ONNX 动态库是可选的第三条路：它缺失时 .onnx 仍能退回 Python 兜底，
+        # 所以单独记账，不并入主 DLL 的致命错误。
+        if _onnx_lib is None:
+            if onnx_path.is_file():
+                try:
+                    lib = ctypes.WinDLL(str(onnx_path))
+                    _bind_onnx(lib)
+                    _onnx_lib = lib
+                except OSError as exc:
+                    onnx_errors.append(f"onnx_infer.dll 加载失败：{exc}")
+            else:
+                onnx_errors.append(f"缺少文件：{onnx_path}")
+
         _load_error = "；".join(errors)
+        _onnx_load_error = "；".join(onnx_errors)
         return BackendStatus(
             yolo_ok=_yolo_lib is not None,
             anomalib_ok=_anomalib_lib is not None,
             dll_dirs=[str(d) for d in DLL_DIRS],
             detail=_load_error,
+            onnx_ok=_onnx_lib is not None,
+            onnx_detail=_onnx_load_error,
+            onnx_provider=_onnx_provider,
         )
 
 
 def status() -> BackendStatus:
     """查询当前状态（未加载则先尝试加载）。"""
-    if _yolo_lib is None and _anomalib_lib is None:
+    if _yolo_lib is None and _anomalib_lib is None and _onnx_lib is None:
         return load_libraries()
     return BackendStatus(
         yolo_ok=_yolo_lib is not None,
         anomalib_ok=_anomalib_lib is not None,
         dll_dirs=[str(d) for d in DLL_DIRS],
         detail=_load_error,
+        onnx_ok=_onnx_lib is not None,
+        onnx_detail=_onnx_load_error,
+        onnx_provider=_onnx_provider,
     )
+
+
+def onnx_available() -> bool:
+    """ONNX 动态库是否可用（未加载时先尝试一次）。
+
+    单独暴露而不是让调用方去读 BackendStatus：后续要在多条分派路径里判断，
+    集中成一个函数才能保证「判断一次、用一次」的口径一致。
+    """
+    if _onnx_lib is not None:
+        return True
+    status()
+    return _onnx_lib is not None
+
+
+def is_onnx_model(path: str) -> bool:
+    """按后缀判断是不是 ONNX 模型。
+
+    只看后缀不看内容：模型文件动辄几百 MB，为了判断格式去读几 KB 头会拖慢
+    整个列表接口；后缀错了 DLL 会在创建阶段给出明确错误。
+    """
+    return Path(str(path)).suffix.lower() == ".onnx"
 
 
 # ---------------------------------------------------------------------------
@@ -458,6 +579,63 @@ def _yolo_handle(engine_path: str, task: str, conf: float, nms: float) -> ctypes
     return handle
 
 
+def _destroy_onnx(handle: ctypes.c_void_p) -> None:
+    """销毁一个 ONNX 句柄。两个 ONNX 缓存共用这一份释放逻辑。"""
+    lib = _onnx_lib
+    if lib is not None and handle:
+        lib.oi_destroy(handle)
+
+
+# 与引擎缓存分开：同一个模型的 .engine 与 .onnx 是两个完全不同的原生对象，
+# 混在一个字典里会让「换了后缀却命中旧句柄」这种错误直接表现为推理结果不对。
+_onnx_yolo_handles = _HandleCache(HANDLE_CACHE_LIMIT, _destroy_onnx)
+_onnx_anom_handles = _HandleCache(HANDLE_CACHE_LIMIT, _destroy_onnx)
+
+
+def _remember_provider(handle: ctypes.c_void_p) -> None:
+    """记录 ONNX 句柄实际使用的执行提供程序，供能力接口显示。"""
+    global _onnx_provider
+    lib = _onnx_lib
+    if lib is None or not handle:
+        return
+    info = OiInfo()
+    if lib.oi_get_info(handle, ctypes.byref(info)) == 0:
+        _onnx_provider = info.provider.decode("utf-8", errors="replace")
+
+
+def _onnx_yolo_handle(
+    onnx_path: str,
+    task: str,
+    conf: float,
+    nms: float,
+) -> ctypes.c_void_p:
+    """取（或创建）YOLO 的 ONNX 句柄。"""
+    key = (os.path.abspath(onnx_path), task, round(conf, 4), round(nms, 4))
+    handle = _onnx_yolo_handles.get(key)
+    if handle:
+        return handle
+
+    lib = _onnx_lib
+    if lib is None:
+        raise InferError(f"onnx_infer.dll 未加载：{_onnx_load_error or '未知原因'}")
+
+    task_id = TASK_NAMES.get(task)
+    if task_id is None:
+        raise InferError(f"不支持的任务类型：{task}，可选 {', '.join(TASK_NAMES)}")
+
+    model_file = Path(onnx_path)
+    if not model_file.is_file():
+        raise InferError(f"ONNX 模型不存在：{onnx_path}")
+
+    handle = lib.oi_create_yolo(str(model_file).encode("utf-8"), task_id, conf, nms)
+    if not handle:
+        raise InferError(_onnx_error(lib, "oi_create_yolo"))
+
+    _remember_provider(handle)
+    _onnx_yolo_handles.put(key, handle)
+    return handle
+
+
 def _lib_error(lib, func_name: str) -> str:
     """读取 last_error 并格式化成可读信息。"""
     try:
@@ -468,38 +646,69 @@ def _lib_error(lib, func_name: str) -> str:
     return f"{func_name} 失败：{message or '（DLL 未返回错误信息）'}"
 
 
+def _onnx_error(lib, func_name: str) -> str:
+    """读取 onnx_infer 的错误串。
+
+    这个 DLL 的失败大多来自"文件放错位置 / 模型布局不认识"，
+    所以错误串本身已经带了排查方向，这里只负责取出来。
+    """
+    try:
+        raw = lib.oi_last_error()
+        message = raw.decode("utf-8", errors="replace") if raw else ""
+    except Exception:  # noqa: BLE001
+        message = ""
+    return f"{func_name} 失败：{message or '（onnx_infer.dll 未返回错误信息）'}"
+
+
 def run_yolo(
     engine_path: str,
     task: str,
     image: np.ndarray,
     conf: float = 0.25,
     nms: float = 0.45,
+    want_masks: bool = False,
 ) -> dict:
     """执行一次 YOLO 推理，返回可 JSON 序列化的结果。
 
     这里只产出整数类别号；类别名与配色统一由 `attach_labels()` 补上，
     这样 DLL 路径与 onnxruntime 降级路径的结构天然一致。
     """
-    lib = _yolo_lib
-    if lib is None:
-        raise InferError(f"yolo_infer.dll 未加载：{_load_error or '未知原因'}")
+    use_onnx = is_onnx_model(engine_path)
+    if use_onnx:
+        lib = _onnx_lib
+        if lib is None:
+            raise InferError(f"onnx_infer.dll 未加载：{_onnx_load_error or '未知原因'}")
+    else:
+        lib = _yolo_lib
+        if lib is None:
+            raise InferError(f"yolo_infer.dll 未加载：{_load_error or '未知原因'}")
 
     height, width = image.shape[:2]
     stride = int(image.strides[0])
     buffer = image.ctypes.data_as(ctypes.POINTER(ctypes.c_ubyte))
 
     with _yolo_lock:
-        handle = _yolo_handle(engine_path, task, conf, nms)
         boxes_ptr = ctypes.POINTER(YiBox)()
         count = ctypes.c_int(0)
         stat = YiFrameStat()
 
-        code = lib.yi_infer_bgr(
-            handle, buffer, width, height, stride,
-            ctypes.byref(boxes_ptr), ctypes.byref(count), ctypes.byref(stat),
-        )
+        if use_onnx:
+            handle = _onnx_yolo_handle(engine_path, task, conf, nms)
+            code = lib.oi_infer_yolo(
+                handle, buffer, width, height, stride,
+                ctypes.byref(boxes_ptr), ctypes.byref(count), ctypes.byref(stat),
+            )
+            error = _onnx_error(lib, "oi_infer_yolo")
+        else:
+            handle = _yolo_handle(engine_path, task, conf, nms)
+            code = lib.yi_infer_bgr(
+                handle, buffer, width, height, stride,
+                ctypes.byref(boxes_ptr), ctypes.byref(count), ctypes.byref(stat),
+            )
+            error = _lib_error(lib, "yi_infer_bgr")
+
         if code != 0:
-            raise InferError(_lib_error(lib, "yi_infer_bgr"))
+            raise InferError(error)
 
         # 立即深拷贝：指针只在下一次推理前有效
         boxes = []
@@ -528,6 +737,17 @@ def run_yolo(
                     [float(box.kpts[j * 3]), float(box.kpts[j * 3 + 1]), float(box.kpts[j * 3 + 2])]
                     for j in range(box.num_kpts)
                 ]
+            # 掩码默认不拷贝：分割结果动辄几十万像素，Web 推理页用不上原始掩码。
+            # 一致性比对需要逐像素 IoU，由工具显式打开，避免给普通请求增胖。
+            if want_masks and item["has_mask"] and box.mask_data:
+                mask_w, mask_h = int(box.mask_w), int(box.mask_h)
+                if mask_w > 0 and mask_h > 0:
+                    raw = ctypes.string_at(
+                        ctypes.cast(box.mask_data, ctypes.c_void_p), mask_w * mask_h
+                    )
+                    item["mask_w"] = mask_w
+                    item["mask_h"] = mask_h
+                    item["mask_b64"] = base64.b64encode(raw).decode("ascii")
             boxes.append(item)
 
         timing = {
@@ -538,7 +758,7 @@ def run_yolo(
         }
 
     return {
-        "backend": "yolo_infer.dll",
+        "backend": "onnx_infer.dll" if use_onnx else "yolo_infer.dll",
         "task": task,
         "image_width": width,
         "image_height": height,
@@ -784,6 +1004,55 @@ def _anom_handle(
     return handle
 
 
+def _onnx_anom_handle(
+    onnx_path: str,
+    metadata_path: str,
+    model_type: str,
+    image_threshold: float = -1.0,
+    pixel_threshold: float = -1.0,
+) -> ctypes.c_void_p:
+    """取（或创建）Anomalib 的 ONNX 句柄。
+
+    缓存键必须带阈值：ONNX 侧与引擎侧一样，阈值在创建时就固定进句柄，
+    复用旧句柄会让用户"拖了滑块但判定没变"。
+    """
+    key = (
+        os.path.abspath(onnx_path),
+        os.path.abspath(metadata_path),
+        model_type,
+        round(float(image_threshold), 6),
+        round(float(pixel_threshold), 6),
+    )
+    handle = _onnx_anom_handles.get(key)
+    if handle:
+        return handle
+
+    lib = _onnx_lib
+    if lib is None:
+        raise InferError(f"onnx_infer.dll 未加载：{_onnx_load_error or '未知原因'}")
+
+    model_file = Path(onnx_path)
+    metadata_file = Path(metadata_path)
+    if not model_file.is_file():
+        raise InferError(f"ONNX 模型不存在：{onnx_path}")
+    if not metadata_file.is_file():
+        raise InferError(f"metadata.json 不存在：{metadata_path}")
+
+    handle = lib.oi_create_anomalib(
+        str(model_file).encode("utf-8"),
+        str(metadata_file).encode("utf-8"),
+        model_type.encode("utf-8"),
+        ctypes.c_float(float(image_threshold)),
+        ctypes.c_float(float(pixel_threshold)),
+    )
+    if not handle:
+        raise InferError(_onnx_error(lib, "oi_create_anomalib"))
+
+    _remember_provider(handle)
+    _onnx_anom_handles.put(key, handle)
+    return handle
+
+
 def run_anomalib_score(
     engine_path: str,
     metadata_path: str,
@@ -814,22 +1083,43 @@ def run_anomalib_score(
     stride = int(rgb.strides[0])
     buffer = rgb.ctypes.data_as(ctypes.POINTER(ctypes.c_ubyte))
 
-    lib = _anomalib_lib
-    if lib is None:
-        raise InferError(f"anomalib_infer.dll 未加载：{_load_error or '未知原因'}")
+    use_onnx = is_onnx_model(engine_path)
+    if use_onnx:
+        lib = _onnx_lib
+        if lib is None:
+            raise InferError(f"onnx_infer.dll 未加载：{_onnx_load_error or '未知原因'}")
+    else:
+        lib = _anomalib_lib
+        if lib is None:
+            raise InferError(f"anomalib_infer.dll 未加载：{_load_error or '未知原因'}")
 
     with _anom_lock:
-        handle = _anom_handle(
-            engine_path, metadata_path, model_type, image_threshold, pixel_threshold
-        )
+        if use_onnx:
+            handle = _onnx_anom_handle(
+                engine_path, metadata_path, model_type, image_threshold, pixel_threshold
+            )
+        else:
+            handle = _anom_handle(
+                engine_path, metadata_path, model_type, image_threshold, pixel_threshold
+            )
         result_ptr = ctypes.POINTER(AiResult)()
         stat = AiFrameStat()
-        code = lib.ai_infer_rgb(
-            handle, buffer, width, height, stride,
-            ctypes.byref(result_ptr), ctypes.byref(stat),
-        )
+
+        if use_onnx:
+            code = lib.oi_infer_anomalib(
+                handle, buffer, width, height, stride,
+                ctypes.byref(result_ptr), ctypes.byref(stat),
+            )
+            error = _onnx_error(lib, "oi_infer_anomalib")
+        else:
+            code = lib.ai_infer_rgb(
+                handle, buffer, width, height, stride,
+                ctypes.byref(result_ptr), ctypes.byref(stat),
+            )
+            error = _lib_error(lib, "ai_infer_rgb")
+
         if code != 0:
-            raise InferError(_lib_error(lib, "ai_infer_rgb"))
+            raise InferError(error)
         result = result_ptr.contents
         anomaly_map = None
         if want_map and result.normalized_map and result.map_w > 0 and result.map_h > 0:
@@ -842,6 +1132,7 @@ def run_anomalib_score(
                 int(result.map_h), int(result.map_w)
             ).astype(np.float32, copy=True)
         return {
+            "backend": "onnx_infer.dll" if use_onnx else "anomalib_infer.dll",
             "raw_score": float(result.raw_score),
             "normalized_score": float(result.normalized_score),
             "is_anomaly": bool(result.is_anomaly),
@@ -869,9 +1160,15 @@ def run_anomalib(
 
     阈值语义：`>= 0` 覆盖 metadata，`< 0` 沿用 metadata（与 DLL 一致）。
     """
-    lib = _anomalib_lib
-    if lib is None:
-        raise InferError(f"anomalib_infer.dll 未加载：{_load_error or '未知原因'}")
+    use_onnx = is_onnx_model(engine_path)
+    if use_onnx:
+        lib = _onnx_lib
+        if lib is None:
+            raise InferError(f"onnx_infer.dll 未加载：{_onnx_load_error or '未知原因'}")
+    else:
+        lib = _anomalib_lib
+        if lib is None:
+            raise InferError(f"anomalib_infer.dll 未加载：{_load_error or '未知原因'}")
 
     import cv2
 
@@ -884,12 +1181,46 @@ def run_anomalib(
     originals = read_metadata_thresholds(metadata_path)
 
     with _anom_lock:
-        handle = _anom_handle(
-            engine_path, metadata_path, model_type, image_threshold, pixel_threshold
-        )
+        if use_onnx:
+            handle = _onnx_anom_handle(
+                engine_path, metadata_path, model_type, image_threshold, pixel_threshold
+            )
+        else:
+            handle = _anom_handle(
+                engine_path, metadata_path, model_type, image_threshold, pixel_threshold
+            )
 
         metadata = AiMetadata()
-        if lib.ai_get_metadata(handle, ctypes.byref(metadata)) == 0:
+        if use_onnx:
+            # ONNX 侧没有 ai_get_metadata，用文件原值 + 句柄信息拼出等价字典。
+            # 阈值语义保持一致：传入 >=0 用传入值，否则用文件值。
+            info = OiInfo()
+            provider = ""
+            if lib.oi_get_info(handle, ctypes.byref(info)) == 0:
+                provider = info.provider.decode("utf-8", errors="replace")
+            maps = originals["anomaly_maps"]
+            if maps:
+                metadata.map_min = float(maps[0])
+                metadata.map_max = float(maps[1])
+            meta_dict = {
+                "model_type": originals["model_type"] or model_type,
+                "normalization": originals["normalization"],
+                "output_contract": "",
+                "image_threshold": (
+                    float(image_threshold) if float(image_threshold) >= 0
+                    else float(originals["image_threshold"]) if originals["image_threshold"] is not None
+                    else 0.5
+                ),
+                "pixel_threshold": (
+                    float(pixel_threshold) if float(pixel_threshold) >= 0
+                    else float(originals["pixel_threshold"]) if originals["pixel_threshold"] is not None
+                    else 0.5
+                ),
+                "input_h": int(info.input_h),
+                "input_w": int(info.input_w),
+                "provider": provider,
+            }
+        elif lib.ai_get_metadata(handle, ctypes.byref(metadata)) == 0:
             meta_dict = {
                 "model_type": metadata.model_type.decode("utf-8", errors="replace"),
                 "normalization": metadata.normalization.decode("utf-8", errors="replace"),
@@ -906,16 +1237,26 @@ def run_anomalib(
 
         result_ptr = ctypes.POINTER(AiResult)()
         stat = AiFrameStat()
-        code = lib.ai_infer_rgb(
-            handle, buffer, width, height, stride,
-            ctypes.byref(result_ptr), ctypes.byref(stat),
-        )
+
+        if use_onnx:
+            code = lib.oi_infer_anomalib(
+                handle, buffer, width, height, stride,
+                ctypes.byref(result_ptr), ctypes.byref(stat),
+            )
+            error = _onnx_error(lib, "oi_infer_anomalib")
+        else:
+            code = lib.ai_infer_rgb(
+                handle, buffer, width, height, stride,
+                ctypes.byref(result_ptr), ctypes.byref(stat),
+            )
+            error = _lib_error(lib, "ai_infer_rgb")
+
         if code != 0:
-            raise InferError(_lib_error(lib, "ai_infer_rgb"))
+            raise InferError(error)
 
         result = result_ptr.contents
         payload = {
-            "backend": "anomalib_infer.dll",
+            "backend": "onnx_infer.dll" if use_onnx else "anomalib_infer.dll",
             "raw_score": float(result.raw_score),
             "normalized_score": float(result.normalized_score),
             "is_anomaly": bool(result.is_anomaly),
@@ -1053,8 +1394,10 @@ def release_handles() -> None:
     """服务退出时释放所有缓存句柄。"""
     with _yolo_lock:
         _yolo_handles.clear()
+        _onnx_yolo_handles.clear()
     with _anom_lock:
         _anom_handles.clear()
+        _onnx_anom_handles.clear()
 
 
 def cache_stats() -> dict:
@@ -1063,6 +1406,10 @@ def cache_stats() -> dict:
         "limit": HANDLE_CACHE_LIMIT,
         "yolo": len(_yolo_handles),
         "anomalib": len(_anom_handles),
+        "onnx_yolo": len(_onnx_yolo_handles),
+        "onnx_anomalib": len(_onnx_anom_handles),
         "yolo_keys": [list(map(str, k)) for k in _yolo_handles.keys()],
         "anomalib_keys": [list(map(str, k)) for k in _anom_handles.keys()],
+        "onnx_yolo_keys": [list(map(str, k)) for k in _onnx_yolo_handles.keys()],
+        "onnx_anomalib_keys": [list(map(str, k)) for k in _onnx_anom_handles.keys()],
     }

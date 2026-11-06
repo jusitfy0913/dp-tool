@@ -180,45 +180,108 @@ def start(project_path: str, items: list[dict], options: dict) -> dict:
 
 
 def _run(job: BatchJob, items: list[dict]) -> None:
-    """工作线程主体：逐图推理、逐图落盘、单张失败不中断。"""
+    """工作线程主体：逐图推理、逐图落盘、单张失败不中断。
+
+    两条通道（``options["mode"]``）：
+    - ``engine``：调用 ``autolabel.run``（.engine / DLL / 外部服务三条路都在里面）；
+    - ``text``：调用 ``textlabel``，文本模型只在第一张图时加载一次（模块内常驻），
+      并把 ``refine`` 透传给它，让"文本出框 + SAM 细化"在批量里也能用。
+
+    为什么不用 ``autolabel.run`` 统一包一层：文本通道不需要引擎、不需要标签文件，
+    硬塞进 ``run`` 会让那个函数长出更多"这个参数在文本模式下无意义"的分支。
+    """
     import autolabel  # 延迟导入：没有 DLL 的环境也能 import 本模块做单测
 
     options = job.options
+    mode = str(options.get("mode") or "engine").strip().lower()
     try:
-        for item in items:
-            if job.stopping():
-                break
-            job.begin(item)
-            try:
-                result = autolabel.run(
-                    image_path=item["path"],
-                    task=options.get("task", "detect"),
-                    engine=options["engine"],
-                    labels_path=options.get("labels") or None,
-                    conf=float(options.get("conf", 0.25)),
-                    nms=float(options.get("nms", 0.45)),
-                    service=options.get("service") or None,
-                    prompts=None,
-                    timeout=float(options.get("timeout", 20.0)),
-                )
-                drafts = result.get("drafts") or []
-            except Exception as exc:  # noqa: BLE001 - 单张失败必须被记录而不是炸掉整批
-                job.fail(item, exc)
-                continue
-
-            try:
-                # 先落盘再记账：写盘失败时这张图的结果本来就没保存，
-                # 计成成功会让统计与磁盘对不上（用户按"已完成"去审核会看到空列表）。
-                annotation_drafts.merge(job.project_path, {item["id"]: drafts})
-            except (OSError, ValueError) as exc:
-                job.fail(item, f"草稿写盘失败：{exc}")
-                continue
-
-            job.succeed(item, len(drafts), result.get("warnings") or [])
+        if mode == "text":
+            result = _run_text(job, items, options)
+        else:
+            result = _run_engine(job, items, options, autolabel)
+        if result is not None:
+            job.crash(result)
     except Exception as exc:  # noqa: BLE001 - 线程里的意外必须反映到状态里，不能静默死掉
         job.crash(exc)
     finally:
         job.finish()
+
+
+def _run_engine(job: "BatchJob", items: list[dict], options: dict, autolabel) -> Exception | None:
+    """引擎通道：返回 ``None`` 表示正常走完，返回异常表示整批崩了。"""
+    for item in items:
+        if job.stopping():
+            break
+        job.begin(item)
+        try:
+            result = autolabel.run(
+                image_path=item["path"],
+                task=options.get("task", "detect"),
+                engine=options["engine"],
+                labels_path=options.get("labels") or None,
+                conf=float(options.get("conf", 0.25)),
+                nms=float(options.get("nms", 0.45)),
+                service=options.get("service") or None,
+                prompts=None,
+                timeout=float(options.get("timeout", 20.0)),
+            )
+            drafts = result.get("drafts") or []
+        except Exception as exc:  # noqa: BLE001 - 单张失败必须被记录而不是炸掉整批
+            job.fail(item, exc)
+            continue
+        if not _persist(job, item, drafts):
+            continue
+        job.succeed(item, len(drafts), result.get("warnings") or [])
+    return None
+
+
+def _run_text(job: "BatchJob", items: list[dict], options: dict) -> Exception | None:
+    """文本通道：先加载模型，之后逐图跑。"""
+    import promptlabel
+    import textlabel
+
+    prompt = str(options.get("prompt") or "").strip()
+    if not prompt:
+        return BatchError("文本通道需要提示词")
+    try:
+        session = textlabel.get_session()  # 一次加载，整批复用
+    except Exception as exc:  # noqa: BLE001 - 模型加载失败整批都没意义
+        return exc
+
+    for item in items:
+        if job.stopping():
+            break
+        job.begin(item)
+        try:
+            image = promptlabel.read_image(item["path"])
+            result = session.predict(
+                image,
+                prompt,
+                box_thr=float(options.get("box_thr", 0.3)),
+                text_thr=float(options.get("text_thr", 0.25)),
+                refine=bool(options.get("refine")),
+                image_key=promptlabel.modelzoo_placeholder_key(item["path"]),
+            )
+            drafts = result.get("drafts") or []
+        except Exception as exc:  # noqa: BLE001
+            job.fail(item, exc)
+            continue
+        if not _persist(job, item, drafts):
+            continue
+        job.succeed(item, len(drafts), result.get("warnings") or [])
+    return None
+
+
+def _persist(job: "BatchJob", item: dict, drafts: list[dict]) -> bool:
+    """把一张图的结果落盘。返回 ``False`` 表示这张图算失败（已记账）。"""
+    try:
+        # 先落盘再记账：写盘失败时这张图的结果本来就没保存，
+        # 计成成功会让统计与磁盘对不上（用户按"已完成"去审核会看到空列表）。
+        annotation_drafts.merge(job.project_path, {item["id"]: drafts})
+    except (OSError, ValueError) as exc:
+        job.fail(item, f"草稿写盘失败：{exc}")
+        return False
+    return True
 
 
 def get(job_id: str) -> dict | None:

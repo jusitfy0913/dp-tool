@@ -1,6 +1,6 @@
 // 入口：页签切换、环境探测、目录浏览弹窗。
 
-import { browse, getCapabilities, getHealth, nativeDialog } from "./api.js";
+import { browse, cancelNativeDialog, getCapabilities, getHealth, nativeDialog } from "./api.js";
 import { initAnnotate } from "./annotate.js";
 import { initDataset } from "./dataset.js";
 import { initEngine } from "./engine.js";
@@ -8,23 +8,31 @@ import { initExport } from "./export.js";
 import { initInfer } from "./infer.js";
 import { initInferBatch } from "./inferbatch.js";
 import { initPipeline } from "./pipeline.js";
+import { initRunsBar } from "./runsbar.js";
+import { initSplitPanes } from "./splitpanes.js";
 import { initTrain } from "./train.js";
 
 // ---------------------------------------------------------------------------
 // 页签
 // ---------------------------------------------------------------------------
-function initTabs() {
+function activateTab(name) {
   const tabs = Array.from(document.querySelectorAll(".tab"));
   const panels = Array.from(document.querySelectorAll(".panel"));
+  const target = tabs.find((tab) => tab.dataset.tab === name);
+  if (!target) return false;
+  tabs.forEach((t) => t.classList.toggle("active", t === target));
+  panels.forEach((p) => p.classList.toggle("active", p.id === `panel-${name}`));
+  // 通知各模块"我这一页现在可见了"。
+  // 标注画布必须先可见才能量到真实尺寸，否则会按 0 宽高初始化成 1×1。
+  document.dispatchEvent(new CustomEvent("tab-change", { detail: { name } }));
+  return true;
+}
 
+function initTabs() {
+  const tabs = Array.from(document.querySelectorAll(".tab"));
   tabs.forEach((tab) => {
     tab.addEventListener("click", () => {
-      tabs.forEach((t) => t.classList.toggle("active", t === tab));
-      const name = tab.dataset.tab;
-      panels.forEach((p) => p.classList.toggle("active", p.id === `panel-${name}`));
-      // 通知各模块"我这一页现在可见了"。
-      // 标注画布必须先可见才能量到真实尺寸，否则会按 0 宽高初始化成 1×1。
-      document.dispatchEvent(new CustomEvent("tab-change", { detail: { name } }));
+      activateTab(tab.dataset.tab);
     });
   });
 }
@@ -77,6 +85,7 @@ async function refreshEnvironment() {
     if (!caps.infer_yolo) problems.push("yolo_infer.dll 不可用");
     if (!caps.infer_anomalib) problems.push("anomalib_infer.dll 不可用");
     if (caps.engine_build === false) problems.push("缺少 trtexec（引擎构建不可用）");
+    if (caps.infer_worker?.state === "tripped") problems.push("推理进程反复崩溃，已暂停");
 
     if (problems.length === 0) {
       dot.className = "dot ok";
@@ -139,12 +148,27 @@ function toast(message, kind = "warn") {
   toast.timer = setTimeout(() => box.classList.remove("show"), 4500);
 }
 
+// 正在等系统选择窗的那一个按钮。再点它就是取消，不能再开第二个框。
+let browseWaiting = null;
+
 /**
  * 弹原生对话框，选中就写回字段。
+ *
+ * 按钮在等待时改成「取消」并且保持可点。以前会改成「…」再禁用，
+ * 系统窗口要是没弹出来，请求五分钟不返回，按钮就一直灰着，只能刷新页面。
  *
  * @returns {Promise<boolean>} true=已处理（含用户取消）；false=应回退到页面内浏览
  */
 async function pickNative(button) {
+  if (browseWaiting?.button === button) {
+    try {
+      await cancelNativeDialog();
+    } catch {
+      /* 服务没接上时，等原来的请求自己结束即可 */
+    }
+    return true;
+  }
+
   const kind = button.dataset.dialog;
   if (!kind) return false;
 
@@ -165,30 +189,50 @@ async function pickNative(button) {
   };
 
   const label = button.textContent;
-  button.disabled = true;
-  button.textContent = "…";
-  // 首次打开子进程要一两秒，先给一句提示，免得用户以为按钮坏了
-  const hint = setTimeout(() => toast("已打开系统对话框，请到桌面窗口完成选择", "info"), 1200);
+  const previousTitle = button.title;
+  button.textContent = "取消";
+  button.classList.add("is-waiting");
+  button.title = "桌面没有弹出窗口时，再点一次就取消，并改用页面里的选择";
+  browseWaiting = { button };
+  const hint = setTimeout(() => toast("正在打开系统选择窗口。没有出现就再点一次「取消」", "info"), 1200);
   try {
     const result = await nativeDialog(payload);
+    const reason = String(result.reason || "");
+    // 窗口没出来、子进程出错：交给页面内浏览，不要假装用户取消了。
+    if (reason === "dialog-not-shown" || reason === "dialog-error" || reason === "no-result") {
+      toast("系统选择窗口没有出现，已改用页面内浏览", "warn");
+      return false;
+    }
+    if (reason === "timeout") {
+      toast("选择超时，已取消", "warn");
+      return true;
+    }
+    // 网页上点了「取消」：系统框收掉，接着打开页面内的选择，避免人只能刷新。
+    if (reason === "cancelled") {
+      toast("已改用页面内浏览", "info");
+      return false;
+    }
     if (result.paths?.length) {
       writeValue(targetId, result.paths[0]);
       toast(`已选择：${result.paths[0]}`, "info");
     }
-    // 取消是有意行为：不动字段、不报错
+    // 取消（系统框里取消，或网页上点了「取消」）是有意行为：不动字段、不报错
     return true;
   } catch (error) {
     if (error.status === 409) {
       toast(error.message, "warn");
       return true;
     }
-    const reason = error.payload?.detail || error.message;
-    toast(`系统对话框打不开（${reason}），已改用页面内浏览`, "warn");
+    const detail = error.payload?.detail || error.message;
+    toast(`系统对话框打不开（${detail}），已改用页面内浏览`, "warn");
     return false;
   } finally {
     clearTimeout(hint);
+    if (browseWaiting?.button === button) browseWaiting = null;
+    button.classList.remove("is-waiting");
     button.disabled = false;
     button.textContent = label;
+    button.title = previousTitle;
   }
 }
 
@@ -349,5 +393,21 @@ initAnnotate();
 initInfer();
 initInferBatch();
 initBrowse();
+// 顶栏的「运行中任务」条要在各页初始化之后挂：它只是读 /api/runs，
+// 不依赖页面状态，但放在最后能保证各页的接管监听已经注册好。
+initRunsBar();
+
+// 顶栏条里点某个任务 → 先把页签切到它所属的页面，再把事件交给页面自己接管
+// （训练页恢复日志与按钮、构建页恢复进度）。页面没接管也不影响：条上仍能停。
+document.addEventListener("trtf:attach-run", (event) => {
+  const kind = String(event.detail?.run?.kind || "");
+  if (kind === "engine-build") activateTab("engine");
+  else if (kind === "infer-batch" || kind === "infer-video") activateTab("infer");
+  else activateTab("train");
+});
+// 分栏拖动条必须在各页初始化之后插入：这些 init 会在卡片里生成表单与列表，
+// 晚一步插入才不会打乱它们按 DOM 顺序取元素。漏掉这一句的后果不是「不能拖」，
+// 而是第二块内容掉进 10px 宽的拖动条列里，被挤成一条竖线（v1.25.0 修）。
+initSplitPanes();
 refreshVersion();
 refreshEnvironment();

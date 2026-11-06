@@ -12,7 +12,8 @@
 //
 // 事件流本身复用 /ws/runs/{id}，和训练页是同一条通道。
 
-import { getJSON, postJSON, stopRun } from "./api.js";
+import { getJSON, listRuns, postJSON, stopRun } from "./api.js";
+import { createLogActions } from "./logs.js";
 import { connectRunEvents } from "./ws.js";
 
 // 只保留最近若干行，防止长时间构建把内存和 DOM 拖慢
@@ -91,6 +92,8 @@ export function initEngine() {
   const probeHint = document.getElementById("engProbe");
   const hint = document.getElementById("engineHint");
   const logBox = document.getElementById("engineLog");
+  const copyLogBtn = document.getElementById("btnCopyBuildLog");
+  const openLogBtn = document.getElementById("btnOpenBuildLog");
   const badge = document.getElementById("engineBadge");
   const btnBuild = document.getElementById("btnBuild");
   const btnStop = document.getElementById("btnBuildStop");
@@ -104,6 +107,17 @@ export function initEngine() {
 
   let active = null; // { runId, stream }
   let lines = [];
+  //: 最近一次构建的 run。构建结束后 active 清空，但磁盘上的日志还在，
+  //: 「日志文件」按钮应该继续指向它。
+  let lastBuildRunId = null;
+
+  const logActions = createLogActions({
+    copyBtn: copyLogBtn,
+    openBtn: openLogBtn,
+    // 这里日志是用 textContent 整段重写的，取 textContent 就够了
+    getText: () => logBox.textContent || "",
+    getRunId: () => active?.runId || lastBuildRunId,
+  });
 
   // 进度视图状态：时间基准放在本地，刷新/事件延迟都不会让数字停住
   const view = {
@@ -160,6 +174,8 @@ export function initEngine() {
     if (lines.length > MAX_LINES) lines = lines.slice(-MAX_LINES);
     logBox.textContent = lines.join("\n");
     logBox.scrollTop = logBox.scrollHeight;
+    // 有内容就能复制。markText 只在「还没启用」时写一次 DOM，不会每行都动
+    logActions.markText();
   }
 
   // -------------------------------------------------------------------------
@@ -343,12 +359,14 @@ export function initEngine() {
     setHint("");
     lines = [];
     render();
+    logActions.reset();
     btnBuild.disabled = true;
     setBadge("启动中", "run");
 
     try {
       const run = await postJSON("/api/engine/build", body);
       active = { runId: run.run_id, stream: null };
+      logActions.sync();
       setBadge("构建中", "run");
       btnStop.disabled = false;
       setHint(`输出目标：${run.engine}`);
@@ -360,59 +378,7 @@ export function initEngine() {
       lines.push("");
       render();
 
-      active.stream = connectRunEvents(run.run_id, {
-        onEvent: (payload) => {
-          if (payload.type === "log") {
-            lines.push(payload.line);
-          } else if (payload.type === "progress") {
-            applyProgress(payload);
-          } else if (payload.type === "error") {
-            lines.push(`[错误] ${payload.message}`);
-          }
-          render();
-        },
-        onClose: (payload) => {
-          stopTicker();
-          const ok = payload.status === "finished";
-          // 主动停止不是「失败」：进度停在中断处，用户在意的正是「停在哪、花了多久」
-          const cancelled = payload.status === "cancelled";
-          setBadge(cancelled ? "已停止" : ok ? "已完成" : "失败", cancelled ? "warn" : ok ? "done" : "fail");
-          lines.push("");
-          lines.push(`[结束] 退出码=${payload.exit} 状态=${payload.status}`);
-          render();
-          btnBuild.disabled = false;
-          btnStop.disabled = true;
-          active = null;
-
-          const spent = view.startedAt ? (Date.now() - view.startedAt) / 1000 : null;
-          if (ok) {
-            if (view.pct < 100) applyProgress({ pct: 100, stage: "done", stage_label: "完成" });
-            // 把「实际 vs 估算」摆出来，用户才知道下次该不该信这个数字
-            const compare = spent != null && view.estimate
-              ? `｜实际 ${fmtSpoken(spent)}，估算 ${fmtSpoken(view.estimate)}`
-              : spent != null
-                ? `｜实际 ${fmtSpoken(spent)}`
-                : "";
-            setHint(`构建完成：${body.engine || autoName(body.onnx)}${compare}`);
-            estimateNote.textContent =
-              `构建耗时已记入 runtime/engine_stats.json，下次同类构建的估算会更准。`;            estimateNote.className = "hint ok";
-          } else if (cancelled) {
-            setHint(`已停止${spent != null ? `，已用 ${fmtSpoken(spent)}` : ""}（中断的构建不产出引擎）`, true);
-            estimateNote.textContent =
-              "进度条停在中断位置。若中断前已打出 `Engine built in`，那段真实耗时仍会计入统计。";
-            estimateNote.className = "hint";
-          } else {
-            setHint("构建失败，看日志尾部定位原因", true);
-            estimateNote.textContent =
-              "进度条停在失败发生的位置。若失败前已打出 `Engine built in`，那段真实耗时仍会计入统计。";
-            estimateNote.className = "hint bad";
-          }
-        },
-        onError: (message) => {
-          lines.push(`[事件流] ${message}`);
-          render();
-        },
-      });
+      bindStream(run.run_id, { engine: body.engine, onnx: body.onnx });
     } catch (error) {
       stopTicker();
       setHint(error.message, true);
@@ -421,8 +387,138 @@ export function initEngine() {
       render();
       btnBuild.disabled = false;
       btnStop.disabled = true;
+      // 409 = 机器上已经有任务在跑（见后端 _reject_if_busy）。
+      // 比起让用户自己去找停止按钮，直接接管那个任务更省事。
+      if (error.status === 409) attachIfRunning();
     }
   });
+
+  /**
+   * 把一个 run 的事件流接到界面上。
+   *
+   * 抽成函数是因为「刚点开始」和「刷新后接管」走的是同一条通道：
+   * 两处各抄一份 onClose 里那套收尾文案，早晚会改漏其中一处。
+   */
+  function bindStream(runId, { engine, onnx }) {
+    btnBuild.disabled = true;
+    btnStop.disabled = false;
+    active.stream = connectRunEvents(runId, {
+      onEvent: (payload) => {
+        if (payload.type === "log") {
+          lines.push(payload.line);
+        } else if (payload.type === "progress") {
+          applyProgress(payload);
+        } else if (payload.type === "error") {
+          lines.push(`[错误] ${payload.message}`);
+        }
+        render();
+      },
+      onClose: (payload) => {
+        stopTicker();
+        const ok = payload.status === "finished";
+        // 主动停止不是「失败」：进度停在中断处，用户在意的正是「停在哪、花了多久」
+        const cancelled = payload.status === "cancelled";
+        setBadge(cancelled ? "已停止" : ok ? "已完成" : "失败", cancelled ? "warn" : ok ? "done" : "fail");
+        lines.push("");
+        lines.push(`[结束] 退出码=${payload.exit} 状态=${payload.status}`);
+        render();
+        btnBuild.disabled = false;
+        btnStop.disabled = true;
+        // 结束后依然能打开完整日志：面板只留最近 MAX_LINES 行
+        lastBuildRunId = active?.runId || lastBuildRunId;
+        active = null;
+        logActions.sync();
+
+        const spent = view.startedAt ? (Date.now() - view.startedAt) / 1000 : null;
+        if (ok) {
+          if (view.pct < 100) applyProgress({ pct: 100, stage: "done", stage_label: "完成" });
+          // 把「实际 vs 估算」摆出来，用户才知道下次该不该信这个数字
+          const compare = spent != null && view.estimate
+            ? `｜实际 ${fmtSpoken(spent)}，估算 ${fmtSpoken(view.estimate)}`
+            : spent != null
+              ? `｜实际 ${fmtSpoken(spent)}`
+              : "";
+          setHint(`构建完成：${engine || autoName(onnx)}${compare}`);
+          estimateNote.textContent =
+            `构建耗时已记入 runtime/engine_stats.json，下次同类构建的估算会更准。`;
+          estimateNote.className = "hint ok";
+        } else if (cancelled) {
+          setHint(`已停止${spent != null ? `，已用 ${fmtSpoken(spent)}` : ""}（中断的构建不产出引擎）`, true);
+          estimateNote.textContent =
+            "进度条停在中断位置。若中断前已打出 `Engine built in`，那段真实耗时仍会计入统计。";
+          estimateNote.className = "hint";
+        } else {
+          setHint("构建失败，看日志尾部定位原因", true);
+          estimateNote.textContent =
+            "进度条停在失败发生的位置。若失败前已打出 `Engine built in`，那段真实耗时仍会计入统计。";
+          estimateNote.className = "hint bad";
+        }
+      },
+      onError: (message) => {
+        lines.push(`[事件流] ${message}`);
+        render();
+      },
+    });
+  }
+
+  /**
+   * 拉一次任务列表，有构建任务在跑就接管。
+   *
+   * 引擎构建动辄十几分钟，页面刷新后不接管的话，用户看到的是一块空进度条
+   * 和可点的「开始构建」——再点一次就是第二个 trtexec 写同一个 .engine。
+   */
+  async function attachIfRunning() {
+    try {
+      const data = await listRuns();
+      const runs = data?.runs || [];
+      const run = runs.find((item) => item.status === "running" && item.kind === "engine-build");
+      if (run) {
+        attachRunningRun(run);
+        return;
+      }
+      // 没有在跑：把最近一次构建的日志留着可查（失败的那次最需要）
+      const last = runs.find((item) => item.kind === "engine-build");
+      if (last) {
+        lastBuildRunId = last.run_id;
+        logActions.sync();
+        openLogBtn.title = `最近一次构建 ${last.run_id} 的完整日志（${last.status}）`;
+      }
+    } catch {
+      /* 由顶栏条负责报「后端未连接」 */
+    }
+  }
+
+  function attachRunningRun(run) {
+    if (!run || run.kind !== "engine-build" || active) return false;
+    active = { runId: run.run_id, stream: null };
+    logActions.reset();
+    logActions.sync();
+    setBadge("构建中", "run");
+    setHint(`已接续正在运行的构建（run ${run.run_id}）`);
+
+    resetProgress(run.estimate_seconds ?? run.meta?.estimate_seconds);
+    // 时钟接着真实起点走：否则「已用」会从 0 重数，看起来像刚启动
+    view.startedAt = Date.now() - Math.max(0, Number(run.elapsed) || 0) * 1000;
+    startTicker();
+
+    lines = [];
+    if (Array.isArray(run.command) && run.command.length) {
+      lines.push(`$ ${run.command.join(" ")}`);
+      lines.push("");
+    }
+    lines.push(`[接续] 正在从后端补发日志…`);
+    render();
+
+    bindStream(run.run_id, { engine: run.meta?.engine || "", onnx: run.meta?.onnx || onnxInput.value.trim() });
+    return true;
+  }
+
+  document.addEventListener("trtf:attach-run", (event) => {
+    const run = event.detail?.run;
+    if (run && run.kind === "engine-build") attachRunningRun(run);
+  });
+
+  attachIfRunning();
 
   btnStop.addEventListener("click", async () => {
     if (!active) return;

@@ -169,16 +169,32 @@ def main(argv: list[str] | None = None) -> int:
     backend = "yolo_infer.dll"
     onnx_path = ""
     status = infer.status()
-    if not status.yolo_ok:
-        onnx_path, reason = onnx_fallback.resolve_onnx_path(args.engine, "")
-        if onnx_path is None:
-            emit({
-                "type": "error",
-                "code": "ENGINE_UNAVAILABLE",
-                "message": f"yolo_infer.dll 不可用（{status.detail or '未知原因'}），且无法降级：{reason}",
-            })
-            capture.release()
-            return 1
+    is_onnx = infer.is_onnx_model(args.engine)
+    dll_ok = status.onnx_ok if is_onnx else status.yolo_ok
+    if dll_ok:
+        backend = "onnx_infer.dll" if is_onnx else "yolo_infer.dll"
+    else:
+        if is_onnx:
+            # 用户直接给了 .onnx：只是退到 Python 兜底，模型路径本身就是 onnx
+            if not Path(args.engine).is_file():
+                emit({
+                    "type": "error",
+                    "code": "ENGINE_UNAVAILABLE",
+                    "message": f"ONNX 模型不存在：{args.engine}",
+                })
+                capture.release()
+                return 1
+            onnx_path = args.engine
+        else:
+            onnx_path, reason = onnx_fallback.resolve_onnx_path(args.engine, "")
+            if onnx_path is None:
+                emit({
+                    "type": "error",
+                    "code": "ENGINE_UNAVAILABLE",
+                    "message": f"yolo_infer.dll 不可用（{status.detail or '未知原因'}），且无法降级：{reason}",
+                })
+                capture.release()
+                return 1
         backend = "onnxruntime"
 
     # 输出帧率 = 原帧率 / 抽帧步长：处理过的帧按这个帧率播放，时长才与原视频一致
@@ -238,7 +254,7 @@ def main(argv: list[str] | None = None) -> int:
 
             try:
                 boxes = infer.run_yolo(args.engine, args.task, frame, conf=args.conf, nms=args.nms) \
-                    if backend == "yolo_infer.dll" \
+                    if backend in ("yolo_infer.dll", "onnx_infer.dll") \
                     else onnx_fallback.run_yolo(
                         onnx_path, args.task, frame, conf=args.conf, nms=args.nms,
                         num_classes=len(label_info["classes"]) or None,

@@ -22,8 +22,10 @@ import mimetypes
 import os
 import re
 import shlex
+import shutil
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -44,18 +46,26 @@ import config
 import dataset
 import infer
 import inferjobs
+import inferproxy
 import labels as labels_mod
 import models as models_mod
+import modelzoo
 import nativedialog
+import ocr_infer
+import ocr_models
 import onnx_fallback
 import pipeline as pipeline_mod
 import progress
+import promptlabel
+import runners
+import textlabel
 import traininfo
+import warmpool
 from runners import manager
 
 #: 应用版本号。前端顶栏与 /api/health 都读它，方便一眼看出「页面连的是哪个后端」。
 #: 起因：改了代码但 8060 上跑的是几小时前的旧进程，排查很久才发现。
-APP_VERSION = "1.23.0"
+APP_VERSION = "1.28.0"
 
 #: 本文件所在目录（6-web/backend）。子进程脚本路径都以它为基准，
 #: 不依赖启动时的工作目录——从仓库根启动和从 backend 启动必须都能跑。
@@ -67,6 +77,107 @@ pipeline_manager = pipeline_mod.PipelineManager(
 )
 
 # ---------------------------------------------------------------------------
+# 并发闸门
+# ---------------------------------------------------------------------------
+#: 「检查 + 创建」必须在同一把锁里完成，否则双击按钮的两个请求会同时通过检查。
+#: 进程创建本身很快（subprocess.Popen 返回就打第一条事件），持锁时间可以忽略。
+_START_LOCK = threading.Lock()
+
+#: kind -> 给用户看的名字。错误信息里写中文，别让用户自己猜 "infer-batch" 是什么。
+RUN_KIND_LABELS = {
+    "yolo-train": "YOLO 训练",
+    "anomalib-train": "Anomalib 训练",
+    "engine-build": "引擎构建",
+    "infer-batch": "目录批量推理",
+    "infer-video": "视频推理",
+}
+
+
+def _describe_run(run: dict) -> str:
+    """把一条 run 摘要写成「名字（run xxx，已运行 N 分钟）」。"""
+    kind = str(run.get("kind") or "")
+    if kind.startswith(runners.EXCLUSIVE_RUN_PREFIX):
+        label = "全流程串联"
+    else:
+        label = RUN_KIND_LABELS.get(kind, kind)
+    elapsed = float(run.get("elapsed") or 0)
+    if elapsed >= 60:
+        spent = f"已运行 {int(elapsed // 60)} 分钟"
+    else:
+        spent = f"已运行 {int(elapsed)} 秒"
+    return f"{label}（run {run.get('run_id')}，{spent}）"
+
+
+def _reject_if_busy() -> None:
+    """已有独占任务时拒绝启动新任务，返回 **409**。
+
+    为什么必须由后端拦而不是前端：前端刷新一次就「失忆」，页面会退回
+    「未开始」状态、按钮变成可点（v1.25.2 之前的行为）。用户点一下就会
+    起第二个训练进程：两个进程抢同一块显卡，通常双双 OOM，还会写进
+    同一个 ``runs/<name>`` 目录把产物盖掉。
+
+    409 而不是 400：前端要据此区分「参数写错」和「机器正忙着」，
+    前者该拦住用户，后者该引导他去停止或接续正在跑的那个任务。
+    """
+    busy = manager.active_exclusive()
+    if busy:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"已有任务正在运行：{_describe_run(busy[0])}。"
+                "同一块 GPU 上并发会抢显存，还可能覆盖同一个产物目录。"
+                "请先在顶部「运行中」条里停止它，或刷新页面接续该任务。"
+            ),
+        )
+
+    # 串联刚创建时它的第一段还没起来（先在后台线程里注册，再启动子进程），
+    # 所以只看 run 会漏掉「刚点了两次开始全流程」这种双击。这里再查一次链本身。
+    for record in pipeline_manager.list(limit=20):
+        if record.get("live", True) and record.get("status") in (pipeline_mod.PENDING, pipeline_mod.CHAIN_RUNNING):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"已有全流程串联在运行：{record.get('title') or record.get('id')}。"
+                    "请先在「全流程串联」卡片里停止它，再启动新的任务。"
+                ),
+            )
+
+# ---------------------------------------------------------------------------
+# 常驻预热进程
+# ---------------------------------------------------------------------------
+def configure_warm_pool() -> None:
+    """把「解释器 + launcher + 工作目录」注册给预热池，并立刻开始预热。
+
+    找不到训练解释器、或关闭了 TRTFORGE_WARM 时什么都不做：
+    预热只是提速，不是训练的前置条件。
+    """
+    if not config.WARM_ENABLED:
+        warmpool.pool.configure({}, enabled=False)
+        return
+    python = config.resolve_python()
+    if not python:
+        warmpool.pool.configure({}, enabled=False)
+        return
+
+    specs: dict[str, dict[str, str]] = {}
+    if "yolo" in config.WARM_KINDS and config.YOLO_LAUNCHER.is_file():
+        specs["yolo"] = {
+            "python": python,
+            "launcher": str(config.YOLO_LAUNCHER),
+            "cwd": str(config.YOLO_LAUNCHER_DIR),
+        }
+    if "anomalib" in config.WARM_KINDS and config.ANOMALIB_LAUNCHER.is_file():
+        specs["anomalib"] = {
+            "python": python,
+            "launcher": str(config.ANOMALIB_LAUNCHER),
+            "cwd": str(config.ANOMALIB_LAUNCHER_DIR),
+        }
+    warmpool.pool.configure(specs, enabled=True, idle_seconds=config.WARM_IDLE_SECONDS)
+    for kind in specs:
+        warmpool.pool.ensure_async(kind)
+
+
+# ---------------------------------------------------------------------------
 # 应用与生命周期
 # ---------------------------------------------------------------------------
 @contextlib.asynccontextmanager
@@ -74,18 +185,52 @@ async def lifespan(app: FastAPI):
     """服务启动时准备目录与事件循环，退出时清理子进程与句柄。"""
     config.ensure_dirs()
     manager.bind_loop(asyncio.get_running_loop())
-    # 提前探测推理库，让 /api/capabilities 立刻反映真实状态
-    infer.load_libraries()
+    # 拉起推理工作进程并探测推理库，让 /api/capabilities 立刻反映真实状态
+    inferproxy.startup()
+    # 预热训练进程：失败只记一笔，不影响服务启动（用户仍可走冷启动）
+    try:
+        configure_warm_pool()
+    except Exception as exc:  # noqa: BLE001
+        print(f"预热进程初始化失败（不影响训练）：{type(exc).__name__}: {exc}", flush=True)
     try:
         yield
     finally:
         # 先停串联（它可能正握着某个 run），再停所有子进程
         pipeline_manager.shutdown_all()
         manager.shutdown_all()
-        infer.release_handles()
+        warmpool.pool.shutdown()
+        inferproxy.shutdown()
 
 
 app = FastAPI(title="TRTForge Web Studio", version=APP_VERSION, lifespan=lifespan)
+
+
+@app.exception_handler(inferproxy.WorkerError)
+async def _worker_error(_request, exc: inferproxy.WorkerError) -> JSONResponse:
+    """推理进程崩溃 503 / 超时 504，所有推理路由共用。"""
+    return JSONResponse(status_code=exc.status, content={"detail": str(exc)})
+
+
+# ---------------------------------------------------------------------------
+# 预热状态（前端切到训练页时查询 / 手动触发）
+# ---------------------------------------------------------------------------
+@app.get("/api/warm/status")
+def warm_status() -> dict:
+    """预热状态：ready 表示下一次点击训练能立刻开训。"""
+    return warmpool.pool.status()
+
+
+@app.post("/api/warm/prewarm")
+def warm_prewarm(kind: str | None = None) -> dict:
+    """手动触发预热（前端切到训练页时也会调）。"""
+    status = warmpool.pool.status()
+    if not status["enabled"]:
+        return {"ok": False, "reason": "预热未启用：TRTFORGE_WARM=0 或未找到训练解释器", **status}
+    kinds = [kind] if kind else warmpool.pool.kinds()
+    for item in kinds:
+        warmpool.pool.ensure_async(item)
+    return {"ok": True, **warmpool.pool.status()}
+
 
 # ---------------------------------------------------------------------------
 # 环境探测
@@ -104,14 +249,23 @@ def health() -> dict:
 def capabilities() -> dict:
     """返回当前环境具备哪些能力，前端据此决定按钮可用性。"""
     data = config.capabilities()
-    backend = infer.status()
+    backend = inferproxy.status()
     data["infer_yolo"] = backend.yolo_ok
     data["infer_anomalib"] = backend.anomalib_ok
+    data["infer_onnx"] = backend.onnx_ok
+    data["infer_onnx_provider"] = backend.onnx_provider
+    data["infer_onnx_detail"] = backend.onnx_detail
     data["infer_detail"] = backend.detail
     # 降级能力：DLL 不可用时，前端可提示「仍可用 ONNX 跑通链路」
     fallback_ok, fallback_detail = onnx_fallback.available()
     data["infer_fallback"] = fallback_ok
     data["infer_fallback_detail"] = fallback_detail
+    ocr_state = inferproxy.ocr_status()
+    _paddle_major, paddle_text = ocr_models.paddle_version()
+    data["infer_ocr"] = ocr_state["ok"]
+    data["infer_ocr_detail"] = ocr_state["detail"]
+    data["paddle_version"] = paddle_text
+    data["infer_worker"] = inferproxy.worker_state()
     # 原生对话框：不可用时前端自动改走页面内目录浏览，不显示一个点不动的按钮
     data["native_dialog"] = nativedialog.available()
     return data
@@ -139,6 +293,13 @@ class YoloTrainRequest(BaseModel):
     # 断点续训：显式给出 last.pt 的绝对路径。非空时后端只拼 --resume-from，
     # 不再依赖 Ultralytics 的 get_latest_run() 去猜「最近一次 run」。
     resume_from: str = Field(default="", description="从指定 last.pt 续训")
+    # 训练起点语义：preset=官方预训练/新实验；finetune=用自己的 best.pt 微调。
+    # 与 resume 的区别：resume 恢复优化器与轮次（参数以检查点为准），
+    # finetune 只载入权重，优化器与轮次重置（参数按表单）。
+    init_mode: str = Field(default="preset", description="preset / finetune")
+    lr0: float | None = Field(default=None, ge=0, description="初始学习率；留空用 Ultralytics 默认 0.01")
+
+    exist_ok: bool = Field(default=False, description="写回已有实验目录时覆盖，而不是新建 exp2")
     python: str | None = Field(default=None, description="覆盖训练解释器")
     # 数据增强：默认值与 Ultralytics 8.4 默认逐项一致，不填即行为不变。
     # 用 None 表示「用户没填」，这样拼命令行时可以整体跳过，避免把默认值
@@ -237,6 +398,33 @@ def build_train_command(request: "YoloTrainRequest", python: str) -> list[str]:
             raise ValueError(f"续训检查点不存在：{checkpoint}")
         command += ["--resume-from", str(checkpoint.resolve())]
 
+    # 起点语义：微调只载入权重、重置优化器；续训必须走 --resume-from。
+    # 两者不能同时生效，否则 Ultralytics 会以 resume 为准，表单上的 epochs / lr0
+    # 全部失效，而用户以为自己在微调。
+    init_mode = request.init_mode if request.init_mode in {"preset", "finetune"} else "preset"
+    if init_mode == "finetune":
+        if request.resume or request.resume_from.strip():
+            raise ValueError("微调与断点续训只能选一个：微调请先取消续训")
+        weights = Path(request.model).expanduser()
+        if not weights.is_file():
+            raise ValueError(f"微调起点权重不存在：{weights}")
+        # 微调默认写回原实验目录，必须 exist_ok=True；否则 Ultralytics 会静默生成
+        # exp2/exp3，用户以为覆盖了原实验，实际多出几个目录。
+        command += ["--init-mode", "finetune", "--exist-ok"]
+    else:
+        command += ["--init-mode", "preset"]
+        if request.exist_ok:
+            command.append("--exist-ok")
+
+    # 学习率：留空 = 不传，用 Ultralytics 默认（0.01）；微调时前端会填 0.001 这种小步长。
+    if request.lr0 is not None:
+        command += ["--lr0", str(request.lr0)]
+
+    # 微调时即使表单没填，也给一个保守的小步长：沿用新训的 0.01 会明显冲掉
+    # 原权重已有的能力，用户看到的是一次「练坏了」的微调。
+    elif init_mode == "finetune":
+        command += ["--lr0", "0.001"]
+
     # 增强参数只在用户填了才拼进命令行：留空 = 用 launcher 默认 = 用 Ultralytics 默认
     augment_fields = (
         ("hsv_h", "--hsv-h"),
@@ -295,16 +483,67 @@ def train_yolo(request: YoloTrainRequest) -> dict:
             raise HTTPException(status_code=400, detail=f"续训检查点不存在：{checkpoint}")
         _ensure_allowed_path(str(checkpoint))
 
+    backup_dir: Path | None = None
+    if request.init_mode == "finetune":
+        weights = Path(request.model).expanduser()
+        if not weights.is_file():
+            raise HTTPException(status_code=400, detail=f"微调起点权重不存在：{weights}")
+        _ensure_allowed_path(str(weights))
+        info = checkpoints.describe_weights(weights)
+        if info:
+            # 写回原实验目录：project/name 由权重路径推导，不信任前端传来的值。
+            # 万一前端状态不同步（比如刚刷新过页面），也不会把结果写到别处。
+            original = Path(info["run_dir"])
+            request.project = str(original.parent)
+            request.name = original.name
+            backup_dir = _backup_run_dir(original)
+
     try:
         command = build_train_command(request, python)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    try:
-        run = manager.create("yolo-train", command, str(config.YOLO_LAUNCHER_DIR))
-    except OSError as exc:
-        raise HTTPException(status_code=500, detail=f"启动训练进程失败：{exc}") from exc
+    # 检查与创建同锁：双击按钮的两个请求不能都通过检查
+    with _START_LOCK:
+        _reject_if_busy()
+        try:
+            run = manager.create(
+                "yolo-train",
+                command,
+                str(config.YOLO_LAUNCHER_DIR),
+                meta={"backup_dir": str(backup_dir)} if backup_dir else None,
+                warm_kind="yolo",
+            )
+        except OSError as exc:
+            raise HTTPException(status_code=500, detail=f"启动训练进程失败：{exc}") from exc
     return run.snapshot()
+
+
+def _backup_run_dir(run_dir: Path) -> Path | None:
+    """微调写回同一实验目录前，把旧结果复制到 ``_prev/<时间戳>/``。
+
+    为什么必须备份：用户选了「写回同一实验目录」，新训练会覆盖 results.csv 与
+    weights/*.pt。不备份的话，一次误操作就换掉了之前几个小时的训练结果。
+    备份失败只返回 None（前端给警告），不阻塞训练——宁可少一份备份，
+    也不能因为这个让训练起不来。
+    """
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    target = run_dir / "_prev" / stamp
+    try:
+        target.mkdir(parents=True, exist_ok=True)
+        for name in ("args.yaml", "results.csv"):
+            source = run_dir / name
+            if source.is_file():
+                shutil.copy2(source, target / name)
+        weights_dir = run_dir / "weights"
+        if weights_dir.is_dir():
+            dst = target / "weights"
+            dst.mkdir(parents=True, exist_ok=True)
+            for item in weights_dir.glob("*.pt"):
+                shutil.copy2(item, dst / item.name)
+    except OSError:
+        return None
+    return target
 
 
 def build_anomalib_train_command(request: "AnomalibTrainRequest", python: str) -> list[str]:
@@ -358,10 +597,17 @@ def train_anomalib(request: AnomalibTrainRequest) -> dict:
     python = _resolve_python(request.python)
     command = build_anomalib_train_command(request, python)
 
-    try:
-        run = manager.create("anomalib-train", command, str(config.ANOMALIB_LAUNCHER_DIR))
-    except OSError as exc:
-        raise HTTPException(status_code=500, detail=f"启动训练进程失败：{exc}") from exc
+    with _START_LOCK:
+        _reject_if_busy()
+        try:
+            run = manager.create(
+                "anomalib-train",
+                command,
+                str(config.ANOMALIB_LAUNCHER_DIR),
+                warm_kind="anomalib",
+            )
+        except OSError as exc:
+            raise HTTPException(status_code=500, detail=f"启动训练进程失败：{exc}") from exc
     return run.snapshot()
 
 
@@ -551,6 +797,42 @@ def list_run_checkpoints(root: str | None = None, project: str | None = None, li
         return checkpoints.list_checkpoints(roots, limit=max(1, min(limit, 200)))
     except OSError as exc:
         raise HTTPException(status_code=400, detail=f"扫描训练目录失败：{exc}") from exc
+
+
+class FinetuneCheckRequest(BaseModel):
+    """微调前的兼容性检查入参。"""
+
+    weights: str = Field(..., description="作为起点的 best.pt 绝对路径")
+    data: str = Field(..., description="本次训练用的 dataset.yaml")
+    task: str = Field(default="detect", description="detect/segment/pose/obb")
+    imgsz: int | None = Field(default=None, description="本次训练的 imgsz，用于尺寸差异提醒")
+
+
+@app.post("/api/train/yolo/finetune-check")
+def yolo_finetune_check(request: FinetuneCheckRequest) -> dict:
+    """开训前告诉用户「用自己的 best.pt 继续训练」会发生什么。
+
+    分两级返回：
+    - blockers：硬性问题，必须拦住（权重不存在、任务头不一致）；
+    - warnings：会被静默改变行为的情况（类别对不上、改尺寸、写回原目录），
+      让用户先看到再决定，而不是训练完才发现有一半权重没生效。
+    """
+    weights = Path(request.weights).expanduser()
+    if not weights.is_file():
+        raise HTTPException(status_code=400, detail=f"权重文件不存在：{weights}")
+    _ensure_allowed_path(str(weights))
+
+    data_yaml = Path(request.data).expanduser()
+    if not data_yaml.is_file():
+        raise HTTPException(status_code=400, detail=f"dataset.yaml 不存在：{data_yaml}")
+    _ensure_allowed_path(str(data_yaml))
+
+    return checkpoints.finetune_check(
+        weights=weights,
+        data_yaml=data_yaml,
+        task=request.task,
+        imgsz=request.imgsz,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -786,18 +1068,25 @@ def build_engine(request: EngineBuildRequest) -> dict:
         "imgsz": imgsz,
     }
     estimate = progress.estimate_seconds(meta, progress.default_store())
+    # 刷新后前端只能拿到 snapshot（GET /api/runs），拿不到创建响应里的
+    # engine / estimate_seconds。放进 meta 才能在「接管」时把进度条和输出路径恢复出来。
+    meta["onnx"] = str(onnx_path)
+    meta["engine"] = str(engine_path)
+    meta["estimate_seconds"] = round(estimate, 1)
 
-    try:
-        run = manager.create(
-            "engine-build",
-            command,
-            cwd=str(config.REPO_ROOT),
-            expect_file=engine_path,
-            meta=meta,
-            estimate=estimate,
-        )
-    except OSError as exc:
-        raise HTTPException(status_code=500, detail=f"启动 trtexec 失败：{exc}") from exc
+    with _START_LOCK:
+        _reject_if_busy()
+        try:
+            run = manager.create(
+                "engine-build",
+                command,
+                cwd=str(config.REPO_ROOT),
+                expect_file=engine_path,
+                meta=meta,
+                estimate=estimate,
+            )
+        except OSError as exc:
+            raise HTTPException(status_code=500, detail=f"启动 trtexec 失败：{exc}") from exc
 
     return {
         **run.snapshot(),
@@ -1032,9 +1321,7 @@ def pipeline_yolo(request: PipelineYoloRequest) -> dict:
             pipeline_mod.StagePlan(
                 name="val",
                 label="引擎精度验证",
-                command=[
-                    python,
-                    str(BACKEND_DIR / "tools" / "val_engine.py"),
+                command=config.tool_command(python, "val_engine.py") + [
                     "--engine", str(engine_path),
                     "--data", str(data_yaml),
                     "--labels", str(labels_path),
@@ -1052,27 +1339,31 @@ def pipeline_yolo(request: PipelineYoloRequest) -> dict:
             )
         )
 
-    pipeline = pipeline_manager.create(
-        kind="yolo",
-        title=f"{name}（{request.task} / {request.precision}）",
-        stages=stages,
-        artifacts={
-            "run_dir": str(run_dir),
-            "pt": str(weights),
-            "onnx": str(onnx_file),
-            "transd_onnx": str(transd_onnx),
-            "engine": str(engine_path),
-            "labels": str(labels_path),
-        },
-        meta={
-            "data": str(data_yaml),
-            "name": name,
-            "project": request.project,
-            "precision": request.precision,
-            "skip_train": request.skip_train,
-            "run_val": request.run_val,
-        },
-    )
+    # 串联的每一段都是独占任务，所以整条链也按独占处理：
+    # 不拦的话，串联跑到「训练」那一段时用户还能从训练页再开一个训练。
+    with _START_LOCK:
+        _reject_if_busy()
+        pipeline = pipeline_manager.create(
+            kind="yolo",
+            title=f"{name}（{request.task} / {request.precision}）",
+            stages=stages,
+            artifacts={
+                "run_dir": str(run_dir),
+                "pt": str(weights),
+                "onnx": str(onnx_file),
+                "transd_onnx": str(transd_onnx),
+                "engine": str(engine_path),
+                "labels": str(labels_path),
+            },
+            meta={
+                "data": str(data_yaml),
+                "name": name,
+                "project": request.project,
+                "precision": request.precision,
+                "skip_train": request.skip_train,
+                "run_val": request.run_val,
+            },
+        )
     return pipeline
 
 
@@ -1463,9 +1754,7 @@ def pipeline_anomalib(request: AnomalibPipelineRequest) -> dict:
             report_dir = (
                 Path(record["artifacts"].get("run_dir") or metadata_path.parent) / "val"
             )
-            command = [
-                python,
-                str(BACKEND_DIR / "tools" / "val_anomaly.py"),
+            command = config.tool_command(python, "val_anomaly.py") + [
                 "--engine", str(engine_path),
                 "--metadata", str(metadata_path),
                 "--out", str(report_dir),
@@ -1495,21 +1784,24 @@ def pipeline_anomalib(request: AnomalibPipelineRequest) -> dict:
     if seeded:
         artifacts.update({key: value for key, value in seeded.items() if value})
 
-    return pipeline_manager.create(
-        kind="anomalib",
-        title=f"{name}（{request.model} / {request.precision}）",
-        stages=stages,
-        artifacts=artifacts,
-        meta={
-            "root": str(root) if root is not None else "",
-            "name": name,
-            "project": request.project,
-            "model": request.model,
-            "precision": request.precision,
-            "skip_train": request.skip_train,
-            "run_val": request.run_val,
-        },
-    )
+    with _START_LOCK:
+        _reject_if_busy()
+        pipeline = pipeline_manager.create(
+            kind="anomalib",
+            title=f"{name}（{request.model} / {request.precision}）",
+            stages=stages,
+            artifacts=artifacts,
+            meta={
+                "root": str(root) if root is not None else "",
+                "name": name,
+                "project": request.project,
+                "model": request.model,
+                "precision": request.precision,
+                "skip_train": request.skip_train,
+                "run_val": request.run_val,
+            },
+        )
+    return pipeline
 
 
 @app.get("/api/pipeline")
@@ -1660,9 +1952,16 @@ def dataset_export(request: DatasetExportRequest) -> dict:
 # 任务查询 / 停止 / 事件流
 # ---------------------------------------------------------------------------
 @app.get("/api/runs")
-def list_runs() -> dict:
-    """列出本次服务生命周期内的所有任务。"""
-    return {"runs": manager.list_runs()}
+def list_runs(limit: int = 0) -> dict:
+    """列出本次服务生命周期内的任务。
+
+    ``limit`` 只取最近的 N 条：顶栏「运行中」条每 3 秒拉一次，长期运行的服务里
+    ``_runs`` 会越攒越多（每条还带完整命令行），不截断就是白白浪费带宽。
+    """
+    runs = manager.list_runs()
+    if limit > 0:
+        runs = runs[:limit]
+    return {"runs": runs}
 
 
 @app.get("/api/runs/{run_id}")
@@ -1672,6 +1971,44 @@ def get_run(run_id: str) -> dict:
     if run is None:
         raise HTTPException(status_code=404, detail=f"未知任务：{run_id}")
     return run.snapshot()
+
+
+@app.get("/api/runs/{run_id}/log")
+def get_run_log(run_id: str, lines: int = 0) -> Response:
+    """下载/查看某个任务的完整日志（纯文本）。
+
+    ``lines=0``（默认）返回全文——这是「点开日志文件」背后的接口，用户要的是能
+    自己 Ctrl+S 存档的那一份；``lines=N`` 只取最后 N 行，给面板做「补一段」用。
+
+    为什么不能只靠 WebSocket：那条流是给**活着**的 run 用的，事件只存在内存里，
+    任务一结束或者服务一重启就没了，而 ``runtime/logs/{run_id}.log`` 一直躺在磁盘上。
+    训练失败要复盘的恰恰是这条已经结束的日志。
+    """
+    # run_id 在 URL 里，直接拼路径就能跳出 runtime/logs。这里只放行 12 位十六进制
+    # （uuid4().hex[:12] 的产物），顺带挡住 ../ 之类的东西。
+    if not re.fullmatch(r"[0-9a-f]{12}", run_id or ""):
+        raise HTTPException(status_code=400, detail=f"非法的任务号：{run_id}")
+
+    log_file = (config.LOG_DIR / f"{run_id}.log").resolve()
+    if log_file.parent != config.LOG_DIR.resolve() or not log_file.is_file():
+        raise HTTPException(status_code=404, detail=f"任务 {run_id} 的日志文件不存在")
+
+    if lines > 0:
+        text = _read_log_tail(log_file, max(1, min(int(lines), 5000)))
+    else:
+        try:
+            text = log_file.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            raise HTTPException(status_code=500, detail=f"读取日志失败：{exc}") from exc
+    return Response(
+        content=text,
+        media_type="text/plain; charset=utf-8",
+        headers={
+            # inline 让浏览器直接显示文本（方便全选复制），文件名带上 run_id 方便另存
+            "Content-Disposition": f'inline; filename="{run_id}.log"',
+            "Cache-Control": "no-store",
+        },
+    )
 
 
 @app.post("/api/runs/{run_id}/stop")
@@ -1831,6 +2168,18 @@ def browse_dialog(payload: NativeDialogRequest, request: Request) -> dict:
     return {"ok": True, **result, "allowed": granted}
 
 
+@app.post("/api/browse/cancel")
+def browse_cancel(request: Request) -> dict:
+    """让当前原生对话框自己关掉。
+
+    窗口没出现时，网页上的按钮会改成「取消」。点它不能只把浏览器请求掐断，
+    服务端那次选择还占着锁，下一次点「浏览」会一直得到「已经有一个选择框」。
+    """
+    if not _is_local_request(request):
+        raise HTTPException(status_code=403, detail="只能取消本机打开的选择框")
+    return {"ok": True, "cancelled": nativedialog.request_cancel()}
+
+
 # ---------------------------------------------------------------------------
 # 推理
 # ---------------------------------------------------------------------------
@@ -1918,6 +2267,42 @@ def _fallback_reason(primary: str, detail: str) -> str:
     return f"{primary} 不可用（{detail}），已自动降级为 onnxruntime"
 
 
+def _select_yolo_backend(engine: str) -> tuple[bool, str, str | None]:
+    """决定 YOLO 这次走哪个后端，返回 (是否走 DLL, 兜底 ONNX 路径, 降级说明)。
+
+    三级顺序：
+    1. 传的是 `.onnx` 且 `onnx_infer.dll` 可用 → 走 ONNX DLL；
+    2. 传的是引擎且 `yolo_infer.dll` 可用 → 走 TRT DLL；
+    3. 以上都不可用 → onnxruntime 降级（只在找不到模型时抛 503）。
+    """
+    backend = inferproxy.status()
+
+    if infer.is_onnx_model(engine):
+        if backend.onnx_ok:
+            return True, "", None
+        path = Path(engine)
+        if not path.is_file():
+            raise HTTPException(status_code=400, detail=f"ONNX 模型不存在：{engine}")
+        return False, str(path), _fallback_reason(
+            "onnx_infer.dll", backend.onnx_detail or "未知原因"
+        )
+
+    if backend.yolo_ok:
+        return True, "", None
+
+    onnx_path, reason = _resolve_fallback_onnx(engine, "")
+    if onnx_path is None:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "yolo_infer.dll 不可用："
+                f"{backend.detail}。请确认已编译 DLL，并设置 OPENCV_DIR / CUDA_PATH。"
+                f"（也可改用 ONNX 降级，但{reason}）"
+            ),
+        )
+    return False, onnx_path, _fallback_reason("yolo_infer.dll", backend.detail or "未知原因")
+
+
 def _run_yolo_once(
     engine: str,
     task: str,
@@ -1925,6 +2310,7 @@ def _run_yolo_once(
     conf: float,
     nms: float,
     labels: str = "",
+    source: str = "",
 ) -> tuple[dict, str | None]:
     """执行一次 YOLO 推理并补齐类别名与配色，返回 (结果, 降级说明)。
 
@@ -1932,26 +2318,12 @@ def _run_yolo_once(
     输出结构。摄像头每秒调 10 次，如果它是"另一条实现"，两边框的顺序、
     字段名、降级行为迟早对不上，而屏幕上看起来都"能出框"，极难发现。
     """
-    backend = infer.status()
-    warning: str | None = None
-    onnx_path = ""
-    if not backend.yolo_ok:
-        onnx_path, reason = _resolve_fallback_onnx(engine, "")
-        if onnx_path is None:
-            raise HTTPException(
-                status_code=503,
-                detail=(
-                    "yolo_infer.dll 不可用："
-                    f"{backend.detail}。请确认已编译 DLL，并设置 OPENCV_DIR / CUDA_PATH。"
-                    f"（也可改用 ONNX 降级，但{reason}）"
-                ),
-            )
-        warning = _fallback_reason("yolo_infer.dll", backend.detail or "未知原因")
+    use_dll, onnx_path, warning = _select_yolo_backend(engine)
 
     label_info = labels_mod.load_labels(labels)
     try:
-        if backend.yolo_ok:
-            result = infer.run_yolo(engine, task, array, conf=conf, nms=nms)
+        if use_dll:
+            result = inferproxy.run_yolo(engine, task, array, conf=conf, nms=nms, source=source)
         else:
             result = onnx_fallback.run_yolo(
                 onnx_path, task, array, conf=conf, nms=nms,
@@ -1989,7 +2361,7 @@ def infer_yolo(
     data, temp_path = _save_upload(image)
     try:
         array = infer.decode_image(data)
-        result, warning = _run_yolo_once(engine, task, array, conf, nms, labels)
+        result, warning = _run_yolo_once(engine, task, array, conf, nms, labels, source=image.filename or "")
         # 先补标签再画图：draw_yolo 要读 label_name 才能把类别名烧进去
         annotated = infer.draw_yolo(array, result["boxes"], result["class_colors"])
     except infer.InferError as exc:
@@ -2004,6 +2376,103 @@ def infer_yolo(
     if warning:
         result["warning"] = warning
     return JSONResponse(result)
+
+
+def _require_model_dir(raw: str, field: str) -> Path:
+    """OCR 模型是目录，不是单个权重文件。"""
+    if not str(raw or "").strip():
+        raise HTTPException(status_code=400, detail=f"{field} 不能为空")
+    path = _ensure_allowed_path(raw)
+    if not path.is_dir():
+        raise HTTPException(status_code=400, detail=f"{field} 不是目录：{path}")
+    return path
+
+
+@app.get("/api/ocr/models")
+def list_ocr_models() -> dict:
+    """扫描 OCR 模型根目录，标出格式和能不能在当前 Paddle 版本上用。"""
+    try:
+        return ocr_models.scan_models()
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"扫描 OCR 模型失败：{exc}") from exc
+
+
+@app.post("/api/infer/ocr")
+def infer_ocr(
+    image: UploadFile = File(...),
+    det_dir: str = Form(...),
+    rec_dir: str = Form(...),
+    textline_ori_dir: str = Form(""),
+    device: str = Form("cpu"),
+    enable_mkldnn: int = Form(1),
+    cpu_threads: int = Form(8),
+    rec_batch_size: int = Form(6),
+    det_thresh: float = Form(0.3),
+    det_box_thresh: float = Form(0.6),
+    det_unclip_ratio: float = Form(1.5),
+    rec_score_thresh: float = Form(0.0),
+) -> JSONResponse:
+    """OCR：检测、识别、方向分类都在 ocr_infer.dll 里完成。"""
+    det = _require_model_dir(det_dir, "检测模型目录")
+    rec = _require_model_dir(rec_dir, "识别模型目录")
+    textline = ""
+    if str(textline_ori_dir or "").strip():
+        textline = str(_require_model_dir(textline_ori_dir, "方向模型目录"))
+
+    data, temp_path = _save_upload(image)
+    try:
+        array = infer.decode_image(data)
+        result = inferproxy.run_ocr(array, source=image.filename or "", options={
+            "det_dir": str(det),
+            "rec_dir": str(rec),
+            "textline_dir": textline,
+            "device": device,
+            "enable_mkldnn": 1 if enable_mkldnn else 0,
+            "cpu_threads": cpu_threads,
+            "rec_batch_size": rec_batch_size,
+            "det_thresh": det_thresh,
+            "det_box_thresh": det_box_thresh,
+            "det_unclip_ratio": det_unclip_ratio,
+            "rec_score_thresh": rec_score_thresh,
+        })
+    except infer.InferError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except ocr_infer.OcrError as exc:
+        raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+    finally:
+        with contextlib.suppress(OSError):
+            temp_path.unlink()
+    return JSONResponse(result)
+
+
+def _select_anomalib_backend(engine: str, metadata: str) -> tuple[bool, str, str | None]:
+    """与 `_select_yolo_backend` 同样的三级顺序，只是主库换成 anomalib_infer。"""
+    backend = inferproxy.status()
+
+    if infer.is_onnx_model(engine):
+        if backend.onnx_ok:
+            return True, "", None
+        path = Path(engine)
+        if not path.is_file():
+            raise HTTPException(status_code=400, detail=f"ONNX 模型不存在：{engine}")
+        return False, str(path), _fallback_reason(
+            "onnx_infer.dll", backend.onnx_detail or "未知原因"
+        )
+
+    if backend.anomalib_ok:
+        return True, "", None
+
+    onnx_path, reason = _resolve_fallback_onnx(engine, metadata)
+    if onnx_path is None:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "anomalib_infer.dll 不可用："
+                f"{backend.detail}。请确认已编译 DLL，并设置 OPENCV_DIR / CUDA_PATH。"
+                f"（也可改用 ONNX 降级，但{reason}）"
+            ),
+        )
+    return False, onnx_path, _fallback_reason("anomalib_infer.dll", backend.detail or "未知原因")
 
 
 @app.post("/api/infer/anomalib")
@@ -2022,31 +2491,19 @@ def infer_anomalib(
     响应里 `thresholds` 同时给出"本次生效值"与"metadata 文件原值"，
     因为 `ai_get_metadata` 拿到的已经是覆盖后的值，原值只能自己读文件。
     """
-    backend = infer.status()
-    warning: str | None = None
-    if not backend.anomalib_ok:
-        onnx_path, reason = _resolve_fallback_onnx(engine, metadata)
-        if onnx_path is None:
-            raise HTTPException(
-                status_code=503,
-                detail=(
-                    "anomalib_infer.dll 不可用："
-                    f"{backend.detail}。请确认已编译 DLL，并设置 OPENCV_DIR / CUDA_PATH。"
-                    f"（也可改用 ONNX 降级，但{reason}）"
-                ),
-            )
-        warning = _fallback_reason("anomalib_infer.dll", backend.detail or "未知原因")
+    use_dll, onnx_path, warning = _select_anomalib_backend(engine, metadata)
 
     data, temp_path = _save_upload(image)
     try:
         array = infer.decode_image(data)
-        if backend.anomalib_ok:
-            result = infer.run_anomalib(
+        if use_dll:
+            result = inferproxy.run_anomalib(
                 engine, metadata, array,
                 model_type=model_type,
                 image_threshold=image_threshold,
                 pixel_threshold=pixel_threshold,
                 colormap=heatmap_colormap,
+                source=image.filename or "",
             )
         else:
             try:
@@ -2086,8 +2543,19 @@ class BatchInferRequest(BaseModel):
     先拷一遍到临时目录再读一遍；前后端本来就在同一台机器上，路径更直接。
     """
 
-    kind: str = Field(default="yolo", description="yolo / anomalib")
-    engine: str = Field(..., description=".engine / .trt / .onnx")
+    kind: str = Field(default="yolo", description="yolo / anomalib / ocr")
+    engine: str = Field(default="", description=".engine / .trt / .onnx；OCR 留空")
+    det_dir: str = Field(default="", description="OCR 检测模型目录")
+    rec_dir: str = Field(default="", description="OCR 识别模型目录")
+    textline_ori_dir: str = Field(default="", description="OCR 文本行方向模型目录，可留空")
+    device: str = Field(default="cpu", description="cpu 或 gpu:0")
+    enable_mkldnn: int = Field(default=1)
+    cpu_threads: int = Field(default=8, ge=1, le=64)
+    rec_batch_size: int = Field(default=6, ge=1, le=64)
+    det_thresh: float = Field(default=0.3, ge=0.0, le=1.0)
+    det_box_thresh: float = Field(default=0.6, ge=0.0, le=1.0)
+    det_unclip_ratio: float = Field(default=1.5, ge=0.5, le=5.0)
+    rec_score_thresh: float = Field(default=0.0, ge=0.0, le=1.0)
     task: str = Field(default="detect", description="detect / segment / pose / obb")
     labels: str = Field(default="", description="labels_*.json，可留空")
     conf: float = Field(default=0.25, gt=0.0, le=1.0)
@@ -2110,6 +2578,7 @@ class BatchInferRequest(BaseModel):
 class VideoInferRequest(BaseModel):
     """视频推理请求。输出 mp4 落在产物目录里。"""
 
+    kind: str = Field(default="yolo", description="只支持 yolo；ocr 会被拒绝")
     engine: str = Field(..., description=".engine / .trt / .onnx")
     task: str = Field(default="detect")
     labels: str = Field(default="")
@@ -2164,8 +2633,43 @@ def build_batch_command(
     单独成函数是为了能被测试直接断言：参数在表单里填了却没进命令行，
     用户只能从日志里翻完整命令才能发现（`--simplify true` 就是这么漏的）。
     """
-    if request.kind not in ("yolo", "anomalib"):
-        raise HTTPException(status_code=400, detail=f"kind 只能是 yolo / anomalib，实际 {request.kind}")
+    if request.kind not in ("yolo", "anomalib", "ocr"):
+        raise HTTPException(status_code=400, detail=f"kind 只能是 yolo / anomalib / ocr，实际 {request.kind}")
+
+    if request.kind == "ocr":
+        det = _require_model_dir(request.det_dir, "检测模型目录")
+        rec = _require_model_dir(request.rec_dir, "识别模型目录")
+        source = _ensure_allowed_path(request.source)
+        if not source.exists():
+            raise HTTPException(status_code=400, detail=f"数据源不存在：{source}")
+        command = config.tool_command(python, "infer_batch.py") + [
+            "--kind", "ocr",
+            "--det-dir", str(det),
+            "--rec-dir", str(rec),
+            "--device", request.device,
+            "--cpu-threads", str(int(request.cpu_threads)),
+            "--rec-batch-size", str(int(request.rec_batch_size)),
+            "--det-thresh", f"{request.det_thresh:g}",
+            "--det-box-thresh", f"{request.det_box_thresh:g}",
+            "--det-unclip-ratio", f"{request.det_unclip_ratio:g}",
+            "--rec-score-thresh", f"{request.rec_score_thresh:g}",
+            "--source", str(source),
+            "--output", str(job_dir),
+            "--limit", str(int(request.limit)),
+            "--jpeg-quality", str(int(request.jpeg_quality)),
+        ]
+        if str(request.textline_ori_dir or "").strip():
+            textline = _require_model_dir(request.textline_ori_dir, "方向模型目录")
+            command += ["--textline-dir", str(textline)]
+        if not request.enable_mkldnn:
+            command.append("--no-mkldnn")
+        if not request.recursive:
+            command.append("--no-recursive")
+        if not request.make_zip:
+            command.append("--no-zip")
+        if not request.full_json:
+            command.append("--no-full-json")
+        return command
 
     engine = _require_file(request.engine, "引擎文件")
     if engine.suffix.lower() not in ENGINE_SUFFIXES:
@@ -2179,9 +2683,7 @@ def build_batch_command(
     if request.labels.strip():
         _require_file(request.labels, "标签文件")
 
-    command = [
-        python,
-        str(BACKEND_DIR / "tools" / "infer_batch.py"),
+    command = config.tool_command(python, "infer_batch.py") + [
         "--kind", request.kind,
         "--engine", str(engine),
         "--source", str(source),
@@ -2227,6 +2729,8 @@ def build_video_command(
     output_path: str | Path,
 ) -> list[str]:
     """组装视频推理命令。校验规则与 bulk 接口保持一致。"""
+    if request.kind == "ocr":
+        raise HTTPException(status_code=400, detail="OCR 不支持视频推理：CPU 单张约 10 秒以上，请改用目录批量")
     engine = _require_file(request.engine, "引擎文件")
     if engine.suffix.lower() not in ENGINE_SUFFIXES:
         raise HTTPException(status_code=400, detail=f"引擎格式不支持：{engine.suffix}")
@@ -2244,9 +2748,7 @@ def build_video_command(
     if request.codec not in ("auto", "avc1", "H264", "mp4v"):
         raise HTTPException(status_code=400, detail=f"不支持的编码器：{request.codec}")
 
-    command = [
-        python,
-        str(BACKEND_DIR / "tools" / "infer_video.py"),
+    command = config.tool_command(python, "infer_video.py") + [
         "--engine", str(engine),
         "--task", request.task,
         "--source", str(source),
@@ -2277,21 +2779,23 @@ def infer_batch(request: BatchInferRequest) -> dict:
     command = build_batch_command(request, sys.executable, job)
     expect = (job / "annotated.zip") if request.make_zip else (job / "results.csv")
 
-    try:
-        run = manager.create(
-            "infer-batch",
-            command,
-            cwd=str(BACKEND_DIR),
-            expect_file=expect,
-            meta={
-                "kind": request.kind,
-                "source": str(Path(request.source).expanduser()),
-                "engine": str(Path(request.engine).expanduser()),
-                "output": str(job),
-            },
-        )
-    except OSError as exc:
-        raise HTTPException(status_code=500, detail=f"启动批量推理失败：{exc}") from exc
+    with _START_LOCK:
+        _reject_if_busy()
+        try:
+            run = manager.create(
+                "infer-batch",
+                command,
+                cwd=str(BACKEND_DIR),
+                expect_file=expect,
+                meta={
+                    "kind": request.kind,
+                    "source": str(Path(request.source).expanduser()),
+                    "engine": str(Path(request.engine).expanduser()),
+                    "output": str(job),
+                },
+            )
+        except OSError as exc:
+            raise HTTPException(status_code=500, detail=f"启动批量推理失败：{exc}") from exc
 
     return {
         **run.snapshot(),
@@ -2314,21 +2818,23 @@ def infer_video(request: VideoInferRequest) -> dict:
     output = job / f"{inferjobs.safe_stem(source.stem)}_annotated.mp4"
     command = build_video_command(request, sys.executable, output)
 
-    try:
-        run = manager.create(
-            "infer-video",
-            command,
-            cwd=str(BACKEND_DIR),
-            expect_file=output,
-            meta={
-                "source": str(source),
-                "engine": str(Path(request.engine).expanduser()),
-                "stride": int(request.stride),
-                "output": str(job),
-            },
-        )
-    except OSError as exc:
-        raise HTTPException(status_code=500, detail=f"启动视频推理失败：{exc}") from exc
+    with _START_LOCK:
+        _reject_if_busy()
+        try:
+            run = manager.create(
+                "infer-video",
+                command,
+                cwd=str(BACKEND_DIR),
+                expect_file=output,
+                meta={
+                    "source": str(source),
+                    "engine": str(Path(request.engine).expanduser()),
+                    "stride": int(request.stride),
+                    "output": str(job),
+                },
+            )
+        except OSError as exc:
+            raise HTTPException(status_code=500, detail=f"启动视频推理失败：{exc}") from exc
 
     return {
         **run.snapshot(),
@@ -2364,7 +2870,7 @@ def infer_frame(
 
     try:
         array = infer.decode_image(data)
-        result, warning = _run_yolo_once(engine, task, array, conf, nms, labels)
+        result, warning = _run_yolo_once(engine, task, array, conf, nms, labels, source="摄像头帧")
     except infer.InferError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -2418,7 +2924,14 @@ def infer_cache() -> dict:
     存在的理由：句柄常驻显存，用户改阈值改到显存告急时需要能看见"现在到底留了几个"。
     没有这个窗口，用户只能靠猜。
     """
-    return {"ok": True, **infer.cache_stats()}
+    stats = inferproxy.cache_stats()
+    return {"ok": True, **stats, "ocr": stats.get("ocr", {}), "worker": inferproxy.worker_state()}
+
+
+@app.post("/api/infer/worker/restart")
+def infer_worker_restart() -> dict:
+    """熔断后由用户手动重启推理进程。"""
+    return {"ok": True, **inferproxy.restart_worker()}
 
 
 # ---------------------------------------------------------------------------
@@ -2488,11 +3001,55 @@ class AnnotationDraftsRequest(BaseModel):
     ``images`` 是**增量**语义：只覆盖传进来的图片，其余图片在磁盘上的草稿保持不变。
     这是刻意的——前端自动保存只会带上被改过的那几张图，批量任务又可能同时在写，
     整份替换会把对方刚写的内容抹掉。
+
+    ``review`` 同样是增量：`{图片 id: {"state": "checked"|"unchecked"}}`。
+    审核和草稿一起提交是常态（按 K 的同时草稿也在变），分成两个请求就会出现
+    "草稿写了、状态丢了"的中间态。
     """
 
     path: str = Field(..., description=".tfanno 工程路径（草稿写在其旁的 *.drafts.json）")
-    images: dict[str, list] = Field(default_factory=dict, description="图片 id → 草稿数组")
+    images: dict[str, list] | None = Field(default=None, description="图片 id → 草稿数组（省略表示不碰草稿）")
+    review: dict[str, dict | str] | None = Field(
+        default=None, description="图片 id → {state, at_ns}；state=unchecked 表示取消"
+    )
     replace: bool = Field(default=False, description="true 时整份替换（用于清空全部草稿）")
+
+
+class AnnotationPromptLabelRequest(BaseModel):
+    """点 / 框提示式预标注（SAM 通道）。
+
+    `points` / `labels` / `box` 都允许传 `null`：`promptlabel.annotate()` 本来就把
+    `None` 当空处理，而 pydantic 默认会拒掉 `null` 并回 422——那样用户看到的是
+    `Input should be a valid list`，而不是后端精心写的那句
+    「请先在画布上点一个点或拉一个框」。当前前端发的是 `[]`，但契约不应该靠这个巧合。
+    """
+
+    image: str = Field(..., description="当前图片绝对路径")
+    points: list[list[float]] | None = Field(default=None, description="提示点 [[x, y], ...]")
+    labels: list[int] | None = Field(default=None, description="每点的标签：1 正 / 0 负；缺省全按正点")
+    box: list[list[float]] | None = Field(default=None, description="框提示 [[x1,y1],[x2,y2]]")
+    epsilon: float = Field(default=0.001, ge=0.0, le=0.1, description="多边形近似系数（相对周长）")
+    label: str = Field(default="", description="草稿类别名")
+    class_id: int = Field(default=0, ge=0)
+
+
+class AnnotationTextLabelRequest(BaseModel):
+    """文本提示预标注（GroundingDINO 通道，可选 SAM 细化）。"""
+
+    image: str = Field(..., description="当前图片绝对路径")
+    prompt: str = Field(..., description="文本提示，如 missing hole")
+    box_thr: float = Field(default=0.3, ge=0.0, le=1.0)
+    text_thr: float = Field(default=0.25, ge=0.0, le=1.0)
+    refine: bool = Field(default=False, description="是否再用 SAM 把框细化成多边形")
+    epsilon: float = Field(default=0.001, ge=0.0, le=0.1)
+    label: str = Field(default="", description="类别名（留空用模型解出的短语）")
+    class_id: int = Field(default=0, ge=0)
+
+
+class ModelDownloadRequest(BaseModel):
+    """触发一次模型下载。"""
+
+    id: str = Field(..., description="模型 id，见 GET /api/modelzoo")
 
 
 class AnnotationAutoLabelBatchRequest(BaseModel):
@@ -2504,9 +3061,14 @@ class AnnotationAutoLabelBatchRequest(BaseModel):
 
     path: str = Field(..., description=".tfanno 工程路径，草稿写入其旁挂文件")
     images: list[dict] = Field(..., description="[{id, path, annotated?}] 待处理图片")
+    mode: str = Field(default="engine", description="engine 自有引擎 / text 文本提示")
     task: str = Field(default="detect")
-    engine: str = Field(..., description=".engine 路径")
+    engine: str = Field(default="", description=".engine 路径（mode=engine 必填）")
     labels: str = Field(default="", description="labels_*.json 路径")
+    prompt: str = Field(default="", description="mode=text 时的文本提示")
+    box_thr: float = Field(default=0.3, ge=0.0, le=1.0)
+    text_thr: float = Field(default=0.25, ge=0.0, le=1.0)
+    refine: bool = Field(default=False, description="text 模式下再用 SAM 细化成多边形")
     conf: float = Field(default=0.25, ge=0.0, le=1.0)
     nms: float = Field(default=0.45, ge=0.0, le=1.0)
     service: str = Field(default="")
@@ -2836,18 +3398,171 @@ def annotation_load_drafts(path: str) -> dict:
 
 @app.post("/api/annotation/drafts")
 def annotation_save_drafts(request: AnnotationDraftsRequest) -> dict:
-    """写草稿（默认增量，`replace=true` 整份替换）。"""
+    """写草稿与审核状态（默认增量，`replace=true` 整份替换）。
+
+    `images` 与 `review` 都省略时是"只读一次返回"的语义，等价于一次空合并——
+    不报错，让前端可以放心地"总是提交一次"而不用先判断有没有改动。
+    """
     target = _drafts_target(request.path)
     try:
         if request.replace:
-            meta = annotation_drafts.save(target, request.images)
+            meta = annotation_drafts.save(
+                target, request.images, review=request.review, replace=True
+            )
         else:
-            meta = annotation_drafts.merge(target, request.images)
+            meta = annotation_drafts.merge(target, request.images, review=request.review)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except OSError as exc:
         raise HTTPException(status_code=500, detail=f"写入草稿失败：{exc}") from exc
     return {"ok": True, "project": str(target), "drafts_path": meta.pop("path", ""), **meta}
+
+
+@app.post("/api/annotation/drafts/review")
+def annotation_set_review(request: AnnotationDraftsRequest) -> dict:
+    """只改审核状态（`K` / `Shift+K` 的专用入口）。
+
+    单独一个路径而不是复用 POST drafts：审核是高频操作（连续按 K），
+    请求体只有 `{path, review}`，不用带上草稿，也就不存在"自动保存还没跑完，
+    审核的请求先把草稿覆盖成空"的竞态。
+    """
+    if not request.review:
+        raise HTTPException(status_code=400, detail="review 不能为空")
+    target = _drafts_target(request.path)
+    try:
+        meta = annotation_drafts.merge(target, review=request.review)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"写入审核状态失败：{exc}") from exc
+    return {"ok": True, "project": str(target), "drafts_path": meta.pop("path", ""), **meta}
+
+
+# ---------------------------------------------------------------------------
+# 提示式预标注（点 / 框 / 文本）
+# ---------------------------------------------------------------------------
+def _prompt_image(path: str) -> Path:
+    """校验图片路径。只接受配置里允许的图片后缀：这条路会读图做推理，
+    放开任意文件等于给了一个"让服务解码任意文件"的入口。"""
+    target = _ensure_allowed_path(path)
+    if not target.is_file():
+        raise HTTPException(status_code=404, detail=f"图片不存在：{target}")
+    if target.suffix.lower() not in config.IMAGE_SUFFIXES:
+        raise HTTPException(status_code=400, detail=f"不支持的图片格式：{target.suffix}")
+    return target
+
+
+def _prompt_error(exc: Exception) -> HTTPException:
+    """把三条通道的业务错误统一映射成 400，并带上"该怎么办"。
+
+    模型缺失是最常见的失败（首次使用没下载），它的错误文本里已经带了下载指引，
+    所以直接透传 message；其余异常也照抄，不做二次措辞——现场排查时
+    原始信息比包装过的话有用。
+    """
+    return HTTPException(status_code=400, detail=str(exc))
+
+
+@app.post("/api/annotation/prompt-label")
+def annotation_prompt_label(request: AnnotationPromptLabelRequest) -> dict:
+    """点 / 框 → SAM → 多边形草稿。
+
+    **不落盘**：草稿由前端接收后进内存草稿池，再由前端的防抖自动保存统一写盘。
+    接口自己写盘会让"用户反悔、不想要这批草稿"变成一次磁盘删除操作。
+    """
+    target = _prompt_image(request.image)
+    if not request.points and not request.box:
+        raise HTTPException(status_code=400, detail="请先在画布上点一个点或拉一个框")
+    try:
+        drafts = promptlabel.annotate(
+            target,
+            points=request.points or [],
+            labels=request.labels or [],
+            box=request.box or [],
+            epsilon=request.epsilon,
+            label=request.label,
+            class_id=request.class_id,
+        )
+    except promptlabel.PromptLabelError as exc:
+        raise _prompt_error(exc) from exc
+    except modelzoo.ModelMissing as exc:
+        raise _prompt_error(exc) from exc
+    except OSError as exc:
+        raise HTTPException(status_code=400, detail=f"提示式预标注失败：{exc}") from exc
+
+    warnings = []
+    if not drafts:
+        warnings.append("没有生成掩码：可以换一个位置再点一次，或把框拉大一些把目标整个包住")
+    return {
+        "ok": True,
+        "channel": "sam",
+        "drafts": drafts,
+        "count": len(drafts),
+        "warnings": warnings,
+    }
+
+
+@app.post("/api/annotation/text-label")
+def annotation_text_label(request: AnnotationTextLabelRequest) -> dict:
+    """文本提示 → 检出框（可选细化成多边形）。"""
+    target = _prompt_image(request.image)
+    if not str(request.prompt or "").strip():
+        raise HTTPException(status_code=400, detail="文本提示不能为空")
+    try:
+        result = textlabel.annotate(
+            target,
+            request.prompt,
+            box_thr=request.box_thr,
+            text_thr=request.text_thr,
+            refine=request.refine,
+            epsilon=request.epsilon,
+            label=request.label,
+            class_id=request.class_id,
+        )
+    except textlabel.TextLabelError as exc:
+        raise _prompt_error(exc) from exc
+    except modelzoo.ModelMissing as exc:
+        raise _prompt_error(exc) from exc
+    except OSError as exc:
+        raise HTTPException(status_code=400, detail=f"文本预标注失败：{exc}") from exc
+
+    return {"ok": True, "channel": "text", **result}
+
+
+# ---------------------------------------------------------------------------
+# 模型仓库
+# ---------------------------------------------------------------------------
+@app.get("/api/modelzoo")
+def modelzoo_list() -> dict:
+    """内置模型清单与本地状态（含正在进行的下载任务）。"""
+    return {"ok": True, **modelzoo.list_models(), "jobs": modelzoo.recent()}
+
+
+@app.post("/api/modelzoo/download")
+def modelzoo_download(request: ModelDownloadRequest) -> dict:
+    """开始下载（幂等：已就绪返回 `already=True`，正在下返回 400 说明原因）。"""
+    try:
+        job = modelzoo.start_download(request.id)
+    except modelzoo.DownloadBusy as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except modelzoo.ModelError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"ok": True, "job": job}
+
+
+@app.get("/api/modelzoo/download/{job_id}")
+def modelzoo_progress(job_id: str) -> dict:
+    job = modelzoo.get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"未知下载任务：{job_id}（服务可能重启过）")
+    return {"ok": True, "job": job}
+
+
+@app.post("/api/modelzoo/download/{job_id}/cancel")
+def modelzoo_cancel(job_id: str) -> dict:
+    job = modelzoo.cancel(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"未知下载任务：{job_id}")
+    return {"ok": True, "job": job}
 
 
 # ---------------------------------------------------------------------------
@@ -2856,16 +3571,21 @@ def annotation_save_drafts(request: AnnotationDraftsRequest) -> dict:
 def _batch_select_images(
     request: AnnotationAutoLabelBatchRequest,
     known_drafts: dict,
+    reviewed: set[str] | None = None,
 ) -> tuple[list[dict], int, list[str]]:
     """把请求里的图片清单过滤成"真正要跑的"。
 
     返回 ``(items, skipped, reasons)``。跳过原因要带回去：用户看到"跳过 12 张"
     却不知道为什么，第一反应是程序坏了。
+
+    `scope=pending` 跳过"已标注 / 已有草稿 / 已审核"三类：审核过的图片用户已经
+    确认过结论，再跑一遍会把人工确认的结果换成新的候选，等于把做过的工作抹掉。
     """
     items: list[dict] = []
     skipped = 0
     reasons: list[str] = []
     seen: set[str] = set()
+    reviewed = reviewed or set()
 
     for raw in request.images:
         if len(items) >= request.limit:
@@ -2884,7 +3604,9 @@ def _batch_select_images(
             continue
         seen.add(image_id)
 
-        if request.scope == "pending" and (raw.get("annotated") or known_drafts.get(image_id)):
+        if request.scope == "pending" and (
+            raw.get("annotated") or known_drafts.get(image_id) or image_id in reviewed
+        ):
             skipped += 1
             continue
 
@@ -2911,18 +3633,44 @@ def annotation_autolabel_batch(request: AnnotationAutoLabelBatchRequest) -> dict
 
     结果直接写进旁挂草稿文件，**不经过响应体**：几百张图的草稿走 HTTP 传一遍
     既慢又容易在超时处丢一半，写盘还能让"中途崩溃"最多损失当前这一张。
+
+    两条通道（`mode`）：
+    - `engine`：逐个跑自训 `.engine`，必须给引擎路径；
+    - `text`：逐个跑文本提示，必须给 prompt，且**启动前**先确认模型就绪——
+      否则会建一个"跑 300 张全失败"的空任务，用户等到最后才看到 300 条错误。
     """
     target = _drafts_target(request.path)
-    engine = _ensure_allowed_path(request.engine)
-    if not engine.is_file():
-        raise HTTPException(status_code=404, detail=f"引擎不存在：{engine}")
+    mode = str(request.mode or "engine").strip().lower()
+    if mode not in ("engine", "text"):
+        raise HTTPException(status_code=400, detail=f"不支持的批量模式：{mode}（engine / text）")
 
+    engine = ""
     labels_path = ""
-    if request.labels.strip():
-        labels_path = str(_ensure_allowed_path(request.labels))
+    prompt = ""
+    if mode == "engine":
+        if not str(request.engine or "").strip():
+            raise HTTPException(status_code=400, detail="引擎通道需要先选择 .engine 文件")
+        engine_path = _ensure_allowed_path(request.engine)
+        if not engine_path.is_file():
+            raise HTTPException(status_code=404, detail=f"引擎不存在：{engine_path}")
+        engine = str(engine_path)
+        if request.labels.strip():
+            labels_path = str(_ensure_allowed_path(request.labels))
+    else:
+        prompt = str(request.prompt or "").strip()
+        if not prompt:
+            raise HTTPException(status_code=400, detail="文本通道需要先填写提示词")
+        # 提前探一次模型：缺文件在这里就报 400，而不是等 300 张图跑完
+        try:
+            textlabel.get_session()
+        except textlabel.ModelMissing as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except OSError as exc:
+            raise HTTPException(status_code=400, detail=f"文本模型无法加载：{exc}") from exc
 
-    known_drafts, _meta = annotation_drafts.load(target)
-    items, skipped, reasons = _batch_select_images(request, known_drafts)
+    known_drafts, known_meta = annotation_drafts.load(target)
+    reviewed = set((known_meta.get("review") or {}).keys())
+    items, skipped, reasons = _batch_select_images(request, known_drafts, reviewed)
     if not items:
         detail = "没有需要处理的图片"
         if reasons:
@@ -2930,9 +3678,14 @@ def annotation_autolabel_batch(request: AnnotationAutoLabelBatchRequest) -> dict
         raise HTTPException(status_code=400, detail=detail)
 
     options = {
+        "mode": mode,
         "task": request.task,
-        "engine": str(engine),
+        "engine": engine,
         "labels": labels_path,
+        "prompt": prompt,
+        "box_thr": request.box_thr,
+        "text_thr": request.text_thr,
+        "refine": request.refine,
         "conf": request.conf,
         "nms": request.nms,
         "service": request.service.strip(),

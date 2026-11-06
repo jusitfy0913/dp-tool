@@ -1,4 +1,4 @@
-﻿// 标注工作台：Canvas 2D 画布、六种形状编辑、撤销重做、自动保存、预标注草稿。
+// 标注工作台：Canvas 2D 画布、六种形状编辑、撤销重做、自动保存、预标注草稿。
 //
 // 坐标系约定与推理页查看器完全一致（复用 viewer.js 的纯函数）：
 //   p_screen = p_image * scale + offset
@@ -13,19 +13,26 @@ import {
   annotationImageUrl,
   autoLabel,
   browse,
+  cancelModelDownload,
+  downloadModel,
   exportAnnotationProject,
   getBatchAutoLabel,
+  getModelDownload,
   importAnnotationProject,
   listBatchAutoLabel,
+  listModelzoo,
   listModels,
   loadAnnotationDrafts,
   loadAnnotationProject,
   nativeDialog,
+  promptLabel,
   saveAnnotationDrafts,
   saveAnnotationProject,
+  saveAnnotationReview,
   scanAnnotationImages,
   startBatchAutoLabel,
   stopBatchAutoLabel,
+  textLabel,
 } from "./api.js";
 import {
   clampScale,
@@ -88,7 +95,9 @@ const TOOL_SHORTCUTS = {
   p: "polygon",
   l: "line",
   t: "point",
-  k: "keypoints",
+  // 关键点组从 K 改成 G：K 让给了「标为已审核」——审核是每个工程都要用的动作，
+  // 而关键点是很少用的工具，占用高频键会让审核流程每次都要先想一下。
+  g: "keypoints",
 };
 
 // ---------------------------------------------------------------------------
@@ -103,6 +112,8 @@ const state = {
   saving: false,
   currentIndex: -1,
   selectedId: "",
+  /** 表格高亮滚动只在「选中对象变了」时做一次，避免每次重绘都把表格拉回去。 */
+  boxScrollId: "",
   tool: "select",
   /** 正在绘制中的顶点（图像坐标）。画完即清空。 */
   pending: [],
@@ -161,6 +172,41 @@ const state = {
   batchTimer: 0,
   /** 训练产物是否已经拉过（懒加载：不展开预标注参数就不扫目录）。 */
   engineLoaded: false,
+  /**
+   * 预标注通道：`engine` 自有引擎 / `prompt` 点框提示（SAM）/ `text` 文本提示。
+   *
+   * 三选一而不是"可叠加"：提示通道要求画布的点击变成"放点"，与绘制工具
+   * 抢同一套鼠标事件。做成叠加态的话，用户点一下不确定是画框还是放点，
+   * 而两者都是"改数据"的操作，猜错的代价是白画一个框。
+   */
+  alChannel: "engine",
+  /**
+   * 提示点：`{points: [[x,y]], labels: [1|0]}`（图像坐标）。
+   * label 1 = 正点（要这里），0 = 负点（不要这里），与 SAM 的 decoder 标签一致。
+   */
+  promptPoints: [],
+  promptLabels: [],
+  /** 拖拽中的框提示 `[[x1,y1],[x2,y2]]`（图像坐标），松手后才有值。 */
+  promptBox: null,
+  /** 正在拖框（`{startScreen, start, moved}`），用于区分"点一下"和"拉一个框"。 */
+  promptDrag: null,
+  /** 提示式推理是否在跑：防止连点 Enter 重复发请求。 */
+  promptBusy: false,
+  /**
+   * 审核状态：图片 id → `{state: "checked", at_ns}`。
+   *
+   * 和草稿分开存（`state.drafts` 是 Map<id, 草稿数组>）：审核状态属于"图"，
+   * 草稿属于"候选"，两者数量与生命周期都不一样，混在一起会让"清空草稿"
+   * 顺手把审核进度一起清掉。
+   */
+  review: new Map(),
+  /** 审核状态是否还在等写盘（连按 K 时合并成一次请求）。 */
+  reviewDirty: false,
+  reviewSaveTimer: 0,
+  /** 内置模型清单与下载任务：`{items, jobs, dir}`，null 表示还没拉过。 */
+  modelzoo: null,
+  /** 正在轮询的下载任务 id 集合（避免同一任务起两个定时器）。 */
+  modelPolls: new Set(),
 };
 
 const el = {};
@@ -313,12 +359,468 @@ async function loadDraftsFromDisk() {
       if (!Array.isArray(drafts) || !drafts.length) continue;
       state.drafts.set(imageId, drafts.map((draft) => ({ ...draft, _draft: true })));
     }
+    // 审核状态和草稿同住一个文件：一起读回来，刷新后"审到哪了"不会倒退
+    state.review = new Map(Object.entries(data.review || {}));
     if (data.warnings?.length) {
       setStatus(`草稿文件有问题：${data.warnings[0]}`, "warn");
     }
   } catch (error) {
     setStatus(`读取草稿失败：${error.message}`, "warn");
   }
+}
+
+// ---------------------------------------------------------------------------
+// 审核状态（已审核 / 未审核）
+// ---------------------------------------------------------------------------
+/**
+ * 待写盘的审核变更：图片 id → `"checked" | "unchecked"`。
+ *
+ * 为什么需要"待写盘"这一层：连续按 K 浏览 20 张是一秒内的事，每张都发一次请求
+ * 会让浏览器排 20 个连接，而写的是同一个文件，服务端串行处理后有一半是白跑的。
+ * 合并成一次写，语义完全一样（每次都是"这几张图的状态变成这样"）。
+ */
+let reviewPending = new Map();
+/** 审核状态写盘请求的链：保证两次写不并发（并发会互相覆盖）。 */
+let reviewSaveTask = null;
+
+function isReviewed(imageId) {
+  return Boolean(imageId && state.review.has(imageId));
+}
+
+function reviewedStats() {
+  const total = state.project?.images?.length || 0;
+  let checked = 0;
+  for (const image of state.project?.images || []) {
+    if (state.review.has(image.id)) checked += 1;
+  }
+  return { checked, total };
+}
+
+function scheduleReviewSave() {
+  if (!state.path) return;
+  if (state.reviewSaveTimer) clearTimeout(state.reviewSaveTimer);
+  state.reviewSaveTimer = window.setTimeout(() => {
+    state.reviewSaveTimer = 0;
+    flushReviewChanges();
+  }, 300);
+}
+
+/**
+ * 把待写的审核变更落盘。
+ *
+ * 成功时用后端返回的 `review` 覆盖内存：后端会把 `unchecked` 从文件里删掉，
+ * 直接拿服务端的结果当权威，比在前端自己模拟"删除"更不容易两边不一致。
+ */
+function flushReviewChanges({ silent = true } = {}) {
+  const run = () => doFlushReview({ silent });
+  const task = (reviewSaveTask || Promise.resolve()).then(run, run);
+  reviewSaveTask = task;
+  task.then(
+    () => {
+      if (reviewSaveTask === task) reviewSaveTask = null;
+    },
+    () => {
+      if (reviewSaveTask === task) reviewSaveTask = null;
+    },
+  );
+  return task;
+}
+
+async function doFlushReview({ silent }) {
+  if (!state.path || reviewPending.size === 0) return;
+  const path = state.path;
+  const batch = reviewPending;
+  reviewPending = new Map();
+  const review = {};
+  for (const [imageId, stateName] of batch) {
+    review[imageId] = { state: stateName, at_ns: String(Date.now()) };
+  }
+  try {
+    const result = await saveAnnotationReview({ path, review });
+    if (path !== state.path) return;
+    // 期间用户可能又按了几张：把它们重新并进待写集合
+    state.review = new Map(Object.entries(result.review || {}));
+    if (reviewPending.size) scheduleReviewSave();
+    renderReviewState();
+    renderImageList();
+    if (!silent) setStatus(`审核状态已保存（已审核 ${state.review.size} 张）`, "ok");
+  } catch (error) {
+    // 失败了要把这批放回去，否则界面显示"已审核"而磁盘上没有，刷新就倒退
+    for (const [imageId, stateName] of batch) {
+      if (!reviewPending.has(imageId)) reviewPending.set(imageId, stateName);
+    }
+    setStatus(`审核状态保存失败：${error.message}`, "bad");
+  }
+}
+
+/** 标为已审核（并可选跳到下一张未审核）。 */
+async function markReviewed({ advance = true } = {}) {
+  const image = currentImage();
+  if (!image) {
+    setStatus("先选一张图片", "bad");
+    return;
+  }
+  state.review.set(image.id, { state: "checked", at_ns: String(Date.now()) });
+  reviewPending.set(image.id, "checked");
+  renderReviewState();
+  renderImageList();
+  if (advance) {
+    const moved = await nextUnreviewed();
+    if (!moved) setStatus(`已审核 ${image.id}（已是最后一张未审核的图片）`, "ok");
+  } else {
+    setStatus(`已把 ${image.id} 标为已审核`, "ok");
+  }
+  flushReviewChanges({ silent: true });
+}
+
+/** 取消当前图片的审核状态。 */
+function unmarkReviewed() {
+  const image = currentImage();
+  if (!image) return;
+  if (!state.review.has(image.id)) {
+    setStatus("当前图片本来就没有审核状态", "warn");
+    return;
+  }
+  state.review.delete(image.id);
+  reviewPending.set(image.id, "unchecked");
+  renderReviewState();
+  renderImageList();
+  flushReviewChanges({ silent: true });
+  setStatus(`已取消 ${image.id} 的审核状态`);
+}
+
+/**
+ * 跳到下一张未审核的图片。
+ *
+ * 只往后找，找不到再绕回开头找一遍（只绕一次）。不无限循环：
+ * 全部审完时应该停下来提示"都审过了"，而不是把用户又送回第一张。
+ */
+async function nextUnreviewed() {
+  const images = state.project?.images || [];
+  if (!images.length) return false;
+  const start = state.currentIndex;
+  for (let step = 1; step <= images.length; step += 1) {
+    const index = (start + step) % images.length;
+    if (index === start) break;
+    if (!state.review.has(images[index].id)) {
+      await switchImage(index);
+      return true;
+    }
+  }
+  return false;
+}
+
+function renderReviewState() {
+  if (el.reviewCount) {
+    const { checked, total } = reviewedStats();
+    el.reviewCount.textContent = `${checked}/${total}`;
+    el.reviewCount.title = `已审核 ${checked} 张，共 ${total} 张`;
+  }
+  const image = currentImage();
+  const checked = isReviewed(image?.id);
+  if (el.unmarkReviewed) el.unmarkReviewed.disabled = !checked;
+}
+
+// ---------------------------------------------------------------------------
+// 提示式预标注（点 / 框 / 文本）
+// ---------------------------------------------------------------------------
+/** 当前是否在提示模式：只有这个模式下画布点击变成"放点"。 */
+function promptActive() {
+  return state.alChannel === "prompt";
+}
+
+function clearPrompt() {
+  state.promptPoints = [];
+  state.promptLabels = [];
+  state.promptBox = null;
+  state.promptDrag = null;
+  renderCanvas();
+}
+
+function setAlChannel(channel) {
+  const next = ["engine", "prompt", "text"].includes(channel) ? channel : "engine";
+  state.alChannel = next;
+  if (next !== "prompt") clearPrompt();
+  if (el.alChannel) el.alChannel.value = next;
+  el.chEngine?.classList.toggle("hidden", next !== "engine");
+  el.chPrompt?.classList.toggle("hidden", next !== "prompt");
+  el.chText?.classList.toggle("hidden", next !== "text");
+  // 切到提示模式就顺手把绘制工具收回 select：否则"点一下"既可能是放点
+  // 也可能是画框，取决于用户上次选的工具，而界面上看不出来。
+  // 工具按钮也一并禁用——按钮亮着却画不出东西，比按钮变灰更让人困惑。
+  if (next === "prompt" && state.tool !== "select") setTool("select");
+  document.querySelectorAll("#panel-annotate .tool").forEach((button) => {
+    button.disabled = next === "prompt" && button.dataset.tool !== "select";
+  });
+  if (next === "text" || next === "prompt") refreshModelzoo();
+  renderCanvas();
+}
+
+/** 读界面上的掩码精细度，夹到合理区间（0 会让 approxPolyDP 退化成原始轮廓）。 */
+function promptEpsilon() {
+  const value = Number(el.alEpsilon?.value ?? 0.001);
+  if (!Number.isFinite(value) || value <= 0) return 0.001;
+  return Math.min(0.05, value);
+}
+
+function promptSuggestionLabel() {
+  const classes = state.project?.classes || [];
+  return classes[0]?.name || "";
+}
+
+async function runPromptLabel() {
+  const image = currentImage();
+  if (!image) {
+    setStatus("先选一张图片", "bad");
+    return;
+  }
+  if (!state.promptPoints.length && !state.promptBox) {
+    setStatus("先在画布上点一个正点、或拉一个框，再按 Enter 执行", "warn");
+    return;
+  }
+  if (state.promptBusy) return;
+  state.promptBusy = true;
+  setStatus("SAM 正在生成掩码…（首次加载模型会慢一些）", "warn");
+  try {
+    const result = await promptLabel({
+      image: imageApiPath(image),
+      points: state.promptPoints,
+      labels: state.promptLabels,
+      box: state.promptBox || [],
+      epsilon: promptEpsilon(),
+      label: (el.alPrompt?.value || "").trim() || promptSuggestionLabel(),
+    });
+    const drafts = result.drafts || [];
+    // 追加而不是替换：用户经常对同一张图连点几处分别出草稿，
+    // 替换会把前一次刚点出来的东西丢掉。
+    const pool = currentDrafts();
+    state.drafts.set(image.id, pool.concat(drafts));
+    markDraftsDirty(image.id);
+    const bits = [`新增 ${drafts.length} 个多边形草稿`];
+    if (result.warnings?.length) bits.push(result.warnings.join("；"));
+    setStatus(bits.join(" · "), drafts.length ? "ok" : "warn");
+    renderAll();
+    renderCanvas();
+  } catch (error) {
+    setStatus(`提示式预标注失败：${error.message}`, "bad");
+  } finally {
+    state.promptBusy = false;
+  }
+}
+
+function textPromptValue() {
+  return (el.alPrompt?.value || "").trim();
+}
+
+async function runTextLabel() {
+  const image = currentImage();
+  if (!image) {
+    setStatus("先选一张图片", "bad");
+    return;
+  }
+  const prompt = textPromptValue();
+  if (!prompt) {
+    setStatus("先在「预标注参数 → 文本提示」里填一句话，例如 missing hole", "bad");
+    el.autoLabelBox?.setAttribute("open", "");
+    return;
+  }
+  if (state.promptBusy) return;
+  state.promptBusy = true;
+  setStatus(`文本预标注中…（${prompt}）首帧要加载模型，之后快很多`, "warn");
+  try {
+    const result = await textLabel({
+      image: imageApiPath(image),
+      prompt,
+      box_thr: Number(el.alBoxThr?.value || 0.3),
+      text_thr: Number(el.alTextThr?.value || 0.25),
+      refine: Boolean(el.alRefine?.checked),
+      epsilon: promptEpsilon(),
+    });
+    const drafts = result.drafts || [];
+    state.drafts.set(image.id, drafts);
+    markDraftsDirty(image.id);
+    const bits = [`${drafts.length} 个草稿（文本：${prompt}）`];
+    if (result.warnings?.length) bits.push(result.warnings.join("；"));
+    setStatus(bits.join(" · "), drafts.length ? "ok" : "warn");
+    renderAll();
+    renderCanvas();
+  } catch (error) {
+    setStatus(`文本预标注失败：${error.message}`, "bad");
+  } finally {
+    state.promptBusy = false;
+  }
+}
+
+/** 当前通道对应的单图执行函数（工具栏「预标注」按钮与 Enter 共用）。 */
+function runCurrentChannel() {
+  if (state.alChannel === "prompt") return runPromptLabel();
+  if (state.alChannel === "text") return runTextLabel();
+  return runAutoLabel();
+}
+
+// ---------------------------------------------------------------------------
+// 内置模型仓库
+// ---------------------------------------------------------------------------
+async function refreshModelzoo({ manual = false } = {}) {
+  if (manual) setStatus("正在读取模型清单…", "warn");
+  try {
+    const data = await listModelzoo();
+    state.modelzoo = data;
+    renderModelzoo();
+    // 有正在跑的任务就接着轮询：刷新页面后进度条不能凭空消失
+    for (const job of data.jobs || []) {
+      if (job.status === "running") pollModelDownload(job.id);
+    }
+    if (manual) {
+      const missing = Number(data.missing || 0);
+      setStatus(
+        missing ? `模型仓库：还缺 ${missing} 个模型（点「下载」）` : "模型仓库：全部就绪",
+        missing ? "warn" : "ok",
+      );
+    }
+  } catch (error) {
+    if (manual) setStatus(`读取模型清单失败：${error.message}`, "bad");
+  }
+}
+
+function renderModelzoo() {
+  if (!el.modelList) return;
+  const data = state.modelzoo;
+  el.modelList.innerHTML = "";
+  if (!data) {
+    if (el.modelCount) el.modelCount.textContent = "—";
+    return;
+  }
+  const items = data.items || [];
+  const present = items.filter((item) => item.present).length;
+  if (el.modelCount) el.modelCount.textContent = `${present}/${items.length}`;
+  if (el.modelHint) {
+    const jobs = (data.jobs || []).filter((job) => job.status === "running");
+    el.modelHint.textContent = jobs.length
+      ? `正在下载：${jobs.map((job) => `${job.model} ${job.percent}%`).join("；")}`
+      : `模型目录：${data.dir || ""}`;
+  }
+  // 运行中的任务按模型索引，用来显示进度条
+  const running = new Map();
+  for (const job of data.jobs || []) {
+    if (job.status === "running") running.set(job.model, job);
+  }
+
+  for (const item of items) {
+    const li = document.createElement("li");
+    li.className = "anno-model" + (item.present ? " present" : "");
+    const head = document.createElement("div");
+    head.className = "anno-model-head";
+    const name = document.createElement("span");
+    name.className = "name";
+    name.textContent = item.name;
+    const stateTag = document.createElement("span");
+    stateTag.className = `anno-model-state ${item.present ? "ok" : ""}`;
+    stateTag.textContent = item.present ? "已就绪" : "未下载";
+    head.append(name, stateTag);
+
+    const use = document.createElement("p");
+    use.className = "anno-hint";
+    use.textContent = `${item.use} · ${item.license} · ${formatBytes(item.total_bytes)}`;
+    li.append(head, use);
+
+    const job = running.get(item.id);
+    if (job) {
+      const bar = document.createElement("div");
+      bar.className = "anno-progress anno-progress-inline";
+      const fill = document.createElement("div");
+      fill.style.width = `${Math.min(100, job.percent || 0)}%`;
+      bar.appendChild(fill);
+      const meta = document.createElement("p");
+      meta.className = "anno-hint";
+      meta.textContent = `${job.percent || 0}% · ${formatBytes(job.downloaded)} / ${formatBytes(job.total)}`;
+      const cancel = document.createElement("button");
+      cancel.type = "button";
+      cancel.className = "mini danger";
+      cancel.textContent = "取消";
+      cancel.addEventListener("click", () => cancelDownload(job.id));
+      li.append(bar, meta, cancel);
+    } else if (!item.present) {
+      const download = document.createElement("button");
+      download.type = "button";
+      download.className = "mini accent";
+      download.textContent = `下载 · ${formatBytes(item.total_bytes)}`;
+      download.addEventListener("click", () => startDownload(item.id));
+      li.appendChild(download);
+    }
+    el.modelList.appendChild(li);
+  }
+}
+
+function formatBytes(value) {
+  const number = Number(value || 0);
+  if (!number) return "未知大小";
+  if (number < 1024 * 1024) return `${(number / 1024).toFixed(0)} KB`;
+  return `${(number / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+async function startDownload(id) {
+  setStatus(`开始下载 ${id}…（支持断点续传）`, "warn");
+  try {
+    const result = await downloadModel(id);
+    if (result.job?.already) {
+      setStatus(`${id} 已就绪`, "ok");
+      await refreshModelzoo({ manual: true });
+      return;
+    }
+    if (result.job?.id) pollModelDownload(result.job.id);
+    await refreshModelzoo();
+  } catch (error) {
+    setStatus(`下载启动失败：${error.message}`, "bad");
+  }
+}
+
+async function cancelDownload(jobId) {
+  try {
+    await cancelModelDownload(jobId);
+    setStatus("已请求取消，当前分片写完就停", "warn");
+    await refreshModelzoo();
+  } catch (error) {
+    setStatus(`取消失败：${error.message}`, "bad");
+  }
+}
+
+/**
+ * 轮询下载进度。
+ *
+ * 用 `setTimeout` 自递归而不是 `setInterval`：请求本身有往返时间，
+ * 固定间隔会在网络慢时堆叠请求，堆到十几个之后进度反而更卡。
+ */
+function pollModelDownload(jobId) {
+  if (!jobId || state.modelPolls.has(jobId)) return;
+  state.modelPolls.add(jobId);
+  const tick = async () => {
+    try {
+      const result = await getModelDownload(jobId);
+      const job = result.job;
+      if (job.status === "running") {
+        if (state.modelzoo) {
+          state.modelzoo.jobs = [job, ...(state.modelzoo.jobs || []).filter((item) => item.id !== job.id)];
+          renderModelzoo();
+        }
+        window.setTimeout(tick, 500);
+        return;
+      }
+      state.modelPolls.delete(jobId);
+      if (job.status === "done") {
+        setStatus(`模型下载完成：${job.model}`, "ok");
+      } else if (job.status === "cancelled") {
+        setStatus(`已取消下载：${job.model}`, "warn");
+      } else {
+        setStatus(`下载失败：${job.model} · ${job.error || "未知原因"}`, "bad");
+      }
+      await refreshModelzoo();
+    } catch (error) {
+      state.modelPolls.delete(jobId);
+      setStatus(`下载进度查询失败：${error.message}`, "bad");
+    }
+  };
+  window.setTimeout(tick, 400);
 }
 
 function classById(id) {
@@ -518,9 +1020,12 @@ async function adoptProject(data, path) {
   state.redo.length = 0;
   state.drafts.clear();
   state.draftDirty.clear();
+  state.review.clear();
+  reviewPending = new Map();
   state.hidden.clear();
   state.selectedId = "";
   state.pending = [];
+  clearPrompt();
   state.viewValid = false;
   state.currentIndex = state.project.images.length ? 0 : -1;
   if (el.path) el.path.value = state.path;
@@ -612,6 +1117,8 @@ async function createProject() {
     state.redo.length = 0;
     state.drafts.clear();
     state.draftDirty.clear();
+    state.review.clear();
+    reviewPending = new Map();
     if (el.path) el.path.value = state.path;
     // 同名旁挂草稿属于"旧工程"：新工程里既没有那些图片，留着只会污染草稿池
     try {
@@ -828,9 +1335,11 @@ function resizeCanvas() {
 
 function renderAll() {
   renderClassList();
+  renderBoxTable();
   renderDraftList();
   renderImageList();
   renderProps();
+  renderReviewState();
   updateSaveState();
   updateEmptyHint();
 }
@@ -951,6 +1460,13 @@ function drawShape(ctx, obj, options = {}) {
         ctx.fill();
       }
       ctx.stroke();
+      // 选中再描一圈青色：表格点中和画布点中是同一种高亮，线宽不够时在深色图上会看丢。
+      if (selected) {
+        ctx.strokeStyle = "#22d3ee";
+        ctx.lineWidth = 4;
+        ctx.setLineDash([]);
+        ctx.stroke();
+      }
       break;
     }
     case "polygon": {
@@ -960,6 +1476,12 @@ function drawShape(ctx, obj, options = {}) {
         ctx.fill();
       }
       ctx.stroke();
+      if (selected) {
+        ctx.strokeStyle = "#22d3ee";
+        ctx.lineWidth = 4;
+        ctx.setLineDash([]);
+        ctx.stroke();
+      }
       break;
     }
     case "line": {
@@ -1018,7 +1540,42 @@ function drawShape(ctx, obj, options = {}) {
 function drawHandles(ctx, obj) {
   const points = obj.points || [];
   ctx.save();
+  // 矩形的手柄画在四个可见角上，不画在存储用的两个对角点上。
+  // 存储点在拖动时会被归一化成左上/右下，手柄若跟着存储点走，
+  // 鼠标按住的那个角会突然跳到另一头。
+  if (obj.shape_type === "rectangle" || obj.shape_type === "rotated_rect") {
+    for (const corner of shapeCorners(obj)) {
+      const screen = imageToScreen(corner);
+      ctx.beginPath();
+      ctx.rect(screen.x - HANDLE_RADIUS, screen.y - HANDLE_RADIUS, HANDLE_RADIUS * 2, HANDLE_RADIUS * 2);
+      ctx.fillStyle = "rgba(8,12,16,0.9)";
+      ctx.fill();
+      ctx.strokeStyle = "#22d3ee";
+      ctx.lineWidth = 1.5;
+      ctx.stroke();
+    }
+    const knob = rotateHandlePoint(obj);
+    if (knob) {
+      const screen = imageToScreen(knob);
+      const top = imageToScreen(shapeCorners(obj)[0]);
+      const top2 = imageToScreen(shapeCorners(obj)[1]);
+      const mid = { x: (top.x + top2.x) / 2, y: (top.y + top2.y) / 2 };
+      ctx.beginPath();
+      ctx.moveTo(mid.x, mid.y);
+      ctx.lineTo(screen.x, screen.y);
+      ctx.strokeStyle = "rgba(255,209,102,0.9)";
+      ctx.lineWidth = 1.5;
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.arc(screen.x, screen.y, 6, 0, Math.PI * 2);
+      ctx.fillStyle = "#ffd166";
+      ctx.fill();
+      ctx.strokeStyle = "rgba(8,12,16,0.9)";
+      ctx.stroke();
+    }
+  }
   for (const point of points) {
+    if (obj.shape_type === "rectangle" || obj.shape_type === "rotated_rect") break;
     const screen = imageToScreen(point);
     ctx.beginPath();
     ctx.rect(screen.x - HANDLE_RADIUS, screen.y - HANDLE_RADIUS, HANDLE_RADIUS * 2, HANDLE_RADIUS * 2);
@@ -1085,7 +1642,25 @@ function pendingPreview() {
   return { shape_type: state.tool, points, class_id: activeClassId(), label: "" };
 }
 
-function renderCanvas() {
+let canvasFrame = 0;
+let canvasSkipMini = false;
+
+function renderCanvas(options = {}) {
+  if (options.coalesce) {
+    canvasSkipMini = canvasSkipMini || Boolean(options.skipMini);
+    if (canvasFrame) return;
+    canvasFrame = requestAnimationFrame(() => {
+      canvasFrame = 0;
+      const skipMini = canvasSkipMini;
+      canvasSkipMini = false;
+      paintCanvas({ skipMini });
+    });
+    return;
+  }
+  paintCanvas(options);
+}
+
+function paintCanvas(options = {}) {
   const canvas = el.canvas;
   if (!canvas) return;
   const ctx = canvas.getContext("2d");
@@ -1146,6 +1721,8 @@ function renderCanvas() {
   const preview = pendingPreview();
   if (preview) drawShape(ctx, preview, { draft: true });
 
+  if (promptActive()) drawPromptOverlay(ctx);
+
   for (const point of state.pending) {
     const screen = imageToScreen(point);
     ctx.beginPath();
@@ -1179,7 +1756,71 @@ function renderCanvas() {
   }
 
   ctx.restore();
-  renderMini();
+  if (!options.skipMini) renderMini();
+}
+
+/**
+ * 画布上的提示叠加层：正点绿实心、负点红叉、框虚线。
+ *
+ * 为什么不复用 `drawShape`：提示点不是标注对象，没有类别、不该被选中/隐藏/
+ * 参与命中测试。走同一条渲染路径会让它出现在"标注数量"和导出里，
+ * 而它只是一个临时输入。
+ */
+function drawPromptOverlay(ctx) {
+  const image = currentImage();
+  if (!image) return;
+
+  const box = state.promptBox || (state.promptDrag?.moved ? dragBoxPoints(state.promptDrag) : null);
+  if (box) {
+    const a = imageToScreen(box[0]);
+    const b = imageToScreen(box[1]);
+    ctx.save();
+    ctx.strokeStyle = "rgba(34,211,238,0.95)";
+    ctx.lineWidth = 1.5;
+    ctx.setLineDash([6, 4]);
+    ctx.strokeRect(Math.min(a.x, b.x), Math.min(a.y, b.y), Math.abs(b.x - a.x), Math.abs(b.y - a.y));
+    ctx.restore();
+  }
+
+  state.promptPoints.forEach((point, index) => {
+    const screen = imageToScreen(point);
+    const negative = Number(state.promptLabels[index]) === 0;
+    ctx.save();
+    ctx.lineWidth = 2;
+    if (negative) {
+      // 负点用叉：圆点靠颜色区分的话，红绿色盲用户看不出区别
+      ctx.strokeStyle = "#f87171";
+      const r = 6;
+      ctx.beginPath();
+      ctx.moveTo(screen.x - r, screen.y - r);
+      ctx.lineTo(screen.x + r, screen.y + r);
+      ctx.moveTo(screen.x + r, screen.y - r);
+      ctx.lineTo(screen.x - r, screen.y + r);
+      ctx.stroke();
+    } else {
+      ctx.fillStyle = "#34d399";
+      ctx.strokeStyle = "rgba(10,14,19,0.9)";
+      ctx.beginPath();
+      ctx.arc(screen.x, screen.y, 5, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.stroke();
+    }
+    // 序号：点多的时候能看出先后，方便删掉点错的那一个
+    ctx.fillStyle = "rgba(230,240,250,0.9)";
+    ctx.font = "11px system-ui";
+    ctx.fillText(String(index + 1), screen.x + 8, screen.y - 8);
+    ctx.restore();
+  });
+}
+
+/** 拖拽中的框：按起点与当前光标算出归一化（左上/右下）的两点。 */
+function dragBoxPoints(drag) {
+  const end = state.hover?.image;
+  if (!drag || !end) return null;
+  return [
+    [Math.min(drag.start[0], end.x), Math.min(drag.start[1], end.y)],
+    [Math.max(drag.start[0], end.x), Math.max(drag.start[1], end.y)],
+  ];
 }
 
 function renderMini() {
@@ -1194,8 +1835,13 @@ function renderMini() {
   const ratio = window.devicePixelRatio || 1;
   const boxW = 180;
   const boxH = 120;
-  mini.width = Math.round(boxW * ratio);
-  mini.height = Math.round(boxH * ratio);
+  const nextW = Math.round(boxW * ratio);
+  const nextH = Math.round(boxH * ratio);
+  // 每帧改 width 会清空并重建画布，拖框时这是卡顿的主要来源。尺寸没变就别动它。
+  if (mini.width !== nextW || mini.height !== nextH) {
+    mini.width = nextW;
+    mini.height = nextH;
+  }
   mini.style.width = `${boxW}px`;
   mini.style.height = `${boxH}px`;
 
@@ -1310,8 +1956,38 @@ function hitTest(point) {
   return null;
 }
 
+/** 旋转框顶部外侧的圆点（图像坐标）。普通矩形没有这个点，所以不能转。 */
+function rotateHandlePoint(obj) {
+  if (!obj || obj.shape_type !== "rotated_rect") return null;
+  const corners = shapeCorners(obj);
+  if (corners.length !== 4) return null;
+  const mid = [(corners[0][0] + corners[1][0]) / 2, (corners[0][1] + corners[1][1]) / 2];
+  const [a, b] = obj.points || [];
+  if (!a || !b) return null;
+  const cx = (a[0] + b[0]) / 2;
+  const cy = (a[1] + b[1]) / 2;
+  const dx = mid[0] - cx;
+  const dy = mid[1] - cy;
+  const len = Math.hypot(dx, dy) || 1;
+  const gap = 22 / state.view.scale;
+  return [mid[0] + (dx / len) * gap, mid[1] + (dy / len) * gap];
+}
+
 function hitHandle(obj, point) {
   const tolerance = (HANDLE_RADIUS + 3) / state.view.scale;
+  if (obj.shape_type === "rectangle" || obj.shape_type === "rotated_rect") {
+    const knob = rotateHandlePoint(obj);
+    if (knob && Math.hypot(point.x - knob[0], point.y - knob[1]) <= tolerance + 2 / state.view.scale) {
+      return { kind: "rotate" };
+    }
+    const corners = shapeCorners(obj);
+    for (let index = 0; index < corners.length; index += 1) {
+      if (Math.hypot(point.x - corners[index][0], point.y - corners[index][1]) <= tolerance) {
+        return { kind: "corner", index };
+      }
+    }
+    return null;
+  }
   const points = obj.points || [];
   for (let index = 0; index < points.length; index += 1) {
     if (Math.hypot(point.x - points[index][0], point.y - points[index][1]) <= tolerance) {
@@ -1486,12 +2162,44 @@ function onPointerDown(event) {
   }
   if (event.button === 2) return;
 
+  // 提示模式接管左键：这一模式下"点击"的含义是放提示点，不是画形状。
+  // 中键平移在它之前就返回了，所以缩放/平移手感不受影响。
+  if (promptActive() && event.button === 0) {
+    if (event.shiftKey) {
+      state.promptPoints.push([point.x, point.y]);
+      state.promptLabels.push(0);
+      setStatus(`已加一个负点（共 ${state.promptPoints.length} 个提示点），Enter 执行`, "warn");
+      renderCanvas();
+      return;
+    }
+    state.promptDrag = { startScreen: screen, start: [point.x, point.y], moved: false };
+    capturePointer(event);
+    return;
+  }
+
   if (state.tool === "select") {
     const selected = selectedObject();
     if (selected) {
       // 1) 顶点手柄优先：拖动只改那一个点
       const handle = hitHandle(selected, point);
       if (handle) {
+        if (handle.kind === "corner") {
+          const corners = shapeCorners(selected);
+          const opposite = corners[(handle.index + 2) % 4];
+          state.drag = {
+            kind: "corner",
+            index: handle.index,
+            opposite: [opposite[0], opposite[1]],
+            pushed: false,
+          };
+          capturePointer(event);
+          return;
+        }
+        if (handle.kind === "rotate") {
+          state.drag = { kind: "rotate", pushed: false };
+          capturePointer(event);
+          return;
+        }
         if (handle.kind === "insert") {
           // 插点会立刻改变几何，所以这一步就得压栈
           pushHistory();
@@ -1603,6 +2311,16 @@ function onPointerMove(event) {
   if (!image) return;
   const point = toImage(screen);
 
+  // 提示拖框：先更新"是不是真的拖了"，再交给渲染
+  if (state.promptDrag) {
+    const dx = screen.x - state.promptDrag.startScreen.x;
+    const dy = screen.y - state.promptDrag.startScreen.y;
+    if (Math.hypot(dx, dy) > 4) state.promptDrag.moved = true;
+    state.hover = { image: point, snap: null };
+    renderCanvas();
+    return;
+  }
+
   if (state.drag) {
     // 拖动途中也要更新 hover：绘制预览、边拖动都靠它拿当前点
     state.hover = { image: point, snap: null };
@@ -1613,13 +2331,15 @@ function onPointerMove(event) {
   const snapped = event.altKey ? { point, snap: null } : snapPoint(point, { allowClose: state.tool === "polygon" });
   state.hover = { image: point, snap: snapped.snap };
 
-  if (state.opts.crosshair || state.pending.length) renderCanvas();
+  if (state.opts.crosshair || state.pending.length) renderCanvas({ coalesce: true, skipMini: true });
 
   // 悬停在顶点/边上时换光标，让"这里能拖"这件事可发现
   if (state.tool === "select") {
     const selected = selectedObject();
     let cursor = "default";
-    if (selected && (hitHandle(selected, point) || hitEdge(selected, point))) cursor = "nwse-resize";
+    const handle = selected ? hitHandle(selected, point) : null;
+    if (handle?.kind === "rotate") cursor = "grab";
+    else if (handle || (selected && hitEdge(selected, point))) cursor = "nwse-resize";
     else if (hitTest(point)) cursor = "move";
     el.canvas.style.cursor = cursor;
   }
@@ -1641,7 +2361,7 @@ function handleDrag(point) {
       x: drag.startOffset.x + (state.cursor.x - drag.startScreen.x),
       y: drag.startOffset.y + (state.cursor.y - drag.startScreen.y),
     };
-    renderCanvas();
+    renderCanvas({ coalesce: true, skipMini: true });
     return;
   }
 
@@ -1659,7 +2379,57 @@ function handleDrag(point) {
     if (dx === 0 && dy === 0) return;
     ensureDragHistory(drag);
     target.points = drag.original.map((p) => [p[0] + dx, p[1] + dy]);
-    renderCanvas();
+    renderCanvas({ coalesce: true, skipMini: true });
+    return;
+  }
+
+  if (drag.kind === "rotate") {
+    const target = selectedObject();
+    if (!target) return;
+    const [a, b] = target.points;
+    const cx = (a[0] + b[0]) / 2;
+    const cy = (a[1] + b[1]) / 2;
+    // 圆点在框的上边外侧。光标在正上方时角度为 0，往右拖角度增大。
+    const next = Math.atan2(point.y - cy, point.x - cx) + Math.PI / 2;
+    if (Math.abs(next - (Number(target.rotation) || 0)) < 1e-4) return;
+    ensureDragHistory(drag);
+    target.rotation = next;
+    renderCanvas({ coalesce: true, skipMini: true });
+    return;
+  }
+
+  if (drag.kind === "corner") {
+    const target = selectedObject();
+    if (!target || !drag.opposite) return;
+    const opposite = drag.opposite;
+    const dx = point.x - opposite[0];
+    const dy = point.y - opposite[1];
+    if (Math.hypot(dx, dy) < 2) return;
+    ensureDragHistory(drag);
+    const angle = target.shape_type === "rotated_rect" ? Number(target.rotation) || 0 : 0;
+    if (angle !== 0) {
+      const cx = (opposite[0] + point.x) / 2;
+      const cy = (opposite[1] + point.y) / 2;
+      const vx = point.x - cx;
+      const vy = point.y - cy;
+      const cos = Math.cos(angle);
+      const sin = Math.sin(angle);
+      const localX = vx * cos + vy * sin;
+      const localY = -vx * sin + vy * cos;
+      const halfW = Math.abs(localX);
+      const halfH = Math.abs(localY);
+      if (halfW < 1 || halfH < 1) return;
+      target.points = [
+        [cx - halfW, cy - halfH],
+        [cx + halfW, cy + halfH],
+      ];
+    } else {
+      target.points = [
+        [Math.min(opposite[0], point.x), Math.min(opposite[1], point.y)],
+        [Math.max(opposite[0], point.x), Math.max(opposite[1], point.y)],
+      ];
+    }
+    renderCanvas({ coalesce: true, skipMini: true });
     return;
   }
 
@@ -1687,8 +2457,7 @@ function handleDrag(point) {
       // 旋转矩形维持对角线方向，只改端点（保角）
       points[index] = [point.x, point.y];
     }
-    renderCanvas();
-    renderProps();
+    renderCanvas({ coalesce: true, skipMini: true });
     return;
   }
 
@@ -1742,19 +2511,37 @@ function handleDrag(point) {
       [Math.min(minX, maxX), Math.min(minY, maxY)],
       [Math.max(minX, maxX), Math.max(minY, maxY)],
     ];
-    renderCanvas();
-    renderProps();
+    renderCanvas({ coalesce: true, skipMini: true });
     return;
   }
 
-  if (drag.kind === "draw") renderCanvas();
+  if (drag.kind === "draw") renderCanvas({ coalesce: true, skipMini: true });
 }
 
 function onPointerUp() {
   const drag = state.drag;
   state.drag = null;
+
+  // 提示模式的松手：拖够距离算一个框，否则算一个正点。
+  const promptDrag = state.promptDrag;
+  state.promptDrag = null;
+  if (promptDrag) {
+    const box = dragBoxPoints(promptDrag);
+    const wide = box && box[1][0] - box[0][0] >= 3 && box[1][1] - box[0][1] >= 3;
+    if (promptDrag.moved && wide) {
+      state.promptBox = box;
+      setStatus("已放置框提示，Enter 执行（Esc 清空）", "warn");
+    } else {
+      state.promptPoints.push(promptDrag.start);
+      state.promptLabels.push(1);
+      setStatus(`已加一个正点（共 ${state.promptPoints.length} 个提示点），Enter 执行`, "warn");
+    }
+    renderCanvas();
+    return;
+  }
+
   if (!drag) return;
-  if (drag.kind === "move" || drag.kind === "vertex" || drag.kind === "edge") {
+  if (drag.kind === "move" || drag.kind === "vertex" || drag.kind === "edge" || drag.kind === "corner" || drag.kind === "rotate") {
     // 没有真正拖动过就别标脏：否则"点一下手柄"也会触发自动保存
     if (drag.pushed) afterEdit();
     else renderCanvas();
@@ -2128,27 +2915,54 @@ async function runBatchAutoLabel() {
     setStatus("上一批还在跑，先停止或等它结束", "warn");
     return;
   }
-  const options = requireEngine();
-  if (!options) return;
+
+  // 通道决定"批量到底跑什么"：引擎通道需要引擎路径，其余两个需要模型/提示。
+  // 提示式（点/框）**不参与批量**：它每次都要人在画布上点，天然不是批量的活；
+  // 这里按"当前通道"决定，但把点框通道落到引擎通道会让人莫名其妙跑错东西，
+  // 所以显式拦一下。
+  const channel = state.alChannel;
+  if (channel === "prompt") {
+    setStatus("点/框提示需要逐张在画布上点，不能批量。批量请选「自有引擎」或「文本提示」", "warn");
+    return;
+  }
+  let options;
+  if (channel === "text") {
+    const prompt = textPromptValue();
+    if (!prompt) {
+      setStatus("文本通道需要先填写提示词", "bad");
+      el.autoLabelBox?.setAttribute("open", "");
+      return;
+    }
+    options = { task: state.project?.task || "detect", engine: "", labels: "" };
+  } else {
+    options = requireEngine();
+    if (!options) return;
+  }
 
   // 先把工程与草稿落盘：后端会读旁挂草稿判断"哪些图已有草稿"，
   // 内存里刚改的东西不先写下去，scope=pending 就会重复跑。
   await flushSave();
   await flushDraftChanges({ silent: true });
+  await flushReviewChanges({ silent: true });
 
   const images = state.project.images.map((image) => ({
     id: image.id,
     path: imageApiPath(image),
     annotated: (image.annotations || []).length > 0,
   }));
-  setStatus(`正在启动批量预标注（${images.length} 张）…`, "warn");
+  setStatus(`正在启动批量预标注（${images.length} 张，通道：${channel === "text" ? "文本提示" : "引擎"}）…`, "warn");
   try {
     const result = await startBatchAutoLabel({
       path: state.path,
       images,
+      mode: channel === "text" ? "text" : "engine",
       task: options.task,
       engine: options.engine,
       labels: options.labels,
+      prompt: channel === "text" ? textPromptValue() : "",
+      box_thr: Number(el.alBoxThr?.value || 0.3),
+      text_thr: Number(el.alTextThr?.value || 0.25),
+      refine: Boolean(el.alRefine?.checked),
       conf: options.conf,
       nms: options.nms,
       service: options.service,
@@ -2251,10 +3065,17 @@ function renderImageList() {
     const li = document.createElement("li");
     li.className = index === state.currentIndex ? "active" : "";
     if (index === state.currentIndex && state.dirty) li.classList.add("dirty");
+    if (state.review.has(image.id)) li.classList.add("reviewed");
     const name = document.createElement("span");
     name.className = "name";
     name.textContent = image.id || image.path.split(/[\\/]/).pop();
     name.title = image.path;
+    // 审核标记：已审核绿勾 / 未审核灰圈。用文字符号而不是图标字体，
+    // 少一个外部依赖，也不会有"图标没加载出来就分不清状态"的问题。
+    const flag = document.createElement("span");
+    flag.className = `review-flag ${state.review.has(image.id) ? "checked" : "pending"}`;
+    flag.textContent = state.review.has(image.id) ? "✓" : "○";
+    flag.title = state.review.has(image.id) ? "已审核 (K 取消用 Shift+K)" : "未审核 (K 标为已审核)";
     const meta = document.createElement("span");
     meta.className = "meta";
     const draftCount = (state.drafts.get(image.id) || []).length;
@@ -2262,7 +3083,7 @@ function renderImageList() {
     const split = document.createElement("span");
     split.className = `split ${image.split}`;
     split.textContent = image.split;
-    li.append(name, meta, split);
+    li.append(flag, name, meta, split);
     li.addEventListener("click", () => switchImage(index));
     el.imageList.appendChild(li);
   });
@@ -2365,6 +3186,93 @@ function renderDraftList() {
       renderCanvas();
     });
     el.draftList.appendChild(li);
+  });
+}
+
+function annotationBounds(obj) {
+  const corners = shapeCorners(obj);
+  if (!corners.length) return null;
+  let minX = Infinity;
+  let minY = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
+  for (const point of corners) {
+    minX = Math.min(minX, point[0]);
+    minY = Math.min(minY, point[1]);
+    maxX = Math.max(maxX, point[0]);
+    maxY = Math.max(maxY, point[1]);
+  }
+  return { x: minX, y: minY, w: Math.max(0, maxX - minX), h: Math.max(0, maxY - minY) };
+}
+
+/** 点表格时，框如果在画面外，就把视野挪到它身上，否则高亮了也看不见。 */
+function revealObject(obj) {
+  const stage = el.stage;
+  const bounds = annotationBounds(obj);
+  if (!stage || !bounds) return;
+  const cx = bounds.x + bounds.w / 2;
+  const cy = bounds.y + bounds.h / 2;
+  const screen = imageToScreen([cx, cy]);
+  const margin = 48;
+  const inside =
+    screen.x >= margin &&
+    screen.y >= margin &&
+    screen.x <= stage.clientWidth - margin &&
+    screen.y <= stage.clientHeight - margin;
+  if (inside) return;
+  state.view.offset = {
+    x: stage.clientWidth / 2 - cx * state.view.scale,
+    y: stage.clientHeight / 2 - cy * state.view.scale,
+  };
+}
+
+function renderBoxTable() {
+  const body = el.boxBody;
+  if (!body) return;
+  body.replaceChildren();
+  const image = currentImage();
+  const rows = (image?.annotations || []).filter((obj) =>
+    ["rectangle", "rotated_rect", "polygon"].includes(obj.shape_type),
+  );
+  if (el.boxCount) el.boxCount.textContent = String(rows.length);
+  if (!rows.length) {
+    const tr = document.createElement("tr");
+    const td = document.createElement("td");
+    td.colSpan = 4;
+    td.className = "empty";
+    td.textContent = image ? "这张图还没有框" : "先打开一张图片";
+    tr.appendChild(td);
+    body.appendChild(tr);
+    return;
+  }
+  rows.forEach((obj, index) => {
+    const bounds = annotationBounds(obj);
+    const tr = document.createElement("tr");
+    if (obj.id === state.selectedId) tr.className = "active";
+    const shapeName = SHAPE_LABELS[obj.shape_type] || obj.shape_type;
+    const angle = obj.shape_type === "rotated_rect" ? (Number(obj.rotation) || 0) * (180 / Math.PI) : 0;
+    const place = bounds
+      ? `${Math.round(bounds.x)},${Math.round(bounds.y)}  ${Math.round(bounds.w)}×${Math.round(bounds.h)}` +
+        (obj.shape_type === "rotated_rect" ? `  ${angle.toFixed(0)}°` : "")
+      : "—";
+    for (const text of [String(index + 1), obj.label || classById(obj.class_id).name, shapeName, place]) {
+      const td = document.createElement("td");
+      td.textContent = text;
+      tr.appendChild(td);
+    }
+    tr.addEventListener("click", () => {
+      state.selectedId = obj.id;
+      state.boxScrollId = obj.id;
+      revealObject(obj);
+      renderAll();
+      renderCanvas();
+      setStatus(`选中 ${obj.label || classById(obj.class_id).name}`);
+    });
+    body.appendChild(tr);
+    if (obj.id === state.selectedId && state.boxScrollId !== obj.id) {
+      state.boxScrollId = obj.id;
+      tr.scrollIntoView({ block: "nearest" });
+    }
   });
 }
 
@@ -3168,6 +4076,13 @@ function onKeyDown(event) {
   if (control) return;
 
   if (event.key === "Escape") {
+    if (promptActive() && (state.promptPoints.length || state.promptBox || state.promptDrag)) {
+      // 提示模式下 Esc 的第一优先级是"撤销我刚放的那些点"，
+      // 而不是"切回选择工具"——用户按 Esc 的动机几乎都是点错了。
+      clearPrompt();
+      setStatus("已清空提示", "");
+      return;
+    }
     state.pending = [];
     state.selectedId = "";
     setTool("select");
@@ -3181,12 +4096,26 @@ function onKeyDown(event) {
     return;
   }
   if (event.key === "Enter") {
+    // 提示模式下 Enter 的语义是"执行这次提示"，优先级高于"结束多边形"
+    if (promptActive() && (state.promptPoints.length || state.promptBox)) {
+      event.preventDefault();
+      runPromptLabel();
+      return;
+    }
     // 多边形 / 关键点用 Enter 结束，比"精确点回起点"宽容
     if (state.tool === "polygon" && state.pending.length >= 3) finishShape(state.pending);
     else if (state.tool === "keypoints" && state.pending.length) finishShape(state.pending);
     return;
   }
   const lower = event.key.toLowerCase();
+  if (lower === "k") {
+    // K 标为已审核并跳下一张；Shift+K 取消。放在工具快捷键之前，
+    // 因为这两个键每个工程都会反复按。
+    event.preventDefault();
+    if (event.shiftKey) unmarkReviewed();
+    else markReviewed();
+    return;
+  }
   // 审核快捷键：A 接受 / D 丢弃 / 空格下一张。
   // 放在工具快捷键之前，且都 preventDefault——空格默认会滚页面，
   // 连按几下画布就"跑没了"，用户会以为图丢了。
@@ -3239,6 +4168,8 @@ export function initAnnotate() {
     draftList: document.getElementById("annoDraftList"),
     draftCount: document.getElementById("annoDraftCount"),
     props: document.getElementById("annoProps"),
+    boxBody: document.getElementById("annoBoxBody"),
+    boxCount: document.getElementById("annoBoxCount"),
     exportFormat: document.getElementById("annoExportFormat"),
     exportOut: document.getElementById("annoExportOut"),
     autoLabelBox: document.getElementById("annoAutoLabelBox"),
@@ -3264,6 +4195,27 @@ export function initAnnotate() {
     batchHint: document.getElementById("annoBatchHint"),
     acceptOne: document.getElementById("annoAcceptOne"),
     rejectOne: document.getElementById("annoRejectOne"),
+    // 审核状态
+    reviewCount: document.getElementById("annoReviewCount"),
+    markReviewed: document.getElementById("annoMarkReviewed"),
+    unmarkReviewed: document.getElementById("annoUnmarkReviewed"),
+    // 预标注通道与提示参数
+    alChannel: document.getElementById("annoAlChannel"),
+    chEngine: document.getElementById("annoChEngine"),
+    chPrompt: document.getElementById("annoChPrompt"),
+    chText: document.getElementById("annoChText"),
+    alPrompt: document.getElementById("annoAlPrompt"),
+    alBoxThr: document.getElementById("annoAlBoxThr"),
+    alTextThr: document.getElementById("annoAlTextThr"),
+    alRefine: document.getElementById("annoAlRefine"),
+    alEpsilon: document.getElementById("annoAlEpsilon"),
+    promptClear: document.getElementById("annoPromptClear"),
+    promptRun: document.getElementById("annoPromptRun"),
+    // 模型仓库
+    modelBox: document.getElementById("annoModelBox"),
+    modelList: document.getElementById("annoModelList"),
+    modelCount: document.getElementById("annoModelCount"),
+    modelHint: document.getElementById("annoModelHint"),
   });
 
   document.getElementById("annoOpen")?.addEventListener("click", () => openProject((el.path.value || "").trim()));
@@ -3298,13 +4250,22 @@ export function initAnnotate() {
     updateZoomLabel();
     renderCanvas();
   });
-  document.getElementById("annoAutoLabel")?.addEventListener("click", runAutoLabel);
+  document.getElementById("annoAutoLabel")?.addEventListener("click", runCurrentChannel);
   document.getElementById("annoExport")?.addEventListener("click", runExport);
   document.getElementById("annoClassAdd")?.addEventListener("click", addClass);
   document.getElementById("annoAcceptAll")?.addEventListener("click", acceptAllDrafts);
   document.getElementById("annoRejectAll")?.addEventListener("click", rejectAllDrafts);
   el.acceptOne?.addEventListener("click", acceptCurrentDraft);
   el.rejectOne?.addEventListener("click", rejectCurrentDraft);
+  el.markReviewed?.addEventListener("click", () => markReviewed());
+  el.unmarkReviewed?.addEventListener("click", unmarkReviewed);
+  el.alChannel?.addEventListener("change", () => setAlChannel(el.alChannel.value));
+  el.promptClear?.addEventListener("click", clearPrompt);
+  el.promptRun?.addEventListener("click", runPromptLabel);
+  // 模型仓库是按需拉的：展开才去问后端，避免一次打开页面就多发一个请求。
+  el.modelBox?.addEventListener("toggle", () => {
+    if (el.modelBox.open && !state.modelzoo) refreshModelzoo();
+  });
   el.batchLabel?.addEventListener("click", runBatchAutoLabel);
   el.batchStop?.addEventListener("click", stopBatchRun);
   el.alRefresh?.addEventListener("click", () => refreshEngineOptions({ manual: true }));
@@ -3410,12 +4371,13 @@ export function initAnnotate() {
   }
   window.addEventListener("beforeunload", (event) => {
     // 草稿有 800ms 防抖窗口，也算"未保存"：预标注跑了几百个框，
-    // 因为刷新丢掉比丢一张手工框更让人崩溃。
-    if (state.dirty || state.draftDirty.size) {
+    // 因为刷新丢掉比丢一张手工框更让人崩溃。审核状态同理。
+    if (state.dirty || state.draftDirty.size || reviewPending.size) {
       event.preventDefault();
       event.returnValue = "有未保存的标注或草稿，确定离开？";
     }
     flushDraftChanges({ silent: true });
+    flushReviewChanges({ silent: true });
   });
 
   // 只读调试钩子：浏览器级 e2e 测试需要断言内部状态（工具、拖拽阶段、点数），
@@ -3448,6 +4410,17 @@ export function initAnnotate() {
     })),
     draftDirty: [...state.draftDirty.keys()],
     draftTotal: [...state.drafts.values()].reduce((sum, list) => sum + list.length, 0),
+    // 提示模式与审核状态：e2e 要断言"点了几下""K 之后跳到哪张""刷新后还在"
+    channel: state.alChannel,
+    prompt: {
+      points: state.promptPoints.length,
+      negatives: state.promptLabels.filter((label) => Number(label) === 0).length,
+      box: state.promptBox ? state.promptBox.map((p) => [Math.round(p[0]), Math.round(p[1])]) : null,
+      busy: state.promptBusy,
+    },
+    review: [...state.review.keys()],
+    reviewed: state.review.size,
+    reviewPending: [...reviewPending.keys()],
     batch: state.batchJob
       ? {
           id: state.batchJob.id,
@@ -3460,6 +4433,8 @@ export function initAnnotate() {
   });
 
   resizeCanvas();
+  // 通道初始化：按默认值把三块参数区显示对
+  setAlChannel(state.alChannel);
   renderAll();
   renderCanvas();
 }

@@ -131,7 +131,13 @@ def test_backend() -> None:
         def shutdown_all(self) -> None:  # lifespan 退出时调用
             pass
 
-        def create(self, kind: str, command: list[str], cwd: str) -> FakeRun:
+        def active_exclusive(self) -> list[dict]:
+            # 并发闸门会问「有没有重任务在跑」；这里永远答「没有」，
+            # 否则每个启动用例都会先撞上 409，测不到参数拼装
+            return []
+
+        def create(self, kind: str, command: list[str], cwd: str, **kwargs) -> FakeRun:
+            # **kwargs：生产代码会带 warm_kind / meta，测试替身只关心 kind 与 command
             captured["kind"] = kind
             captured["command"] = command
             return FakeRun()

@@ -23,7 +23,7 @@ from typing import Any, Iterable
 
 JSON_PREFIX = "TRTFORGE_JSON "
 SUPPORTED_MODELS = {"patchcore", "padim", "efficientad"}
-SUPPORTED_MODES = {"check-env", "train-export"}
+SUPPORTED_MODES = {"check-env", "train-export", "warm"}
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
 
 
@@ -34,6 +34,46 @@ def emit(event: dict[str, Any]) -> None:
 def emit_error(code: str, message: str, **extra: Any) -> None:
     payload = {"type": "error", "code": code, "message": message}
     payload.update(extra)
+    emit(payload)
+
+
+# ---------------------------------------------------------------------------
+# 启动阶段计时
+# ---------------------------------------------------------------------------
+# Anomalib 的启动大头是 import（torch + anomalib + lightning 实测约 5~6 秒），
+# 但日志里只有一行 "Anomalib train-export start"，用户看不出时间花在哪。
+# 阶段事件与 YOLO launcher 保持同一套字段，前端只需实现一次渲染。
+_T0 = time.perf_counter()
+_last_phase_at = _T0
+#: warm 进程收到真实任务的时间点；非 None 表示本次 main 复用了预热进程
+_TASK_T0: float | None = None
+
+
+def reset_phase_clock() -> bool:
+    """把阶段时钟归零，返回本次是否为预热进程复用。"""
+    global _T0, _last_phase_at, _TASK_T0
+    warm_hit = _TASK_T0 is not None
+    _T0 = time.perf_counter()
+    _last_phase_at = _T0
+    _TASK_T0 = None
+    return warm_hit
+
+
+def emit_phase(phase: str, label: str, **extra: Any) -> None:
+    """报告一个启动阶段的耗时（TRTFORGE_JSON phase 事件）。"""
+    global _last_phase_at
+    now = time.perf_counter()
+    payload: dict[str, Any] = {
+        "type": "phase",
+        "phase": phase,
+        "label": label,
+        "pid": os.getpid(),
+        "python": sys.executable,
+        "elapsed_ms": int((now - _T0) * 1000),
+        "step_ms": int((now - _last_phase_at) * 1000),
+    }
+    payload.update(extra)
+    _last_phase_at = now
     emit(payload)
 
 
@@ -435,6 +475,9 @@ def mode_train_export(args: argparse.Namespace) -> int:
     )
     patch_anomalib_version_dir_for_windows()
 
+    # torch + anomalib + lightning 的导入是 Anomalib 启动的最大头，先报出来
+    emit_phase("deps", "训练依赖已导入", module="anomalib")
+
     model_name = normalize_model(args.model)
     root = Path(args.root).expanduser()
     normal_dir = resolve_path(root, args.normal_dir)
@@ -474,7 +517,9 @@ def mode_train_export(args: argparse.Namespace) -> int:
         eval_batch_size=eval_batch_size,
     )
     datamodule.setup()
+    emit_phase("data", "数据集已就绪")
     model = create_model(model_name, imagenet_dir)
+    emit_phase("model", "模型已构建", model=model.__class__.__name__)
     emit(
         {
             "type": "anomaly_model",
@@ -495,6 +540,7 @@ def mode_train_export(args: argparse.Namespace) -> int:
         default_root_dir=Path(args.project),
     )
 
+    emit_phase("train_start", "开始训练", total=max_epochs, model=model_name)
     emit({"type": "progress", "stage": "train", "epoch": 0, "total": max_epochs, "pct": 5.0})
     engine.train(datamodule=datamodule, model=model)
     emit({"type": "progress", "stage": "train", "epoch": max_epochs, "total": max_epochs, "pct": 70.0})
@@ -617,6 +663,51 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def mode_warm(_: argparse.Namespace) -> int:
+    """常驻预热：先把 torch / anomalib / lightning 全部导入好，等后端下发一次任务。
+
+    这里导入的正是 mode_train_export 里那几处 import，所以命中预热进程时
+    5~6 秒的导入开销基本归零。不预建模型：模型对象带有设备与状态，
+    跨任务复用比重新构建风险高得多。
+    """
+    global _TASK_T0
+    os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
+    add_anomalib_source_path()
+    import torch  # noqa: F401 - 预热导入，下面 anomalib 依赖它
+    from anomalib.data import Folder  # noqa: F401
+    from anomalib.deploy.export import ExportType  # noqa: F401
+    from anomalib.engine import Engine  # noqa: F401
+    from anomalib.models import EfficientAd, Patchcore  # noqa: F401
+    from anomalib.models.image.padim import Padim  # noqa: F401
+    import trtforge_metadata  # noqa: F401
+
+    patch_anomalib_version_dir_for_windows()
+    emit(
+        {
+            "type": "event",
+            "name": "warm_ready",
+            "pid": os.getpid(),
+            "elapsed_ms": int((time.perf_counter() - _T0) * 1000),
+        }
+    )
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            emit_error("BAD_WARM_COMMAND", f"预热进程收到非法指令：{line[:200]}")
+            return 2
+        argv = payload.get("argv") if isinstance(payload, dict) else None
+        if not isinstance(argv, list) or not argv:
+            emit_error("BAD_WARM_COMMAND", "预热指令缺少 argv 列表")
+            return 2
+        _TASK_T0 = time.perf_counter()
+        return main([str(item) for item in argv])
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     os.environ.setdefault("PYTHONIOENCODING", "utf-8")
     os.environ.setdefault("PYTHONUNBUFFERED", "1")
@@ -625,6 +716,9 @@ def main(argv: list[str] | None = None) -> int:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     if hasattr(sys.stderr, "reconfigure"):
         sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    # 尽早发第一条 phase：Web 端靠它确认进程已起来
+    warm_hit = reset_phase_clock()
+    emit_phase("boot", "python 进程已启动", warm=warm_hit)
     args = build_parser().parse_args(argv)
     try:
         if args.mode == "check-env":
@@ -634,6 +728,8 @@ def main(argv: list[str] | None = None) -> int:
                 emit_error("DATA_NOT_FOUND", "请先选择 Anomalib Folder 数据集 root。")
                 return 2
             return mode_train_export(args)
+        if args.mode == "warm":
+            return mode_warm(args)
         emit_error("UNSUPPORTED_MODE", f"未知 mode：{args.mode}")
         return 2
     except KeyboardInterrupt:
