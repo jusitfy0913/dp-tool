@@ -127,6 +127,11 @@ results/
 # 上传的临时图片、任务日志、Python 缓存都不入库
 6-web/runtime/
 6-web/backend/__pycache__/
+
+# 内置模型仓库（v1.24）：SAM / GroundingDINO / BERT 分词表
+# 权重是 0.5~1 GB 的二进制文件，仓库只保存清单与下载地址；
+# 本地由「标注 → 模型仓库」按需下载，下载目录可用 TRTFORGE_MODEL_DIR 覆盖。
+6-web/models/
 **/__pycache__/
 *.pyc
 
@@ -140,6 +145,16 @@ build/infer_dlls/
 # 只作为「外部 HTTP 服务」的候选实现，本项目只调用其 HTTP 接口、不分发其代码。
 # 目录约 64MB，且 GPL-3.0 与仓库许可不同，因此不入库。
 /8-X-AnyLabeling-main/
+
+# PaddleOCR 官方源码（约 129MB）与飞桨 OCR 模型（约 538MB），本地参考与模型来源，不入库；
+# 自研 OCR 推理代码在 ocr/ocr_infer
+/9-python-paddleOCR/
+# Anomalib 本地训练产物（PatchCore bottle，约 780MB），测试一致性对比用，可重新训练得到
+2-python-anomaly/launcher/resultsbottle/
+# 仓库根目录运行产物（调试截图等）
+/runtime/
+# 文档压缩包，与 docs/深度学习介绍/ 内容重复
+docs/*.rar
 
 # 本地提交信息临时文件（每次提交前重写，不入库）
 /.git-commit-msg.txt
