@@ -10,7 +10,7 @@
 > 自 2026-10-31 起，日常使用推荐 [Web 工作站 `6-web`](../6-web/)（免编译，浏览器打开即用），
 > 功能覆盖训练与推理；Qt 版仍可完整编译运行（见 [WORKFLOW_GUIDE 第 6.1 节](WORKFLOW_GUIDE.md)），
 > 适合离线单机环境。**本文的页签名称、按钮位置均为 Qt 版，与 Web 版布局不同，请勿混用。**
-> 两版差异对照见 [readme 的「Web 版工作站」章节](../readme.md)。
+> Web 版怎么点，看 [Web 操作手册](TRTForge_Web操作手册.md)。两版差异对照见 [readme 的「Web 版工作站」章节](../readme.md)。
 
 ---
 

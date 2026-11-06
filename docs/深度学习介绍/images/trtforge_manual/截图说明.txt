@@ -1,0 +1,13 @@
+本目录用于存放《TRTForge 操作手册》配套界面截图（可选）。
+
+建议截取 PNG，按下列文件名保存，手册正文会引用这些路径：
+
+01_main_window.png          主窗口：可见顶部 GPU/CUDA/TRT 状态与四个页签
+02_engine_builder.png       ENGINE BUILDER：输入 ONNX、动态形状、构建按钮与日志区
+03_annotation.png           标注页：画布、工具栏、标签列表
+04_training_yolo.png        训练页：YOLO 模式、Python 路径、环境与训练按钮
+05_training_anomalib.png    训练页：Anomalib 模式
+06_inference_yolo.png       推理页：YOLO 任务、加载引擎、源选择
+07_inference_anomaly.png    推理页：异常检测任务、三画布
+
+截取时请隐藏个人隐私路径；分辨率建议宽度 1280~1920。

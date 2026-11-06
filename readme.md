@@ -1,12 +1,16 @@
-﻿# deeplearning 项目说明
+# deeplearning 项目说明
 
 本项目围绕工业视觉深度学习训练与 TensorRT 部署闭环建设，当前核心产品显示名为 **DefectVision AI Studio（AI 缺陷检测视觉工作站）**。项目核心方向是把标注、数据集导出、YOLO/Anomalib 训练、ONNX 导出、TensorRT 引擎构建和 C++ 推理验证整合为一套工业 AI 缺陷检测闭环平台。
+
+日常操作请用浏览器版。给人看的步骤、截图和流程图在 [Web 操作手册](docs/TRTForge_Web操作手册.md)。整套网页怎么拼、用了哪些技术，看 [Web Studio 架构与功能介绍](docs/WebStudio架构与功能介绍.md)。现有缺陷、安全漏洞和商业化路线图看 [商业化差距分析与优化建议](docs/商业化差距分析与优化建议.md)。桌面版步骤仍看 [Qt 操作手册](docs/TRTForge_操作手册.md)。
+
+要发给别人使用、又不附带源码时，在开发机执行 `packaging/package_web_user.ps1`。对方电脑需为 CUDA 11.8，先运行安装包里的 `install_train_env.bat` 配置训练环境（不必预先安装 Anaconda；无 AVX2 的机器会自动改用 Polars 兼容包），再用 `config.json` 填写数据目录。细节见 [WORKFLOW_GUIDE 7.1.3](docs/WORKFLOW_GUIDE.md)。
 
 ## 主要模块
 
 | 路径 | 说明 |
 | --- | --- |
-| `6-web` | **浏览器版工作站（推荐）**：FastAPI 后端 + 零构建前端，功能覆盖训练导出、引擎构建、数据集划分导出、标注工作台与推理演示，不需要 Qt。详见 `6-web/README.md` |
+| `6-web` | **浏览器版工作站（推荐）**：FastAPI 后端 + 零构建前端，功能覆盖训练导出、引擎构建、数据集划分导出、标注工作台与推理演示，不需要 Qt。操作步骤见 [Web 操作手册](docs/TRTForge_Web操作手册.md)，开发和版本记录见 `6-web/README.md` |
 | `4-qt-studio` | DefectVision AI Studio Qt 桌面程序；当前编译产物仍为 `TRTForge.exe`，包含 ONNX 转 TensorRT、标注数据集、YOLO/Anomalib 训练页和推理演示页。**已被 `6-web` 取代，保留作迁移参考** |
 | `4-qt-studio/installer` | Windows 安装包脚本（Inno Setup）：递归打包 `4-qt-studio/bin` 内已编译的 exe 与全部运行库，详见 `4-qt-studio/README.md` 中「制作 Windows 安装包」 |
 | `3-cpp-tensorrt/trtexec` | 命令行版 `trtexec` 封装（TensorRT C++ 采样工具、profiler/tracer 脚本） |
@@ -18,7 +22,7 @@
 | `6-web/backend` | Web 版后端：启动 launcher 子进程、转发训练事件、ctypes 调推理 DLL |
 | `6-web/frontend` | Web 版前端：原生 HTML/JS，无 npm 构建步骤 |
 | `1-python-yolo/ultralytics-main` | YOLO 训练、验证、导出的 Python 开源工程来源 |
-| `docs` | 架构设计、推理流程、部署总结等中文文档 |
+| `docs` | 架构设计、推理流程、部署总结等中文文档。操作入口：[Web 操作手册](docs/TRTForge_Web操作手册.md)。发给使用人员、不附源码的安装包见 [packaging/package_web_user.ps1](packaging/package_web_user.ps1) |
 | `openspec` | 需求规格和变更提案 |
 
 ## GitHub 仓库
@@ -132,6 +136,334 @@ python tf_anomalib_launcher.py --mode check-env
 引擎构建页选择 ONNX 后会在后台线程自动识别第一个输入 tensor 的名称和维度，并弹出“ONNX 加载中”进度提示；识别完成后提供统一 `H/W` 输入，修改一次高度和宽度即可同步覆盖 `min / opt / max` 三组动态 shape。
 
 ## 版本更新记录
+
+### v1.28.0 — 2026-11-06（Web Studio 推理进程隔离）
+
+**一句话**：Web Studio **1.28.0** 起，YOLO / Anomalib / ONNX / OCR 推理 DLL 只在独立子进程 **`infer_worker`** 里加载；DLL 崩溃不再拖垮整个 Web 服务，当前请求返回 503/504 并自动或手动重启工作进程。详情见 `6-web/README.md` 的 v1.28.0 变更点与 `docs/WORKFLOW_GUIDE.md` §7.8。
+
+### v1.27.0 — 2026-11-05（推理页接入文字识别，仍走 ocr_infer.dll）
+
+**一句话**：Web 推理页多了「OCR 文字识别」。检测、识别、文本行方向都在原来的 `ocr_infer.dll` 里完成，Python 只负责收图和把文字画回页面。桌面版程序没有改。
+
+```yaml
+version_diff:
+  component: web-ocr-inference
+  old_version: "1.26.0"
+  new_version: "1.27.0"
+  old:
+    web_ocr: false
+    infer_kinds: [yolo, anomalib]
+    ocr_runtime: "仅 Qt 桌面版调用 ocr_infer.dll"
+  new:
+    web_ocr: true
+    infer_kinds: [yolo, anomalib, ocr]
+    backend: ocr_infer.dll
+    paddle: "2.6.2"
+    model_format: "inference.pdmodel + inference.pdiparams + inference.yml"
+    unsupported_in_this_version:
+      - "inference.json（Paddle 3.x 模型，页面置灰）"
+      - "文档方向分类"
+      - "UVDoc 弯曲矫正"
+      - "视频"
+      - "摄像头"
+    packaging: "package_web_user.ps1 -WithOcr，默认关闭"
+  measured_2026_11_05:
+    image: "00006737.jpg（登机牌）"
+    lines: 75
+    contains: "登机牌"
+    cpu_mkldnn_ms: 3765
+    gpu0_ms: 1147
+    rotated_180_with_cls: "angle=1，仍识别出登机牌与张祺伟"
+```
+
+| 项目 | 老版本（v1.26.0） | 新版本（v1.27.0） | 影响 |
+| --- | --- | --- | --- |
+| 推理页类型 | 只有 YOLO 和异常检测 | 增加 OCR | 选文字识别后，引擎路径换成三个模型目录 |
+| 谁在算 | 文字识别只在桌面版 | Web 也调用同一份 `ocr_infer.dll` | 不新写一套 Python OCR |
+| 能用的模型 | 桌面版自带目录 | 老版 `pdmodel`（本机放在 `9-python-paddleOCR/model/legacy_v4`） | 已下载的 `inference.json` 模型会显示灰色，提示需要飞桨 3.x |
+| 方向 | 桌面版可选 | 文本行方向可选；正图 `angle=0`，倒图 `angle=1` | 留空就只做检测和识别 |
+| 批量 | 目录 / 视频 / 摄像头 | OCR 只支持目录批量，写出 `ocr/*.ocr.json` 和 `ocr_summary.csv` | 视频和摄像头会直接提示不支持 |
+| 安装包 | 不含飞桨运行库 | `-WithOcr` 才拷贝 `paddle_inference.dll`（约 1.7GB）和 `mklml.dll` | 默认安装包体积不变 |
+
+**参数（单张与目录批量共用）**
+
+| 参数 | 默认 | 作用 |
+| --- | --- | --- |
+| 检测模型目录 / 识别模型目录 | 必填 | 各自含 `inference.pdmodel`、`inference.pdiparams`、`inference.yml` |
+| 文本行方向目录 | 空 | 空 = 不旋转文本行 |
+| 设备 | `cpu` | `cpu` 或 `gpu:0` |
+| 线程 / 识别 batch | 8 / 6 | CPU 线程数、识别一次送几行 |
+| MKLDNN | 开 | 只在 CPU 生效；关掉会从几秒变成约一百秒 |
+| det_thresh / det_box_thresh / unclip | 0.3 / 0.6 / 1.5 | 检测框松紧 |
+| 识别分数下限 | 0 | 低于它的行不返回 |
+
+**使用方式**：推理页把类型改成「OCR 文字识别」，选检测和识别目录，上传图片后点开始推理。右边出现文字多边形和文本表，可复制全部文字，或导出 JSON / CSV / TXT。
+
+**应用场景**：登机牌、单据、标签上的印刷文字。单张 CPU 大约数秒，不适合视频流。文档整页方向和弯曲矫正留到下一期。
+
+**验证**：`run_all_tests.py` **40 个脚本全绿**（v1.26.0 是 38 个）。其中 `test_ocr_api.py` 10 项、`test_ocr_infer_dll.py` 10 项。`ocr_basic.exe` 在补上 `mklml.dll` 搜索路径后退出码 0。
+
+### v1.26.0 — 2026-11-05（`.onnx` 走自己的动态库，与 `.engine` 结果可自动比对）
+
+**一句话**：推理页填 `.onnx` 时不再走 Python `onnxruntime`，改走新增的 `onnx_infer.dll`；
+同一张图分别用 `.engine` 与 `.onnx` 跑，结果差异可以一条命令判定通过/不通过。
+
+| 项目 | 老版本（v1.25.3） | 新版本（v1.26.0） | 影响 |
+| --- | --- | --- | --- |
+| `.onnx` 推理 | Python `import onnxruntime` 兜底 | 优先 `onnx_infer.dll`（ONNX Runtime C API，CPU 必用、有 CUDA 时自动加速） | 打包只多 `onnxruntime.dll` 等 2 个文件 |
+| 后端分派 | 引擎 / ONNX 两条独立代码路径 | 三级分派：`.onnx` → `onnx_infer.dll`；`.engine` → TensorRT DLL；都不可用才兜底 | 参数语义统一，换后端不改请求 |
+| 结果可追溯 | 无后端信息 | 推理结果与批量/视频 JSON 都带 `backend` 字段 | 页面徽标与实际执行者一致 |
+| 一致性校验 | 靠人眼看两张图 | `compare_backends.py`（结果级）+ `compare_raw_tensors.py`（张量级），超阈值非零退出 | 回归可进 CI |
+| 诊断能力 | 出问题只能看最终图 | `TRTFORGE_RAW_DUMP=<dir>` 导出输入/输出原始张量（未设置零开销） | 能分清是模型差异还是后处理差异 |
+
+**新增目录**：`3-cpp-tensorrt/onnx_infer/`（C ABI 头、ORT 会话封装、四任务解码、Anomalib 管道、README）。
+**新增脚本**：`scripts/fetch_onnxruntime.ps1`；`build_infer_dlls.ps1` 增加 `-Targets onnx_infer`。
+**新增工具**：`6-web/backend/tools/` 下 `compare_backends.py`、`compare_raw_tensors.py`、
+`test_backend_consistency.py`、`test_onnx_infer_dll.py`。
+**打包**：`packaging/package_web_user.ps1` 带上 `onnx_infer.dll` 与 ORT 运行库，并写 `bin_manifest.txt` 清单自检。
+
+**实测结果（2026-11-05，Windows 10 / CPU EP）**
+
+| 用例 | 指标 | 结果 |
+| --- | --- | --- |
+| YOLO detect（PCB 8 张） | 匹配率 / 最小 IoU / 置信度差 | 100% / > 0.92 / < 0.02，8/8 通过 |
+| YOLO detect 原始张量 | 余弦相似度 / 最大相对差 | 0.999998 / ≤ 1.3% |
+| Anomalib 三模型（8 张） | 分数差 / 判定一致 | ≤ 0.055 / 100%，8/8 通过 |
+| Anomalib 原始张量 | 余弦相似度 / 二值 mask 一致率 | 0.9917 / 100% |
+| 四任务耗时（CPU） | detect 960 / seg 320 / pose 320 / obb 320 | 70.2 / 14.6 / 11.5 / 12.6 ms |
+
+**验证**：`run_all_tests.py` **38 个脚本全绿**（v1.25.3 是 35 个），前端 js 全部 `node --check` 通过；
+`POST /api/infer/yolo`、`POST /api/infer/anomalib`、`infer_batch.py`、`infer_video.py` 四路实测
+均返回 `backend: "onnx_infer.dll"`。细节见 `3-cpp-tensorrt/onnx_infer/README.md` 与 `6-web/README.md`。
+
+标注页补充（2026-11-03）：矩形四个角拖动时，按住的角跟着鼠标走，不再跳到对角。旋转框选中后，拖上边外侧的黄点才能旋转。右栏「标注框」表列出当前图片的框，点一行，图上对应的框会青色加粗高亮。
+
+
+
+### v1.25.0 — 2026-11-03（训练「点完就开始」，并支持拿自己的 best.pt 继续微调）
+
+**一句话**：从点「开始训练」到第一个 epoch 的固定开销，YOLO 由 **1.56s** 降到 **0.19s**，
+Anomalib 由 **4.32s** 降到 **≈0s**；页面上多了启动清单；历史训练多了一个「用它微调」按钮。
+
+| 项目 | 老版本（v1.24.2） | 新版本（v1.25.0） | 影响 |
+| --- | --- | --- | --- |
+| YOLO 开训固定开销 | 每次新起进程重新 import，实测 1.56s | 预热进程池提前导入，实测 0.19s | 省 **1.37s** |
+| Anomalib 开训固定开销 | 实测 4.32s | 命中预热 0.00s | 省 **4.32s** |
+| 启动过程可见性 | 只有「运行中」，卡住时分不清是加载慢还是死了 | 清单 `spawned → boot → deps → model → data → train_start`，每步耗时 + 总耗时 | 慢的时候能定位 |
+| 联网检查 | Ultralytics 每次开训查 PyPI | 默认 `YOLO_OFFLINE=1` | 少一次外网等待 |
+| 解释器探测 | 每次开训 import torch 探一遍 | 结果缓存 30 秒（路径+mtime+大小失效） | 连续开训不再重复 |
+| 训练起点 | 只有「新训」和「断点续训」 | 新增「用它微调」：载入 `best.pt`，**重置优化器与轮次**，写回原目录 | 补几张图不用重训 100 轮 |
+| 覆盖旧结果 | 同目录再训静默生成 `exp2` | 微调带 `--exist-ok` 写回原目录，覆盖前备份到 `_prev/<时间戳>/` | 不误删上次结果 |
+| 学习率 | 表单没有这一项 | 表单新增 `lr0`；微调自动填 0.001 | 微调不会把原权重练坏 |
+
+**参数（环境变量）**
+
+| 变量 | 默认 | 作用 |
+| --- | --- | --- |
+| `TRTFORGE_WARM` | `1` | 预热进程池开关；`0` = 回到冷启动（排障 / 内存紧） |
+| `TRTFORGE_WARM_KINDS` | `yolo,anomalib` | 只预热其中一类 |
+| `TRTFORGE_WARM_IDLE_SECONDS` | `1800` | 空闲多久回收预热进程 |
+| `TRTFORGE_YOLO_ONLINE` | `0` | `1` 才允许 Ultralytics 联网查更新 |
+
+**新增接口**：`GET /api/warm/status`、`POST /api/warm/prewarm?kind=`、`POST /api/train/yolo/finetune-check`。
+
+**微调 vs 续训（别混）**
+
+| 场景 | 请求字段 | 起点 | 优化器 / 轮次 | 超参来源 |
+| --- | --- | --- | --- | --- |
+| 新训 | `init_mode=preset` | 官方预训练权重 | 全新 | 表单 |
+| 微调 | `init_mode=finetune` | 历史 run 的 `best.pt` | 重置 | 表单（自动 `lr0=0.001` / `epochs=30` / `mosaic=0.3` / `close_mosaic=15`） |
+| 续训 | `resume_from=<last.pt>` | 历史 run 的 `last.pt` | 恢复 | 检查点（表单参数失效） |
+
+微调前置检查会**拦住任务头不一致**（`detect` 权重拿去 `segment`），提示类别增删，
+`imgsz` 变化只提醒。适用范围：同产品、同类别体系，只补了少量新样本。
+
+**验证**：`run_all_tests.py` **33 个脚本全绿**（v1.24.2 是 30 个），新增
+`test_warmpool.py`（25 项）、`test_phase_events.py`（15 项）、`test_finetune_request.py`（26 项）；
+`bench_startup.py` 输出上面那组冷/热对比；页面实测 1 轮 YOLO 训练清单显示
+`deps 0.07s / model 0.03s / data 18.50s`，微调确认 `_prev/` 备份出现。
+
+### v1.24.2 — 2026-11-03（浏览按钮不再卡死，窄窗口不再挡住按钮）
+
+| 项目 | 老版本（v1.24.1） | 新版本（v1.24.2） | 影响 |
+| --- | --- | --- | --- |
+| 浏览 | 系统窗口没弹出来时，按钮变成灰色「…」，要刷新才能再点 | 按钮变成可点的「取消」。窗口约 12 秒还没出现，就改用页面里的选择 | 不用再刷新页面 |
+| 窄窗口 | 训练日志会盖住左栏下面的按钮 | 收起的折叠内容不再排到日志上面，表单按自己的高度往下排 | 窄屏和 1600 宽都能点到「小缺陷预设」 |
+| 画布 | 矩形拖角、旋转黄点、表格点行高亮这次验证前没逐项点过 | 已在页面上点过：角跟着鼠标走，黄点能转到 90°，点表格哪一行哪一个框高亮 | 这三项可用 |
+
+顶栏版本是 `v1.24.2`。第一轮测试里 8060 自己退出过一次，日志里没有异常，重放没有再发生，推理代码这次没改。
+
+### v1.24.1 — 2026-11-03（权重到位后跑真图，修掉 3 个阻断性缺陷）
+
+v1.24 交付时本机没有模型权重，SAM / GroundingDINO 只验证了"模型缺失"路径。这一版把
+**214.3 MiB** 权重真的下到本地、用真图跑通，抓到 v1.24 里**单测完全覆盖不到的阻断性缺陷**。
+
+**总结一句话：v1.24 的点框提示通道在真机上 100% 崩；文本通道能跑但分数与参考实现对不齐。**
+
+| 项目 | 老版本（v1.24） | 新版本（v1.24.1） | 影响 |
+| --- | --- | --- | --- |
+| 内置模型体积 | 手估 40.1 MB / ≈700 MB（合计"约 760 MB"） | 按 `Content-Length` 校准：26.85 + 15.74 + 171.28 + 0.44 = **214.3 MiB** | 进度条分母对了，能真正走到 100% |
+| 下载镜像 | `hf-mirror.com/CVHub520/...` 三条回退 | GitHub 直连 → `ghfast.top` → `gh-proxy.com` | 原来三条回退**实测全 404**，主源不通时白等超时 |
+| 点框提示 | **任意一次点/框都抛 `ValueError` → 500** | 正常出多边形 | `build_prompt()` 写 `points or []`，而上游给的是 numpy 数组 |
+| SAM encoder 输入 | 写死 NCHW `(1,3,H,W)`，被 onnxruntime 拒收 | 按签名判断，本项目是 **HWC rank-3 `[H,W,3]`** | 报错 `Invalid rank for input: input_image Got: 4 Expected: 3` |
+| provider 选择 | `get_available_providers()` 直接信任 | 新增 `onnxenv.py`：先 `LoadLibrary` 探 provider DLL | 缺 cuDNN 的机器上不再每次建 session 都打一大段 `LoadLibrary failed with error 126` |
+| 文本通道通道序 | 直接喂 BGR，注释称"顺序无关" | `preprocess_image()` 内做 `BGR→RGB` | 与参考实现 `qt_img_to_rgb_cv_img()` 一致，分数可对齐 |
+| 回归脚本数 | 29 个 | **30 个**（多 `test_onnxenv.py`）；`test_prompt_label.py` 49 → **63** 项 | 两个新缺陷都有对应回归测试 |
+
+**新增文件**：`6-web/backend/onnxenv.py`、`6-web/backend/tools/test_onnxenv.py`（11 项）。
+**改动文件**：`modelzoo.py`（体积 / 镜像）、`promptlabel.py`（提示展开 / encoder 布局 / provider）、
+`textlabel.py`（provider / RGB）、`app.py`（`APP_VERSION = "1.24.1"`）、`test_prompt_label.py`。
+
+**OpenSpec**：本次走了一个正式变更 `harden-prompt-autolabel-with-real-weights`
+（已归档为 `2026-11-03-harden-prompt-autolabel-with-real-weights`）。理由不是"改功能"，
+而是 v1.24 归档的两个需求**验收标准没真正执行**——`--strict` 校验通过，主规格新增 4 个场景：
+
+| 需求 | 新增场景 | 守住的是什么 |
+| --- | --- | --- |
+| `Prompt Based Auto Labeling` | 提示输入容忍数组类型 | 上游可能给 numpy 数组，不能写 `points or []` |
+| `Prompt Based Auto Labeling` | 内置权重上真机可跑通 | 必须按模型声明的签名造输入，不能假定张量布局 |
+| `Builtin Model Repository` | 体积与实际文件一致 | 体积同时是进度分母与完整性判据，必须是服务端真实值 |
+| `Builtin Model Repository` | 回退地址可用 | 候选镜像必须实测能返回该文件 |
+
+**真机实测**（Windows 10 / CPU / `onnxruntime` CPU EP）：SAM 首次 0.76 s、缓存命中 0.077 s、
+框提示 0.079 s；GroundingDINO 加载 4.80 s、单图 4.42 s。明细表见下方 v1.24 的
+「耗时（v1.24.1 真机实测）」。
+
+**有一件事 v1.24.1 没能改善，写在这里免得后人白试**：PCB 图 3034×1586（比例 1.91）被硬拉伸到
+模型固定输入 1200×800（比例 1.5）后，`missing hole` 会出一个占图 95.7% 的大框。
+试过 letterbox 等比补边，PCB 上确实降到 75.2%，但 `bus.jpg` 上退化成**半辆车**——
+这份导出权重是按拉伸验证的，不能换。用 `bus.jpg` + `bus` 自检可得到 0.91 分的紧致整框，
+说明**管线本身没问题**，剩下的是模型能力与该导出权重的固有行为。
+
+### v1.24 — 2026-11-02（提示式预标注：点一下 / 框一下 / 说一句话，外加审核状态）
+
+v1.23 把标注变成"跑一遍 → 人只审核"，但那个"跑"有个前提：**已经训好一个 YOLO 引擎**。
+新项目开工时没有引擎，第一版数据只能从零手工画；而有引擎的场景又被另一个问题拖着：
+审到第 300 张去吃饭，回来不记得自己审到哪了。
+
+这一版补的就是这两头：**没有引擎也能出草稿**（点框 / 文本两条免训练通道），
+以及**审核到哪了一张看得见**（`K` 标已审核并跳下一张）。
+
+| 项目 | 老版本（v1.23） | 新版本（v1.24） | 影响 |
+| --- | --- | --- | --- |
+| 预标注通道 | 只有自训 `.engine` | 引擎 / 点框（SAM）/ 文本（GroundingDINO）三选一 | 新项目没有引擎也能先出草稿，不用从空白画起 |
+| 点框提示 | 无内置实现（只能接外部 HTTP 服务） | 画布上左键正点、`Shift+左键` 负点、拖动出框，`Enter` 出多边形 | 不规则目标能把边界贴着轮廓切出来 |
+| 文本提示 | 无 | 填 `missing hole` 直接出框，可再细化成多边形 | 开放词表，不训也能检；类别名直接来自解出的短语 |
+| 权重获取 | 用户自己找 GitHub Release | 标注页「模型仓库」：清单 + 下载 + 续传 + 进度 + 取消 | 首次使用少一次"文件放哪、要不要改名" |
+| 置信度 | 引擎通道有分数，分割通道没有 | 点框草稿**固定灰档 `?`**，文本通道用真实 conf 进绿/黄/红 | 不把"点哪切哪"伪装成"机器很确定" |
+| 审核状态 | 只有 `A`/`D`/空格，不知道看到哪 | `K` 标已审核并跳下一张未审核、`Shift+K` 取消、列表 `✓`/`○`、`已审核 12/64` | 中断后能接着审，不用靠记忆 |
+| 草稿文件 | v1：只有 `images` | v2：多一个 `review` 块，v1 自动兼容 | 审核与草稿同一次原子写盘 |
+| 批量任务 | `engine` 一种模式 | `engine` / `text`，text 模式启动前先验模型 | 不会建一个"跑 300 张全失败"的空任务 |
+| 快捷键 | `K` = 关键点组 | `K` = 审核，关键点组改 `G` | **破坏性变更**，见下方 |
+
+**三条通道怎么选**
+
+| 通道 | 依赖 | 出什么 | 什么时候用 |
+| --- | --- | --- | --- |
+| 自有引擎 | 自己训的 `.transd.onnx` 编出的 `.engine` | 矩形 / 旋转框 / 多边形 / 关键点 | 已有同类缺陷模型，批量最快 |
+| 点框提示（SAM） | MobileSAM，encoder 26.9 MB + decoder 15.7 MB | 多边形 | 目标不规则、边界要贴轮廓；标前几十张给训练用 |
+| 文本提示（GroundingDINO） | SwinT int8 171 MB + BERT 分词表 0.44 MB | 矩形（可选细化成多边形） | 新缺陷类型、开放词表；一句话先看召回 |
+
+三条通道产出的都是**草稿**，后面 `A` 接受 / `D` 丢弃 / `空格` 下一张 / `K` 已审核完全共用。
+结果一律进旁挂 `<工程名>.drafts.json`，**`.tfanno` 一个字节都不改**（Qt 版因此仍双向兼容）。
+
+**模型从哪来**
+
+- 页面下载：标注页右栏「模型仓库」→ 点「下载」→ 进度条 → 可取消。落地目录 `6-web/models/`
+  （已加入 `.gitignore`，权重不进版本库）。
+- 换盘/换机器：设 `TRTFORGE_MODEL_DIR` 指向已下载的目录，重启服务生效。
+- 被墙 / 内网：把下表文件名**原样**放进该目录，刷新仓库卡片即显示「已就绪」，
+  不必走下载。文件名必须一致，改名会认不出来。
+
+| 模型 id | 文件 | 体积（v1.24.1 实测） | 用途 |
+| --- | --- | --- | --- |
+| `mobile_sam` | `mobile_sam.encoder.onnx` + `sam_vit_h_4b8939.decoder.onnx` | 26.85 + 15.74 MB | 点框通道 |
+| `grounding_dino_swint` | `groundingdino_swint_ogc_quant.onnx` | **171.28 MB** | 文本通道 |
+| `bert_tokenizer` | `bert_base_uncased_tokenizer.json` | 0.44 MB | 文本通道必需（仓库内已有兜底副本） |
+
+> **合计 214.3 MiB（约 215 MB，按 1024 计）。** v1.24 初版表里写的"40.1 MB / ≈700 MB"是手估的，按 700 MB 算
+> 进度条只能走到 24%。现在 `modelzoo.CATALOG` 的 `size` 是对着服务端 `Content-Length`
+> 逐个校准过的，它同时是进度条分母和完整性判据，**不要再手改**。
+
+下载实现要点：64 KB 分块流式写 `.part`；已存在 `.part` 时带 `Range` 续传；每个文件按
+**GitHub 直连 → `ghfast.top` 代理 → `gh-proxy.com` 代理**顺序尝试（v1.24.1 改，原来那三条
+`hf-mirror.com/CVHub520/...` 实测全是 404）；分词表另配 `@local:` 兜底（仓库内有一份就直接拷，
+不联网）；取消会删掉 `.part`（留着半个文件会让下次续传接在错位置）；同一模型并发下载返回 409。
+
+**耗时（v1.24.1 真机实测，Windows 10 / CPU）**
+
+测试图 `01_missing_hole_01.jpg`（3034×1586），`onnxruntime` 走 CPU EP：
+
+| 操作 | 实测 | 备注 |
+| --- | --- | --- |
+| SAM image encode | **0.76 s**（首次，含 encode） | MobileSAM 是为 CPU 设计的轻量 encoder |
+| SAM decode | **0.077 s** | encoder 缓存命中后只跑 decoder，差 10 倍 |
+| SAM 框提示 | **0.079 s** | 同一 embedding，出 11 个多边形 |
+| GroundingDINO 首次加载 | **4.80 s** | 171 MB int8，读盘 + 建 session，之后常驻 |
+| GroundingDINO 单图推理 | **4.42 s** | 1200×800，CPU |
+| 文本 + 细化成多边形 | **4.84 s** | 5 个框 → 8 个多边形（含一次 SAM encode） |
+
+**已知限制（不是 bug，改之前先看）**
+
+| 限制 | 实测依据 | 结论 |
+| --- | --- | --- |
+| 输入被硬拉伸到 1200×800，原图比例偏离 1.5 多时框偏大 | PCB 图 1.91 → `missing hole` 最大框占图 95.7% | 试过 letterbox 等比补边：PCB 上降到 75.2%，但 `bus.jpg` 上退化成**半辆车**。这份导出权重按拉伸验证，**不能改 letterbox** |
+| 分数普遍偏低 | int8 量化，常见 0.3~0.7 | 默认 `box_thr=0.3` 照参考配置，别按 YOLO 的 0.5 直觉调 |
+| 管线自检方法 | `bus.jpg` + `bus` → 0.91 分、紧致整框 | 出了怪框先用这张图验，能区分"模型能力不足"和"代码写错了" |
+
+**为什么自己写代码、只用官方权重**
+
+AnyLabeling 的推理内核只有 `onnxruntime + cv2 + numpy`，与 Qt 只耦合三个函数调用，
+剥离比重写贵；但它的代码是 **GPL-3.0**，抄进仓库会把整仓传染。权重本身是 **Apache-2.0**，
+与代码许可无关。所以本版**零外部源码复制**，只按 ONNX 输入输出契约重写了
+预处理 / 提示展开 / 后处理三件事，其余仍是 `onnxruntime` + `cv2` + `numpy`。
+
+**审核状态怎么存**
+
+```json
+{
+  "version": 2,
+  "images": { "01_missing_hole_01": [ ... ] },
+  "review": { "01_missing_hole_01": { "state": "checked", "at_ns": "1762083000000000000" } }
+}
+```
+
+- v1 文件（没有 `review`）直接读出空审核，不报错。
+- 取消审核 = 从 `review` 里**删键**，不写 `"state":"unchecked"`，文件不会来回变长。
+- `clear()` 默认**保留审核**：清草稿是"这批候选我不要了"，不等于"把审核进度忘掉"。
+- 批量 `scope=pending` 现在也跳过**已审核**的图——用户确认过的结论不该被新候选换掉。
+
+**破坏性变更**
+
+| 键 | v1.23 | v1.24 |
+| --- | --- | --- |
+| `K` | 关键点组 | **标为已审核并跳下一张未审核** |
+| `Shift+K` | 无 | 取消审核 |
+| `G` | 无 | 关键点组 |
+
+**验收**
+
+- 新增 `test_prompt_label.py` **63/63**（轮廓近似 / 点数上限 400 / 退化掩码不抛异常 /
+  encode 缓存命中 / 1024↔原图坐标往返 ≤1px / 提示点越界夹取 / **numpy 提示不崩** /
+  **encoder 布局 HWC·NHWC·NCHW 三种**）。
+- 新增 `test_text_label.py` **62/62**（tokenizer 编号与 special token / 短语还原 /
+  `box_thr`·`text_thr` 边界 / 越界框夹取 / 退化框丢弃 / 模型缺失抛 `ModelMissing`）。
+- 新增 `test_modelzoo.py` **53/53**（清单推导 / 目录环境变量覆盖 / `.part` 续传带 Range /
+  取消删半成品 / 并发第二份被拒 / 接口层 400·404·409）。
+- 新增 `test_onnxenv.py` **11/11**（v1.24.1：剔除 TensorRT / CUDA DLL 缺失即剔除 /
+  真环境自检）。
+- `test_annotation_drafts.py` 扩到 **87/87**（v1→v2 兼容 / review 增量合并 / 坏 review 跳过 /
+  `clear` 保留审核 / 接口读写）。
+- 回归 `run_all_tests.py`：**30 个脚本全绿**（约 47 秒）；前端 3 个 `.mjs`（23 / 17 / 37 条断言）
+  与 13 个 `js/*.js` 的 `node --check` 全通过。
+- 模型缺失路径实测：文本通道抛「需要先下载模型「grounding_dino_swint / bert_tokenizer」」，
+  点框通道抛「缺少 mobile_sam.encoder.onnx, sam_vit_h_4b8939.decoder.onnx」并给出
+  `TRTFORGE_MODEL_DIR` 提示——接口层统一转 400，不是 500。
+- **模型到位路径实测（v1.24.1 补）**：见上方「耗时（v1.24.1 真机实测）」与
+  `6-web/README.md` 的「v1.24.1 变更点」。v1.24 初版那句"权重未下载、无真图数字"已失效。
+
+细节见 `6-web/README.md` 的「三条预标注通道」「点框提示」「文本提示」「模型仓库」「审核状态」
+五节与 `docs/WORKFLOW_GUIDE.md` 的 §2.9。
 
 ### v1.23 — 2026-11-02（标注预标注变成"跑一遍、只审核"）
 
@@ -461,6 +793,55 @@ v1.16 之前的链路虽然齐了，但「跑一遍」要人守着换五个页�
   mAP50 **0.125**、mAP50-95 **0.090**、P **0.500**、R **0.250**（2 张 val、12 个 GT）。
 - 浏览器实测：历史记录「查看」能还原阶段/产物/精度；「日志」按钮读出 210 行 trtexec 日志；
   服务重启后遗留记录显示 `已停止` + 「服务重启，任务已中断」，「停止」按钮置灰、轮询停止。
+
+细节见 `6-web/README.md` 的「训练完成后一键跑完全流程（v1.17）」与
+`docs/WORKFLOW_GUIDE.md` 的 §5.5。
+
+### v1.17 — 2026-11-02（一键全流程串联 + 引擎精度验证）
+
+v1.16 之前的链路虽然齐了，但「跑一遍」要人守着换五个页面：训练页点开始 → 等完 →
+导出页选权重 → 引擎页选 ONNX → 推理页填标签 → 最后还得自己判断精度够不够。
+中间任何一步忘了衔接，就得重新翻路径。这一版把这段路压成**一次点击**，
+并补上了此前完全没有的**引擎精度量化**（以前的「精度」全靠肉眼看几张图）。
+
+| 项目 | 老版本（v1.16） | 新版本（v1.17） | 影响 |
+| --- | --- | --- | --- |
+| 全流程 | 五个页面手工接力，人守着 | 训练页底部「全流程串联」卡片：训练→导出→校验→编译→补标签→精度验证 | 一次点击跑到精度报告 |
+| 参数 | 每页重填一遍 | 直接复用「训练参数」表单，卡片只多 4 项（精度/split/是否验证/跳过训练） | 不重复填、不会填串 |
+| 失败处理 | 无（靠人看日志） | 某段失败整链 `failed`，后续 `skipped`，已完成产物全部保留；不自动重试 | 不用从第一步重来 |
+| 停止 | — | 只停当前阶段那一个 run（Windows 上杀父进程不会连带杀子进程） | 停了就是真的停了，不再偷偷占着 GPU |
+| 精度 | 只能看几张图「感觉还行」 | `val_engine.py` 走 DLL 逐张推理，COCO 口径算 mAP50 / mAP50-95 / P / R | 引擎好坏有数字，可写进验收单 |
+| 重启后 | 记录丢失，页面可能永远转圈 | `runtime/pipelines/*.json` 持久化；启动时把遗留 `running` 标成「服务重启，任务已中断」 | 历史可查，不会假死 |
+
+**四个设计决策，改之前先看这里**
+
+1. **串联本身不 spawn 子进程，只决定「下一段跑什么」。**
+   如果做成一个大进程组，在 Windows 上点「停止」只能杀父进程，训练/trtexec 会变成孤儿继续跑
+   （照样占显存）。现在每段都是普通 run，停止 = 对当前那一个 `terminate()`，
+   而已经完成的段产物原样留在磁盘上。
+2. **元数据类步骤用可执行函数（callable），不用子进程。**
+   「校验 `.transd.onnx` 的转置布局」「写 `labels_*.json`」这类操作是读一个文件、写一个文件，
+   起子进程要多花 1~2 秒还多一份日志噪音，直接在编排线程里同步做完更合适。
+   训练 / 导出 / 编译 / 验证这种分钟级、要日志流的才走 run。
+3. **失败不自动重试。**
+   训练 OOM、数据集路径写错这类问题重试一次只是再烧一遍 GPU 时间，
+   而且会把「哪里出错了」淹没在第二次日志里。失败就停，把原因和已完成的产物摆出来。
+4. **重启后必须清理遗留的 `running`。**
+   正常退出会走 `shutdown_all()`，但断电/任务管理器强杀不会。这些记录留在磁盘上时，
+   前端按 `status` 轮询会永远转圈、点「停止」只能拿到 409。所以启动时统一标成
+   `cancelled`（原因写清楚），历史仍然可查。
+
+**验收（全部实测）**
+
+- 新增 `test_pipeline_stages.py` **49/49**：三段全成功、中途失败短路、callable 段、
+  进行中停止、报告收集与缺失容错、快照隔离、重启遗留清理、产物去重、`expect_file` 必须是 `Path`。
+- 新增 `test_val_metrics.py` **37/37**：IoU 边界（0.50 恰好命中）、完美预测、多类 AP、
+  P-R 曲线、无 GT 容错。
+- 回归 `run_all_tests.py`：**17 个脚本全绿**，约 29 秒。
+- 真链路（后端 1.17.0 + PCB `pcb_best.pt`）：跳过训练跑 `export → probe → build → labels → val`，
+  整链 **1 分 24 秒 success**，产出 `best.transd.onnx` / `pcb_best_fp32.engine` /
+  `labels_pipe_smoke2.json` / `val/val_report.json`，精度卡片显示
+  mAP50 **0.125**、mAP50-95 **0.090**、P **0.500**、R **0.250**（2 张 val、12 个 GT）。
 
 细节见 `6-web/README.md` 的「训练完成后一键跑完全流程（v1.17）」与
 `docs/WORKFLOW_GUIDE.md` 的 §5.5。
@@ -980,10 +1361,16 @@ Web 端：「模型训练」页 → 展开「数据增强」→ 填想改的项�
 | --- | --- |
 | `2-python-anomaly/anomalib-main/src/anomalib/models/components/base/export_mixin.py` | `torch.onnx.export` 的 `dynamo` 参数改为能力探测 |
 | `2-python-anomaly/anomalib-main/trtforge_metadata.py` | 新增 `calibrate_postprocessed_thresholds()`、`_threshold_between_distributions()`、`_calibration_percentile()` |
-| `2-python-anomaly/launcher/tf_anomalib_launcher.py` | 后处理契约分支接入阈值校准；`collect_images()` 改为多目录轮转取样 |
+| 标注 | 打开 / 新建 `.tfanno`、六种形状绘制（矩形/旋转矩形/多边形/线/点/关键点组）、缩放平移吸附、撤销重做、3 秒自动保存、修订号冲突弹窗、类别与属性面板、自动标注草稿层（**v1.23**：整工程批量预标注 + 草稿旁挂落盘 + `A`/`D`/空格审核 + 置信度分档着色；**v1.24**：点框提示（SAM）与文本提示（GroundingDINO）两条免训练通道 + 模型仓库页内下载 + `K` 已审核跳下一张）、导出 YOLO / COCO / VOC |
 | `docs/异常检测模型对比与选型_PatchCore_PaDiM_EfficientAd.md` | 新增 |
+| 全流程串联 | **v1.17 YOLO**：训练→导出→校验→编译→补标签→精度验证（mAP）；**v1.18 Anomalib**：训练+导出+校准→校验 metadata→编译→引擎精度验证（AUROC / 漏检 / 误报 / 最优阈值），支持跳过训练复用已有产物 |
 | `docs/WORKFLOW_GUIDE.md` | 新增 |
 | `readme.md` | 新增模型速查表、阈值校准说明、版本更新记录 |
+**路径选择（v1.20）**：所有填文件/文件夹的地方点按钮就弹 Windows 系统对话框
+（文件 / 多选 / 文件夹 / 另存为），`Shift` + 点击退回页面内目录浏览。
+浏览器自身不能弹系统框，所以框由后端在本机桌面弹出，因此只对本机访问启用。
+细节见 `6-web/README.md` 的「选路径：原生对话框（v1.20）」。
+
 
 ### v1.1 — 2026-10-28（五级目录重构）
 
@@ -996,6 +1383,9 @@ Web 端：「模型训练」页 → 展开「数据增强」→ 填想改的项�
 
 ## Web 版工作站（6-web，推荐）
 
+| `TRTFORGE_DIALOG_TIMEOUT` | 原生对话框最长等待秒数，超时按取消处理（默认 300） |
+| `TRTFORGE_DIALOG_DISABLE` | 设为 `1` 关闭原生对话框，全部走页面内目录浏览 |
+| `TRTFORGE_MODEL_DIR` | **v1.24**：内置模型仓库（SAM / GroundingDINO / BERT 分词表）目录，默认 `6-web/models` |
 不用 Qt、不用编译 `TRTForge.exe`，浏览器里就能跑训练和推理。
 
 ### 为什么迁
@@ -1026,18 +1416,12 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_web_studio.ps1
 
 | 页面 | 能力 |
 | --- | --- |
-| 训练导出 | 选 YOLO / Anomalib、填参数（含优化器/学习率/workers/patience/amp/resume）、环境自检、实时日志、参数回显、阶段与 `epoch n/N` 进度、每轮耗时与预计剩余、每轮指标表、loss/mAP 内联 SVG 曲线、一键停止；v1.14 新增数据集概览（漏标/孤儿标/类别分布/分辨率）、增强预览（原图 vs 增强后）、断点续训（扫历史 run → 一键续训）；**v1.15 新增导出 ONNX**（四任务头 / `.transd.onnx` / 一键送去编译） |
+| 训练导出 | 选 YOLO / Anomalib、填参数（含优化器/学习率/workers/patience/amp/resume）、环境自检、实时日志、参数回显、阶段与 `epoch n/N` 进度、每轮耗时与预计剩余、每轮指标表、loss/mAP 内联 SVG 曲线、一键停止；v1.14 新增数据集概览（漏标/孤儿标/类别分布/分辨率）、增强预览（原图 vs 增强后）、断点续训（扫历史 run → 一键续训）；**v1.15 新增导出 ONNX**（四任务头 / `.transd.onnx` / 一键送去编译）；**v1.25 新增启动阶段清单与预热进程池（YOLO 1.56s→0.19s、Anomalib 4.32s→≈0s）、`lr0` 表单项、「用它微调 best.pt」（写回原目录 + `_prev/` 自动备份）** |
 | 引擎构建 | 选 ONNX 自动探测形状、fp16/fp32、动态 shape、实时编译日志、8 阶段进度条 + 预计剩余（历史耗时自学习）、产物落盘校验 |
 | 数据集 | 扫描 YOLO 目录 / `.tfanno`、固定哈希划分预览、导出 YOLO / COCO / VOC |
-| 标注 | 打开 / 新建 `.tfanno`、六种形状绘制（矩形/旋转矩形/多边形/线/点/关键点组）、缩放平移吸附、撤销重做、3 秒自动保存、修订号冲突弹窗、类别与属性面板、自动标注草稿层（**v1.23**：整工程批量预标注 + 草稿旁挂落盘 + `A`/`D`/空格审核 + 置信度分档着色）、导出 YOLO / COCO / VOC |
+| 标注 | 打开 / 新建 `.tfanno`、六种形状绘制（矩形/旋转矩形/多边形/线/点/关键点组）、缩放平移吸附、撤销重做、3 秒自动保存、修订号冲突弹窗、类别与属性面板、自动标注草稿层、导出 YOLO / COCO / VOC |
 | 推理演示 | 模型下拉自动发现产物、`conf`/`nms` 与 Anomalib 双阈值滑块、SVG 矢量框叠加、热能图色带、结果明细表（可排序/点行高亮）、置信度直方图、计时分解、JSON/CSV 导出；**v1.16 新增目录批量、视频与摄像头**（批量出 CSV/JSON/ZIP，视频出可内联播放的 mp4，摄像头逐帧只回 JSON 框） |
-| 全流程串联 | **v1.17 YOLO**：训练→导出→校验→编译→补标签→精度验证（mAP）；**v1.18 Anomalib**：训练+导出+校准→校验 metadata→编译→引擎精度验证（AUROC / 漏检 / 误报 / 最优阈值），支持跳过训练复用已有产物 |
 | 环境说明 | 展示后端探测到的解释器、launcher、DLL、trtexec 状态与环境变量 |
-
-**路径选择（v1.20）**：所有填文件/文件夹的地方点按钮就弹 Windows 系统对话框
-（文件 / 多选 / 文件夹 / 另存为），`Shift` + 点击退回页面内目录浏览。
-浏览器自身不能弹系统框，所以框由后端在本机桌面弹出，因此只对本机访问启用。
-细节见 `6-web/README.md` 的「选路径：原生对话框（v1.20）」。
 
 从 v1.11 起，**标注全流程都可以在浏览器完成**（画、改、存、导出），不再需要 Qt 版；
 `.tfanno` 格式与 Qt 双向互通，历史工程可以直接打开继续标。
@@ -1051,8 +1435,55 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_web_studio.ps1
 | `CUDA_PATH` | CUDA 根目录，推理 DLL 运行时必需 |
 | `TRTFORGE_TRTEXEC` | `trtexec.exe` 路径，不设则从 `CUDA_PATH\bin` / CUDA 根 / PATH 自动找 |
 | `TRTFORGE_BROWSE_ROOTS` | 额外允许浏览的目录（分号分隔），默认只允许仓库内 |
-| `TRTFORGE_DIALOG_TIMEOUT` | 原生对话框最长等待秒数，超时按取消处理（默认 300） |
-| `TRTFORGE_DIALOG_DISABLE` | 设为 `1` 关闭原生对话框，全部走页面内目录浏览 |
+不用 Qt、不用编译 `TRTForge.exe`，浏览器里就能跑训练和推理。
+
+### 为什么迁
+
+Qt 版要求每台机器先装 Qt 6.8.3 + MSVC 才能编出界面。Web 版把界面层换成浏览器，训练仍走原来的 launcher、推理仍走原来编好的 DLL，**算法与推理实现一行未改**。
+这样就绕开了「换一台机器就要重新配 Qt 工具链」的问题，也让 Linux / macOS 侧有机会用同一套界面。
+
+> **2026-10-31 更正**：此前这里写"本机长期没有 Qt，界面一直不可用"。经排查那是误判——Qt 6.8.3 与 MSVC 其实都在，真正原因是 OpenCV 被硬编码到不存在的 `D:/thirdparty/opencv`。
+> 现已修复并完成全量编译，`TRTForge.exe` 可正常启动（见 v1.9）。所以现在两条路都通：**Web 版免编译、适合日常**；**Qt 版适合离线单机、无浏览器环境**。
+
+### 三步启动
+
+```powershell
+# 1) 装依赖（用装了 torch 的环境）
+D:\Anaconda3\envs\dpenv\python.exe -m pip install -r 6-web\backend\requirements.txt
+
+# 2) 编推理 DLL（只需一次，不依赖 Qt，但要 OpenCV）
+$env:OPENCV_DIR = "E:\thirdparty\opencv"
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\build_infer_dlls.ps1
+
+# 3) 启动
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_web_studio.ps1
+```
+
+然后打开 <http://127.0.0.1:8060>。顶部状态灯显示「环境就绪」即可使用。
+
+### 已实现能力
+
+| 页面 | 能力 |
+| --- | --- |
+| 训练导出 | 选 YOLO / Anomalib、填参数（含优化器/学习率/workers/patience/amp/resume）、环境自检、实时日志、参数回显、阶段与 `epoch n/N` 进度、每轮耗时与预计剩余、每轮指标表、loss/mAP 内联 SVG 曲线、一键停止；v1.14 新增数据集概览（漏标/孤儿标/类别分布/分辨率）、增强预览（原图 vs 增强后）、断点续训（扫历史 run → 一键续训）；**v1.15 新增导出 ONNX**（四任务头 / `.transd.onnx` / 一键送去编译）；**v1.25 新增启动阶段清单与预热进程池（YOLO 1.56s→0.19s、Anomalib 4.32s→≈0s）、`lr0` 表单项、「用它微调 best.pt」（写回原目录 + `_prev/` 自动备份）** |
+| 引擎构建 | 选 ONNX 自动探测形状、fp16/fp32、动态 shape、实时编译日志、8 阶段进度条 + 预计剩余（历史耗时自学习）、产物落盘校验 |
+| 数据集 | 扫描 YOLO 目录 / `.tfanno`、固定哈希划分预览、导出 YOLO / COCO / VOC |
+| 标注 | 打开 / 新建 `.tfanno`、六种形状绘制（矩形/旋转矩形/多边形/线/点/关键点组）、缩放平移吸附、撤销重做、3 秒自动保存、修订号冲突弹窗、类别与属性面板、自动标注草稿层、导出 YOLO / COCO / VOC |
+| 推理演示 | 模型下拉自动发现产物、`conf`/`nms` 与 Anomalib 双阈值滑块、SVG 矢量框叠加、热能图色带、结果明细表（可排序/点行高亮）、置信度直方图、计时分解、JSON/CSV 导出；**v1.16 新增目录批量、视频与摄像头**（批量出 CSV/JSON/ZIP，视频出可内联播放的 mp4，摄像头逐帧只回 JSON 框） |
+| 环境说明 | 展示后端探测到的解释器、launcher、DLL、trtexec 状态与环境变量 |
+
+从 v1.11 起，**标注全流程都可以在浏览器完成**（画、改、存、导出），不再需要 Qt 版；
+`.tfanno` 格式与 Qt 双向互通，历史工程可以直接打开继续标。
+
+### 关键环境变量
+
+| 变量 | 作用 |
+| --- | --- |
+| `TRTFORGE_PYTHON` | 训练用 `python.exe`，不设则自动探测 |
+| `OPENCV_DIR` | OpenCV 根目录，如 `E:\thirdparty\opencv`。**推理 DLL 运行时必需，CMake 构建时也读它**（`-DOPENCV_DIR` 优先，其次本环境变量，都没有才交给 CMake 常规搜索） |
+| `CUDA_PATH` | CUDA 根目录，推理 DLL 运行时必需 |
+| `TRTFORGE_TRTEXEC` | `trtexec.exe` 路径，不设则从 `CUDA_PATH\bin` / CUDA 根 / PATH 自动找 |
+| `TRTFORGE_BROWSE_ROOTS` | 额外允许浏览的目录（分号分隔），默认只允许仓库内 |
 
 完整说明见 `6-web/README.md`；设计决策见 `openspec/changes/add-web-studio/`。
 

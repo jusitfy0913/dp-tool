@@ -81,6 +81,69 @@ oi_create -> oi_infer_file / oi_infer_bgr -> oi_destroy
 - PaddleOCR 新版 `cpp_infer` 中 `EnableNewIR`、`EnableCINN`、`SetOptimizationLevel`、`DeletePass` 等新 API 在 2.6.2 包中不可用，当前已在推理创建路径跳过这些调用。
 - GPU 推理需要 `zlibwapi.dll`，已放入 `4-qt-studio/bin`，必须是 x64 版本。
 
+## Web ctypes 调用（v1.27.0）
+
+浏览器推理页不直接链接这个 DLL。`6-web/backend/ocr_infer.py` 用 ctypes 按 `ocr_infer_c.h` 声明 `oi_create`、`oi_infer_bgr`、`oi_destroy`，和 `onnx_infer.dll` 分开放，因为两边都有 `oi_` 前缀。
+
+加载是懒的：第一次文字识别请求才 `WinDLL`。Windows 上会把下面两个目录加进 `os.add_dll_directory`：
+
+- `4-qt-studio/bin`（`ocr_infer.dll`、`paddle_inference.dll`）
+- `ocr/ocr_infer/third_party/paddle_inference/third_party/install/mklml/lib`（`mklml.dll`）
+
+少了第二个目录时，CPU 创建预测器会报 `mklml.dll` 错误码 126。安装包用 `package_web_user.ps1 -WithOcr` 时，会把 `mklml.dll` 拷进安装目录的 `bin`，并把 `version.txt` 写成 `bin/paddle_inference_version.txt`。
+
+`oi_result` 的指针在下一次推理或销毁后失效，Python 侧在返回前把文字、分数、角度和多边形都拷进普通字典。句柄最多缓存 2 个；正在推理的句柄不会被淘汰。
+
+```yaml
+version_diff:
+  component: ocr_infer
+  old_version: "桌面版首版，仅 TRTForge.exe 调用"
+  new_version: "1.27.0 Web 也可调用，DLL 本体未改"
+  unchanged:
+    - "ocr_infer.dll / ocr_infer_c.h / 4-qt-studio 桌面源码"
+    - "Paddle Inference 2.6.2，CUDA 11.8，cuDNN 8.6"
+  added_callers:
+    - "6-web/backend/ocr_infer.py"
+    - "POST /api/infer/ocr"
+    - "infer_batch.py kind=ocr"
+  parameters:
+    det_dir: "必填，含 inference.pdmodel、inference.pdiparams、inference.yml"
+    rec_dir: "必填，同上；字典写在 yml 的 PostProcess.character_dict"
+    textline_ori_dir: "可空。老版 cls 需自备 yml，类别 0=0 度，1=180 度"
+    device: "cpu 或 gpu:0，默认 cpu"
+    enable_mkldnn: "默认开，只在 CPU 生效"
+    cpu_threads: 8
+    rec_batch_size: 6
+    det_thresh: 0.3
+    det_box_thresh: 0.6
+    det_unclip_ratio: 1.5
+    rec_score_thresh: 0
+  usage:
+    single_image: "推理页选 OCR，或 POST /api/infer/ocr"
+    directory_batch: "kind=ocr，产出 ocr/*.ocr.json 与 ocr_summary.csv"
+    cli_check: "4-qt-studio/bin/ocr_basic.exe <det_dir> <rec_dir> <image> [cls_dir]"
+  scenarios:
+    - "登机牌、单据、标签上的印刷中文和英文"
+    - "倒着的文本行：加上 ch_ppocr_mobile_v2.0_cls，并使用补好的 inference.yml"
+  not_in_this_version:
+    - "inference.json（Paddle 3.x）"
+    - "文档方向、UVDoc"
+    - "视频和摄像头"
+  measured_2026_11_05:
+    image: "docs/version2.x/ppocr/images/ch_ppocr_mobile_v2.0/00006737.jpg"
+    det: "9-python-paddleOCR/model/legacy_v4/ch_PP-OCRv4_det_infer"
+    rec: "9-python-paddleOCR/model/legacy_v4/ch_PP-OCRv4_rec_infer"
+    cls: "9-python-paddleOCR/model/legacy_v4/ch_ppocr_mobile_v2.0_cls_infer"
+    lines: 75
+    sample_text: "登机牌"
+    cpu_mkldnn_ms: 3765
+    gpu0_ms: 1147
+    upright_angle: 0
+    rotated_180_angle: 1
+```
+
+官方 `ch_PP-OCRv4_*` 与 `ch_ppocr_mobile_v2.0_cls` 压缩包没有 `inference.yml`。Web 用 `6-web/backend/tools/gen_legacy_ocr_yml.py` 生成，已有文件默认不覆盖。方向模型的 yml 把输入写成宽 192、高 48，类别列表是 `0_degree` 与 `180_degree`。
+
 ## 首版说明
 
 TRTForge UI 默认使用 `cpu + MKLDNN`。如需 GPU，可在 OCR 模式中选择 `GPU 0`，但必须确认 Paddle Inference 包为 GPU 版且 CUDA/cuDNN 运行库完整。
