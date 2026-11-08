@@ -188,8 +188,8 @@ foreach ($target in $targetsToBuild) {
 Write-Host ""
 Write-Host "==== 结果 ===="
 $produced = @()
-foreach ($name in @("yolo_infer", "anomalib_infer", "onnx_infer")) {
-    $dll = Join-Path $BinDir "$name.dll"
+foreach ($name in @("yolo_infer", "anomalib_infer", "onnx_infer", "int8_calib")) {
+    $dll = Join-Path $BinDir $(if ($name -eq "int8_calib") { "int8_calib.exe" } else { "$name.dll" })
     if (Test-Path $dll) {
         $item = Get-Item $dll
         $produced += [pscustomobject]@{

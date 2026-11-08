@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 # 打「推理 + 训练」用户包。对方电脑统一为 CUDA 11.8。
 #
 # 包里有：编译后的网页程序、编译后的训练启动器、推理 DLL、
@@ -225,6 +225,10 @@ $serverArgs = @(
     "--include-module=tools.val_anomaly",
     "--include-module=tools.infer_batch",
     "--include-module=tools.infer_video",
+    "--include-module=infer_worker",
+    "--include-module=tools.int8_launch",
+    "--include-module=int8calib",
+    "--include-module=inferproxy",
     "--include-module=uvicorn.logging",
     "--include-module=uvicorn.loops",
     "--include-module=uvicorn.loops.auto",
@@ -309,6 +313,7 @@ Write-Host "[6/6] 检查有没有把源码打进去"
 $leaks = Get-ChildItem -LiteralPath $dest -Recurse -File | Where-Object {
     $_.Name -in @(
         "app.py", "config.py", "infer.py", "frozen_entry.py",
+        "infer_worker.py", "inferproxy.py",
         "tf_yolo_launcher_bin.py", "tf_anomalib_launcher_bin.py"
     )
 }

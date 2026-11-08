@@ -52,6 +52,17 @@ powershell -File scripts\build_infer_dlls.ps1
 第二个环境变量是给 **CUDA 11.8 + MSVC 14.44** 这组搭配用的，原因见「常见问题」。
 产物落在 `4-qt-studio/bin/`。
 
+编 `onnx_infer.dll` 前先准备 ONNX Runtime（不进 git）：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\fetch_onnxruntime.ps1
+```
+
+OCR 模型同样不进 git。默认目录是 `9-python-paddleOCR/model/legacy_v4/`
+（`ch_PP-OCRv4_det_infer`、`ch_PP-OCRv4_rec_infer`、`ch_ppocr_mobile_v2.0_cls_infer`），
+下载地址、`inference.yml` 生成命令，以及另外几项不入库目录，写在仓库根 `readme.md` 的
+「不入库、换机器要自己准备的文件」。也可以用环境变量 `TRTFORGE_OCR_MODEL_DIR` 指到别的目录。
+
 ### 3. 启动
 
 **最省事的方式（推荐）**：双击仓库根目录的 `启动Web端.bat`。
@@ -1531,6 +1542,41 @@ v1.23 解决了"跑一遍"，但**跑完之后还剩一个问题：看到第几�
      「启动用时 4.78 秒（命中热启动）」全部补回；顶栏出现「运行中 1 / YOLO 训练 0:05」；
   3. 点顶栏的「停止」→ 任务 `status=cancelled`，条子消失，训练页徽标变「已停止」；
   4. 停止后再点开始 → 200 正常启动（锁已释放，不会卡死）。
+
+#### v1.29.0 变更点（相对 v1.28.0）——检测验证报告，以及 YOLO 的 INT8
+
+分类任务这次不做。
+
+**验证报告（只做检测）**
+
+全流程跑完精度验证后，结果卡片在 mAP、精确率、召回率下面多了三格：漏检、过检、判错。下面还有一张混淆矩阵和问题框清单。
+
+- 行是标注类别，列是预测类别。斜线是判对，最后一列是漏检，最后一行是过检，其余格子是判错。
+- 配对用的置信度和 IoU 0.5，与卡片上的精确率、召回率是同一批框：精确率 = 判对 / (判对 + 判错 + 过检)，召回率 = 判对 / (判对 + 判错 + 漏检)。
+- 页面最多显示 100 条问题框。全量在同目录的 `val_images.csv`（文件、问题、真实类别、预测类别、置信度）。JSON 里最多留 500 条，避免流水线记录过大。
+- 分割、姿态、旋转框仍然不能跑这步验证。
+
+**YOLO INT8**
+
+引擎页和 YOLO 全流程的精度里可以选 int8。要准备一个图片文件夹；全流程留空则用本次验证集。默认均匀抽 100 张，最多 500 张。预处理和推理一致：等比缩放、灰边 114、除以 255。
+
+- 第一次编译调用 `4-qt-studio/bin/int8_calib.exe`，写出 `{引擎名}.cache` 和 `{引擎名}.engine`。算不了 INT8 的层用 FP16。
+- 同一份模型和同一批图再次编译，改走 `trtexec --int8 --fp16 --calib=缓存`，不再读图。
+- 异常检测不能选 INT8。
+- 程序由 `scripts/build_infer_dlls.ps1` 在编译 `yolo_infer` 时一起生成。速度提升以实测为准，不保证 1.5～2 倍。
+
+```yaml
+version_diff:
+  from: "1.28.0"
+  to: "1.29.0"
+  old:
+    - 检测验证只有 mAP、精确率、召回率
+    - 引擎精度只有 fp16 / fp32
+  new:
+    - 混淆矩阵 + 漏检 / 过检 / 判错清单（val_images.csv）
+    - YOLO 可选 int8，用图片校准，缓存可复用
+  note: 分类任务未做。异常检测不做 INT8。
+```
 
 #### v1.28.0 变更点（相对 v1.27.0）——推理进程隔离（infer_worker）
 

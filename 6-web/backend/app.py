@@ -65,7 +65,7 @@ from runners import manager
 
 #: 应用版本号。前端顶栏与 /api/health 都读它，方便一眼看出「页面连的是哪个后端」。
 #: 起因：改了代码但 8060 上跑的是几小时前的旧进程，排查很久才发现。
-APP_VERSION = "1.28.0"
+APP_VERSION = "1.29.0"
 
 #: 本文件所在目录（6-web/backend）。子进程脚本路径都以它为基准，
 #: 不依赖启动时的工作目录——从仓库根启动和从 backend 启动必须都能跑。
@@ -872,7 +872,9 @@ class EngineBuildRequest(BaseModel):
 
     onnx: str = Field(..., description="待转换的 ONNX 绝对路径")
     engine: str = Field(default="", description="输出引擎路径，留空按 ONNX 同名推导")
-    precision: str = Field(default="fp16", description="fp32 / fp16")
+    precision: str = Field(default="fp16", description="fp32 / fp16 / int8")
+    calib_dir: str = Field(default="", description="INT8 校准图片文件夹")
+    calib_count: int = Field(default=100, ge=1, le=500, description="从文件夹均匀抽取的张数")
     dynamic: bool = Field(default=False, description="是否编译动态 shape")
     min_shape: str = Field(default="", description="如 1x3x640x640")
     opt_shape: str = Field(default="", description="如 1x3x640x640")
@@ -996,7 +998,7 @@ def build_engine(request: EngineBuildRequest) -> dict:
     if request.engine.strip():
         engine_path = Path(request.engine.strip()).expanduser()
     else:
-        tag = "fp16" if request.precision == "fp16" else "fp32"
+        tag = request.precision if request.precision in ("fp16", "int8") else "fp32"
         engine_path = onnx_path.with_name(f"{onnx_path.stem}_{tag}.engine")
 
     if not engine_path.parent.is_dir():
@@ -1021,15 +1023,8 @@ def build_engine(request: EngineBuildRequest) -> dict:
         )
 
     # 组装 trtexec 参数。fp32 是 trtexec 默认行为，它没有 --fp32 参数，不传。
-    command = [trtexec, f"--onnx={onnx_path}", f"--saveEngine={engine_path}"]
-    if request.precision == "fp16":
-        command.append("--fp16")
-    elif request.precision != "fp32":
-        raise HTTPException(
-            status_code=400, detail=f"不支持的精度：{request.precision}，可选 fp32 / fp16"
-        )
-    command.append(f"--workspace={request.workspace_mb}")
-
+    # INT8 改由 int8calib 决定：缓存还对就走 trtexec，否则走 int8_calib.exe。
+    shapes = None
     if request.dynamic:
         shapes = (
             request.min_shape.strip(),
@@ -1041,6 +1036,37 @@ def build_engine(request: EngineBuildRequest) -> dict:
                 status_code=400,
                 detail="启用动态 shape 时必须同时填 min / opt / max，例如 1x3x640x640",
             )
+    if request.precision == "int8":
+        import int8calib
+
+        folder = Path(request.calib_dir.strip()).expanduser() if request.calib_dir.strip() else None
+        if folder is None or not folder.is_dir():
+            raise HTTPException(status_code=400, detail="INT8 需要一个放校准图片的文件夹")
+        _ensure_allowed_path(str(folder))
+        try:
+            command = int8calib.prepare_command(
+                trtexec=trtexec,
+                onnx_path=onnx_path,
+                engine_path=engine_path,
+                images=int8calib.list_images(folder),
+                count=request.calib_count,
+                workspace_mb=request.workspace_mb,
+                input_name=probe.get("input_name") or "images",
+                shapes=shapes,
+            )
+        except int8calib.Int8Error as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    else:
+        command = [trtexec, f"--onnx={onnx_path}", f"--saveEngine={engine_path}"]
+        if request.precision == "fp16":
+            command.append("--fp16")
+        elif request.precision != "fp32":
+            raise HTTPException(
+                status_code=400, detail=f"不支持的精度：{request.precision}，可选 fp32 / fp16 / int8"
+            )
+        command.append(f"--workspace={request.workspace_mb}")
+
+    if request.dynamic and request.precision != "int8":
         input_name = probe.get("input_name") or "images"
         command += [
             f"--minShapes={input_name}:{shapes[0]}",
@@ -1049,6 +1075,11 @@ def build_engine(request: EngineBuildRequest) -> dict:
         ]
 
     if request.extra_args.strip():
+        if request.precision == "int8" and not str(command[0]).lower().endswith("trtexec.exe"):
+            raise HTTPException(
+                status_code=400,
+                detail="第一次做 INT8 校准不能加额外参数。同一批图再次编译会走 trtexec，那时可以加。",
+            )
         command += shlex.split(request.extra_args.strip(), posix=False)
 
     # 进度估算的信息：trtexec 的耗时几乎全在 tactic 搜索，而它主要由
@@ -1119,7 +1150,9 @@ class PipelineYoloRequest(BaseModel):
     workers: int = Field(default=8, ge=0)
     pretrained: str = Field(default="true")
 
-    precision: str = Field(default="fp16", description="引擎精度 fp16 / fp32")
+    precision: str = Field(default="fp16", description="引擎精度 fp16 / fp32 / int8")
+    calib_dir: str = Field(default="", description="INT8 校准图片文件夹，留空则用本次验证 split")
+    calib_count: int = Field(default=100, ge=1, le=500)
     workspace_mb: int = Field(default=4096, ge=256, le=65536)
 
     skip_train: bool = Field(default=False, description="跳到已有 .pt，只跑导出之后的部分")
@@ -1206,8 +1239,8 @@ def pipeline_yolo(request: PipelineYoloRequest) -> dict:
             status_code=400,
             detail="精度评估目前只支持 detect；请关闭「完成后验证」，或把任务类型改为 detect",
         )
-    if request.precision not in ("fp16", "fp32"):
-        raise HTTPException(status_code=400, detail="precision 只能是 fp16 / fp32")
+    if request.precision not in ("fp16", "fp32", "int8"):
+        raise HTTPException(status_code=400, detail="precision 只能是 fp16 / fp32 / int8")
 
     trtexec = config.resolve_trtexec()
     if not trtexec:
@@ -1234,7 +1267,7 @@ def pipeline_yolo(request: PipelineYoloRequest) -> dict:
 
     transd_onnx = weights.with_name(f"{weights.stem}.transd.onnx")
     onnx_file = weights.with_suffix(".onnx")
-    tag = "fp16" if request.precision == "fp16" else "fp32"
+    tag = request.precision if request.precision in ("fp16", "int8") else "fp32"
     engine_path = weights.with_name(f"{weights.stem}_{tag}.engine")
     labels_path = _labels_json_path(run_dir, name if not request.skip_train else run_dir.name)
 
@@ -1289,14 +1322,51 @@ def pipeline_yolo(request: PipelineYoloRequest) -> dict:
             callable=lambda: _pipeline_probe_transd(transd_onnx),
         )
     )
-    build_command = [
-        trtexec,
-        f"--onnx={transd_onnx}",
-        f"--saveEngine={engine_path}",
-    ]
-    if request.precision == "fp16":
-        build_command.append("--fp16")
-    build_command.append(f"--workspace={request.workspace_mb}")
+    if request.precision == "int8":
+        import int8calib
+
+        if request.calib_dir.strip():
+            folder = Path(request.calib_dir.strip()).expanduser()
+            if not folder.is_dir():
+                raise HTTPException(status_code=400, detail=f"校准图片文件夹不存在：{folder}")
+            _ensure_allowed_path(str(folder))
+            calib_images = int8calib.list_images(folder)
+        else:
+            try:
+                calib_images = traininfo.list_split_images(data_yaml, request.val_split)
+            except traininfo.OverviewError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            calib_images = [
+                path for path in calib_images if path.suffix.lower() in int8calib.IMAGE_SUFFIXES
+            ]
+        if not calib_images:
+            raise HTTPException(status_code=400, detail="INT8 校准没有可用图片。请指定文件夹，或确认验证集里有图。")
+        if int8calib.find_calib_exe() is None:
+            raise HTTPException(
+                status_code=400,
+                detail="找不到 int8_calib.exe。请先运行 scripts\\build_infer_dlls.ps1。",
+            )
+        list_path = run_dir / "int8_images.txt"
+        list_path.parent.mkdir(parents=True, exist_ok=True)
+        int8calib.write_image_list(list_path, calib_images)
+        build_command = config.tool_command(python, "int8_launch.py") + [
+            "--trtexec", trtexec,
+            "--onnx", str(transd_onnx),
+            "--engine", str(engine_path),
+            "--list", str(list_path),
+            "--count", str(request.calib_count),
+            "--workspace", str(request.workspace_mb),
+            "--input-name", "images",
+        ]
+    else:
+        build_command = [
+            trtexec,
+            f"--onnx={transd_onnx}",
+            f"--saveEngine={engine_path}",
+        ]
+        if request.precision == "fp16":
+            build_command.append("--fp16")
+        build_command.append(f"--workspace={request.workspace_mb}")
 
     stages.append(
         pipeline_mod.StagePlan(

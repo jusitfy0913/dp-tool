@@ -186,7 +186,59 @@ def main() -> int:
     check("低分误检不进入 conf 统计", near(report["precision"], 1.0), str(report["precision"]))
     check("低分误检仍影响 AP（排在后面但计入曲线）", report["map50"] <= 1.0)
 
-    # ---- 12. 空输入 ------------------------------------------------------
+    # ---- 12. 混淆矩阵与问题框 --------------------------------------------
+    # 判对优先于判错：类别 0 的预测框盖住类别 0 的 GT，即使也盖住类别 1，也算判对。
+    mixed = [
+        {
+            "file": "a.jpg",
+            "preds": [
+                {"box": [0, 0, 10, 10], "score": 0.9, "cls": 0},
+                {"box": [0, 0, 10, 10], "score": 0.8, "cls": 1},
+                {"box": [50, 50, 60, 60], "score": 0.7, "cls": 0},
+            ],
+            "gts": {0: [[0, 0, 10, 10]], 1: [[20, 20, 30, 30]]},
+        }
+    ]
+    report = valmetrics.evaluate(mixed, 2, conf=0.25)
+    found = report["diagnosis"]
+    # 三个预测框：一个判对，一个盖在已被占用的 GT 上所以是过检，一个落在空白处也是过检。类别 1 的 GT 没人检到。
+    check("判对 1、判错 0、漏检 1、过检 2",
+          (found["correct"], found["wrong"], found["miss"], found["extra"]) == (1, 0, 1, 2),
+          str((found["correct"], found["wrong"], found["miss"], found["extra"])))
+    check("精确率 = 判对 / (判对+判错+过检)",
+          near(report["precision"], 0.3333, 1e-4), str(report["precision"]))
+    check("召回率 = 判对 / (判对+判错+漏检)",
+          near(report["recall"], 1 / 2), str(report["recall"]))
+    kinds = sorted(row["kind"] for row in found["errors"])
+    check("问题清单只有漏检和过检", kinds == ["extra", "extra", "miss"], str(kinds))
+
+    swapped = [
+        {
+            "file": "b.jpg",
+            "preds": [{"box": [0, 0, 10, 10], "score": 0.95, "cls": 1}],
+            "gts": {0: [[0, 0, 10, 10]]},
+        }
+    ]
+    found = valmetrics.diagnosis(swapped, 2, conf=0.25)
+    check("类别判错进非对角格", found["matrix"][0][1] == 1 and found["wrong"] == 1, str(found["matrix"]))
+    check("判错不计入漏检和过检", found["miss"] == 0 and found["extra"] == 0)
+    check("判错行带文件名和两个类别",
+          found["errors"][0]["file"] == "b.jpg"
+          and found["errors"][0]["gt_class"] == 0
+          and found["errors"][0]["pred_class"] == 1)
+
+    low = valmetrics.diagnosis(
+        [{"preds": [{"box": [0, 0, 10, 10], "score": 0.1, "cls": 0}], "gts": {0: [[0, 0, 10, 10]]}}],
+        1,
+        conf=0.25,
+    )
+    check("低于 conf 的预测框当成没检出来", low["miss"] == 1 and low["correct"] == 0, str(low))
+
+    capped = valmetrics.cap_errors({"errors": [{"kind": "miss"}] * 3}, limit=2)
+    check("问题框截断只影响列表",
+          capped["errors_total"] == 3 and capped["errors_omitted"] == 1 and len(capped["errors"]) == 2)
+
+    # ---- 13. 空输入 ------------------------------------------------------
     empty = valmetrics.evaluate([], 0)
     check("空输入不崩", empty["map50"] == 0.0 and empty["num_images"] == 0)
 

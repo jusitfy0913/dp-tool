@@ -86,6 +86,16 @@ target_link_libraries(yolo_infer PRIVATE
 if(NOT DEFINED TRTFORGE_BIN_DIR)
     set(TRTFORGE_BIN_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../4-qt-studio/bin")
 endif()
+add_executable(int8_calib src/int8_calib.cpp)
+target_include_directories(int8_calib PRIVATE ${TRT_INCLUDE} ${OpenCV_INCLUDE_DIRS})
+target_link_directories(int8_calib PRIVATE ${TRT_LIBDIR} ${CUDA_LIBDIR})
+target_link_libraries(int8_calib PRIVATE ${OpenCV_LIBS} nvinfer nvonnxparser cudart)
+set_target_properties(int8_calib PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${TRTFORGE_BIN_DIR}"
+    RUNTIME_OUTPUT_DIRECTORY_DEBUG "${TRTFORGE_BIN_DIR}"
+    RUNTIME_OUTPUT_DIRECTORY_RELEASE "${TRTFORGE_BIN_DIR}"
+)
+
 set_target_properties(yolo_infer PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${TRTFORGE_BIN_DIR}"
     RUNTIME_OUTPUT_DIRECTORY_DEBUG "${TRTFORGE_BIN_DIR}"

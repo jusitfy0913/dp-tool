@@ -96,6 +96,20 @@ Qt 界面内部仍按四个功能分目录：`src/annotation` 标注，`src/trai
 
 `third_party/` 已加入 `.gitignore`，Paddle 源码与构建产物不会进入版本库。
 
+### 不入库、换机器要自己准备的文件
+
+下面几项在 `.gitignore` 里，克隆仓库后不会出现。软件日常推理不依赖前三项；缺了只影响「重新编译 ONNX 推理库」或「OCR 文字识别」。
+
+| 路径 | 是什么 | 怎么得到 |
+| --- | --- | --- |
+| `3-cpp-tensorrt/onnx_infer/third_party/onnxruntime/` | ONNX Runtime 1.16.3 头文件和 DLL（约 10 MB 起）。编译 `onnx_infer.dll` 时用。安装包从 `4-qt-studio/bin` 带运行库，使用人员不用这一步 | 在仓库根目录执行 `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\fetch_onnxruntime.ps1`。只要 CPU 版加 `-Variant cpu`。脚本从 NuGet 下载 `Microsoft.ML.OnnxRuntime.Gpu` 1.16.3（与 CUDA 11.8 对齐，不要换到 1.17+） |
+| `9-python-paddleOCR/model/legacy_v4/` | PP-OCRv4 检测、识别、方向模型（`.pdmodel` / `.pdiparams`，合计约 500 MB）。Web 默认到这里找 OCR 模型，也可用环境变量 `TRTFORGE_OCR_MODEL_DIR` 改位置 | 从 `https://paddleocr.bj.bcebos.com/` 下载并解压到 `model/legacy_v4/`：`PP-OCRv4/chinese/ch_PP-OCRv4_det_infer.tar`、`PP-OCRv4/chinese/ch_PP-OCRv4_rec_infer.tar`、`dygraph_v2.0/ch/ch_ppocr_mobile_v2.0_cls_infer.tar`。官方包没有 `inference.yml`，在 `6-web/backend` 下执行 `python tools/gen_legacy_ocr_yml.py` 补上。字典用 PaddleOCR 2.x 的 `ppocr/utils/ppocr_keys_v1.txt` |
+| `9-python-paddleOCR/PaddleOCR-main/` | PaddleOCR 官方源码（约 129 MB），只作对照和取字典，不参与编译、不打进安装包 | `git clone --depth 1 https://github.com/PaddlePaddle/PaddleOCR.git 9-python-paddleOCR/PaddleOCR-main` |
+| `2-python-anomaly/launcher/resultsbottle/` | 本机一次 PatchCore（MVTec bottle）训练产物（onnx / engine / ckpt，约 780 MB）。当前测试和安装包都不读这个目录 | 不需要下载。要复现时在异常检测训练里把输出目录指到这里 |
+| `runtime/`、`docs/*.rar` | 调试截图，以及和 `docs/深度学习介绍/` 重复的压缩包 | 不用准备 |
+
+用户安装包不包含上表这些目录。文字识别要在打包时加 `-WithOcr -OcrModelDir <legacy_v4 目录>`，模型会进安装目录的 `models\ocr`。
+
 ### 训练环境准备（Python 解释器）
 
 程序不内嵌 Python，训练时的解释器由训练页 `Python 环境` 指定，再对每个任务用 `QProcess` 拉起。已验证可用的环境要求：
@@ -136,6 +150,10 @@ python tf_anomalib_launcher.py --mode check-env
 引擎构建页选择 ONNX 后会在后台线程自动识别第一个输入 tensor 的名称和维度，并弹出“ONNX 加载中”进度提示；识别完成后提供统一 `H/W` 输入，修改一次高度和宽度即可同步覆盖 `min / opt / max` 三组动态 shape。
 
 ## 版本更新记录
+
+### v1.29.0 — 2026-11-06（检测验证报告 + YOLO INT8）
+
+**一句话**：Web Studio **1.29.0** 的检测验证会给出混淆矩阵，以及漏检、过检、判错清单；YOLO 引擎可以选 INT8，用一批图片做校准。分类任务这次没做。详情见 `6-web/README.md` 的 v1.29.0 变更点。
 
 ### v1.28.0 — 2026-11-06（Web Studio 推理进程隔离）
 

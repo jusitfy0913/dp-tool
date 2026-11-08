@@ -36,6 +36,9 @@ def _run_tool(name: str, argv: list[str]) -> int:
     if name == "infer_worker":
         from infer_worker import main
         return main(argv)
+    if name == "int8_launch":
+        from tools.int8_launch import main
+        return main(argv)
     print(f"未知工具：{name}", file=sys.stderr)
     return 2
 

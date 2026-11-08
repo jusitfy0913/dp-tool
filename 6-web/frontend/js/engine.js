@@ -43,6 +43,10 @@ const ENGINE_SUFFIXES = /\.(engine|trt|plan)$/i;
  * 必须与后端 build_engine 的默认推导一致，否则「留空自动推导」和
  * 「浏览目录后自动补名」会给出两个不同的文件名，用户会以为选错了。
  */
+export function precisionTag(value) {
+  return value === "fp16" || value === "int8" ? value : "fp32";
+}
+
 export function engineOutName(onnxPath, tag) {
   if (!onnxPath) return "";
   const base = onnxPath.replace(/^.*[\\/]/, "").replace(/\.onnx$/i, "");
@@ -143,7 +147,7 @@ export function initEngine() {
 
   function autoName(path) {
     if (!path) return "留空自动推导为 <onnx名>_fp16.engine";
-    const tag = precision.value === "fp16" ? "fp16" : "fp32";
+    const tag = precisionTag(precision.value);
     return engineOutName(path, tag) || "留空自动推导为 <onnx名>_fp16.engine";
   }
 
@@ -305,7 +309,7 @@ export function initEngine() {
   function normalizeOut(announce) {
     const before = outInput.value.trim();
     if (!before) return;
-    const tag = precision.value === "fp16" ? "fp16" : "fp32";
+    const tag = precisionTag(precision.value);
     const after = normalizeEngineOut(before, onnxInput.value.trim(), tag);
     if (!after || after === before) return;
     outInput.value = after;
@@ -320,6 +324,12 @@ export function initEngine() {
   dynamic.addEventListener("change", () => {
     shapeGroup.classList.toggle("hidden", !dynamic.checked);
   });
+  const calibBox = document.getElementById("engCalib");
+  function syncCalib() {
+    calibBox?.classList.toggle("hidden", precision.value !== "int8");
+  }
+  precision.addEventListener("change", syncCalib);
+  syncCalib();
 
   // -------------------------------------------------------------------------
   // 提交构建
@@ -332,6 +342,8 @@ export function initEngine() {
       onnx: onnxInput.value.trim(),
       engine: outInput.value.trim(),
       precision: precision.value,
+      calib_dir: document.getElementById("engCalibDir")?.value.trim() || "",
+      calib_count: Number(document.getElementById("engCalibCount")?.value) || 100,
       dynamic: dynamic.checked,
       min_shape: shapeInputs.min.value.trim(),
       opt_shape: shapeInputs.opt.value.trim(),
@@ -352,7 +364,7 @@ export function initEngine() {
     // 再兜一次规范化：用户可能改完没离开输入框就直接点「开始构建」，
     // 那种情况下 blur/change 还没跑，目录会原样送到后端被拒。
     if (body.engine) {
-      body.engine = normalizeEngineOut(body.engine, body.onnx, body.precision === "fp16" ? "fp16" : "fp32");
+      body.engine = normalizeEngineOut(body.engine, body.onnx, precisionTag(body.precision));
       outInput.value = body.engine;
     }
 

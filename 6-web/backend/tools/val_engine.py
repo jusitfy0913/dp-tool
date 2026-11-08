@@ -11,8 +11,9 @@
         --labels <labels_x.json> --split val --conf 0.25 --nms 0.45 --out <目录>
 
 产物：
-    val_report.json   指标 + 每类 AP + P-R 曲线（供前端画图）
+    val_report.json   指标 + 每类 AP + 混淆矩阵 + 问题框（JSON 里最多 500 条）
     val_report.csv    每类一行，给 Excel
+    val_images.csv    漏检 / 过检 / 判错的框，全量，给 Excel
 
 事件：每 10 张（或 0.5 秒）打一条 `TRTFORGE_JSON {...}` 到 stdout，
      与训练/批量推理同一套协议，后端 runners 直接能转成 WebSocket 事件。
@@ -113,6 +114,14 @@ def select_images(split_dirs: list[Path], limit: int) -> list[Path]:
     return images
 
 
+def class_name(classes: list[str], cls: int | None) -> str:
+    if cls is None:
+        return ""
+    if 0 <= cls < len(classes):
+        return classes[cls]
+    return f"cls{cls}"
+
+
 def write_csv(path: Path, report: dict, classes: list[str]) -> None:
     """每类一行；与批量推理的 CSV 一致用 utf-8-sig + \\n，Excel 打开不乱码。"""
     with path.open("w", encoding="utf-8-sig", newline="") as handle:
@@ -128,6 +137,23 @@ def write_csv(path: Path, report: dict, classes: list[str]) -> None:
                 row.get("predictions", 0),
                 "" if row.get("ap50") is None else f"{row['ap50']:.4f}",
                 "" if row.get("ap") is None else f"{row['ap']:.4f}",
+            ])
+
+
+def write_images_csv(path: Path, report: dict, classes: list[str]) -> None:
+    """每个有问题的框一行。kind 用中文，Excel 里不用再对编码表。"""
+    kind_text = {"miss": "漏检", "extra": "过检", "wrong": "判错"}
+    with path.open("w", encoding="utf-8-sig", newline="") as handle:
+        writer = csv.writer(handle, lineterminator="\n")
+        writer.writerow(["file", "kind", "gt_class", "pred_class", "score", "iou"])
+        for row in (report.get("diagnosis") or {}).get("errors") or []:
+            writer.writerow([
+                row.get("file") or "",
+                kind_text.get(row.get("kind"), row.get("kind") or ""),
+                class_name(classes, row.get("gt_class")),
+                class_name(classes, row.get("pred_class")),
+                "" if row.get("score") is None else f"{row['score']:.4f}",
+                "" if row.get("iou") is None else f"{row['iou']:.4f}",
             ])
 
 
@@ -268,6 +294,12 @@ def main(argv: list[str]) -> int:
 
     json_path = out_dir / "val_report.json"
     csv_path = out_dir / "val_report.csv"
+    images_csv = out_dir / "val_images.csv"
+    write_images_csv(images_csv, report, classes)
+    diagnosis_report = report.setdefault("diagnosis", {})
+    # 流水线记录会整份保存这份 JSON。问题框很多时只留前 500 条，全量在 CSV。
+    valmetrics.cap_errors(diagnosis_report)
+    diagnosis_report["images_csv"] = str(images_csv)
     json_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     write_csv(csv_path, report, classes)
 

@@ -1086,7 +1086,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_web_studio.ps1
 | --- | --- |
 | 选 ONNX | 选完自动调 `/api/engine/probe` 显示输入/输出形状与体积；未转置的 YOLO 会标红 |
 | 输出引擎 | 留空自动推导为 `<onnx名>_fp16.engine`；「浏览」只能选到目录，选中后自动补成 `目录\<onnx名>_<精度>.engine` |
-| 精度 | `fp16` 省显存（推荐）/ `fp32` |
+| 精度 | `fp16` 省显存（推荐）/ `fp32` / `int8`（YOLO，需选校准图片文件夹，默认抽 100 张）。同一批图再次编译沿用 `.cache` |
 | 动态 shape | 勾选后填 min/opt/max，如 `1x3x960x960` |
 | workspace | 默认 4096 MB |
 
@@ -1142,9 +1142,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_web_studio.ps1
 
 | 控件 | 说明 | 默认 |
 | --- | --- | --- |
-| 引擎精度 | `fp16` 省显存 / `fp32` 精度优先 | fp16 |
+| 引擎精度 | `fp16` / `fp32` / `int8`（只给 YOLO。留空校准文件夹就用验证集） | fp16 |
 | 验证用 split | `val` / `test` / `train` | val |
-| 编译后用引擎做精度验证 | 关掉就只到「生成标签」为止 | 勾选 |
+| 编译后用引擎做精度验证 | 关掉就只到「生成标签」为止。勾选后，检测任务会多一张混淆矩阵和漏检/过检/判错清单（`val_images.csv`） | 勾选 |
 | 跳过训练（用已有 .pt） | 勾选后必须给出 `.pt` 绝对路径，从导出开始跑 | 不勾 |
 
 **每一段都是独立任务**：串联本身不 spawn 子进程，只负责决定"下一段跑什么"。

@@ -381,6 +381,7 @@
             <select id="pipePrecision">
               <option value="fp16">fp16（默认，速度优先）</option>
               <option value="fp32">fp32（精度优先）</option>
+              <option value="int8">int8（YOLO，用图片校准，通常更快）</option>
             </select>
           </label>
         </div>
@@ -395,6 +396,18 @@
           </label>
 
           <div class="actions">
+            <div id="pipeCalib" class="hidden">
+              <label>校准图片文件夹（留空就用上面的验证集）
+                <div class="row">
+                  <input type="text" id="pipeCalibDir" placeholder="留空 = 验证集">
+                  <button type="button" class="mini" data-browse="pipeCalibDir" data-dialog="dir">浏览</button>
+                </div>
+              </label>
+              <label>校准张数
+                <input type="number" id="pipeCalibCount" value="100" min="1" max="500">
+              </label>
+              <p class="hint">从文件夹或验证集里均匀抽图，默认 100 张，最多 500 张。异常检测不能用 INT8。</p>
+            </div>
             <label class="check-row"><input type="checkbox" id="pipeRunVal" checked> 编译后用引擎做精度验证</label>
             <label class="check-row"><input type="checkbox" id="pipeSkipTrain"> 跳过训练（用已有 .pt）</label>
           </div>
@@ -477,6 +490,7 @@
         </div>
 
         <div class="stat-grid" id="pipeMetrics" hidden></div>
+        <div id="pipeValDetail" hidden></div>
 
         <div class="pipe-log" id="pipeLog" hidden>
           <div class="pipe-log-head">
@@ -975,6 +989,7 @@
             <select id="engPrecision">
               <option value="fp16">fp16（推荐，显存约省一半）</option>
               <option value="fp32">fp32</option>
+              <option value="int8">int8（需要校准图片，通常更快）</option>
             </select>
           </label>
           <label>workspace (MB)
@@ -991,6 +1006,19 @@
           <label>min <input type="text" id="engMin" placeholder="1x3x640x640"></label>
           <label>opt <input type="text" id="engOpt" placeholder="1x3x640x640"></label>
           <label>max <input type="text" id="engMax" placeholder="8x3x640x640"></label>
+        </div>
+
+        <div id="engCalib" class="hidden">
+          <label>校准图片文件夹
+            <div class="row">
+              <input type="text" id="engCalibDir" placeholder="放几十到几百张现场图片">
+              <button type="button" class="mini" data-browse="engCalibDir" data-dialog="dir">浏览</button>
+            </div>
+          </label>
+          <label>校准张数
+            <input type="number" id="engCalibCount" value="100" min="1" max="500">
+          </label>
+          <p class="hint">均匀抽取，默认 100 张，最多 500 张。图片和模型都没变时，再次编译会沿用校准缓存。</p>
         </div>
 
         <label>额外参数

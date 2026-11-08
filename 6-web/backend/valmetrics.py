@@ -248,6 +248,7 @@ def evaluate(
     total_gts = sum(row["instances"] for row in per_class)
     recall_at_conf = round(tp / total_gts, 4) if total_gts else 0.0
     precision_at_conf = round(tp / (tp + fp), 4) if (tp + fp) else 0.0
+    found = diagnosis(images, num_classes, conf=conf)
 
     return {
         "map50": map50,
@@ -261,7 +262,155 @@ def evaluate(
         "iou_thresholds": [round(float(t), 2) for t in iou_thresholds],
         "per_class": per_class,
         "curves": curves,
+        "diagnosis": found,
     }
+
+
+def _gt_list(item: dict) -> list[dict]:
+    """把一张图的 GT 摊平成 [{cls, box}]。类别键可能是 int，也可能是从 JSON 读回来的 str。"""
+    rows: list[dict] = []
+    for key, boxes in (item.get("gts") or {}).items():
+        try:
+            cls = int(key)
+        except (TypeError, ValueError):
+            continue
+        for box in boxes or []:
+            rows.append({"cls": cls, "box": [float(v) for v in box[:4]]})
+    return rows
+
+
+def _best_gt(box: list[float], gts: list[dict], used: set[int], threshold: float, *, cls: int | None) -> tuple[int, float]:
+    """在还没被占用的 GT 里找 IoU 最大的一个。cls 给出时只看同一类。"""
+    best_index = -1
+    best_iou = -1.0
+    for index, gt in enumerate(gts):
+        if index in used:
+            continue
+        if cls is not None and gt["cls"] != cls:
+            continue
+        value = iou_xyxy(box, gt["box"])
+        if value >= threshold - 1e-9 and value > best_iou:
+            best_iou = value
+            best_index = index
+    return best_index, best_iou
+
+
+def diagnosis(
+    images: Sequence[dict],
+    num_classes: int,
+    *,
+    conf: float = 0.25,
+    iou: float = 0.5,
+) -> dict[str, Any]:
+    """在 conf 与 IoU 0.5 下给出混淆矩阵和有问题的框。
+
+    配对分两步，保证和 ``evaluate`` 的精确率、召回率是同一批框：
+
+    1. 先按类别、按置信度从高到低，把预测框配给同类 GT。配上的是「判对」。
+    2. 剩下的框里，重叠够大但类别不同的配成「判错」。
+       再剩下的预测框是「过检」，没被配上的 GT 是「漏检」。
+
+    因此：精确率 = 判对 / (判对 + 判错 + 过检)，召回率 = 判对 / (判对 + 判错 + 漏检)。
+
+    矩阵比类别数多一行一列，下标 ``num_classes`` 是背景：
+    最后一列是漏检，最后一行是过检，其余非对角格是判错。
+    """
+    num_classes = max(int(num_classes), 0)
+    size = num_classes + 1
+    matrix = [[0 for _ in range(size)] for _ in range(size)]
+    errors: list[dict[str, Any]] = []
+    correct = wrong = miss = extra = 0
+
+    for item in images:
+        file_name = str(item.get("file") or "")
+        preds = [
+            pred for pred in _normalize_preds(item.get("preds") or [])
+            if pred["score"] >= conf and 0 <= pred["cls"] < num_classes
+        ]
+        preds.sort(key=lambda pred: pred["score"], reverse=True)
+        gts = [gt for gt in _gt_list(item) if 0 <= gt["cls"] < num_classes]
+        used_gt: set[int] = set()
+        used_pred: set[int] = set()
+
+        for pred_index, pred in enumerate(preds):
+            gt_index, _value = _best_gt(pred["box"], gts, used_gt, iou, cls=pred["cls"])
+            if gt_index < 0:
+                continue
+            used_gt.add(gt_index)
+            used_pred.add(pred_index)
+            matrix[pred["cls"]][pred["cls"]] += 1
+            correct += 1
+
+        for pred_index, pred in enumerate(preds):
+            if pred_index in used_pred:
+                continue
+            gt_index, value = _best_gt(pred["box"], gts, used_gt, iou, cls=None)
+            if gt_index < 0:
+                continue
+            used_gt.add(gt_index)
+            used_pred.add(pred_index)
+            gt = gts[gt_index]
+            matrix[gt["cls"]][pred["cls"]] += 1
+            wrong += 1
+            errors.append({
+                "file": file_name,
+                "kind": "wrong",
+                "gt_class": gt["cls"],
+                "pred_class": pred["cls"],
+                "score": round(pred["score"], 4),
+                "iou": round(value, 4),
+            })
+
+        for gt_index, gt in enumerate(gts):
+            if gt_index in used_gt:
+                continue
+            matrix[gt["cls"]][num_classes] += 1
+            miss += 1
+            errors.append({
+                "file": file_name,
+                "kind": "miss",
+                "gt_class": gt["cls"],
+                "pred_class": None,
+                "score": None,
+                "iou": None,
+            })
+
+        for pred_index, pred in enumerate(preds):
+            if pred_index in used_pred:
+                continue
+            matrix[num_classes][pred["cls"]] += 1
+            extra += 1
+            errors.append({
+                "file": file_name,
+                "kind": "extra",
+                "gt_class": None,
+                "pred_class": pred["cls"],
+                "score": round(pred["score"], 4),
+                "iou": None,
+            })
+
+    return {
+        "iou": round(float(iou), 2),
+        "background": num_classes,
+        "matrix": matrix,
+        "correct": correct,
+        "wrong": wrong,
+        "miss": miss,
+        "extra": extra,
+        "errors": errors,
+    }
+
+
+def cap_errors(found: dict[str, Any], limit: int = 500) -> dict[str, Any]:
+    """JSON 里只留前 limit 条问题框。调用前应已把全量写进 CSV。"""
+    errors = list(found.get("errors") or [])
+    found["errors_total"] = len(errors)
+    if len(errors) > limit:
+        found["errors"] = errors[:limit]
+        found["errors_omitted"] = len(errors) - limit
+    else:
+        found["errors_omitted"] = 0
+    return found
 
 
 def box_iou_matrix(a: Sequence[Sequence[float]], b: Sequence[Sequence[float]]) -> np.ndarray:

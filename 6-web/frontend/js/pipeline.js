@@ -78,6 +78,7 @@ export function initPipeline() {
     artifactsBox: document.getElementById("pipeArtifactsBox"),
     artifactRows: document.getElementById("pipeArtifactRows"),
     metrics: document.getElementById("pipeMetrics"),
+    valDetail: document.getElementById("pipeValDetail"),
     historyRows: document.getElementById("pipeHistoryRows"),
     log: document.getElementById("pipeLog"),
     logTitle: document.querySelector("#pipeLog .pipe-log-head span"),
@@ -88,6 +89,7 @@ export function initPipeline() {
   dom.btnStart.addEventListener("click", onStart);
   dom.btnStop.addEventListener("click", onStop);
   dom.kind.addEventListener("change", syncKind);
+  dom.precision.addEventListener("change", syncCalib);
   dom.skipTrain.addEventListener("change", syncSkipTrain);
   dom.anomalySkipTrain.addEventListener("change", syncSkipTrain);
   dom.btnPickBest.addEventListener("click", pickBestWeights);
@@ -117,6 +119,13 @@ function syncKind() {
   dom.btnStart.textContent = kind === "anomalib" ? "开始全流程（异常检测）" : "开始全流程";
   setHint("");
   syncSkipTrain();
+  syncCalib();
+}
+
+function syncCalib() {
+  const box = document.getElementById("pipeCalib");
+  if (!box) return;
+  box.classList.toggle("hidden", dom.kind.value !== "yolo" || dom.precision.value !== "int8");
 }
 
 function syncSkipTrain() {
@@ -157,6 +166,8 @@ function buildPayload() {
     name: value("runName"),
     python: value("pythonPath") || null,
     precision: dom.precision.value,
+    calib_dir: value("pipeCalibDir"),
+    calib_count: Number(value("pipeCalibCount")) || 100,
     skip_train: dom.skipTrain.checked,
     weights: dom.weights.value.trim(),
     run_val: dom.runVal.checked,
@@ -185,6 +196,10 @@ function buildAnomalyPayload() {
 async function onStart() {
   const kind = dom.kind.value;
   const anomaly = kind === "anomalib";
+  if (anomaly && dom.precision.value === "int8") {
+    setHint("异常检测还不能用 INT8，请改回 fp16 或 fp32", "warn");
+    return;
+  }
   const payload = anomaly ? buildAnomalyPayload() : buildPayload();
 
   if (anomaly) {
@@ -450,6 +465,10 @@ function renderMetrics(record) {
   const metrics = record.metrics;
   dom.metrics.innerHTML = "";
   dom.metrics.hidden = !metrics;
+  if (dom.valDetail) {
+    dom.valDetail.innerHTML = "";
+    dom.valDetail.hidden = true;
+  }
   if (!metrics) return;
 
   // 两条链的精度口径完全不同：检测是 mAP/P/R，异常检测是 AUROC/漏检/误报。
@@ -474,10 +493,100 @@ function renderMetrics(record) {
   if (Array.isArray(metrics.per_class) && metrics.per_class.length) {
     console.table(metrics.per_class);
   }
+  renderValDetail(metrics);
+}
+
+const KIND_TEXT = { miss: "漏检", extra: "过检", wrong: "判错" };
+
+function classLabel(metrics, cls) {
+  if (cls === null || cls === undefined || cls === "") return "—";
+  const names = metrics.classes || [];
+  const index = Number(cls);
+  if (Number.isInteger(index) && names[index]) return names[index];
+  return `类别 ${cls}`;
+}
+
+function renderValDetail(metrics) {
+  const found = metrics.diagnosis;
+  const host = dom.valDetail;
+  if (!host || !found || !Array.isArray(found.matrix)) return;
+
+  const names = (metrics.classes || []).slice();
+  const background = found.background ?? names.length;
+  while (names.length < background) names.push(`类别 ${names.length}`);
+  const headers = names.concat(["没检出来"]);
+  const rowNames = names.concat(["多检出来"]);
+
+  const note = document.createElement("p");
+  note.className = "pipe-val-note";
+  note.textContent = "行是标注，列是预测。斜线是判对，最后一列是漏检，最后一行是过检，其他格子是判错。"
+    + " 精确率 = 判对 / (判对 + 判错 + 过检)，召回率 = 判对 / (判对 + 判错 + 漏检)。";
+
+  const table = document.createElement("table");
+  table.className = "data-table conf-matrix";
+  const thead = document.createElement("thead");
+  const headRow = document.createElement("tr");
+  ["标注 \\ 预测"].concat(headers).forEach((text) => {
+    const th = document.createElement("th");
+    th.textContent = text;
+    headRow.appendChild(th);
+  });
+  thead.appendChild(headRow);
+  const tbody = document.createElement("tbody");
+  found.matrix.forEach((row, rowIndex) => {
+    const tr = document.createElement("tr");
+    const th = document.createElement("th");
+    th.textContent = rowNames[rowIndex] || "";
+    tr.appendChild(th);
+    row.forEach((value, colIndex) => {
+      const td = document.createElement("td");
+      td.textContent = String(value);
+      if (rowIndex === colIndex && rowIndex < background) td.className = "is-hit";
+      tr.appendChild(td);
+    });
+    tbody.appendChild(tr);
+  });
+  table.append(thead, tbody);
+
+  const listTitle = document.createElement("p");
+  listTitle.className = "pipe-val-note";
+  const total = found.errors_total ?? (found.errors || []).length;
+  const shown = (found.errors || []).slice(0, 100);
+  listTitle.textContent = total
+    ? `问题框 ${total} 条，下面显示前 ${shown.length} 条。`
+    : "没有漏检、过检或判错。";
+  if (found.images_csv) listTitle.textContent += ` 完整清单：${found.images_csv}`;
+
+  host.append(note, table, listTitle);
+  if (shown.length) {
+    const list = document.createElement("table");
+    list.className = "data-table";
+    const listHead = document.createElement("tr");
+    ["文件", "问题", "真实类别", "预测类别", "置信度"].forEach((text) => {
+      const th = document.createElement("th");
+      th.textContent = text;
+      listHead.appendChild(th);
+    });
+    const listBody = document.createElement("tbody");
+    shown.forEach((row) => {
+      const tr = document.createElement("tr");
+      [row.file || "—", KIND_TEXT[row.kind] || row.kind || "—",
+        classLabel(metrics, row.gt_class), classLabel(metrics, row.pred_class),
+        row.score == null ? "—" : String(row.score)].forEach((text) => {
+        const td = document.createElement("td");
+        td.textContent = text;
+        tr.appendChild(td);
+      });
+      listBody.appendChild(tr);
+    });
+    list.append(listHead, listBody);
+    host.appendChild(list);
+  }
+  host.hidden = false;
 }
 
 function yoloMetricItems(metrics) {
-  return [
+  const items = [
     ["mAP50", fmtNum(metrics.map50, 4)],
     ["mAP50-95", fmtNum(metrics.map5095, 4)],
     ["精确率 P", fmtNum(metrics.precision, 3)],
@@ -486,6 +595,15 @@ function yoloMetricItems(metrics) {
     ["GT 实例", metrics.num_gts ?? "—"],
     ["conf 阈值", fmtNum(metrics.conf, 2)],
   ];
+  const found = metrics.diagnosis;
+  if (found) {
+    items.push(
+      ["漏检", found.miss ?? 0],
+      ["过检", found.extra ?? 0],
+      ["判错", found.wrong ?? 0],
+    );
+  }
+  return items;
 }
 
 function anomalyMetricItems(metrics) {

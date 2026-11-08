@@ -1077,6 +1077,12 @@ table.env td:first-child { width: 250px; color: var(--text); }
 .data-table tbody tr:hover { background: var(--surface-2); }
 .data-table tbody tr.selected { background: var(--cyan-a10); box-shadow: inset 2px 0 0 var(--cyan); }
 
+/* 验证报告：混淆矩阵格子居中，判对的那条斜线用浅色底，方便扫一眼 */
+.conf-matrix { width: auto; margin: 8px 0 14px; }
+.conf-matrix td, .conf-matrix th { text-align: center; min-width: 3.2em; }
+.conf-matrix td.is-hit { background: var(--cyan-a10); font-weight: 600; }
+.pipe-val-note { margin: 4px 0 10px; color: var(--text-dim); font-size: var(--fs-sm); }
+
 /* 数据集预览列表：图片多时只滚动容器，不把整页撑长。
    表格本体用 .data-table，这里只补容器约束与更紧凑的行高。 */
 .scrollbox {
