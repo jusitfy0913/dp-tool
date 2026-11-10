@@ -1,0 +1,8 @@
+{
+    "hypothesis":  "短预算下 AdamW 比 SGD 收敛更快",
+    "changed":  "optimizer auto-\u003eAdamW, lr0 0.01-\u003e0.002",
+    "train":  {
+                  "optimizer":  "AdamW",
+                  "lr0":  0.002
+              }
+}

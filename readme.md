@@ -22,6 +22,8 @@
 | `6-web/backend` | Web 版后端：启动 launcher 子进程、转发训练事件、ctypes 调推理 DLL |
 | `6-web/frontend` | Web 版前端：原生 HTML/JS，无 npm 构建步骤 |
 | `1-python-yolo/ultralytics-main` | YOLO 训练、验证、导出的 Python 开源工程来源 |
+| `7-autoresearch-yolo` | **YOLO 自主实验循环**：固定时间预算 + 单一适应度 + 台账留痕，在 PCB 数据集上做超参与增强的自动化实验。**对生产 launcher 零改动**，只 import 其纯函数；产物严格收敛在该目录内。用法与参数见 `7-autoresearch-yolo/README.md` |
+| `7-autoresearch-master` | Karpathy autoresearch 原始副本（LLM 预训练方法论来源），**仅供参考，不参与本工程构建** |
 | `docs` | 架构设计、推理流程、部署总结等中文文档。操作入口：[Web 操作手册](docs/TRTForge_Web操作手册.md)。发给使用人员、不附源码的安装包见 [packaging/package_web_user.ps1](packaging/package_web_user.ps1) |
 | `openspec` | 需求规格和变更提案 |
 
@@ -150,6 +152,59 @@ python tf_anomalib_launcher.py --mode check-env
 引擎构建页选择 ONNX 后会在后台线程自动识别第一个输入 tensor 的名称和维度，并弹出“ONNX 加载中”进度提示；识别完成后提供统一 `H/W` 输入，修改一次高度和宽度即可同步覆盖 `min / opt / max` 三组动态 shape。
 
 ## 版本更新记录
+
+### v1.32.0 — 2026-11-10（YOLO 自主实验循环：把"调参"变成可留痕的实验）
+
+**一句话**：新增 `7-autoresearch-yolo` 模块，用「固定时间预算 + 单一适应度 + 台账留痕」在 PCB 数据集上做 YOLO 超参与增强的自动化实验。**对 `1-python-yolo/launcher` 零文件改动**（只 `import` 它三个纯函数），补丁前的代码用 git tag `yolo-stable-before-autoexp` 与 `_backup/launcher_20261110/` 双重锁住。
+
+**为什么不再手调**：默认 100 epoch @640 要约 35~40 分钟，一次试错半小时；而且改了 epoch 数和改了增强的实验混在一起看，分不清是哪个起的作用；跑完十几个 `exp` / `exp-2` / `exp-3` 目录后也记不清对应哪套参数。
+
+**核心机制**
+
+| 机制 | 做法 | 解决什么 |
+| --- | --- | --- |
+| 固定预算 | `budget_seconds`（默认 600 秒）转成 Ultralytics 的 `time`（小时）传入，到点即停并按首轮实测耗时反推 epoch 数 | 不同配置、不同模型规模的实验可以横比 |
+| 单一适应度 | 取 `results.csv` **最后一行**的 `mAP50-95`，不取历史最佳 | 取 max 会让"早慧型"配置虚高，固定预算下比的就是到点那一刻 |
+| 确定性切分 | `split` 把 139 张 val 确定性切成 tune 97 / holdout 42（固定 `seed=42`，先排序再洗牌） | `best.pt` 是按 val 选的，若搜索也盯这 139 张就会把它拟合掉 |
+| holdout 纪律 | 搜索期一次不许看，只在最后验收跑一次 | 否则看到的只是"在这 139 张上很好"，不是泛化好 |
+| 硬链接镜像 | 732 MB 训练集用 `os.link` 镜像进 `splits/pcb/` | 不占额外磁盘，且不改动原始数据集 |
+| 台账 | `results.tsv` 一行一个实验，含请求/实际生效 batch、峰值显存、假设描述 | 可回溯、可横比 |
+| 显存预检 | 开训前比对可用显存与保守需求，不够直接拒绝 | 挡住 Ultralytics 的静默降 batch |
+
+**为什么必须挡住静默降 batch**：Ultralytics 首轮 OOM 会自动把 batch 减半重来（`16→8→4→2`，每次从第 1 个 epoch 重头再来）。batch 一变，`nbs` 归一化后的等效学习率、正则强度全跟着变，那次实验就与台账里其它实验**不是同一件事**，横比全是假的。现在预检不过就记 `preflight_blocked`，零训练时间消耗，也不污染 `crash` 统计。
+
+**本机实测（T1000 8GB）**
+
+- `batch=16 @640`，可用显存 5302 MB → **OOM**。根因是 `6-web` 两套常驻服务各挂一个 `infer_worker.py` 长期占用约 2.7 GB；且这张卡在 Ultralytics 的 AMP 黑名单里，训练强制 fp32，激活显存比常规高一截。
+- `batch=8 @640` → 正常，峰值 1769.5 MB，约 24~26 秒/epoch。
+- 完全相同的配置 600 秒跑三次，mAP50-95 = `0.40496` / `0.41109` / `0.40385`，**sigma 0.003184**，
+  极差 0.00724。远低于上游要求的 0.01，说明 600 秒预算充足，keep 阈值取 2σ = **0.006368**。
+
+**首轮 5 个假设的结论（600 秒基准）**
+
+| 改动 | tune mAP50-95 | 判定 |
+| --- | --- | --- |
+| `imgsz 640→960, batch 8→4` | **0.45862** | **KEEP**（holdout 复核 0.473726，同向成立） |
+| `close_mosaic 10→3` | 0.41078 | discard（噪声内） |
+| `lr0 0.01→0.02` | 0.40715 | discard（噪声内） |
+| `optimizer→AdamW, lr0=0.002` | 0.40407 | discard（噪声内） |
+| `mosaic 1.0→0.5, scale 0.5→0.7` | 0.3892 | discard（真退步） |
+
+只有提高分辨率是真信号（约 15 sigma）。值得注意的是 960 在 600 秒内只跑得完 12 个 epoch，
+却比 640 的 24 个 epoch 更好——**"每张图看得更清楚"的收益大于"多看几遍"**。
+
+**用法**（详见 [7-autoresearch-yolo/README.md](7-autoresearch-yolo/README.md)）
+
+```powershell
+cd 7-autoresearch-yolo
+python autoexp.py split --data "..\PCB data\PCB缺陷检测\data.yaml"   # 只需一次
+python autoexp.py run --config experiments/cur.json                  # 跑一次实验
+python autoexp.py report                                             # 看台账
+python autoexp.py noise --repeat 3                                   # 测噪声底（决定 keep 阈值）
+python autoexp.py holdout --weights runs/autoexp/exp_0007/weights/best.pt
+```
+
+**范围说明**：本轮只搭地基，**不含**"谁来决定下一次改什么参数"那一层，全程不需要任何大模型 API。Anomalib 侧不做——现有 `anomaly_val_report.json` 是 `auroc 1.0 / f1 1.0 / tp44 fp0 tn20 fn0`，奖励信号已饱和，任何配置都得满分，循环没有梯度可爬。EfficientAd 也不适合：20 epoch 要 3525 秒，压进 5 分钟预算会把 LR 日程一起改掉，实验之间比的就不再是"同一套方法跑多久"。
 
 ### v1.31.0 — 2026-11-10（网页端推理改成进程池：多人同时用不再排队）
 

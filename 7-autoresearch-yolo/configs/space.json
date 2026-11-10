@@ -1,0 +1,135 @@
+{
+  "_comment": "搜索空间白名单。run 子命令会按本文件校验 cur.json，越界直接拒绝。enum 表示只允许列出的取值，min/max 表示数值区间。train 下的键必须在这里声明过，否则视为越界。",
+  "budget_seconds": {
+    "min": 120,
+    "max": 7200
+  },
+  "model": {
+    "enum": ["yolov8n.pt", "yolov8s.pt", "yolov8m.pt"]
+  },
+  "train": {
+    "device": {
+      "enum": ["0", "cpu"]
+    },
+    "imgsz": {
+      "enum": [640, 800, 960, 1152, 1280]
+    },
+    "batch": {
+      "enum": ["4", "8", "16", "-1"]
+    },
+    "optimizer": {
+      "enum": ["auto", "SGD", "AdamW", "Adam", "NAdam", "RAdam", "RMSProp"]
+    },
+    "lr0": {
+      "min": 0.0005,
+      "max": 0.02
+    },
+    "lrf": {
+      "min": 0.01,
+      "max": 0.2
+    },
+    "momentum": {
+      "min": 0.85,
+      "max": 0.98
+    },
+    "weight_decay": {
+      "min": 0.0,
+      "max": 0.001
+    },
+    "freeze": {
+      "enum": [0, 5, 10, 15]
+    },
+    "close_mosaic": {
+      "min": 0,
+      "max": 30
+    },
+    "mosaic": {
+      "min": 0.0,
+      "max": 1.0
+    },
+    "mixup": {
+      "min": 0.0,
+      "max": 0.3
+    },
+    "scale": {
+      "min": 0.0,
+      "max": 0.9
+    },
+    "translate": {
+      "min": 0.0,
+      "max": 0.3
+    },
+    "degrees": {
+      "min": 0.0,
+      "max": 30.0
+    },
+    "shear": {
+      "min": 0.0,
+      "max": 10.0
+    },
+    "perspective": {
+      "min": 0.0,
+      "max": 0.001
+    },
+    "fliplr": {
+      "min": 0.0,
+      "max": 1.0
+    },
+    "flipud": {
+      "min": 0.0,
+      "max": 1.0
+    },
+    "hsv_h": {
+      "min": 0.0,
+      "max": 0.1
+    },
+    "hsv_s": {
+      "min": 0.0,
+      "max": 1.0
+    },
+    "hsv_v": {
+      "min": 0.0,
+      "max": 1.0
+    },
+    "cos_lr": {
+      "enum": [true, false]
+    },
+    "warmup_epochs": {
+      "min": 0.0,
+      "max": 5.0
+    },
+    "nbs": {
+      "enum": [16, 32, 64]
+    },
+    "multi_scale": {
+      "min": 0.0,
+      "max": 0.9
+    },
+    "rect": {
+      "enum": [true, false]
+    },
+    "patience": {
+      "min": 0,
+      "max": 100
+    },
+    "workers": {
+      "min": 0,
+      "max": 12
+    },
+    "seed": {
+      "enum": [0]
+    },
+    "deterministic": {
+      "enum": [true]
+    },
+    "amp": {
+      "enum": [true, false]
+    },
+    "cache": {
+      "enum": ["ram", "disk", false, true]
+    },
+    "plots": {
+      "enum": [false]
+    }
+  }
+}

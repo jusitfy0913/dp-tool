@@ -161,3 +161,11 @@ docs/*.rar
 
 # 本地提交信息临时文件（每次提交前重写，不入库）
 /.git-commit-msg.txt
+
+# 自动实验循环的数据镜像（硬链接镜像原始 PCB 数据集，约 914MB，可由 autoexp.py split 重建，不入库）
+/7-autoresearch-yolo/splits/
+# 自动实验循环的训练产物与临时权重
+/7-autoresearch-yolo/weights/
+/7-autoresearch-yolo/noise.log
+# launcher 的物理备份（代码与权重，可由 tag yolo-stable-before-autoexp 复原）
+/7-autoresearch-yolo/_backup/

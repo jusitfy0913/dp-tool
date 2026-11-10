@@ -2466,6 +2466,117 @@ Anomalib 的模型 + 后处理占 150~200 ms，池化就能兑现。
 **还没做的**：`infer_batch.py` / `infer_video.py` 仍是单进程串行。批量脚本没有 HTTP 与管道开销，
 收益比网页端更大，但要另设计分片与保序写盘，留作第二期。
 
+### 7.16 YOLO 自主实验循环（v1.32.0）
+
+**要解决什么**：手动调 YOLO 有三个实际痛点——单次 100 epoch @640 约 35~40 分钟，一次试错半小时没了；
+改了 epoch 数和改了增强的实验混在一起看，分不清是哪个起的作用；跑完十几个 `exp` / `exp-2` / `exp-3`
+目录后记不清哪个对应哪套参数。
+
+**在哪儿**：`7-autoresearch-yolo/`，与 `7-autoresearch-master/` 并列。后者是 Karpathy 的
+LLM 预训练方法论来源，**不参与本工程构建**；本模块只借用它的问题形式，不复用任何代码。
+
+**循环**
+
+```mermaid
+flowchart TD
+    A["读 experiments/best.json"] --> B["写 experiments/cur.json<br/>只写改动的字段"]
+    B --> C["autoexp.py run<br/>budget_seconds 硬截断"]
+    C --> D["读 results.tsv 新增行"]
+    D --> E{"fitness 提升超过 2 sigma?"}
+    E -->|是| F["更新 best.json，记 keep"]
+    E -->|否| G["记 discard，best.json 不动"]
+    F --> H{"继续?"}
+    G --> H
+    H -->|是| A
+    H -->|否| I["autoexp.py holdout<br/>一次性验收"]
+```
+
+**四个设计决定**
+
+| 决定 | 理由 |
+| --- | --- |
+| 预算用 Ultralytics 的 `time`（小时），不用 epoch 数 | epoch 数一变，不同配置就不可比了。`time` 到点即停，并按首轮实测耗时反推 epoch 数，于是"跑 600 秒"对所有配置含义相同 |
+| 适应度取 `results.csv` **最后一行**，不取 max | 取历史最佳会让"早慧型"配置虚高；固定预算下比的就是到点那一刻的水平 |
+| val 集再切成 tune(97) / holdout(42) | `best.pt` 本来就是按这 139 张选的。若搜索也盯它，跑二十次就把它拟合掉了。holdout 搜索期一次不许看，只在最后验收跑一次 |
+| 显存预检，拒绝静默降 batch | 见下 |
+
+**为什么必须挡住「自动降 batch」**：Ultralytics 首轮 OOM 会自动把 batch 减半重来
+（`16→8→4→2`，每次从第 1 个 epoch 重头再来，日志里只有一行黄字）。batch 一变，
+`nbs` 归一化后的等效学习率、正则强度全跟着变，那次实验就与台账里其它实验**不是同一件事**，
+横比全是假的。`preflight_vram()` 在开训前比对可用显存与保守需求，不够直接拒绝，
+记 `preflight_blocked`（不污染 `crash` 统计），零训练时间消耗。台账另设 `batch_req` / `batch_eff`
+两列，万一被降过也能立刻看出来。
+
+**与生产代码的关系：零文件改动**
+
+`autoexp.py` 只 `import` `1-python-yolo/launcher/tf_yolo_launcher.py` 的三个纯函数
+（`build_parser()` / `build_train_kwargs()` / `load_yolo()`），不修改它。这样超参映射与界面训练
+100% 一致，而生产 launcher 一行没动。
+
+两道锁：
+
+```powershell
+git tag -l "yolo-stable*"                                        # yolo-stable-before-autoexp
+git diff yolo-stable-before-autoexp -- 1-python-yolo/launcher    # 应为空
+```
+
+`7-autoresearch-yolo/_backup/launcher_<日期>/` 另有 launcher 的 `.py` 与 `configs/` 实体副本
+（不含 `runs/`，约 6 MB），不依赖 git 状态。
+
+**写入守卫**：`assert_sandbox()` 拒绝任何落在 `7-autoresearch-yolo/` 之外的写入，并显式列出黑名单
+`1-python-yolo/launcher/runs`、`2-python-anomaly/launcher/results`、`6-web/runtime`、`4-qt-studio`、
+`3-cpp-tensorrt`。数据集用硬链接镜像，原始 `PCB data/` 只读，标注缓存走内存（`cache: "ram"`），
+不往原始 `labels/` 写 `.cache`。
+
+**本机实测（T1000 8GB）**
+
+| 配置 | 结果 |
+| --- | --- |
+| `batch=16 @640`，可用显存 5302 MB | **OOM**。自动降 16→8→4→2 后仍失败 |
+| `batch=8 @640` | 正常，峰值 1769.5 MB，约 24~26 秒/epoch，600 秒约 23~24 个 epoch |
+| 同配置 600 秒跑三次 | mAP50-95 = `0.40496` / `0.41109` / `0.40385`，**sigma 0.003184**，keep 阈值 2σ = **0.006368** |
+| 同配置 120 秒跑两次 | mAP50-95 分别 `0.19745` / `0.19586`，差 0.0016（但整体只在 0.197，仍在爬坡期） |
+
+**首轮 5 个假设（600 秒基准）**
+
+| 改动 | tune mAP50-95 | 判定 |
+| --- | --- | --- |
+| `imgsz 640→960, batch 8→4` | **0.45862** | **KEEP** |
+| `close_mosaic 10→3` | 0.41078 | discard（噪声内） |
+| `lr0 0.01→0.02` | 0.40715 | discard（噪声内） |
+| `optimizer→AdamW, lr0=0.002` | 0.40407 | discard（噪声内） |
+| `mosaic 1.0→0.5, scale 0.5→0.7` | 0.3892 | discard（真退步） |
+
+holdout 复核：640 基线 `0.438055` → 960 `0.473726`，提升同向成立。结论记录在
+`experiments/best.json`。960 在 600 秒内只跑得完 12 个 epoch，却胜过 640 的 24 个 epoch——
+PCB 缺陷尺寸小，分辨率的收益大于重复遍历的收益。
+
+**验收必须用同一把尺子**：第一次验 `exp_0006` 时 `holdout` 默认从 `configs/base.json` 读了
+`imgsz=640`，等于拿 640 去量 960 训出来的模型，得 0.328896，看着像灾难性过拟合，
+实际是量错了。现已改为自动从该次训练的 `args.yaml` 读回 `imgsz` 与 `batch`。
+
+OOM 根因：`6-web` 的两套常驻服务（端口 8060 / 8094）各挂一个 `infer_worker.py`，长期占约 2.7 GB；
+且这张卡在 Ultralytics 的 AMP 黑名单里，训练强制 fp32，激活显存比常规高一截。跑实验前若不需要
+Web 端，建议停掉一套。
+
+**为什么不覆盖 Anomalib**：现有 `anomaly_val_report.json` 是 `auroc 1.0 / f1 1.0 / tp44 fp0 tn20 fn0`，
+奖励信号已饱和，任何配置都得满分，循环没有梯度可爬，只会退化成"寻找跑得最快的退化配置"。
+EfficientAd 也不适合：20 epoch 要 3525 秒，压进 5 分钟预算会把 LR 日程一起改掉，实验之间比的
+就不再是"同一套方法跑多久"，而是"不同的训练配方"。
+
+**命令**
+
+```powershell
+cd 7-autoresearch-yolo
+python autoexp.py split --data "..\PCB data\PCB缺陷检测\data.yaml"   # 只需一次
+python autoexp.py run --config experiments/cur.json
+python autoexp.py report
+python autoexp.py noise --repeat 3
+python autoexp.py holdout --weights runs/autoexp/exp_0007/weights/best.pt
+```
+
+完整参数说明、台账字段与应用场景见 `7-autoresearch-yolo/README.md`。
+
 ---
 
 ## 8. 常见故障排查
