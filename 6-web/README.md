@@ -1903,6 +1903,145 @@ version_diff:
     tests: "后端 44 个脚本全绿（test_onnx_fallback 76 项、test_infer_timing 15 项）；前端 6 套全绿"
 ```
 
+#### v1.33.0 变更点（相对 v1.32.1）——新增「自动实验」页签：LLM 提议、程序裁判
+
+**问题**：`7-autoresearch-yolo` 的第 4 阶段（LLM 决策层）只有命令行。
+开一夜 30 轮，用户既填不了 API Key，也看不到「模型想改什么、为什么改、判定是 keep 还是 discard」。
+
+**做法**：加一个**外置页签**，一个字节都不动训练页的老流程。
+
+| 隔离点 | 具体做法 | 为什么不能偷懒合并 |
+| --- | --- | --- |
+| 路由 | 新增 `backend/autoexp_api.py`（独立 `APIRouter`，`/api/autoexp/*`）；`app.py` 只 `include_router` | 改 `/api/train/yolo` 等于把两条生命周期完全不同的任务绑在一起 |
+| 前端 | 新增 `frontend/js/autoexp.js`，不 import `train.js` 的任何状态 | 两个页面各有一份「当前 run」，共享状态必然互相顶掉 |
+| 事件 | autoexp 发 `{"type": "agent"}`，训练发 `{"type": "event"}` | 训练页的事件 switch 里没有 `agent`，所以即便同时开着也不会渲染自动实验的内容 |
+| 任务类型 | `runners` 新增独占 kind `autoexp-agent`，复用顶栏「运行中」条 | 从顶栏点回来要落到正确的页签，否则会显示一篇看不懂的训练日志 |
+| 训练页接管 | `train.js` 的 `TRAIN_KINDS` 只含 `yolo-train` / `anomalib-train` 等 | 否则点「开始训练」遇 409 时会去 attach 自动实验的 run，把控制台顶掉 |
+| GPU | 与训练页共用同一把 `gpulock`，按 **pid 委派** | 见下 |
+
+**锁委派为什么要传 pid，而不是一个布尔开关**
+
+后端替子进程拿锁（owner=`web`，pid=后端），子进程若照常检查就会看到「pid 不是我」
+而直接退出码 5——一轮都跑不了。但如果传 `AUTOEXP_GPU_LOCK=parent` 这样的布尔开关，
+子进程又会**连「命令行正另跑着一轮实验」也看不见**，两个训练一起抢显存，正是这把锁要防的事。
+所以只传 `AUTOEXP_GPU_LOCK_PID=<后端 pid>`，子进程仅在「持有者 pid 恰好等于它」时跳过。
+
+| 场景 | 行为 |
+| --- | --- |
+| 网页启动自动实验，锁被另一套 Web / 命令行持有 | **409**，文案带占用方与 PID；不再让 agent 起跑后无限等锁 |
+| `autoexp.py run`，锁由自家后端持有 | 写入日志「显卡锁由网页后端持有」，正常训练 |
+| `autoexp.py run`，锁由别的进程持有 | 退出码 5，不建实验目录、不写台账 |
+
+**Key 的三条边界**
+
+1. 只落盘到 `runtime/autoexp_llm.json`（`runtime/` 已 gitignore）。
+2. `GET /api/autoexp/llm-config` 永不返回原文，只给 `has_key` + 遮罩（`sk-****1a2b`）；
+   保存时 `api_key` 留空 = 不修改，传 `__clear__` = 删除。
+3. 传子进程只走环境变量 `AUTOEXP_API_KEY`，不进 `argv`（argv 会出现在顶栏 tooltip、
+   `runtime/logs/*.log` 与事件流里）。
+
+**改动文件**
+
+| 文件 | 改动 |
+| --- | --- |
+| `backend/autoexp_api.py` | 新增。`/status` `/history` `/llm-config`(GET/POST) `/llm-test` `/start` `/stop` `/prompt-preview` `/ping` |
+| `backend/app.py` | `include_router`、`set_busy_check(_reject_if_busy)`、`RUN_KIND_LABELS["autoexp-agent"]`、`APP_VERSION → 1.33.0` |
+| `backend/runners.py` | `EXCLUSIVE_RUN_KINDS` 增加 `autoexp-agent` |
+| `frontend/index.html` / `js/autoexp.js` / `js/main.js` / `js/runsbar.js` / `css/style.css` | 页签、配置卡片、日志与台账表、顶栏路由 |
+| `backend/tools/test_autoexp_api.py` | 新增 13 项接口契约测试（含「Key 不进 argv」「按 pid 委派」「忙时 409」） |
+| `frontend/tests/test_autoexp_fmt.mjs` | 新增 27 项格式化与时长估算测试 |
+
+**默认值**：轮数 **30**（一轮约 11 分钟 ≈ 5.5 小时），时间上限 8 小时，连续 5 轮无 KEEP 自动停。
+三个上限先到者生效——只限轮数会被等显卡拖到天亮，只限时间会在模型连续失败时白烧一晚 API 费。
+
+**测试**：`python tools/test_autoexp_api.py` 13 / 13；`node tests/test_autoexp_fmt.mjs` 27 / 27；
+`node tests/test_runsbar.mjs` 28 / 28；autoexp 侧 `run_all_tests.py` 42 / 42。
+
+#### v1.33.1 变更点（相对 v1.33.0）——修自动实验首个实测事故：`max_tokens` 被思考吃光
+
+**问题**：自动实验页签第一次真跑（30 轮计划），第 2 轮起连续报错、5 轮后停机：
+
+```text
+[autoexp] 返回内容不是合法 JSON：找不到 JSON 对象：'{"hypothesis": "分辨率收益在 640→800→960 上单调递增...
+[autoexp] 返回内容不是合法 JSON：返回内容为空
+[autoexp] 提议被拒：train.imgsz = 1024 不在允许取值 [640, 800, 960, 1152, 1280] 内
+[autoexp] 连续 5 轮没有进展，停止（省下无意义的 API 花费）
+```
+
+**真凶**：`max_tokens=900` 对**推理型模型**（`deepseek-flash` / `deepseek-reasoner` / o 系列）
+是不够的——它把「思考」和「正文」算进同一个预算。审计文件里一眼可见：
+`completion_tokens=900` 且 `reasoning_tokens=900`，正文剩 0。
+「返回内容为空」与「JSON 半截」是同一件事的两种表现。
+
+| 修复点 | 老行为 | 新行为 |
+| --- | --- | --- |
+| 输出预算 | `max_tokens=900`，页面不可调 | **4096**，页面上可调；后端透传给子进程 |
+| 截断 | 半截 JSON 直接丢给上层，报「不是合法 JSON」 | `llm.chat()` 认出 `finish_reason=length`，**自动翻倍重试**（上限 8192），仍不够才抛 `LLMTruncated` |
+| 报错文案 | 所有失败都显示 `[调用失败] PROPOSAL_UNPARSABLE` | 新增 `OUTPUT_TRUNCATED` 事件，日志直接写「把 max_tokens 调到 4096 以上」 |
+| 停止原因 | 「没进展」与「没提议」共用计数器，文案都是「连续 N 轮没有进展」 | 分开：`--max-stale`（搜索瓶颈）与 `--max-errors`（模型侧故障，默认 3），前端新增 `agent_stop` 事件按原因分色 |
+| 参数取值 | 模型只知道能改哪些**键名**，不知道取值范围 | user 消息补 `search_space`（`enum` / `min` / `max`），不再提出 `imgsz=1024`、`batch=2` |
+| 自检 | 推理型模型在 16 token 自检下被截断 → 可能显示「连接失败」 | `ping()` 捕获 `LLMTruncated` 仍报「连通正常」，并说明「只有思考、没有正文」 |
+
+**改动文件**
+
+| 文件 | 改动 |
+| --- | --- |
+| `backend/autoexp_api.py` | `LlmConfigRequest.max_tokens`（256~32768）、`AgentStartRequest.max_errors`（1~50）；`/llm-config` GET/POST 与 `/status` 带上 `max_tokens`；`/start` 透传 `--max-errors` |
+| `frontend/index.html` | 「模型接口」新增 **max_tokens（输出预算）** 输入框与说明；「运行方式」新增「连续失败就停」 |
+| `frontend/js/autoexp.js` | `aeMaxTokens` / `aeMaxErrors` 读写；`agent_start` 显示 `max_tokens`（<1500 标黄）；`OUTPUT_TRUNCATED` 专属日志；新增 `agent_stop` 分支；结束语显示失败轮数 |
+| `backend/app.py` | `APP_VERSION → 1.33.1` |
+| `backend/tools/test_autoexp_api.py` | 新增 2 项：`max_tokens` 往返与越界拒绝、`--max-errors` 透传（13 → **15**） |
+
+**测试**：`python tools/test_autoexp_api.py` **15 / 15**；`node tests/test_autoexp_fmt.mjs` 27 / 27；
+`node tests/test_runsbar.mjs` 28 / 28；autoexp 侧 `run_all_tests.py` **47 / 47**。
+
+详细复盘见 [../7-autoresearch-yolo/README.md](../7-autoresearch-yolo/README.md) §14.9 / §14.10 / v0.2.1。
+
+#### v1.33.2 变更点（相对 v1.33.1）——修「5 轮全 DISCARD」暴露的三个问题
+
+**背景**：v1.33.1 修完截断后，模型侧**首次做到 5 轮 0 失败**（目标达成）。
+但那 5 轮里混着三个与模型无关的问题，导致「KEEP 0 次」这件事既不可信、也白烧了一轮。
+
+**现场**
+
+| 轮 | 实验 | 实际跑的配置 | mAP50-95 | 判定 |
+| --- | --- | --- | --- | --- |
+| 1 | exp_0015 | 1152 / b4 | — | crash（30 秒 OOM） |
+| 2 | exp_0016 | 960 / b4 + degrees10 | 0.42967 | DISCARD |
+| 3 | exp_0017 | **640 / b8** + warmup1 | 0.39062 | DISCARD（整轮无效） |
+| 4 | exp_0018 | 960 / b4 + cos_lr | — | crash（253 秒静默死） |
+| 5 | exp_0019 | 960 / b4 + freeze10 | 0.39189 | DISCARD |
+
+| 修复点 | 老行为 | 新行为 |
+| --- | --- | --- |
+| 继承基准 | `cur.json` 只写本轮改动，`run` 按 `base.json` 合并 → 模型以为在 960、实际跑 640 | `cur.json` 写「`best.json` 的 train + 本轮提议」，`_ask_proposal` 也按最优校验；审计新增 `inherited_from` |
+| KEEP 阈值 | 全库一个 σ（640 实测 0.0032），960 的抖动被当成 16σ 的真实差异 | 按 `imgsz × batch` 分组：该组实测 → 台账里配置相同的重复实验 → 全局（标 `calibrated=false`） |
+| 阈值来源可见 | 页面上只有一个数字 | `agent_verdict` 与审计新增 `threshold_source` / `threshold_calibrated` / `noise_group`；未校准时日志明写「这组参数没测过噪声底」 |
+| batch 降级 | 事后比较 `batch_req`/`batch_eff`，只打一行警告，fitness 照写 | `_exec_tee` 命中 `Reducing to batch=N` 即终止子进程，状态记 `batch_downgraded`（新），`fitness` 留空，不计 crash |
+| 搜索空间 | `imgsz` 含 1152 / 1280 | 去掉这两个：本机 T1000 8GB 实测必 OOM，留着只会白烧一轮并触发静默降 batch |
+
+**改动文件**
+
+| 文件 | 改动 |
+| --- | --- |
+| `7-autoresearch-yolo/autoexp.py` | `noise_threshold_for()` / `train_signature()` / `noise_group_key()`；`judge_round()` 新增 `calibrated` / `group`；`_ask_proposal(inherit_train=...)`；`_exec_tee` 新增降 batch 拦截与 `EXIT_BATCH_DOWNGRADED=78`；`cmd_noise` 写 `groups`；新状态 `batch_downgraded` |
+| `7-autoresearch-yolo/configs/space.json` | `imgsz` 枚举 → `[640, 800, 960]` |
+| `7-autoresearch-yolo/prompts/experimenter.md` | 继承口径改为「当前最优」；删掉 1152/1280；补 960 噪声未校准时的策略建议；补 2026-11-10 五轮结论 |
+| `7-autoresearch-yolo/run_all_tests.py` | 新增 6 条（47 → **53**） |
+| `backend/app.py` | `APP_VERSION → 1.33.2` |
+
+**测试**：autoexp `run_all_tests.py` **53 / 53**；`python tools/test_autoexp_api.py` **15 / 15**。
+
+**还需要人工做的一件事**：960 的真实噪声底已经补测完成（见上表）：
+`groups["imgsz=960|batch=4"]` 的 sigma = 0.008070、2σ = 0.016139，
+三次样本 `0.45984 / 0.45789 / 0.44183`。KEEP 判定从这一刻起才真正可信。
+
+顺带一个必须知道的环境前提：`6-web` 的 `infer_worker` 会在训练期间懒加载模型、
+抢走约 1.7 GB 显存。960/batch4 需要 5.5 GB，两者叠加会把 8 GB 撑爆。
+跑长实验前先 `nvidia-smi` 确认 used 接近 800 MB。
+
+详细复盘见 [../7-autoresearch-yolo/README.md](../7-autoresearch-yolo/README.md) v0.2.2。
+
 #### v1.32.1 变更点（相对 v1.31.0）——跨进程 GPU 互斥：网页端与命令行不再抢显存
 
 **问题**：`_reject_if_busy()` 只查本进程内存里的任务表。两种真实情况它看不见：

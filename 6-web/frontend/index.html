@@ -34,6 +34,7 @@
   <button class="tab" data-tab="dataset">数据集</button>
   <button class="tab" data-tab="annotate">标注</button>
   <button class="tab" data-tab="infer">推理演示</button>
+  <button class="tab" data-tab="autoexp">自动实验</button>
   <button class="tab" data-tab="about">环境说明</button>
 </nav>
 
@@ -1440,6 +1441,144 @@
           </p>
         </details>
       </aside>
+    </div>
+  </section>
+
+  <!-- ==================== 自动实验（第 4 阶段：LLM 决策层） ==================== -->
+  <!-- 这一页是**外置模块**：它自己起进程、自己跑训练，不经过 /api/train/yolo，
+       也不会改动训练页的任何状态。两者共用同一套 GPU 互斥，所以不会同时抢卡。 -->
+  <section class="panel" id="panel-autoexp">
+    <div class="split">
+      <aside class="side">
+        <div class="card">
+          <h2>模型接口
+            <span class="badge" id="aeKeyBadge">未配置</span>
+          </h2>
+          <p class="hint">
+            只支持 OpenAI 兼容的 <code>/chat/completions</code>：DeepSeek、OpenAI、vLLM、本地 Ollama 都行。
+            Key 只存在本机 <code>runtime/</code> 下，页面上永远只显示遮罩值。
+          </p>
+          <label>接口地址 base_url
+            <input type="text" id="aeBaseUrl" placeholder="https://api.deepseek.com">
+          </label>
+          <label>模型 model
+            <input type="text" id="aeModel" placeholder="deepseek-chat">
+          </label>
+          <div class="grid2">
+            <label>temperature
+              <input type="number" id="aeTemperature" step="0.1" min="0" max="2" value="0.7">
+            </label>
+            <label>max_tokens（输出预算）
+              <input type="number" id="aeMaxTokens" step="256" min="256" max="32768" value="4096">
+            </label>
+          </div>
+          <p class="hint">
+            <b>推理型模型（deepseek-flash / reasoner / o 系列）把「思考」和「正文」算进同一个 max_tokens。</b>
+            给 900 会全被思考吃掉、正文剩 0，现象是「返回内容为空」或 JSON 半截。
+            建议 4096；非推理型模型可以降到 1000 省点钱。
+          </p>
+          <label>API Key
+            <input type="password" id="aeApiKey" placeholder="留空表示不修改已保存的 Key"
+                   autocomplete="off">
+          </label>
+          <div class="actions">
+            <button type="button" class="mini" id="aeSaveLlm">保存</button>
+            <button type="button" class="mini" id="aeTestLlm">测试连通性</button>
+            <button type="button" class="ghost mini" id="aePreviewPrompt">预览提示词</button>
+          </div>
+          <p class="hint" id="aeLlmHint"></p>
+
+          <details>
+            <summary>常用地址</summary>
+            <table class="env">
+              <tr><td><code>https://api.deepseek.com</code></td><td>DeepSeek（deepseek-chat）</td></tr>
+              <tr><td><code>https://api.openai.com/v1</code></td><td>OpenAI（gpt-4o-mini）</td></tr>
+              <tr><td><code>http://localhost:11434/v1</code></td><td>本地 Ollama（qwen2.5）</td></tr>
+              <tr><td><code>http://localhost:8000/v1</code></td><td>本地 vLLM</td></tr>
+            </table>
+          </details>
+        </div>
+
+        <div class="card">
+          <h2>运行方式</h2>
+          <div class="grid2">
+            <label>轮数 rounds
+              <input type="number" id="aeRounds" min="1" max="200" step="1" value="30">
+            </label>
+            <label>时间上限（小时）
+              <input type="number" id="aeHours" min="0" max="48" step="0.5" value="8">
+            </label>
+            <label>连续无进展就停
+              <input type="number" id="aeMaxStale" min="1" max="50" step="1" value="5">
+            </label>
+            <label>连续失败就停
+              <input type="number" id="aeMaxErrors" min="1" max="50" step="1" value="3">
+            </label>
+            <label>等显卡最长（秒）
+              <input type="number" id="aeLockWait" min="0" step="60" value="3600">
+            </label>
+          </div>
+          <p class="hint" id="aeBudgetHint">
+            一轮约 11 分钟（600 秒训练 + 启动与验证开销）。30 轮 ≈ 5.5 小时。
+          </p>
+          <div class="actions">
+            <button type="button" class="primary" id="aeStart">开始自动实验</button>
+            <button type="button" id="aeStop" disabled>停止</button>
+          </div>
+          <p class="hint" id="aeStartHint"></p>
+          <p class="hint">
+            判定规则：只有比当前最佳高出 <b>2σ</b>（当前 <span id="aeThreshold">—</span>）才算 KEEP。
+            模型只负责提建议，成败由程序按噪声阈值算，它说“显著提升”不算数。
+          </p>
+        </div>
+      </aside>
+
+      <div class="main">
+        <div class="card">
+          <h2>自动实验日志 <span class="badge" id="aeRunBadge">未开始</span>
+            <span class="log-actions">
+              <button type="button" class="ghost mini" id="aeCopyLog" disabled>复制</button>
+            </span>
+          </h2>
+          <div class="run-progress">
+            <div class="run-progress-head">
+              <span class="badge" id="aeStage">待启动</span>
+              <span id="aeRound">轮次 -/-</span>
+              <span id="aeKept">KEEP 0</span>
+              <span id="aeElapsed">已用 0:00</span>
+            </div>
+            <div class="progress"><div class="bar" id="aeProgressBar"></div></div>
+          </div>
+          <pre class="log" id="aeLog">等待开始…</pre>
+        </div>
+
+        <div class="card">
+          <h2>台账与判定
+            <span class="badge" id="aeLedgerCount">0 条</span>
+          </h2>
+          <p class="hint">
+            「模型提议」来自 LLM，「判定」由程序按噪声阈值给出。两者分开看：
+            提议看起来再合理，只要差值进了噪声区间就是 DISCARD。
+          </p>
+          <div class="scrollbox">
+            <table class="data-table" id="aeTable">
+              <thead>
+                <tr><th>实验</th><th>模型提议</th><th>mAP50-95</th><th>差值</th><th>判定</th></tr>
+              </thead>
+              <tbody id="aeRows"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card" id="aePreviewCard" hidden>
+      <h2>提示词预览（不调 API、不跑训练）
+        <span class="log-actions">
+          <button type="button" class="ghost mini" id="aeClosePreview">关闭</button>
+        </span>
+      </h2>
+      <pre class="log" id="aePreviewText"></pre>
     </div>
   </section>
 

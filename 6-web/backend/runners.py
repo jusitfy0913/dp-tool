@@ -49,6 +49,9 @@ EXCLUSIVE_RUN_KINDS = frozenset(
         "engine-build",
         "infer-batch",
         "infer-video",
+        # 自动实验循环：外层是 agent，内层会派生真正的训练进程。
+        # 必须算独占，否则它和网页训练会同时抢显存（两块训练一起 OOM）。
+        "autoexp-agent",
     }
 )
 

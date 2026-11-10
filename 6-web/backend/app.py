@@ -40,6 +40,7 @@ import annotationimport
 import augpreview
 import autolabel
 import autolabeljobs
+import autoexp_api
 import checkpoints
 import config
 import dataset
@@ -65,7 +66,7 @@ from runners import manager
 
 #: 应用版本号。前端顶栏与 /api/health 都读它，方便一眼看出「页面连的是哪个后端」。
 #: 起因：改了代码但 8060 上跑的是几小时前的旧进程，排查很久才发现。
-APP_VERSION = "1.31.0"
+APP_VERSION = "1.33.2"
 
 #: 单图推理返回的标注图 JPEG 质量。
 #: 这张图只用于导出（查看时前端用本地原图 + SVG 叠加层），所以让体积优先：
@@ -95,6 +96,7 @@ RUN_KIND_LABELS = {
     "engine-build": "引擎构建",
     "infer-batch": "目录批量推理",
     "infer-video": "视频推理",
+    "autoexp-agent": "自动实验循环",
 }
 
 
@@ -4085,6 +4087,11 @@ def index() -> FileResponse:
 # 挂在最后，避免覆盖 /api 路由
 if config.FRONTEND_DIR.is_dir():
     app.mount("/static", StaticFiles(directory=str(config.FRONTEND_DIR)), name="static")
+
+# 自动实验（外置模块）：整块功能收在自己的 APIRouter 里，
+# 上报并发闸门复用 `_reject_if_busy`，避免「自动实验和网页训练同时开跑」。
+autoexp_api.set_busy_check(_reject_if_busy)
+app.include_router(autoexp_api.router)
 
 
 @app.middleware("http")

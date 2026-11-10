@@ -29,11 +29,13 @@ report   打印台账
 from __future__ import annotations
 
 import argparse
+import contextlib
 import csv
 import importlib.util
 import json
 import os
 import random
+import re
 import statistics
 import subprocess
 import sys
@@ -65,6 +67,52 @@ RESULTS_TSV = ROOT / "results.tsv"
 HOLDOUT_TSV = ROOT / "holdout.tsv"
 
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
+
+# ---------------------------------------------------------------------------
+# 第 4 阶段：LLM 决策层（agent 子命令）
+# ---------------------------------------------------------------------------
+# 这些路径单独成组，避免和上面「跑一次实验」那套混在一起看。
+AGENT_DIR = EXPERIMENTS_DIR / "agent"
+#: 每轮审计快照（请求、响应、tokens、判定）。排查「模型当时看到了什么」全靠它。
+AGENT_AUDIT_PREFIX = "round_"
+PROMPT_MD = ROOT / "prompts" / "experimenter.md"
+BEST_JSON = EXPERIMENTS_DIR / "best.json"
+NOISE_JSON = EXPERIMENTS_DIR / "_noise_summary.json"
+#: agent 每轮写这里的改动项，与人工流程完全一致（人也能看懂、也能直接 run）
+CUR_JSON = EXPERIMENTS_DIR / "cur.json"
+
+#: 给 Web 端读的结构化事件前缀。必须与 launcher 完全一致，
+#: 否则后端 `_parse_line()` 会把它当普通日志，界面上就看不到决策块。
+JSON_PREFIX = "TRTFORGE_JSON "
+
+#: 是否把事件打到 stdout。只有 agent 子命令加 --events 才打开；
+#: 其它子命令保持原来的「只用 stderr 说话」行为，避免污染原有输出。
+EVENTS_ENABLED = False
+
+#: 冻结字段：即使 space.json 里声明了，也不许模型改。
+#:
+#: 为什么必须冻结 `data`：space.json 根本不校验它。一旦让模型动它，
+#: 理论上可以把 splits/pcb_tune.yaml 换成 pcb_holdout.yaml ——
+#: holdout 纪律当场作废，而台账上一切正常，没有任何迹象。
+#:
+#: 为什么第一版连 `model` 一起冻结：n -> s -> m 会显著改变 600 秒内能跑完的
+#: epoch 数（m 可能只跑 3~4 轮），很容易整晚都在试大模型而没有进展。
+#: 想放开只需把 "model" 从这个集合里删掉，其它代码不用动。
+FROZEN_TOP = {"data", "task", "budget_seconds", "epochs", "model", "name"}
+FROZEN_TRAIN = {"device", "seed", "deterministic", "cache", "workers",
+                "amp", "patience", "plots", "val", "save", "profile", "fraction"}
+
+#: 提议里允许出现的顶层键（其余一律拒绝）。
+PROPOSAL_KEYS = {"hypothesis", "changed", "reasoning", "train"}
+
+#: 噪声摘要缺失时的兜底阈值。等于 2026-11-10 实测的 2 sigma（0.006368）。
+#: 用一个实测值兜底而不是 0：0 会让任何微小波动都被判成 KEEP。
+FALLBACK_KEEP_THRESHOLD = 0.0064
+
+#: 主动中止训练时的退出码（batch 被 Ultralytics 静默降级）。
+#: 与普通崩溃区分开：这不是「训练出错」，而是「我们发现这次实验已经不可比，
+#: 于是主动中止」——所以不该计入 crash 统计，也不该写 fitness。
+EXIT_BATCH_DOWNGRADED = 78
 
 #: 禁止写入的生产产物目录。命中即抛异常，不做「尽力而为」。
 FORBIDDEN_ROOTS = [
@@ -142,6 +190,27 @@ HOLDOUT_HEADER = [
 def log(message: str) -> None:
     """统一日志出口：写 stderr 并立即 flush，父进程重定向到文件时不会丢行。"""
     print(f"[autoexp] {message}", file=sys.stderr, flush=True)
+
+
+def emit_event(payload: dict[str, Any]) -> None:
+    """把一条结构化事件写到 stdout（Web 端据此渲染决策块与进度）。
+
+    为什么与 :func:`log` 分开两条流：
+    - `log()` 走 stderr，是**给人看的**、带 `[autoexp]` 前缀、粘在日志文件里；
+    - `emit_event()` 走 stdout，是**给程序解析的**，一行一个 JSON。
+    后端 `runners._parse_line()` 正是按 stdout 里的 `TRTFORGE_JSON ` 前缀分流。
+    混在一起的话，`[autoexp] ...` 这种半结构化文本会让界面出现两套格式。
+
+    `EVENTS_ENABLED` 为 False 时静默丢弃，保证 run / noise / holdout 这些
+    老命令的输出与加这个功能之前逐字节一致。
+    """
+    if not EVENTS_ENABLED:
+        return
+    try:
+        body = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), default=str)
+    except (TypeError, ValueError):
+        body = json.dumps({"type": "log", "line": str(payload)}, ensure_ascii=False)
+    print(JSON_PREFIX + body, flush=True)
 
 
 def now_iso() -> str:
@@ -732,6 +801,128 @@ def load_gpulock() -> Any:
         return None
 
 
+def derive_result_status(result: dict[str, Any], returncode: int) -> str:
+    """由 ``result.json`` 与子进程退出码决定这一轮的状态。
+
+    抽成模块级函数是为了能被测试直接调用，也为了逼着调用方只用 ``returncode``：
+    ``--events`` 走 tee 分支时没有 ``Popen`` 对象，早先那版直接用 ``proc.returncode``
+    会在网页端每一轮训练结束时抛 ``NameError``，表现为「训练明明跑完了，台账却没有记录」。
+    """
+    raw = result.get("status") or ("crash" if int(returncode) != 0 else "ok")
+    return "done" if raw == "ok" else str(raw)
+
+
+#: Ultralytics 遇到首轮 OOM 会打印这句并把 batch 减半。
+#: 一旦出现，这次实验的等效学习率与正则强度都变了，与台账里其它实验不可比。
+BATCH_DOWNGRADE_PATTERN = re.compile(r"Reducing to batch=\s*(\d+)", re.IGNORECASE)
+
+
+def _exec_tee(cmd: list[str], log_path: Path, exp_id: str, created_at: str,
+              downgrade_flag: Path | None = None) -> int:
+    """跑 ``_exec`` 子进程，并把它的输出**同时**写进日志文件和 stdout。
+
+    agent 模式专用。需求是两头都要：
+    - 后端要从 stdout 拿到 launcher 的 ``TRTFORGE_JSON`` 事件，网页日志栏才能
+      显示 epoch 进度和验证指标；
+    - 同时必须留一份完整日志在 ``runs/autoexp/<exp>/.autoexp.log``，否则训练
+      报错时没法事后复盘（后端那 3000 行前端缓冲不是归档）。
+
+    只逐行转发、**不做解析**：后端 ``runners._parse_line()`` 已经会区分
+    JSON 事件和普通日志。在这里再判一次就是把同一套分流规则写两遍，
+    以后改一处忘另一处，界面就会出现错位。
+
+    唯一的例外是 ``BATCH_DOWNGRADE_PATTERN``：那是**必须立刻拦下**的事件。
+    Ultralytics 首轮 OOM 会把 batch 减半重来，batch 一变，nbs 归一化后的等效
+    学习率与正则强度全跟着变，这次实验就和台账里其它实验不是同一件事了。
+    以前只靠事后比较 ``batch_requested`` 与 ``batch_effective``，等发现时
+    已经白跑完整轮 600 秒；现在命中即写标记、终止子进程，省下这 10 分钟。
+
+    返回子进程退出码，与 ``subprocess.run(...).returncode`` 语义一致；
+    被本函数主动终止时返回 ``EXIT_BATCH_DOWNGRADED``。
+    """
+    process: subprocess.Popen[bytes] | None = None
+    returncode = 1
+    downgraded_to: int | None = None
+    with log_path.open("w", encoding="utf-8") as log_handle:
+        log_handle.write(f"# {exp_id} {created_at}\n")
+        log_handle.write(f"# cmd: {' '.join(cmd)}\n\n")
+        log_handle.flush()
+        process = subprocess.Popen(
+            cmd,
+            cwd=str(ROOT),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            bufsize=0,
+        )
+        # 记下真正的训练进程号。Web 端「停止」要杀整棵树：
+        # Windows 上杀父进程不会连带子进程，没有这个 pid 就只能等它自己跑完。
+        _write_child_pid(process.pid)
+        try:
+            assert process.stdout is not None
+            for raw in iter(process.stdout.readline, b""):
+                line = raw.decode("utf-8", errors="replace")
+                log_handle.write(line)
+                log_handle.flush()
+                sys.stdout.write(line)
+                sys.stdout.flush()
+                if downgraded_to is None:
+                    hit = BATCH_DOWNGRADE_PATTERN.search(line)
+                    if hit:
+                        downgraded_to = int(hit.group(1))
+                        message = (
+                            f"{exp_id} 检测到 Ultralytics 把 batch 降到 {downgraded_to}："
+                            "这次实验的等效学习率与正则强度都变了，与台账其它实验不可比，"
+                            "已立即中止（不写指标，不计入 crash）"
+                        )
+                        log(message)
+                        for handle in (log_handle, sys.stdout):
+                            handle.write(message + "\n")
+                            handle.flush()
+                        if downgrade_flag is not None:
+                            try:
+                                downgrade_flag.parent.mkdir(parents=True, exist_ok=True)
+                                downgrade_flag.write_text(
+                                    json.dumps({"exp_id": exp_id, "batch_effective": downgraded_to,
+                                                "line": line.strip()[:400]},
+                                               ensure_ascii=False, indent=2),
+                                    encoding="utf-8",
+                                )
+                            except OSError:
+                                pass
+                        with contextlib.suppress(Exception):
+                            process.terminate()
+                        break
+            returncode = process.wait()
+        except BaseException:
+            # 被 Ctrl+C 或父进程终止：先把子进程收掉，再让异常继续往上抛。
+            # 不收的话训练会变成孤儿进程，继续占着显卡，而界面上显示「已停止」。
+            with contextlib.suppress(Exception):
+                process.terminate()
+                process.wait(timeout=10)
+            raise
+        finally:
+            _clear_child_pid()
+    if downgraded_to is not None:
+        return EXIT_BATCH_DOWNGRADED
+    return returncode
+
+
+def _write_child_pid(pid: int) -> None:
+    """记录当前训练子进程号，供 Web 端「停止」时杀整棵树。"""
+    try:
+        AGENT_DIR.mkdir(parents=True, exist_ok=True)
+        (AGENT_DIR / "child.pid").write_text(str(pid), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _clear_child_pid() -> None:
+    try:
+        (AGENT_DIR / "child.pid").unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     config_path = Path(args.config).resolve()
     override = load_json(config_path)
@@ -754,6 +945,21 @@ def cmd_run(args: argparse.Namespace) -> int:
     # 和空的 runs 目录，否则台账会多出一堆「从没跑过」的编号，看的人会以为丢数据了。
     lock = load_gpulock()
     lock_held = False
+    # 锁委派：Web 后端为一个独占任务取锁时（owner=web），子进程会看到
+    # 「pid 是别人且存活」而直接退出码 5，一轮都跑不了。
+    #
+    # 这里**只跳过「父进程自己持有的那把锁」**，不是无条件跳过：
+    # 后端把自己的 pid 通过 AUTOEXP_GPU_LOCK_PID 传进来，只有持有者 pid
+    # 与之相等才认为「这把锁是我家父进程的」。
+    # 为什么不能只用一个布尔开关：那样连「命令行正另跑着一轮实验」也看不见，
+    # 结果就是两个训练一起抢显存 —— 正是这把锁要防的事。
+    parent_pid = os.environ.get("AUTOEXP_GPU_LOCK_PID", "").strip()
+    delegated = False
+    if lock is not None and parent_pid.isdigit():
+        holder = lock.read()
+        if holder is not None and int(holder.get("pid") or 0) == int(parent_pid):
+            lock = None
+            delegated = True
     if lock is not None:
         holder = lock.read()
         if holder is not None and int(holder.get("pid") or 0) != os.getpid():
@@ -763,6 +969,12 @@ def cmd_run(args: argparse.Namespace) -> int:
         lock_held, lock_reason = lock.acquire("autoexp", "autoexp-run", args.exp_id or "")
         if lock_held and lock_reason:
             log(f"注意：跨进程互斥未生效——{lock_reason}")
+    elif delegated:
+        # 两种情况都会走到「lock 为空」，但含义完全相反：
+        # 一种是真找不到 gpulock.py（于是确实没有互斥），
+        # 另一种是网页后端已经替我们持锁（互斥是生效的，只是持有者不是我）。
+        # 混成一句「未找到 gpulock.py」会让人以为互斥失效，去排查一个不存在的故障。
+        log("显卡锁由网页后端持有，本轮不再重复加锁")
     else:
         log("注意：未找到 6-web/backend/gpulock.py，本次不做跨进程互斥")
 
@@ -826,13 +1038,14 @@ def _run_locked(
         str(exp_dir),
     ]
     started = time.time()
-    with log_path.open("w", encoding="utf-8") as log_handle:
-        log_handle.write(f"# {exp_id} {snapshot['created_at']}\n")
-        log_handle.write(f"# cmd: {' '.join(cmd)}\n\n")
-        log_handle.flush()
-        # 锁的释放在 cmd_run 的 finally 里，这里不再重复：
-        # 两处都放会让人以为「必须两层救援」，实际只需最外层那一处。
-        proc = subprocess.run(cmd, cwd=str(ROOT), stdout=log_handle, stderr=subprocess.STDOUT)
+    # 两种模式都走 tee。以前只有 --events（网页端）走 tee，于是命令行 `run` 与
+    # `noise` 完全绕过了「降 batch 就中止」的拦截——2026-11-10 测 960 噪声时
+    # 亲眼看到日志里出现 `Reducing to batch=2` 而程序毫无反应，就是这个原因。
+    # 拦截必须是**确定**的，不能取决于调用方有没有传 --events。
+    returncode = _exec_tee(
+        cmd, log_path, exp_id, snapshot["created_at"],
+        downgrade_flag=exp_dir / "batch_downgraded.json",
+    )
     elapsed = round(time.time() - started, 1)
 
     result_path = exp_dir / "result.json"
@@ -843,17 +1056,37 @@ def _run_locked(
         except (OSError, ValueError):
             result = {}
 
-    status = result.get("status") or ("crash" if proc.returncode != 0 else "ok")
-    if status == "ok":
-        status = "done"
+    status = derive_result_status(result, returncode)
     if not result:
-        result = {"status": "crash", "error": f"子进程退出码 {proc.returncode}，且未生成 result.json"}
+        result = {"status": "crash", "error": f"子进程退出码 {returncode}，且未生成 result.json"}
+
+    # batch 降级是**主动中止**，不是训练崩溃：训练本身没出错，是我们发现
+    # 条件已经变了于是叫停。所以单独一个状态，既不计 crash 也不写 fitness。
+    downgrade_note: dict[str, Any] = {}
+    downgrade_file = exp_dir / "batch_downgraded.json"
+    if downgrade_file.is_file():
+        try:
+            downgrade_note = load_json(downgrade_file)
+        except (OSError, ValueError):
+            downgrade_note = {}
+    if returncode == EXIT_BATCH_DOWNGRADED or downgrade_note:
+        status = "batch_downgraded"
+        result = {
+            "status": status,
+            "error": (
+                "BATCH_DOWNGRADED: 首轮 OOM 触发 Ultralytics 自动降 batch"
+                f"（→ {downgrade_note.get('batch_effective', '?')}）。"
+                "等效学习率与正则强度随之改变，本次结果与台账其它实验不可比，已作废"
+            ),
+            **{k: v for k, v in result.items() if k in ("exp_id", "elapsed_seconds")},
+        }
 
     row = {
         "exp_id": exp_id,
         "created_at": snapshot["created_at"],
         # 适应度取 results.csv 最后一轮，不是历史最佳：固定预算下比的就是到点那一刻的水平
-        "fitness_map50_95": result.get("map50_95", ""),
+        # batch 降级一律留空：它已经不是同一套参数，写进去会污染「当前最优」。
+        "fitness_map50_95": "" if status == "batch_downgraded" else result.get("map50_95", ""),
         "best_map50_95": result.get("best_map50_95", ""),
         "map50": result.get("map50", ""),
         "precision": result.get("precision", ""),
@@ -874,6 +1107,8 @@ def _run_locked(
 
     # batch 被 Ultralytics 自动降过，说明这次实验与请求的参数不是同一件事，
     # 后续和其它实验横向比较会失真，必须显式提示。
+    # 这是**兜底**：正常路径上 _exec_tee 已经中止并把状态改成了 batch_downgraded；
+    # 这里覆盖非 tee 分支（命令行直接 run）以及「降级信息只体现在 batch_effective」的情况。
     if status == "done":
         req, eff = str(row["batch_req"]), str(row["batch_eff"])
         if req and eff and req != eff:
@@ -883,6 +1118,10 @@ def _run_locked(
     log(f"{exp_id} 结束：status={status} mAP50-95={fitness} epochs={row['epochs_done']} 用时={elapsed}s")
     if status == "crash":
         log(f"失败详情见 {log_path}")
+        return 1
+    if status == "batch_downgraded":
+        log(f"已作废：{result.get('error', '')}")
+        log("处理：把 batch 或 imgsz 调低到显存装得下的组合，再重跑这一个方向。")
         return 1
     if status == "preflight_blocked":
         log(f"预检拦截，未消耗训练时间：{result.get('error', '')}")
@@ -989,6 +1228,19 @@ def cmd_exec(args: argparse.Namespace) -> int:
             return 1
 
         model = launcher.load_yolo(weights)
+        # 注册 launcher 自己的训练回调。
+        #
+        # 为什么必须有这一步：`load_yolo()` 只发 deps / model 两条 phase 事件，
+        # 真正的 `progress`（epoch/total/pct）与 `epoch_summary`（验证指标）
+        # 是由回调发出来的，而回调只在 launcher 的 `run()` 里注册。
+        # 少了这一步，autoexp 跑起来界面上只有 Ultralytics 的原始文本流，
+        # 一行 epoch 进度都看不到——看起来像卡死，实际在正常训练。
+        #
+        # 用 suppress 包住：万一上游改了回调签名，也只是「少几条进度事件」，
+        # 不该让整轮实验因为一个观测功能而失败。
+        with contextlib.suppress(Exception):
+            launcher.add_train_callbacks(model, namespace)
+
         model.train(**kwargs)
 
         save_dir = Path(getattr(model.trainer, "save_dir", out_dir))
@@ -1295,10 +1547,39 @@ def cmd_noise(args: argparse.Namespace) -> int:
     else:
         log("结论：噪声过大，当前预算不可用于自动搜索，必须先提高 budget_seconds 或 batch")
     log("=" * 60)
-    save_json(
-        ROOT / "experiments" / "_noise_summary.json",
-        {"created_at": now_iso(), "values": values, "mean": mean, "sigma": sigma, "spread": spread},
-    )
+
+    # 按 (imgsz, batch) 分组记录：640 能跑 24 个 epoch、960 只能跑 12，
+    # 两者末行 mAP 的抖动不是一个量级。只存一个全局 sigma 等于逼着所有分辨率
+    # 共用同一把尺子，而 agent 的判定正是靠这把尺子（见 noise_threshold_for）。
+    train_cfg = cfg.get("train") or {}
+    key = noise_group_key(train_cfg.get("imgsz"), train_cfg.get("batch"))
+    summary_path = ROOT / "experiments" / "_noise_summary.json"
+    previous: dict[str, Any] = {}
+    if summary_path.is_file():
+        try:
+            previous = load_json(summary_path)
+        except (OSError, ValueError):
+            previous = {}
+    groups = previous.get("groups") or {}
+    if not isinstance(groups, dict):
+        groups = {}
+    groups[key] = {
+        "created_at": now_iso(),
+        "values": values,
+        "mean": mean,
+        "sigma": sigma,
+        "spread": spread,
+        "keep_threshold": round(2 * sigma, 6),
+    }
+    save_json(summary_path, {
+        "created_at": now_iso(), "values": values, "mean": mean, "sigma": sigma, "spread": spread,
+        "groups": groups,
+        "_comment": (
+            "顶层字段是最近一次测量的结果（向后兼容）；groups 按 imgsz×batch 分列，"
+            "agent 判定 KEEP 时会优先用 groups 里对应那一组，没有才退回顶层。"
+        ),
+    })
+    log(f"已按组记录：groups[{key}] = sigma {sigma:.6f}")
     return 0
 
 
@@ -1345,6 +1626,1207 @@ def cmd_report(args: argparse.Namespace) -> int:
             except (TypeError, ValueError):
                 shown = raw
             print(f"  {row.get('exp_id',''):<28} mAP50-95={shown}  n={row.get('num_images','')}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# 第 4 阶段：LLM 决策层
+# ---------------------------------------------------------------------------
+# 职责切分（这是整个设计的前提，改代码前先读一遍）：
+#   - 模型只负责「提议下一组参数」，它不知道、也不决定 KEEP / DISCARD；
+#   - 判定由本模块按实测噪声底 2 sigma 算死。
+# 为什么不能让模型自己判断成败：实测 sigma = 0.0032，而 exp_0007(+0.0037)、
+# exp_0008(+0.0001)、exp_0010(-0.0031) 全在噪声内。把数字交给模型，它几乎
+# 必然把噪声讲成趋势，然后沿着错误方向持续加码——这是它最典型的行为模式。
+
+
+class ProposalError(ValueError):
+    """模型返回的内容没法解析成提议。与网络错误区分开：这类可以「再问一次」。"""
+
+
+def load_llm() -> Any:
+    """加载同目录的 ``llm.py``（零第三方依赖）。
+
+    优先按**文件路径**加载而不是 ``import llm``：``llm`` 是个太通用的名字，
+    sys.path 上任何同名模块都会把它遮蔽掉，而那种错误的表现是
+    「莫名其妙调用了别的东西」，极难排查。
+
+    返回 None 表示文件缺失或加载失败——调用方据此降级，不要让
+    一个可选功能成为老命令跑不起来的原因。
+    """
+    module_path = ROOT / "llm.py"
+    if not module_path.is_file():
+        return None
+    try:
+        spec = importlib.util.spec_from_file_location("autoexp_llm", module_path)
+        if spec is None or spec.loader is None:
+            return None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    except Exception as exc:  # noqa: BLE001 - 缺了它就退回「不做决策层」
+        log(f"加载 llm.py 失败：{type(exc).__name__}: {exc}")
+        return None
+
+
+def _as_float(value: Any) -> float | None:
+    """宽松转 float：台账里全是字符串，空串/None/「nan」都要当作没有值。"""
+    try:
+        text = str(value).strip()
+    except Exception:  # noqa: BLE001
+        return None
+    if not text:
+        return None
+    try:
+        number = float(text)
+    except (TypeError, ValueError):
+        return None
+    if number != number:  # NaN
+        return None
+    return number
+
+
+def noise_threshold() -> tuple[float, float | None, str]:
+    """取 keep 阈值。
+
+    返回 ``(阈值, sigma, 来源说明)``。sigma 为 None 表示没有实测数据。
+
+    **为什么阈值必须由代码算、不能问模型**：这是整个功能的安全底线。
+    模型对「0.0037 算不算提升」没有概念，它只会讲故事。
+
+    注意这是**全局**阈值，用它去判所有分辨率是不对的——见 :func:`noise_threshold_for`。
+    """
+    if NOISE_JSON.is_file():
+        try:
+            summary = load_json(NOISE_JSON)
+        except (OSError, ValueError):
+            summary = {}
+        sigma = _as_float(summary.get("sigma"))
+        if sigma is not None and sigma > 0:
+            # 先把 sigma 收敛到 6 位再乘 2：否则「阈值」与「2 × 报告的 sigma」
+            # 在 6 位精度下会差一个末位，测试和人对不上（0.008069739 → 0.016139
+            # 而不是 2 × 0.00807 = 0.016140）。
+            sigma = round(sigma, 6)
+            return round(2 * sigma, 6), sigma, "experiments/_noise_summary.json"
+    return FALLBACK_KEEP_THRESHOLD, None, (
+        f"兜底常量（未找到 _noise_summary.json，先跑 noise 子命令可得到实测值）"
+    )
+
+
+#: 台账/快照里，「同一套配置」用这个签名判定。键排序保证可比较。
+def train_signature(train: dict[str, Any] | None) -> str:
+    """把 ``train`` 字典压成一个可比较的签名。
+
+    用途是「找出配置完全相同、只是重复跑了几次」的实验，用它们的离散度
+    当作那份配置的真实噪声底——这是唯一不含真实配置效应的方差来源。
+    """
+    items = {k: v for k, v in (train or {}).items() if not str(k).startswith("_")}
+    return json.dumps(items, ensure_ascii=False, sort_keys=True, default=str)
+
+
+def noise_group_key(imgsz: Any, batch: Any) -> str:
+    """噪声底的分组键：分辨率 × 批次。
+
+    为什么恰好是这两个：它们是本机上决定「一次实验能跑多少 epoch」和
+    「显存能有多紧」的两个变量，而 epoch 数直接决定末行 mAP 抖多大。
+    同样的 600 秒，640 能跑 24 轮、960 只能跑 12 轮，两者的抖动不可能一样。
+    """
+    try:
+        size = int(imgsz)
+    except (TypeError, ValueError):
+        size = 0
+    return f"imgsz={size or '?'}|batch={batch if batch not in (None, '') else '?'}"
+
+
+def _recorded_group_sigma(key: str) -> tuple[float, int] | None:
+    """读 ``_noise_summary.json`` 里按组记录过的 sigma。"""
+    if not NOISE_JSON.is_file():
+        return None
+    try:
+        summary = load_json(NOISE_JSON)
+    except (OSError, ValueError):
+        return None
+    groups = summary.get("groups") or {}
+    if not isinstance(groups, dict):
+        return None
+    entry = groups.get(key)
+    if not isinstance(entry, dict):
+        return None
+    sigma = _as_float(entry.get("sigma"))
+    if sigma is None or sigma <= 0:
+        return None
+    return round(sigma, 6), len(entry.get("values") or [])
+
+
+def _replicate_sigma(
+    rows: list[dict[str, str]],
+    signature: str,
+) -> tuple[float, list[str]] | None:
+    """用台账里**配置完全相同**的多次实验求 sigma。
+
+    这是最可信的一类数据：配置一样、预算一样，差异只可能来自随机性
+    （数据打乱、cuDNN 非确定性、mAP 阈值抖动）。
+
+    要求至少 2 个样本（1 个样本无从谈离散度）。
+    """
+    if not signature:
+        return None
+    values: list[float] = []
+    exp_ids: list[str] = []
+    for row in rows:
+        if (row.get("status") or "").strip() != "done":
+            continue
+        value = _as_float(row.get("fitness_map50_95"))
+        if value is None:
+            continue
+        exp_id = str(row.get("exp_id") or "")
+        snapshot_path = EXPERIMENTS_DIR / f"{exp_id}.json"
+        if not snapshot_path.is_file():
+            continue
+        try:
+            resolved = load_json(snapshot_path).get("resolved") or {}
+        except (OSError, ValueError):
+            continue
+        if train_signature(resolved.get("train") or {}) != signature:
+            continue
+        values.append(value)
+        exp_ids.append(exp_id)
+    if len(values) < 2:
+        return None
+    return round(statistics.pstdev(values), 6), exp_ids
+
+
+def noise_threshold_for(
+    rows: list[dict[str, str]],
+    train_cfg: dict[str, Any] | None,
+    *,
+    global_threshold: float,
+    global_sigma: float | None,
+    global_source: str,
+) -> dict[str, Any]:
+    """按「这组参数」取噪声底，而不是全库一个数。
+
+    ## 为什么必须有这一层
+
+    2026-11-10 那场 5 轮实测里出现了一个反直觉现象：同一套 960 基座，
+    三次实验拿回 0.4586 / 0.4297 / 0.3919——跨度 0.067。而判定用的
+    σ=0.0032 是在 **640** 上用重复实验测出来的（640 能跑 24 个 epoch，
+    末行 mAP 反而稳）。用 640 的尺子去量 960，等于把「960 本来的抖动」
+    当成「真实的巨大进步/退步」。
+
+    更糟的是这个偏差有方向：谁运气好跑出高点，谁就被记住，之后所有实验
+    都追不上那个高点的随机上沿 —— 表现为「KEEP 永远是 0」，而人以为是
+    「模型提的方向都不行」。
+
+    ## 取值优先级
+
+    1. ``_noise_summary.json`` 的 ``groups[key]``：用 ``noise --config`` 在该配置上
+       真实重复测过。这是唯一「确定可信」的数据。
+    2. 台账里**配置完全相同**的多次实验：配置一样，差异只可能来自随机性。
+    3. 以上都没有 → 退回全局 sigma，但 ``calibrated=False``。
+       调用方必须把这件事告诉用户：**这一轮的判定是拿别的分辨率的尺子量的**。
+
+    第 3 条刻意不「猜一个更大的数」：凭空放大阈值和凭空缩小一样没有依据，
+    只会让人以为门槛是校准过的。诚实地说「没测过」，用户才知道该去跑 noise。
+    """
+    train = train_cfg or {}
+    key = noise_group_key(train.get("imgsz"), train.get("batch"))
+
+    recorded = _recorded_group_sigma(key)
+    if recorded is not None:
+        sigma, count = recorded
+        return {
+            "threshold": round(2 * sigma, 6),
+            "sigma": sigma,
+            "group": key,
+            "calibrated": True,
+            "samples": count,
+            "source": f"{NOISE_JSON.name} 的 groups[{key}]（{count} 次重复实测）",
+        }
+
+    replicate = _replicate_sigma(rows, train_signature(train))
+    if replicate is not None:
+        sigma, exp_ids = replicate
+        return {
+            "threshold": round(2 * sigma, 6),
+            "sigma": sigma,
+            "group": key,
+            "calibrated": True,
+            "samples": len(exp_ids),
+            "source": f"台账里配置相同的 {len(exp_ids)} 次实验（{', '.join(exp_ids)}）",
+        }
+
+    return {
+        "threshold": global_threshold,
+        "sigma": global_sigma,
+        "group": key,
+        "calibrated": False,
+        "samples": 0,
+        "source": f"全局阈值（{global_source}）——注意：这是别的配置测出来的尺子",
+    }
+
+
+def params_diff(cfg: dict[str, Any], base: dict[str, Any]) -> dict[str, Any]:
+    """算出 cfg 相对 base 的改动，只保留改动项。
+
+    不能把整份 40 多个参数的快照塞给模型：那会让每轮 prompt 涨到上万 token，
+    同时把「这次到底改了什么」淹没在噪声里——而后者才是决策需要的信息。
+    """
+    skip = {"_comment", "hypothesis", "changed", "resolved", "exp_id",
+            "created_at", "config_source", "resources_at_start"}
+    diff: dict[str, Any] = {}
+    for key, value in cfg.items():
+        if key in skip or key == "train":
+            continue
+        if base.get(key) != value:
+            diff[key] = value
+    train_diff: dict[str, Any] = {}
+    for key, value in (cfg.get("train") or {}).items():
+        if (base.get("train") or {}).get(key) != value:
+            train_diff[key] = value
+    if train_diff:
+        diff["train"] = train_diff
+    return diff
+
+
+def current_best(rows: list[dict[str, str]], base: dict[str, Any]) -> dict[str, Any] | None:
+    """台账里适应度最高的那条有效实验。
+
+    只看 ``status == "done"``：崩溃行和预检拦截行没有可比指标，
+    把它们算进来会让「当前最佳」莫名其妙地变低。
+    """
+    best: dict[str, Any] | None = None
+    for row in rows:
+        if (row.get("status") or "").strip() != "done":
+            continue
+        value = _as_float(row.get("fitness_map50_95"))
+        if value is None:
+            continue
+        if best is None or value > best["fitness"]:
+            best = {"exp_id": row.get("exp_id", ""), "fitness": value, "row": row}
+    if best is None:
+        return None
+    exp_id = str(best.get("exp_id") or "")
+    snapshot_path = EXPERIMENTS_DIR / f"{exp_id}.json"
+    resolved: dict[str, Any] = {}
+    if snapshot_path.is_file():
+        try:
+            resolved = load_json(snapshot_path).get("resolved") or {}
+        except (OSError, ValueError):
+            resolved = {}
+    best["params_diff"] = params_diff(resolved, base) if resolved else {}
+    return best
+
+
+def history_with_delta(
+    rows: list[dict[str, str]],
+    base: dict[str, Any],
+    limit: int = 30,
+) -> list[dict[str, Any]]:
+    """把台账整理成「给模型看的历史」。
+
+    只给三样东西：改了什么、拿到了什么、相对当时的最佳差多少。
+    `delta` 用**当时的历史最佳**而非最终最佳来算——否则早期实验的 delta
+    会随着后期进步而全部变成负数，看不出「当时赢没赢」。
+    """
+    entries: list[dict[str, Any]] = []
+    running_best: float | None = None
+    for row in rows:
+        status = (row.get("status") or "").strip()
+        value = _as_float(row.get("fitness_map50_95"))
+        delta = None
+        if value is not None and running_best is not None:
+            delta = round(value - running_best, 6)
+
+        exp_id = str(row.get("exp_id") or "")
+        diff: dict[str, Any] = {}
+        snapshot_path = EXPERIMENTS_DIR / f"{exp_id}.json"
+        if snapshot_path.is_file():
+            try:
+                resolved = load_json(snapshot_path).get("resolved") or {}
+                diff = params_diff(resolved, base) if resolved else {}
+            except (OSError, ValueError):
+                diff = {}
+
+        entries.append({
+            "exp_id": exp_id,
+            "status": status or "unknown",
+            "fitness": value,
+            "delta_vs_best_then": delta,
+            "changed": row.get("changed", ""),
+            "hypothesis": row.get("hypothesis", ""),
+            "params_diff": diff,
+        })
+
+        # 只有跑完的实验才推进「历史最佳」：崩溃行不能抬高基准
+        if status == "done" and value is not None:
+            running_best = value if running_best is None else max(running_best, value)
+
+    return entries[-limit:] if limit > 0 else entries
+
+
+def build_agent_context(
+    rows: list[dict[str, str]],
+    base: dict[str, Any],
+    space: dict[str, Any],
+    round_index: int,
+    rounds_total: int,
+    history_limit: int = 30,
+) -> dict[str, Any]:
+    """组装给模型看的全部信息。
+
+    刻意**不含** holdout 的任何数据或文件路径：模型看到的东西会进日志、
+    进审计 JSON、进 prompt 缓存。holdout 纪律的底线是「搜索期一次都不许看」，
+    所以这条边界要从源头卡住，而不是指望模型自觉。
+    """
+    threshold, sigma, source = noise_threshold()
+    # 下划线开头的键（_comment 等）是给人和程序看的元数据，既不是参数也不能改。
+    # 不过滤的话它会混进 allowed_top_level，等于告诉模型「你可以设一个 _comment 字段」。
+    def _real_keys(mapping: dict[str, Any]) -> set[str]:
+        return {k for k in mapping if not str(k).startswith("_")}
+
+    allowed_train = sorted(_real_keys(space.get("train", {}) or {}) - FROZEN_TRAIN)
+    allowed_top = sorted((_real_keys(space) - {"train"}) - FROZEN_TOP)
+
+    # 只给出「能改的那些键」的取值约束，而不是整份 space.json：
+    # 冻结键写出来只会诱导模型去改它们。
+    #
+    # 这一项曾经是整条链路上最贵的一处疏漏：旧版只给 allowed_train（**键名**），
+    # 没有给取值。模型只能猜，于是提出 imgsz=1024、batch=2 这种必然越界的值，
+    # 每次都被拒、重问一次、再被拒，整轮作废——一轮就是 11 分钟。
+    # 把 enum / min / max 明确摆出来，比任何「请遵守搜索空间」的措辞都有效。
+    train_space = space.get("train", {}) or {}
+    top_space = {k: v for k, v in space.items() if k != "train"}
+    search_space: dict[str, Any] = {}
+    top_rules = {k: top_space[k] for k in allowed_top if k in top_space}
+    if top_rules:
+        search_space.update(top_rules)
+    train_rules = {k: train_space[k] for k in allowed_train if k in train_space}
+    if train_rules:
+        search_space["train"] = train_rules
+
+    baseline = {k: v for k, v in base.items() if not k.startswith("_")}
+    incumbent = current_best(rows, base)
+
+    context: dict[str, Any] = {
+        "round": round_index,
+        "rounds_total": rounds_total,
+        "noise": {
+            "sigma": sigma,
+            "keep_threshold": threshold,
+            "source": source,
+            "note": "差异绝对值小于 keep_threshold 一律视为随机波动，不要当成趋势",
+        },
+        "baseline": baseline,
+        "allowed_train": allowed_train,
+        "search_space": search_space,
+        "frozen_fields": sorted(FROZEN_TOP | FROZEN_TRAIN),
+        "incumbent": (
+            {
+                "exp_id": incumbent["exp_id"],
+                "fitness_map50_95": round(incumbent["fitness"], 6),
+                "params_diff_from_baseline": incumbent.get("params_diff", {}),
+                "note": (
+                    "下一轮里你没写的参数，继承「baseline + 上面这个 diff」，"
+                    "**不是**继承 baseline 本身。"
+                ),
+            }
+            if incumbent else None
+        ),
+        "history": history_with_delta(rows, base, history_limit),
+    }
+    # 顶层当前全被冻结（model / budget_seconds / data 都不许动），所以这个列表是空的。
+    # 空数组反而是个「你还能改顶层哦」的暗示，干脆不出现。
+    if allowed_top:
+        context["allowed_top_level"] = allowed_top
+    return context
+
+
+_FALLBACK_SYSTEM = (
+    "你是 YOLO 训练参数搜索助手。只输出一个 JSON 对象，字段为 "
+    "hypothesis / changed / reasoning / train。"
+    "train 里只放本次要改的参数。不要输出 JSON 以外的任何内容。"
+)
+
+
+def render_messages(context: dict[str, Any]) -> list[dict[str, str]]:
+    """把上下文拼成对话消息。
+
+    system prompt 来自 ``prompts/experimenter.md`` 而不是硬编码在 Python 里：
+    上游 autoresearch 最重要的一课是「调研究策略应该改 markdown」。
+    用户想换策略（比如只搜增强、或专攻学习率）时改一个 md 就行，不用碰代码。
+    """
+    if PROMPT_MD.is_file():
+        try:
+            system = PROMPT_MD.read_text(encoding="utf-8")
+        except OSError:
+            system = _FALLBACK_SYSTEM
+    else:
+        system = _FALLBACK_SYSTEM
+    # 注意：system 里必须出现 "json" 字样，否则 OpenAI / DeepSeek 的
+    # response_format=json_object 会直接报 400。两份内容都满足。
+    user = (
+        "以下是本轮实验的上下文（JSON）。请给出下一组要试的参数：\n"
+        + json.dumps(context, ensure_ascii=False, indent=2)
+    )
+    return [{"role": "system", "content": system}, {"role": "user", "content": user}]
+
+
+def parse_proposal(content: str) -> dict[str, Any]:
+    """把模型回的内容解析成 dict。
+
+    模型偶尔会包一层 ```json 代码块，或者在 JSON 前后加一句「好的，我的提议是」。
+    这两种都不该让整轮废掉——它们是无害的表达习惯，不是错误决策。
+    """
+    text = (content or "").strip()
+    if not text:
+        # 空正文多半是「输出预算被思考吃光」，而不是模型不会写 JSON。
+        # 把这个可能性直接写进错误里，省掉一轮瞎猜。
+        raise ProposalError(
+            "返回内容为空。若使用推理型模型（deepseek-flash / reasoner / o 系列），"
+            "通常是 max_tokens 太小、被思考阶段耗尽，请调到 4096 以上"
+        )
+
+    if text.startswith("```"):
+        # 去掉首行 ``` 或 ```json，再去掉结尾的 ```
+        first_break = text.find("\n")
+        if first_break >= 0:
+            text = text[first_break + 1:]
+        if text.rstrip().endswith("```"):
+            text = text.rstrip()[:-3]
+        text = text.strip()
+
+    try:
+        data = json.loads(text)
+    except ValueError:
+        # 兜底：截取第一个 { 到最后一个 }。宁可多试一次，也不要因为
+        # 一句「好的」就空耗一轮 API 费。
+        start, end = text.find("{"), text.rfind("}")
+        if start < 0 or end <= start:
+            # 带上总长度：160 字以内就是「模型在闲聊」，几百字以上却没闭合花括号，
+            # 那基本是输出被截断——这两种情况的下一步动作完全不同。
+            raise ProposalError(
+                f"找不到 JSON 对象（正文 {len(text)} 字符）：{text[:160]!r}"
+            ) from None
+        try:
+            data = json.loads(text[start:end + 1])
+        except ValueError as exc:
+            raise ProposalError(
+                f"JSON 解析失败：{exc}（正文 {len(text)} 字符）；原文={text[:160]!r}"
+            ) from exc
+
+    if not isinstance(data, dict):
+        raise ProposalError(f"顶层必须是对象，实际是 {type(data).__name__}")
+    return data
+
+
+def validate_proposal(
+    proposal: dict[str, Any],
+    base: dict[str, Any],
+    space: dict[str, Any],
+) -> tuple[list[str], dict[str, Any] | None]:
+    """校验模型的提议。返回 ``(错误列表, 合并后的完整配置)``。
+
+    比 ``validate_against_space()`` 多两层：
+      1. 顶层字段白名单 —— 模型不许自己发明 "epochs" 之类的键；
+      2. 冻结字段 —— 即使 space.json 声明了也不许改（见 FROZEN_TOP 的注释）。
+
+    最后还独立断言一次数据路径。这一条**不能省**：`space.json` 根本不校验
+    `data`，而 `data` 指向 holdout 就等于让整个搜索在验收集上过拟合，
+    且台账上完全看不出来。
+    """
+    errors: list[str] = []
+
+    unknown = set(proposal) - PROPOSAL_KEYS
+    if unknown:
+        errors.append(f"出现了不允许的顶层字段：{sorted(unknown)}（只允许 {sorted(PROPOSAL_KEYS)}）")
+
+    frozen_top_hit = sorted(set(proposal) & FROZEN_TOP)
+    if frozen_top_hit:
+        errors.append(f"这些字段被冻结，不允许修改：{frozen_top_hit}")
+
+    train = proposal.get("train", {})
+    if train is None:
+        train = {}
+    if not isinstance(train, dict):
+        errors.append("train 必须是对象")
+        train = {}
+
+    frozen_train_hit = sorted(set(train) & FROZEN_TRAIN)
+    if frozen_train_hit:
+        errors.append(f"这些训练参数被冻结，不允许修改：{frozen_train_hit}")
+
+    if errors:
+        return errors, None
+
+    merged = deep_merge(base, {"train": train})
+    errors.extend(validate_against_space(merged, space))
+    if errors:
+        return errors, None
+
+    # 数据路径硬校验（见上面的注释：这一条是安全边界，不是洁癖）
+    try:
+        data_path = Path(resolve_data_path(str(merged.get("data", "")))).resolve()
+        splits_root = SPLITS_DIR.resolve()
+        inside = data_path == splits_root or splits_root in data_path.parents
+        if not inside:
+            errors.append(f"data 必须落在 {splits_root} 内，实际是 {data_path}")
+        elif "tune" not in data_path.name:
+            # 只允许 tune 切分。holdout 的名字里没有 "tune"，会在这里被拦下。
+            errors.append(f"data 只能指向 tune 切分，实际是 {data_path.name}")
+    except Exception as exc:  # noqa: BLE001 - 解析失败本身就是错误
+        errors.append(f"data 路径无法解析：{type(exc).__name__}: {exc}")
+
+    return errors, (merged if not errors else None)
+
+
+def judge_round(
+    fitness: float | None,
+    incumbent_fitness: float | None,
+    threshold: float,
+    *,
+    threshold_source: str | None = None,
+    calibrated: bool | None = None,
+    group: str | None = None,
+) -> tuple[str, str]:
+    """按噪声阈值判定 keep / discard，返回 ``(结论, 理由)``。
+
+    这是全流程唯一有权说「这个改动算成功」的地方，而且它只看数字。
+
+    ``calibrated=False`` 时必须把它写进理由：那意味着阈值是**别的配置**
+    测出来的尺子，用它判 KEEP/DISCARD 都可能错。让这句话出现在台账和界面上，
+    用户才知道该去补一次 ``noise`` 测量，而不是怀疑模型。
+    """
+    if fitness is None:
+        return "DISCARD", "没有产出有效指标（崩溃或预检拦截），本轮不计入进展"
+    if incumbent_fitness is None:
+        return "KEEP", "首个有效实验，自动作为后续比较的基准"
+
+    delta = fitness - incumbent_fitness
+    caveat = ""
+    if calibrated is False:
+        caveat = (
+            f"（注意：{group or '当前配置'} 的噪声底没测过，"
+            f"这里借用了其它配置的阈值，结论仅供参考；建议先跑一次 noise 校准）"
+        )
+
+    if delta > threshold:
+        return (
+            "KEEP",
+            f"提升 {delta:+.5f}，超过噪声阈值 {threshold:.5f}，可判定为真实改进{caveat}",
+        )
+    if delta < -threshold:
+        return (
+            "DISCARD",
+            f"下降 {delta:+.5f}，超过噪声阈值 {threshold:.5f}，是真实的负向{caveat}",
+        )
+    return (
+        "DISCARD",
+        f"差异 {delta:+.5f}，未超过噪声阈值 {threshold:.5f}，无法与随机波动区分{caveat}",
+    )
+
+
+def _write_agent_audit(index: int, record: dict[str, Any]) -> Path | None:
+    """写单轮审计快照。
+
+    成本核算与「模型当时到底看到了什么」全靠它：出问题时第一件事就是
+    对比 prompt 与实际发生在台账上的改动。
+    """
+    try:
+        AGENT_DIR.mkdir(parents=True, exist_ok=True)
+        path = AGENT_DIR / f"{AGENT_AUDIT_PREFIX}{index:04d}.json"
+        save_json(path, record)
+        return path
+    except OSError as exc:
+        log(f"审计快照写入失败（不影响实验）：{exc}")
+        return None
+
+
+def update_best(
+    exp_id: str,
+    row: dict[str, str],
+    cfg: dict[str, Any],
+    threshold: float,
+    sigma: float | None,
+) -> None:
+    """KEEP 之后刷新 ``experiments/best.json``。
+
+    沿用原有 schema，让「人看的文件」与「自动维护的文件」是同一份，
+    不新增第二处「当前最佳」的事实来源——两份真相迟早不一致。
+    holdout 结论留空并注明需人工验收：搜索期禁止调用 holdout 是纪律。
+    """
+    previous: dict[str, Any] = {}
+    if BEST_JSON.is_file():
+        try:
+            previous = load_json(BEST_JSON)
+        except (OSError, ValueError):
+            previous = {}
+
+    base = load_json(BASE_JSON) if BASE_JSON.is_file() else {}
+    diff = params_diff(cfg, base)
+    noise_mean = None
+    if NOISE_JSON.is_file():
+        try:
+            noise_mean = _as_float(load_json(NOISE_JSON).get("mean"))
+        except (OSError, ValueError):
+            noise_mean = None
+
+    fitness = _as_float(row.get("fitness_map50_95"))
+    payload = {
+        "_comment": previous.get("_comment")
+        or "当前最佳配置。由 autoexp agent 自动维护：只有超过 2 sigma 噪声阈值的实验才会写到这里。",
+        "updated_at": now_iso(),
+        "exp_id": exp_id,
+        "source": "autoexp agent",
+        "top_level": {k: v for k, v in diff.items() if k != "train"},
+        "train": diff.get("train", {}),
+        "evidence": {
+            "tune_map50_95": fitness,
+            "baseline_tune_mean": noise_mean,
+            "noise_sigma": sigma,
+            "keep_threshold_2sigma": threshold,
+            "delta_tune": (
+                None if (fitness is None or noise_mean is None)
+                else round(fitness - noise_mean, 6)
+            ),
+            "holdout_map50_95": None,
+        },
+        "note": (
+            f"holdout 尚未验收，需人工执行：python autoexp.py holdout --exp-id {exp_id}"
+        ),
+    }
+    save_json(BEST_JSON, payload)
+
+
+def _ask_proposal(
+    llm: Any,
+    messages: list[dict[str, str]],
+    base: dict[str, Any],
+    space: dict[str, Any],
+    attempts: int = 2,
+    inherit_train: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    """问模型要一组参数；被拒绝时带着理由再问一次。
+
+    只重问一次的理由：越界通常说明它没仔细看搜索空间，提示一次就够；
+    真不听话的任务重复问只会烧钱，不如跳过这一轮。
+
+    ``inherit_train``：当前最优相对基线的差值（``best.json`` 的 ``train``）。
+    校验与合并都基于「最优 + 本轮改动」，因为 `run` 最终是用 base 合并 cur.json，
+    所以模型没写的键必须在这里就补成最优值——否则「在 960 上改 warmup」
+    会变成「在 640 上改 warmup」，整轮结论作废。
+    """
+    history = list(messages)
+    meta: dict[str, Any] = {"attempts": 0, "usages": [], "finish_reasons": []}
+    last_error = "未获得有效提议"
+    inherited = {k: v for k, v in (inherit_train or {}).items() if not str(k).startswith("_")}
+
+    for attempt in range(1, attempts + 1):
+        meta["attempts"] = attempt
+        try:
+            reply = llm.chat(history)
+        except llm.LLMTruncated as exc:
+            # 截断单独处理：这**不是**模型不会写 JSON，是输出预算不够。
+            # 以前两者共用同一句「返回内容不是合法 JSON」，害得人只会去改提示词。
+            meta["error"] = str(exc)
+            meta["truncated"] = True
+            log(f"模型输出被截断：{exc}")
+            emit_event({
+                "type": "agent",
+                "name": "agent_error",
+                "code": "OUTPUT_TRUNCATED",
+                "message": str(exc),
+                "max_tokens": getattr(exc, "max_tokens", 0),
+                "reasoning_tokens": getattr(exc, "reasoning_tokens", 0),
+            })
+            return None, meta
+        except llm.LLMError as exc:
+            meta["error"] = str(exc)
+            log(f"模型调用失败：{exc}")
+            emit_event({"type": "agent", "name": "agent_error", "code": "LLM_FAILED", "message": str(exc)})
+            return None, meta
+
+        content = reply.get("content") or ""
+        meta["usages"].append(reply.get("usage") or {})
+        meta["latency_ms"] = reply.get("latency_ms")
+        if reply.get("finish_reason"):
+            meta["finish_reasons"].append(reply.get("finish_reason"))
+
+        try:
+            proposal = parse_proposal(content)
+        except ProposalError as exc:
+            last_error = f"返回内容不是合法 JSON：{exc}"
+            log(last_error)
+            emit_event({"type": "agent", "name": "agent_error", "code": "PROPOSAL_UNPARSABLE", "message": last_error})
+            # 空正文不要塞进历史。部分兼容接口会因为 assistant 的 content 为空
+            # 直接 400，于是「重问一次」变成「必然失败一次」，白烧一次费用。
+            if content.strip():
+                history = history + [{"role": "assistant", "content": content}]
+            history = history + [
+                {
+                    "role": "user",
+                    "content": (
+                        "只输出一个 JSON 对象，不要任何其它文字，也不要 markdown 代码块。"
+                        "`train` 的每个值都必须落在 `search_space` 声明的 enum 或 min/max 内。请重来。"
+                    ),
+                },
+            ]
+            continue
+
+        # 把继承的最优值并进来再校验：cur.json 最终会被 `run` 用 base 合并，
+        # 所以模型没写的键在这里就得补成最优值，否则实际跑的不是它以为的配置。
+        candidate = dict(proposal)
+        if inherited:
+            merged_train = {**inherited, **dict(proposal.get("train") or {})}
+            candidate["train"] = merged_train
+        errors, merged = validate_proposal(candidate, base, space)
+        meta["proposal"] = proposal
+        meta["candidate"] = candidate
+        meta["raw"] = content
+        if not errors and merged is not None:
+            meta["resolved"] = merged
+            return proposal, meta
+
+        last_error = "；".join(errors) or "提议无效"
+        log(f"提议被拒：{last_error}")
+        emit_event({
+            "type": "agent",
+            "name": "agent_rejected",
+            "attempt": attempt,
+            "reasons": errors or [last_error],
+        })
+        if content.strip():
+            history = history + [{"role": "assistant", "content": content}]
+        history = history + [
+            {
+                "role": "user",
+                "content": (
+                    "上面的提议被程序拒绝，原因：\n- " + "\n- ".join(errors or [last_error])
+                    + "\n请只使用 `search_space` 里声明过的参数名与取值"
+                    "（enum 只能取列出的值，min/max 是连续区间），重新给出 JSON。"
+                ),
+            },
+        ]
+
+    meta["error"] = last_error
+    return None, meta
+
+
+def cmd_agent(args: argparse.Namespace) -> int:
+    """无人值守连跑：提议 -> 校验 -> 训练 -> 判定 -> 记账。"""
+    global EVENTS_ENABLED
+    EVENTS_ENABLED = bool(getattr(args, "events", False))
+
+    llm = load_llm()
+    if llm is None:
+        log("找不到可用的 llm.py（或加载失败），agent 无法启动")
+        return 1
+
+    base = load_json(BASE_JSON)
+    space = load_json(SPACE_JSON) if SPACE_JSON.is_file() else {}
+    rounds_total = max(1, int(getattr(args, "rounds", 30) or 30))
+
+    # 时间上限：0 表示不限。两个上限取先到者，防止「轮数没到但已经天亮」。
+    hours = float(getattr(args, "hours", 8.0) or 0)
+    deadline = (time.time() + hours * 3600) if hours > 0 else None
+
+    # --dry-run：把第一轮的完整 prompt 打出来，不调 API、不跑训练。
+    # 这是「花钱之前先看一眼」的唯一机会，值得单独一条路径。
+    if getattr(args, "dry_run", False):
+        rows_now = read_tsv(RESULTS_TSV)
+        context = build_agent_context(rows_now, base, space, 1, rounds_total)
+        threshold, sigma, source = noise_threshold()
+        # dry-run 也要反映真实的判定口径：否则预览里写着 0.0064，
+        # 真跑起来却按 960 那组的标准判，人会以为程序自相矛盾。
+        inc_now = current_best(rows_now, base)
+        train_now = dict(base.get("train") or {})
+        if inc_now is not None:
+            train_now.update((inc_now.get("params_diff") or {}).get("train", {}))
+        nb = noise_threshold_for(
+            rows_now, train_now,
+            global_threshold=threshold, global_sigma=sigma, global_source=source,
+        )
+        context["noise"] = {
+            "sigma": nb["sigma"],
+            "keep_threshold": nb["threshold"],
+            "source": nb["source"],
+            "group": nb["group"],
+            "calibrated": nb["calibrated"],
+            "note": (
+                "本轮判定用的阈值。calibrated=false 表示这组参数没测过噪声底，"
+                "阈值是借来的，结论仅供参考"
+            ),
+        }
+        messages = render_messages(context)
+        bar = "=" * 72
+        print(bar)
+        print(f"system prompt：{len(messages[0]['content'])} 字符（来自 prompts/experimenter.md）")
+        print(bar)
+        print(messages[0]["content"])
+        print(bar)
+        print("user 消息（本轮上下文）")
+        print(bar)
+        print(messages[1]["content"])
+        print(bar)
+        print(f"当前 keep 阈值：{nb['threshold']}（sigma={nb['sigma']}，来源：{nb['source']}）")
+        print(f"分组：{nb['group']}  已校准：{nb['calibrated']}")
+        print(f"模型配置：{llm.describe_config()}")
+        return 0
+
+    threshold, sigma, source = noise_threshold()
+    log(f"agent 启动：最多 {rounds_total} 轮，时间上限 {hours or '不限'} 小时")
+    log(f"keep 阈值 {threshold}（sigma={sigma}，来自 {source}）")
+
+    # 启动就说清楚「这把尺子准不准」。等到判定完再解释已经晚了一轮：
+    # 640 的 σ 拿去量 960，会让后续每一轮都被判 DISCARD 而人不知道原因。
+    try:
+        rows_now = read_tsv(RESULTS_TSV)
+        inc_now = current_best(rows_now, base)
+        if inc_now is not None:
+            train_now = dict(base.get("train") or {})
+            train_now.update((inc_now.get("params_diff") or {}).get("train", {}))
+            nb = noise_threshold_for(
+                rows_now, train_now,
+                global_threshold=threshold, global_sigma=sigma, global_source=source,
+            )
+            if nb["calibrated"]:
+                log(f"噪声底已校准：{nb['group']}（sigma={nb['sigma']}，{nb['source']}）")
+            else:
+                log(f"注意：{nb['group']} 的噪声底还没测过，本轮判定会借用全局阈值。")
+                log(f"      {nb['source']}")
+                log("      建议先补测一次（约 30 分钟）："
+                    "python autoexp.py noise --config experiments/cur.json --repeat 3")
+    except (OSError, ValueError):
+        pass
+    # 把 max_tokens 打出来：推理型模型被截断时，这一行是唯一能直接对照的数字。
+    llm_cfg = llm.load_config()
+    log(
+        f"模型 {llm.describe_config()}；max_tokens={llm_cfg.get('max_tokens')}"
+        f"；Key {llm.mask_key(llm.resolve_key()) or '未配置'}"
+    )
+    if int(llm_cfg.get("max_tokens") or 0) < 1500:
+        log("注意：max_tokens 偏小。推理型模型会把「思考」和「正文」算进同一预算，"
+            "容易被截断成半截 JSON（表现为「返回内容为空」）。建议改到 4096。")
+    emit_event({
+        "type": "agent",
+        "name": "agent_start",
+        "rounds": rounds_total,
+        "hours": hours,
+        "keep_threshold": threshold,
+        "sigma": sigma,
+        "model": llm.describe_config(),
+        "max_tokens": llm_cfg.get("max_tokens"),
+    })
+
+    max_stale = max(1, int(getattr(args, "max_stale", 5) or 5))
+    # 「没拿到有效提议」有自己的上限，且比 stale 更小：
+    # 连续 3 次问不出合规 JSON，多半是配置坏了（预算太小/模型名错/限流），
+    # 再问 2 轮只是把钱烧掉，还让「连续 N 轮没有进展」这句话骗人。
+    max_errors = max(1, int(getattr(args, "max_errors", 3) or 3))
+    stale = 0
+    errors = 0
+    kept = 0
+    completed = 0
+    started_at = time.time()
+
+    for index in range(1, rounds_total + 1):
+        stop = evaluate_stop(
+            stale=stale, max_stale=max_stale,
+            errors=errors, max_errors=max_errors,
+            now=time.time(), deadline=deadline,
+        )
+        if stop is not None:
+            code, message = stop
+            log(message)
+            emit_event({"type": "agent", "name": "agent_stop", "code": code, "message": message})
+            break
+
+        log(f"===== 第 {index}/{rounds_total} 轮 =====")
+        emit_event({"type": "agent", "name": "round_start", "round": index, "rounds": rounds_total})
+
+        rows = read_tsv(RESULTS_TSV)
+        incumbent = current_best(rows, base)
+        context = build_agent_context(rows, base, space, index, rounds_total)
+
+        # 噪声底按「当前最优所在的那组参数」取，而不是全库一个数。
+        # 640 能跑 24 epoch、960 只能跑 12，两者末行 mAP 的抖动差一个量级；
+        # 用同一个阈值判，等于拿 640 的尺子量 960（见 noise_threshold_for 的注释）。
+        incumbent_train = (incumbent.get("params_diff") or {}).get("train", {}) if incumbent else {}
+        incumbent_full_train = dict(base.get("train") or {})
+        incumbent_full_train.update(incumbent_train)
+        noise = noise_threshold_for(
+            rows, incumbent_full_train,
+            global_threshold=threshold, global_sigma=sigma, global_source=source,
+        )
+        round_threshold = float(noise["threshold"])
+        context["noise"] = {
+            "sigma": noise["sigma"],
+            "keep_threshold": round_threshold,
+            "source": noise["source"],
+            "group": noise["group"],
+            "calibrated": noise["calibrated"],
+            "note": (
+                "本轮判定用的阈值。calibrated=false 表示这组参数没测过噪声底，"
+                "阈值是借来的，结论仅供参考"
+            ),
+        }
+        messages = render_messages(context)
+
+        proposal, meta = _ask_proposal(llm, messages, base, space, inherit_train=incumbent_train)
+        if proposal is None:
+            # 注意：这里**不加** stale。这一轮根本没产生实验结果，
+            # 说「没有进展」会让排查方向跑偏——真正的问题在模型侧。
+            errors += 1
+            log(f"第 {index} 轮无有效提议（连续失败 {errors}/{max_errors}），跳过：{meta.get('error', '')}")
+            _write_agent_audit(index, {
+                "round": index,
+                "created_at": now_iso(),
+                "outcome": "skipped",
+                "error": meta.get("error", ""),
+                "truncated": bool(meta.get("truncated")),
+                "attempts": meta.get("attempts"),
+                "finish_reasons": meta.get("finish_reasons", []),
+                "usages": meta.get("usages", []),
+            })
+            continue
+
+        # 拿到有效提议就清零：error 计数衡量的是「连续」，不是累计。
+        errors = 0
+
+        resolved: dict[str, Any] = meta["resolved"]
+        # cur.json 写的是「从当前最优出发、本轮要显式声明的改动」。
+        #
+        # 为什么不能只写 proposal.train：`run` 是用 **base.json** 合并的，
+        # 于是「只写 warmup_epochs」会在 **640** 上跑，而模型以为它在 960 上
+        # 做单变量对照（2026-11-10 第 3 轮真实发生过：exp_0017 意图 960，
+        # 实际 640，整轮结论作废）。
+        # 把最优配置相对基线的差值一并写上，既有显式声明、又能直接 `run`：
+        # 提议里的键排在后面，所以本轮想改的仍然会覆盖继承来的值。
+        best_train = dict(incumbent_train)
+        proposal_train = dict(proposal.get("train") or {})
+        effective_train = {**best_train, **proposal_train}
+        cur_payload = {
+            "hypothesis": str(proposal.get("hypothesis") or "").strip(),
+            "changed": str(proposal.get("changed") or "").strip(),
+            "train": effective_train,
+        }
+        save_json(CUR_JSON, cur_payload)
+
+        log(f"模型提议：{cur_payload['hypothesis']}")
+        log(f"改动：{cur_payload['changed'] or '（无）'}")
+        if best_train:
+            inherited = ", ".join(f"{k}={v}" for k, v in best_train.items() if k not in proposal_train)
+            if inherited:
+                log(f"继承当前最优（{incumbent['exp_id'] if incumbent else '?'}）：{inherited}")
+        emit_event({
+            "type": "agent",
+            "name": "agent_proposal",
+            "round": index,
+            "hypothesis": cur_payload["hypothesis"],
+            "changed": cur_payload["changed"],
+            "params": json.dumps(cur_payload["train"], ensure_ascii=False),
+            "reasoning": str(proposal.get("reasoning") or "").strip()[:400],
+            "inherited_from": (incumbent or {}).get("exp_id"),
+        })
+
+        rows_before = len(rows)
+        run_code, run_waited = _run_with_lock_wait(args, index, deadline)
+        if run_code is None:
+            # 等到超时也没拿到显卡：不算一轮失败，直接收工
+            log("等待显卡超时，停止")
+            break
+
+        rows_after = read_tsv(RESULTS_TSV)
+        if len(rows_after) <= rows_before:
+            stale += 1
+            log(f"第 {index} 轮没有产生台账行（退出码 {run_code}），跳过")
+            _write_agent_audit(index, {
+                "round": index,
+                "created_at": now_iso(),
+                "outcome": "no_ledger",
+                "exit_code": run_code,
+                "proposal": proposal,
+                "usages": meta.get("usages", []),
+            })
+            continue
+
+        row = rows_after[-1]
+        exp_id = str(row.get("exp_id") or "")
+        fitness = _as_float(row.get("fitness_map50_95"))
+        incumbent_fitness = incumbent["fitness"] if incumbent else None
+        verdict, reason = judge_round(
+            fitness, incumbent_fitness, round_threshold,
+            threshold_source=noise["source"],
+            calibrated=noise["calibrated"],
+            group=noise["group"],
+        )
+
+        completed += 1
+        if verdict == "KEEP":
+            kept += 1
+            stale = 0
+            update_best(exp_id, row, resolved, round_threshold, noise["sigma"])
+            log(f"判定 KEEP：{reason}；best.json 已更新为 {exp_id}")
+        else:
+            stale += 1
+            log(f"判定 DISCARD：{reason}")
+
+        delta = None if (fitness is None or incumbent_fitness is None) else round(fitness - incumbent_fitness, 6)
+        emit_event({
+            "type": "agent",
+            "name": "agent_verdict",
+            "round": index,
+            "exp_id": exp_id,
+            "fitness": fitness,
+            "delta": delta,
+            "threshold": round_threshold,
+            "threshold_source": noise["source"],
+            "calibrated": noise["calibrated"],
+            "verdict": verdict,
+            "reason": reason,
+            "stale": stale,
+        })
+
+        _write_agent_audit(index, {
+            "round": index,
+            "created_at": now_iso(),
+            "exp_id": exp_id,
+            "outcome": "done",
+            "verdict": verdict,
+            "reason": reason,
+            "fitness": fitness,
+            "incumbent_fitness": incumbent_fitness,
+            "delta": delta,
+            "threshold": round_threshold,
+            "threshold_source": noise["source"],
+            "threshold_calibrated": noise["calibrated"],
+            "noise_group": noise["group"],
+            "inherited_from": (incumbent or {}).get("exp_id"),
+            "proposal": proposal,
+            "resolved_train": resolved.get("train", {}),
+            "run_exit_code": run_code,
+            "lock_waits": run_waited,
+            "usages": meta.get("usages", []),
+            "attempts": meta.get("attempts"),
+        })
+
+    elapsed = round(time.time() - started_at, 1)
+    log(f"agent 结束：完成 {completed} 轮，KEEP {kept} 次，失败 {errors} 轮，用时 {elapsed}s")
+    emit_event({
+        "type": "agent",
+        "name": "agent_summary",
+        "completed": completed,
+        "kept": kept,
+        "errors": errors,
+        "stale": stale,
+        "elapsed_seconds": elapsed,
+    })
+    # 有有效实验就算成功，别让「一个都没留住」变成非零退出码——
+    # 无人值守时退出码会被上层当成故障，而全部 discard 是完全正常的科研结果。
+    # 但「一轮都没跑成」必须非零：那说明配置坏了，退出码 0 会让人以为跑过了。
+    return 0 if completed > 0 or rounds_total == 0 else 1
+
+
+def evaluate_stop(
+    *,
+    stale: int,
+    max_stale: int,
+    errors: int,
+    max_errors: int,
+    now: float,
+    deadline: float | None,
+) -> tuple[str, str] | None:
+    """该不该收工。返回 ``(原因代码, 给用户看的文案)``，None 表示继续。
+
+    三个刹车分开判，因为含义完全不同：
+    - ``deadline``：墙钟到点，正常收工；
+    - ``stale``：有结果但没赢 → 搜索可能到瓶颈，该换维度或收工；
+    - ``errors``：压根没拿到有效提议 → 是模型/配置的问题，继续问就是白烧钱。
+
+    旧版把后两者塞进同一个计数器，于是「模型输出一直被 max_tokens 截断」
+    会被报成「连续 5 轮没有进展」，用户以为是调参到了瓶颈——排查方向完全错。
+    """
+    if deadline is not None and now > deadline:
+        return ("deadline", "到达时间上限，停止")
+    if errors >= max_errors:
+        return (
+            "errors",
+            f"连续 {errors} 轮没有拿到有效提议，停止。"
+            "这通常不是搜索瓶颈，而是模型侧的问题：输出被 max_tokens 截断、模型名写错、"
+            "被限流或余额不足。先看最后一次报错，或回到「模型接口」点一次「测试连通性」。",
+        )
+    if stale >= max_stale:
+        return ("stale", f"连续 {stale} 轮没有进展，停止（省下无意义的 API 花费）")
+    return None
+
+
+def _run_with_lock_wait(
+    args: argparse.Namespace,
+    index: int,
+    deadline: float | None,
+) -> tuple[int | None, int]:
+    """跑一轮实验；显卡被别人占着时等一会儿再试。
+
+    为什么不能直接失败：无人值守跑一晚，中途在网页上手动训一次很正常。
+    那种情况下 agent 应该暂停等待，而不是整晚就此结束。
+    返回 ``(退出码, 等待次数)``；``(None, n)`` 表示等到超时。
+    """
+    wait_seconds = max(0, int(getattr(args, "lock_wait", 3600) or 0))
+    waited = 0
+    wait_deadline = time.time() + wait_seconds if wait_seconds else None
+
+    while True:
+        code = cmd_run(argparse.Namespace(
+            config=str(CUR_JSON),
+            exp_id=None,
+            no_validate=False,
+            allow_low_resources=False,
+            tee_events=True,
+        ))
+        if code != 5:
+            return code, waited
+        waited += 1
+        if wait_deadline is not None and time.time() > wait_deadline:
+            return None, waited
+        if deadline is not None and time.time() > deadline:
+            return None, waited
+        log("显卡被其它任务占用，60 秒后重试（不会消耗轮数）")
+        emit_event({"type": "agent", "name": "agent_wait_gpu", "round": index, "waits": waited})
+        time.sleep(60)
+
+
+def cmd_llm_test(args: argparse.Namespace) -> int:
+    """连通性自检：验证 base_url + Key + 模型名三者都对。
+
+    Key 只从环境变量取（``AUTOEXP_API_KEY`` / ``DEEPSEEK_API_KEY``），
+    **不提供 --api-key 参数**：命令行会出现在进程列表、日志和运行中条的
+    tooltip 里，把 Key 放进 argv 等于把它贴到界面上。
+    """
+    llm = load_llm()
+    if llm is None:
+        print(json.dumps({"ok": False, "error": "找不到可用的 llm.py"}, ensure_ascii=False))
+        return 1
+
+    overrides: dict[str, Any] = {}
+    if getattr(args, "base_url", None):
+        overrides["base_url"] = args.base_url
+    if getattr(args, "model", None):
+        overrides["model"] = args.model
+    if getattr(args, "temperature", None) is not None:
+        overrides["temperature"] = args.temperature
+
+    try:
+        result = llm.ping(overrides or None)
+    except llm.LLMError as exc:
+        print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False))
+        return 1
+    except Exception as exc:  # noqa: BLE001 - 任何异常都要变成可解析的输出
+        print(json.dumps(
+            {"ok": False, "error": f"{type(exc).__name__}: {exc}"}, ensure_ascii=False
+        ))
+        return 1
+
+    print(json.dumps(result, ensure_ascii=False))
     return 0
 
 
@@ -1411,6 +2893,44 @@ def build_parser() -> argparse.ArgumentParser:
     p_report = sub.add_parser("report", help="打印台账")
     p_report.add_argument("--sort", default="fitness_map50_95")
     p_report.set_defaults(func=cmd_report)
+
+    # 第 4 阶段：LLM 决策层
+    p_agent = sub.add_parser("agent", help="让大模型提议参数，连跑多轮（自动 keep/discard）")
+    p_agent.add_argument(
+        "--rounds", type=int, default=30,
+        help="最多跑几轮，默认 30（600 秒预算下约 5.5 小时）",
+    )
+    p_agent.add_argument(
+        "--hours", type=float, default=8.0,
+        help="时间上限（小时），默认 8；0 表示不限。与 --rounds 先到者生效",
+    )
+    p_agent.add_argument(
+        "--max-stale", type=int, default=5,
+        help="连续多少轮没有 KEEP 就停，默认 5（省下无意义的 API 花费）",
+    )
+    p_agent.add_argument(
+        "--max-errors", type=int, default=3,
+        help="连续多少轮拿不到有效提议就停，默认 3（这属于模型侧故障，不是搜索瓶颈）",
+    )
+    p_agent.add_argument(
+        "--lock-wait", type=int, default=3600,
+        help="显卡被网页端占用时最多等多少秒，默认 3600；0 表示不等",
+    )
+    p_agent.add_argument(
+        "--dry-run", action="store_true",
+        help="只打印第一轮的完整提示词，不调 API、不跑训练",
+    )
+    p_agent.add_argument(
+        "--events", action="store_true",
+        help="向 stdout 输出 TRTFORGE_JSON 事件（Web 端据此显示决策与进度）",
+    )
+    p_agent.set_defaults(func=cmd_agent)
+
+    p_llm_test = sub.add_parser("llm-test", help="测试模型接口连通性（Key 只从环境变量读）")
+    p_llm_test.add_argument("--base-url", default=None, help="临时覆盖接口地址")
+    p_llm_test.add_argument("--model", default=None, help="临时覆盖模型名")
+    p_llm_test.add_argument("--temperature", type=float, default=None)
+    p_llm_test.set_defaults(func=cmd_llm_test)
 
     return parser
 

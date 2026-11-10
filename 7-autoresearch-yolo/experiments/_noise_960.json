@@ -1,0 +1,7 @@
+{
+  "_comment": "960 基座的噪声测量配置。2026-11-10 用它跑了 3 次，得到 sigma=0.008070、2σ=0.016139，已写入 experiments/_noise_summary.json 的 groups。以后改了 batch 或换了显卡可复用：python autoexp.py noise --config experiments/_noise_960.json --repeat 3",
+  "train": {
+    "imgsz": 960,
+    "batch": "4"
+  }
+}

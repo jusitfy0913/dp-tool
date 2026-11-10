@@ -2,6 +2,7 @@
 
 import { browse, cancelNativeDialog, getCapabilities, getHealth, nativeDialog } from "./api.js";
 import { initAnnotate } from "./annotate.js";
+import { initAutoexp } from "./autoexp.js";
 import { initDataset } from "./dataset.js";
 import { initEngine } from "./engine.js";
 import { initExport } from "./export.js";
@@ -392,6 +393,10 @@ initDataset();
 initAnnotate();
 initInfer();
 initInferBatch();
+// 自动实验是外置模块：它只读 /api/autoexp/*，不参与上面任何一页的状态。
+// 放在 infer 之后初始化，是为了让它的事件接管晚于训练页——两边同时存在时，
+// 训练页先注册的监听优先，不会被这个模块影响。
+initAutoexp();
 initBrowse();
 // 顶栏的「运行中任务」条要在各页初始化之后挂：它只是读 /api/runs，
 // 不依赖页面状态，但放在最后能保证各页的接管监听已经注册好。
@@ -403,6 +408,7 @@ document.addEventListener("trtf:attach-run", (event) => {
   const kind = String(event.detail?.run?.kind || "");
   if (kind === "engine-build") activateTab("engine");
   else if (kind === "infer-batch" || kind === "infer-video") activateTab("infer");
+  else if (kind === "autoexp-agent") activateTab("autoexp");
   else activateTab("train");
 });
 // 分栏拖动条必须在各页初始化之后插入：这些 init 会在卡片里生成表单与列表，

@@ -35,13 +35,20 @@
 
 ```
 7-autoresearch-yolo/
-├── autoexp.py                驱动器（单文件，5 个子命令）
+├── autoexp.py                驱动器（单文件，7 个子命令）
+├── llm.py                    OpenAI 兼容客户端（零第三方依赖，纯标准库）
+├── prompts/
+│   └── experimenter.md       系统提示词：角色 / 机器事实 / 已证伪方向（改策略只改这里）
 ├── configs/
 │   ├── base.json             基线配置（所有实验的底色）
-│   └── space.json            搜索空间白名单，越界直接拒绝
+│   ├── space.json            搜索空间白名单，越界直接拒绝
+│   ├── llm.json              模型接口默认值（不含密钥）
+│   └── llm.local.json        本地覆盖（gitignore），临时换厂商用
 ├── experiments/
 │   ├── exp_NNNN.json         每次实验的完整参数快照（可回溯）
-│   └── cur.json              下一次要跑的参数（只写改动的字段）
+│   ├── cur.json              下一次要跑的参数（只写改动的字段）
+│   ├── best.json             当前最佳配置 + 证据（agent 只在 KEEP 时改它）
+│   └── agent/round_NNNN.json 每轮审计：提议原文、tokens、判定理由（gitignore）
 ├── splits/                   由 split 子命令生成
 │   ├── pcb_tune.yaml         训练用 val = tune（97 张）
 │   ├── pcb_holdout.yaml      验收用 val = holdout（42 张）
@@ -62,6 +69,8 @@
 | `runs/` | 训练产物，可重跑 |
 | `weights/` | 本地权重 |
 | `_backup/` | launcher 快照，可由 tag `yolo-stable-before-autoexp` 复原 |
+| `configs/llm.local.json` | 本地接口覆盖，可能含内网地址 |
+| `experiments/agent/` | 每轮审计含完整 prompt 与模型原文，体积随轮数线性增长 |
 
 即：**clone 下来只有 21 个小文本文件**，跑一次 `split` 就能恢复完整数据集视图。
 
@@ -121,6 +130,13 @@ python autoexp.py split --data "..\PCB data\PCB缺陷检测\data.yaml" --holdout
 python autoexp.py run --config experiments/cur.json
 ```
 
+> **注意「继承」两套口径**（2026-11-10 踩过坑）：
+> - 手动 `run` 合并的是 `configs/base.json`。上面那个 `cur.json` 没写的键全取基线。
+> - `agent` 自动跑时，`cur.json` 由程序写，**没写的键继承的是 `experiments/best.json`
+>   （当前最优）+ 本轮改动**，不是基线。否则「在 960 上改 warmup」会悄悄变成
+>   「在 640 上改 warmup」，整轮结论作废（真实事故：exp_0017）。
+> - 程序还会在每轮审计里记 `inherited_from`，事后能查到那一轮的起点是谁。
+
 ### 5.3 看台账
 
 ```powershell
@@ -128,10 +144,13 @@ python autoexp.py report
 python autoexp.py report --sort best_map50_95
 ```
 
-### 5.4 测噪声底（决定 keep 阈值，只做一次）
+### 5.4 测噪声底（决定 keep 阈值）
 
 ```powershell
+# 基线（640）
 python autoexp.py noise --config configs/base.json --repeat 3
+# 换了分辨率/批次就再测一次，两种配置的抖动不是一个量级
+python autoexp.py noise --config experiments/cur.json --repeat 3
 ```
 
 同一配置跑 3 次，输出 mAP50-95 的均值、sigma 与极差，并给结论：
@@ -139,6 +158,28 @@ python autoexp.py noise --config configs/base.json --repeat 3
 - `sigma <= 0.01` → 预算够用，keep 阈值取 2 sigma
 - `0.01 < sigma <= 0.02` → 预算偏紧，阈值放大
 - `sigma > 0.02` → **不可用于自动搜索**，必须先加大 `budget_seconds`
+
+结果写进 `experiments/_noise_summary.json`，同时按 `imgsz × batch` 分组存进
+`groups` 字段。`agent` 判定 KEEP 时**优先用当前最优那一组的 sigma**：
+
+| 取值顺序 | 来源 | `calibrated` |
+|---|---|---|
+| 1 | `groups["imgsz=960\|batch=4"]`，即在该配置上真实重复测过 | `true` |
+| 2 | 台账里**配置完全相同**的多次实验，用它们的离散度 | `true` |
+| 3 | 全局 sigma | **`false`** |
+
+`calibrated=false` 时，判定理由和网页事件里都会明写「这组参数的噪声底没测过，
+借用了别的配置的阈值」。**看到这句话就说明该去补一次 `noise`**——不然
+「+0.03 到底是真提升还是抖动」根本无从判断。
+
+> 为什么必须分组：640 能跑 24 个 epoch，960 只能跑 12 个。实测（2026-11-10）
+> 640/batch8 的 sigma = 0.003184，而 960/batch4 是 **0.008070**，差 2.5 倍。
+> 用 640 的 2σ=0.006368 去判 960，会把「960 本来就有 0.008 的抖动」当成真实提升
+> （误 KEEP），也会把一次 ±0.01 的正常起伏读成「明显退步」。两个方向都会错。
+>
+> 顺带一条实测结论：960 的三次重复是 0.45984 / 0.45789 / 0.44183，
+> 而 exp_0006 的 0.45862 正落在这个分布里（+0.005 < 1σ）。
+> 也就是说**它不是幸运高点**，后续实验追不上它，是因为模型提的方向确实不好。
 
 ### 5.5 最后验收（搜索结束后只跑一次）
 
@@ -194,6 +235,8 @@ python autoexp.py holdout --weights runs/autoexp/exp_0007/weights/best.pt
 | `holdout` | `--config` `--weights` `--exp-id` `--split-yaml` `--imgsz` `--batch` | 搜索期禁止调用 |
 | `noise` | `--config` `--repeat` | 默认重复 3 次 |
 | `report` | `--sort` | 默认按 `fitness_map50_95` 降序 |
+| `agent` | `--rounds` `--hours` `--max-stale` `--lock-wait` `--dry-run` `--events` | 见 §十五。`--rounds` 默认 **30**（≈5.5 小时） |
+| `llm-test` | `--base-url` `--model` `--temperature` | 连通性自检。**Key 只从环境变量读，没有 `--api-key` 参数**（见 §十五 的安全边界） |
 
 ## 七、应用场景
 
@@ -226,8 +269,14 @@ python autoexp.py holdout --weights runs/autoexp/exp_0007/weights/best.pt
 | `batch_req` / `batch_eff` | 请求的 batch / 实际生效的 batch。**两者不等说明被自动降过，该行不可与其它行横比** |
 | `model` | 权重文件名 |
 | `budget_seconds` | 本次预算 |
-| `status` | `done` / `crash` / `preflight_blocked` |
+| `status` | `done` / `crash` / `preflight_blocked` / `batch_downgraded` |
 | `hypothesis` / `changed` | 假设与改动描述 |
+
+`batch_downgraded` 是**主动作废**而不是崩溃：训练中一旦出现 Ultralytics 的
+`Reducing to batch=N`，说明首轮 OOM 已经触发自动减半，等效学习率与正则强度
+都变了，这次实验与台账其它行不是同一件事。程序会立刻中止子进程、把
+`fitness_map50_95` 留空、把状态记为 `batch_downgraded`，并在该 run 目录写
+`batch_downgraded.json` 留证。它**不计入 crash 统计**，也不会污染 `current_best`。
 
 改表头时会按**列名**迁移旧数据并留 `.bak` 备份，不会让历史行错位。
 
@@ -340,6 +389,33 @@ keep 阈值（2 sigma）= 0.006368
 **怎么用这个数**：新实验的 `fitness_map50_95` 必须比当前最佳高 **0.0064 以上**才算赢。
 小于这个幅度的提升，无法与随机波动区分，一律 discard。
 
+**但这是 640 的尺子。** 换了分辨率/批次就必须重测——2026-11-10 补测 960/batch4：
+
+| 实验 | mAP50-95 | epoch 数 | 训练秒数 |
+|---|---|---|---|
+| `exp_0023` | 0.45984 | 11 | 619.9 |
+| `exp_0024` | 0.45789 | 11 | 623.6 |
+| `exp_0025` | 0.44183 | 12 | 622.2 |
+
+```
+均值   0.453187
+sigma  0.008070
+极差   0.018010
+keep 阈值（2 sigma）= 0.016139
+```
+
+| 配置 | sigma | 2σ 阈值 | 相对 640 |
+|---|---|---|---|
+| `640 / batch8` | 0.003184 | 0.006368 | 1× |
+| `960 / batch4` | **0.008070** | **0.016139** | **2.5×** |
+
+结果写在 `experiments/_noise_summary.json` 的 `groups["imgsz=960|batch=4"]`，
+`agent` 判 KEEP 时会自动用这一组。
+
+**一个重要的推论**：`exp_0006` 的 0.45862 落在这三次的分布里（均值 0.4532，+0.005 < 1σ）。
+所以它是**可信的**，不是「运气好跑出来的高点」。后续实验追不上它，是因为
+模型提的方向（`degrees 10`、`freeze 10`）确实有害 —— 不是阈值冤枉了它们。
+
 **三点值得注意**
 
 1. **sigma 0.0032 远低于上游要求的 0.01**，说明 600 秒预算在这张卡上是充足的，
@@ -391,7 +467,262 @@ keep 阈值（2 sigma）= 0.006368
 960 训出来的模型。已改成**自动从该次训练的 `args.yaml` 读回 `imgsz` 与 `batch`**，
 命令行显式传 `--imgsz` 时才覆盖。教训：验收时必须用训练时的同一把尺子。
 
-## 十四、版本记录
+## 十三之二、第二轮：LLM 自动跑 5 轮（2026-11-10 16:12~16:48）
+
+**结果：完成 5 轮，KEEP 0 次，失败 0 轮，用时 36:53。**
+「失败 0 轮」是那次的主要目标（v0.2.1 修了截断），已达成。但结果里混着三个工程问题，
+详见 v0.2.2 的记录。
+
+| 轮 | 实验 | 模型声称的改动 | **实际跑的配置** | mAP50-95 | 判定 |
+|---|---|---|---|---|---|
+| 1 | `exp_0015` | `imgsz 960→1152` | 1152 / b4 | — | crash（30 秒 OOM） |
+| 2 | `exp_0016` | `degrees 0→10` | 960 / b4 | 0.42967 | DISCARD |
+| 3 | `exp_0017` | `warmup 3→1`（称 960 不变） | **640 / b8** | 0.39062 | DISCARD（**轮次作废**） |
+| 4 | `exp_0018` | `cos_lr true` | 960 / b4 | — | crash（253 秒静默死） |
+| 5 | `exp_0019` | `freeze 0→10` | 960 / b4 | 0.39189 | DISCARD |
+
+**用 960 自己的阈值（0.016139）重判，结论不变**：
+
+- `+degrees 10`：−0.02895 → 超过 1.8σ，**真实负向**。旋转增强在这个数据集上有害。
+- `+freeze 10`：−0.06673 → 超过 4σ，**真实负向**。冻前 10 层效果最差。
+- `warmup 3→1`：那一轮实际跑在 640 上，**结论作废**，值得在 960 上重试。
+
+所以「KEEP 0 次」是**真实的科研结果**：模型提的这两个方向都不好。
+这一轮真正的问题不在判定，而在「继承错了配置」和「环境把显存抢光了」。
+
+**环境教训（比代码更重要）**
+
+960/batch4 训练时整卡占用约 5.5 GB。`6-web` 的 `infer_worker` 是懒加载的：
+浏览网页、点一次推理，它就会把模型加载进显存并常驻。训练期间被触发 =
+5.5 + 1.7 > 8 GB，表现为「预检通过 → 第一个 batch OOM → 降 batch → 崩在主机内存」。
+本轮 `exp_0020~0022` 连续三次崩就是这个原因，停掉 worker 后同样配置一次跑通。
+
+```powershell
+# 跑长实验前先看一眼
+nvidia-smi --query-gpu=memory.used,memory.free --format=csv
+# 空闲应约 800 MB used；> 1.5 GB 就先停掉网页端推理 worker
+```
+
+## 十四、第 4 阶段：LLM 决策层（`agent` 子命令）
+
+前十三节是「人能自动跑实验」。这一节解决最后一个问题：**谁来决定下一次改什么参数**。
+
+### 14.1 职责切分（核心，改代码前先读）
+
+| 角色 | 由谁做 | 为什么 |
+|---|---|---|
+| 提出下一组参数 | 大模型 | 它的强项：读台账、找模式、提假设 |
+| 判定 keep / discard | **代码，按 2σ 噪声阈值** | 它的弱项且危害最大。sigma=0.003184，而首轮 `+0.0037` / `+0.0001` / `-0.0031` 全在噪声内。把数字交给模型，它几乎必然把噪声讲成趋势，然后沿错误方向持续加码 |
+| 能改哪些字段 | **代码，冻结白名单** | 见 14.2 |
+| 写台账 / 更新 best.json | 代码 | 保证留痕格式与人手工跑时完全一致 |
+
+**结论**：模型是「提议者」，不是「裁判」。这条边界不是保守，而是由实测数据逼出来的。
+
+### 14.2 冻结字段
+
+即使 `space.json` 声明了，`validate_proposal()` 也会拒绝修改：
+
+| 字段 | 冻结原因 |
+|---|---|
+| `data` | **硬红线**。`space.json` 根本不校验它。允许改的话，理论上能把 `splits/pcb_tune.yaml` 换成 `pcb_holdout.yaml`，holdout 纪律当场作废，而台账上一切正常、看不出异常。代码里另有一道独立断言：`data` 必须落在 `splits/` 内**且**文件名含 `tune` |
+| `budget_seconds` / `epochs` / `task` / `name` | 改了就不再是「同一套方法跑同样的时间」，横比作废 |
+| `model` | 第一版刻意冻结：`n→s→m` 会显著改变 600 秒内跑得完的 epoch 数（m 也许只跑 3~4 轮），很容易整晚试大模型而毫无进展。想放开删掉 `FROZEN_TOP` 里的 `"model"` 即可，其它代码不用动 |
+| `device` / `seed` / `deterministic` / `cache` / `workers` / `amp` / `patience` / `plots` | 影响可复现性或进程稳定性，不属于研究变量 |
+
+另有两层校验：顶层字段白名单（只允许 `hypothesis` / `changed` / `reasoning` / `train`），
+以及沿用 `space.json` 的枚举与区间校验。
+
+> 实测中模型最容易犯的错不是改错参数，而是**把 `batch` 写成数字 `4`**。
+> `space.json` 里它是字符串枚举 `["4","8","16","-1"]`，所以会被拒绝并重问一次。
+> 这类「格式性错误」正是自动校验存在的意义。
+
+### 14.3 提示词即策略
+
+`prompts/experimenter.md` 里写的是：
+
+- 角色（你是研究员，不负责判断成败）
+- 输出 JSON 的严格格式
+- **这台机器的硬事实**（T1000 8GB 强制 fp32、`batch=16@640` 必 OOM、960 只能配 batch=4、640 能跑 24 epoch / 960 只跑 12）
+- **已证伪的方向**（`lr0 0.02` / `AdamW` / `close_mosaic 3` / 减弱增强）
+- 方法论约束（单变量对照、连续无进展就换维度、不要重复试过的方向）
+
+改策略**只改这个 md**，不碰 Python。这是上游 autoresearch 最重要的一课：
+研究策略应该是一等公民，不是埋在代码里的常量。
+
+### 14.4 轮数与时间上限
+
+一轮 = 600 秒训练 + 约 60~90 秒启动与验证开销 ≈ **11 分钟**。
+
+| 轮数 | 墙钟时间 |
+|---|---|
+| 10 | ≈ 1.8 小时 |
+| **30（默认）** | **≈ 5.5 小时** |
+| 50 | ≈ 9 小时，会先撞 8 小时时间上限 |
+
+两个上限（`--rounds` / `--hours`）**先到者生效**，都必须有：
+只限轮数时，某几轮卡在等显卡上会拖到天亮；只限时间时，模型调用连续失败会白烧一晚 API 费。
+
+`--max-stale 5`：连续 5 轮没有 KEEP 就停。整晚都在噪声里打转说明搜索空间已到瓶颈。
+
+### 14.5 命令
+
+```powershell
+cd 7-autoresearch-yolo
+
+# 1) 先看提示词：不调 API、不跑训练、不花钱
+python autoexp.py agent --dry-run
+
+# 2) 测连通性（Key 只从环境变量读）
+$env:AUTOEXP_API_KEY = "sk-..."
+python autoexp.py llm-test
+
+# 3) 开跑
+python autoexp.py agent --rounds 30 --hours 8 --events
+
+# 4) 换厂商：改 configs/llm.local.json（已 gitignore），不动入库文件
+#    {"base_url": "http://localhost:11434/v1", "model": "qwen2.5"}
+```
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `--rounds` | **30** | 最多跑几轮 |
+| `--hours` | 8 | 时间上限（小时），0 表示不限 |
+| `--max-stale` | 5 | 连续多少轮没有 KEEP 就停（**搜索到瓶颈**） |
+| `--max-errors` | 3 | 连续多少轮拿不到有效提议就停（**模型侧故障**，不是瓶颈） |
+| `--lock-wait` | 3600 | 显卡被网页端占用时最多等多少秒，0 表示不等 |
+| `--dry-run` | — | 只打印第一轮完整提示词 |
+| `--events` | — | 向 stdout 输出 `TRTFORGE_JSON` 事件（网页端需要） |
+
+### 14.6 支持的模型接口
+
+只支持 OpenAI 兼容的 `/chat/completions`：
+
+| 服务 | `base_url` | 备注 |
+|---|---|---|
+| DeepSeek | `https://api.deepseek.com` | 默认。中文任务、价格低 |
+| OpenAI | `https://api.openai.com/v1` | |
+| 本地 Ollama | `http://localhost:11434/v1` | 模型名写 `qwen2.5` 这类 |
+| 本地 vLLM | `http://localhost:8000/v1` | |
+
+兼容性处理：若上游不认 `response_format={"type":"json_object"}`（某些中转/vLLM 版本），
+`llm.chat()` 会收到 400 后**自动去掉该字段重试一次**，不会因为「兼容接口不认这个开关」
+就让整个功能不可用。`llm-test` 则完全不发这个字段——自检只验证「能不能通」，
+不引入格式约束，避免把「模型不听话」误判成「配置错」。
+
+### 14.7 API Key 的三条安全边界
+
+1. 只存在 `6-web/runtime/autoexp_llm.json`（`6-web/runtime/` 已 gitignore）。
+2. GET 接口**永不返回原文**，只给 `has_key` 与遮罩 `sk-****1a2b`；再保存时留空 = 不修改。
+3. 传给子进程**只走环境变量**，绝不进 `argv`。命令行会出现在「运行中」条 tooltip、
+   `runtime/logs/*.log` 和 WebSocket 事件里，Key 一旦进 argv 就等于贴到界面上。
+   `llm.py` 另有 `mask_key()`，所有对外文本都过它；`load_config()` 会主动剔除
+   `api_key` 字段，防止 Key 随配置字典流进日志与审计快照。
+
+### 14.8 审计与成本
+
+每轮写 `experiments/agent/round_NNNN.json`，含：模型提议原文、校验结果、`usage`
+（prompt / completion tokens）、实际写入的参数、判定与理由、退出码、等锁次数。
+出问题时第一件事就是拿它和 `results.tsv` 对照——「模型当时看到了什么」和
+「实际改了什么」必须能对上。
+
+**实测 token 量（2026-11-10，写这份文档时量的，不是估的）**
+
+| 项 | 值 | 说明 |
+| --- | --- | --- |
+| system prompt | 2 354 字符（≈1.2 k token） | 来自 `prompts/experimenter.md`，**每轮完全相同** |
+| user 消息（12 条历史） | 5 292 字符（≈2.0 k token） | 基线 + 搜索空间 + 台账摘要 |
+| user 消息（跑满 30 条历史） | ≈9 800 字符（≈3.5 k token） | `history_limit=30` 封顶，**不会再涨** |
+| **单轮输入** | **≈3.2 k → 5.5 k token** | 随台账变长而增，上限固定；v0.2.1 起含 `search_space` 取值表 |
+| 单轮输出 | 推理型模型 600~1 800 token（含思考） | `max_tokens=4096`，截断时自动加倍到 8192 |
+| **每轮 API 调用次数** | **1 次** | 提议越界/JSON 不合法时带理由再问 1 次，最多 2 次 |
+
+30 轮的账：输入约 **13 万 token**、输出约 **2 万 token**（推理型模型按 §14.9 计价）。
+
+| 供应商档位（举例，按你实际价目表为准） | 30 轮总花费 |
+| --- | --- |
+| DeepSeek `deepseek-chat`（≈¥2/M 入、¥8/M 出） | **≈ ¥0.25 ~ 0.35** |
+| DeepSeek `deepseek-flash` 等推理型（思考 token 也计费） | **≈ ¥0.5 ~ 1.0** |
+| OpenAI `gpt-4o-mini`（$0.15/$0.60 每 M） | ≈ $0.025（¥0.18） |
+| OpenAI `gpt-4o`（$2.5/$10 每 M） | ≈ $0.42（¥3.0） |
+
+所以准确说法是**几毛钱**，不是「几分钱」（旧版这句写乐观了）。
+
+**真正的约束不是钱，是电和墙钟时间**：一轮 600 秒训练，整机按 150 W 算约 25 Wh，
+30 轮 ≈ 0.75 kWh、电费 ¥0.45 左右——**API 费与电费在同一量级**，别指望靠省 API 省出什么。
+
+**烧钱的刹车有三个**，都在代码里：
+
+1. `--rounds` / `--hours` 先到者生效 → 最多 30 次提问。
+2. `--max-stale`（默认 5）：连续 5 轮**跑完但没赢**才停（搜索到瓶颈）。
+3. `--max-errors`（默认 3）：连续 3 轮**拿不到有效提议**就停（模型侧故障）。
+   这两件事的含义完全不同，v0.2.1 之前共用一个计数器，会把「模型输出一直被截断」
+   报成「连续 5 轮没有进展」——文案一错，排查方向就跟着错。
+4. `llm.chat` 内建重试：`max_retries=3` 表示**最多 3 次尝试**（含首次），只针对 429 / 5xx
+   这类可重试状态码，退避 2→6→18 秒。网络抖动不会变成新的一轮，也不额外提问。
+
+### 14.9 推理型模型：`max_tokens` 是「思考 + 正文」的共用预算（2026-11-10 实测事故）
+
+这是本功能上线后遇到的第一个真事故，写在这里是因为**它看起来完全不像它本身**。
+
+**现场**：`max_tokens=900`，模型 `deepseek-flash`。30 轮里只有第 1 轮跑成，之后连续
+5 轮报错并停机，日志长这样：
+
+```text
+[autoexp] 返回内容不是合法 JSON：找不到 JSON 对象：'{"hypothesis": "分辨率收益在 640→800→960 上单调递增...
+[autoexp] 返回内容不是合法 JSON：返回内容为空
+[autoexp] 提议被拒：train.imgsz = 1024 不在允许取值 [640, 800, 960, 1152, 1280] 内
+[autoexp] 连续 5 轮没有进展，停止（省下无意义的 API 花费）
+```
+
+**真凶**（`experiments/agent/round_0004.json` 里存着，直接可查）：
+
+| 轮次 | `completion_tokens` | `reasoning_tokens` | 正文实际拿到 |
+|---|---|---|---|
+| 1（成功） | 629 | 416 | 213 token → JSON 完整 |
+| 3 第 1 次 | **900** | **900** | **0** → 空 |
+| 4 第 1 次 | **900** | **900** | **0** → 半截 |
+
+推理型模型把「思考」和「正文」算进**同一个** `max_tokens`。900 被思考吃干净，正文
+一个字都不剩。所以「返回内容为空」和「JSON 突然半截」是同一个原因的两种表现。
+
+**修法（v0.2.1）**
+
+| 修的是 | 怎么修 | 为什么这样修 |
+|---|---|---|
+| 预算 | 默认 `max_tokens` 900 → **4096**，页面上可调 | 一轮 11 分钟，省 3000 token（约 0.002 元）而废掉整轮是最差的交易 |
+| 截断 | `llm.chat()` 认出 `finish_reason == "length"` → **自动把预算翻倍重试**（上限 8192），仍不够才抛 `LLMTruncated` | 截断重发同样的请求只会得到同样的半截；这不是网络抖动，不该退避等待 |
+| 报错文案 | `LLMTruncated` 单独一个异常类型，消息直接写「被 max_tokens=N 截断：其中推理占 X，正文只有 Y，把预算调到 4096 以上」 | 旧文案「不是合法 JSON」会让人去改提示词、换模型，方向完全错 |
+| 空正文 | 空正文不再塞进对话历史（部分兼容接口会对空 assistant 内容返回 400） | 否则「重问一次」变成「必然失败一次」 |
+| 判据 | `stale`（没赢）与 `errors`（没提议）分开计数，`--max-errors` 默认 3 | 5 轮全是模型侧故障，却报「连续 5 轮没有进展」，等于把配置问题伪装成科研结论 |
+| 自检 | `llm.ping()` 捕获 `LLMTruncated` 并仍报「连通正常」 | 自检用 16 token，推理型模型必然截断；若因此报失败，用户会以为自己 Key 坏了 |
+
+**怎么一眼看出是这个问题**：看 `experiments/agent/round_NNNN.json` 的 `usages`，
+若 `completion_tokens == max_tokens` 且 `reasoning_tokens` 接近 `completion_tokens`，
+就是预算不够，别去怀疑提示词。
+
+### 14.10 模型看不到取值 = 白烧轮数
+
+同一场事故里还有第二个坑：`build_agent_context()` 早期只给 `allowed_train`
+（一串**键名**），没给取值。模型只能凭经验猜，于是提出 `imgsz=1024`、`batch=2`——
+这两个值不在 `space.json` 的 enum 里，必然被拒，重问一次又被拒，整轮作废。
+
+现在 user 消息里带完整的 `search_space`（只含可改的键，冻结项不出现）：
+
+```json
+"search_space": {
+  "train": {
+    "imgsz": {"enum": [640, 800, 960, 1152, 1280]},
+    "lr0":   {"min": 0.0005, "max": 0.02},
+    "batch": {"enum": ["4", "8", "16", "-1"]}
+  }
+}
+```
+
+代价是每轮多约 1.5 k 输入 token（≈¥0.003）；收益是少废掉一整轮（11 分钟 + 电费）。
+顺带把 `_comment` 这类元数据键滤掉了——旧版 `allowed_top_level` 里赫然写着一个
+`_comment`，等于告诉模型「你可以设一个 `_comment` 字段」。
+
+## 十五、版本记录
 
 ### v0.1.0 (2026-11-10)
 
@@ -443,3 +774,203 @@ Windows 实现把非控制台信号的 sig 直接交给 `TerminateProcess(handle
 写成 `os.kill(pid, 0)` 等于「以退出码 0 杀掉那个进程」。实测确认：本进程调
 `os.kill(os.getpid(), 0)` 后无声退出。现改为 Windows 走
 `OpenProcess` + `GetExitCodeProcess`，POSIX 仍用 `os.kill(pid, 0)`。
+
+### v0.2.0 (2026-11-10) — 第 4 阶段：LLM 决策层
+
+一句话：**从「我告诉你改什么」变成「模型提议、程序裁判、连跑一夜」**。
+
+| 分类 | 变化 | 老版本行为 → 新版本行为 |
+|---|---|---|
+| 新增 | `agent` 子命令：提议 → 校验 → 训练 → 判定 → 记账，全程无人值守 | v0.1.x 每轮都得人改 `configs/*.json` 再手动 `run` → 现在 `agent` 自己循环 |
+| 新增 | `llm.py`（零依赖，`urllib` 直连 OpenAI 兼容接口） | 无 → 支持 DeepSeek / OpenAI / vLLM / Ollama，`response_format` 不被支持时自动重试纯文本 |
+| 新增 | `prompts/experimenter.md` 当选「策略文件」 | 策略埋在代码里 → 改 markdown 就能换研究方向，不动代码 |
+| 新增 | `configs/llm.json`（无密钥的默认端点） | 无 → 入库文件只放 `base_url` / `model`，Key 走环境变量或 `6-web/runtime/` |
+| 新增 | `--rounds` 默认 **30**（≈5.5 小时）、`--hours` 默认 8、`--max-stale` 默认 5 | 无轮数概念 → 三个上限先到者生效，避免跑到天亮 |
+| 新增 | 判定权在代码：`fitness - best > 2σ` 才 KEEP | 无自动判定 → 模型说「显著提升」不算数，只有差值说话 |
+| 新增 | 冻结字段 + `data` 断言（禁止指向 `pcb_holdout.yaml`） | 无 → 模型改不动 `data` / `epochs` / `budget_seconds` / `seed` 等，也不可能偷看 holdout |
+| 新增 | `--events` 输出 `TRTFORGE_JSON {"type": "agent"}` | 无 → 网页端能实时看到「提议 / 判定 / 进度」，且与训练页事件（`type: "event"`）互不干扰 |
+| 变化 | `run` 的锁检查支持**锁委派** | Web 后端持锁时，子进程一律看不懂、退出码 5 → 现在后端把自己 pid 通过 `AUTOEXP_GPU_LOCK_PID` 传下去，只有「pid 恰好等于持有者」才跳过；别的进程持锁照样退出码 5 |
+| 修复 | `run` 的结果状态改由 `derive_result_status()` 统一判定 | `--events`（tee）分支下 `result.json` 缺失时用了未定义的 `proc` → `NameError`，表现为「训练跑完了台账却没记录」；现只依赖 `returncode`，并抽成可单测的函数 |
+| 修复 | `llm.load_config()` 优先级重排 | 环境变量压过 `configs/llm.json` 而 **显式指定被忽略** → shell 里遗留的 `AUTOEXP_MODEL` 会让页面设置静默失效；现为「内置默认 ← 入库文件 ← `llm.local.json` ← 环境变量 ← 本次显式指定」 |
+| 修复 | 锁委派时的日志文案 | 被委派时也打印「未找到 gpulock.py，本次不做互斥」→ 会让人去排查一个不存在的故障；现区分「后端持有」与「真的没装模块」 |
+
+**安全边界（新版本才有）**
+
+- `data` 字段做路径断言：解析后若落在 `pcb_holdout.yaml` 上直接拒绝，防止用验证集调参。
+- Key 只走环境变量传入子进程，不进 `argv`；`load_config()` 主动剔除 `api_key` 字段。
+- 进程被停时必须杀整棵树（`autoexp.py agent` → `_exec` → launcher → PyTorch），
+  只杀父进程会让界面显示「已停止」而显卡仍被占着。
+
+**已验证**
+
+```powershell
+python run_all_tests.py       # 42 项，不跑训练，约 3 秒
+```
+
+- `derive_result_status()`：`ok→done` / `done` 不变 / 非零退出 `crash` / 保留子进程自报的 `oom`。
+- `_exec_tee()`：真实子进程的事件行同时进 stdout 与 `autoexp.log`，退出码原样返回。
+- 真实 tee 链路：`cmd_run(tee_events=True)` + 120 秒预算跑完 `exp_0013`，`status=done`、
+  mAP50-95=0.19586，证明「网页端那一轮也能正确记账」（该冒烟行事后已从台账移除）。
+- 网页端：`/api/autoexp/*` 13 项接口测试通过；`agent` 页签渲染、轮数默认 30、
+  阈值显示 0.006368（σ=0.003184）、台账 12 条均正确。
+
+**已知限制**
+
+- `--rounds` 一轮约 11 分钟，30 轮要 5.5 小时，中途想看结果只能靠网页端日志与台账。
+- 主机的**内存**（不是显存）也会成为瓶颈：`exp_0012` 在 imgsz 640 / batch 8 下跑了
+  624 秒后因 OpenCV 分配失败崩掉，台账如实记为 `crash`。这不是 autoexp 的 bug，
+  但多轮无人值守时应该把 `workers` 留小一些。
+
+### v0.2.1 (2026-11-10) — 修实测事故：推理型模型把输出预算吃光
+
+一句话：**`max_tokens` 是「思考 + 正文」的共用预算，900 会让正文一个字都不剩。**
+
+首个真实 `agent` 长跑（30 轮计划）跑到第 2 轮就开始全体报错，5 轮后停机：
+第 1 轮成功（`reasoning_tokens=416`），第 3、4 轮 `completion_tokens=900`
+且 `reasoning_tokens=900`——思考独占预算，正文剩 0，也就是「返回内容为空」或 JSON 半截。
+
+| 分类 | 变化 | 老版本行为 → 新版本行为 |
+|---|---|---|
+| 修复 | `max_tokens` 默认 900 → **4096**（`configs/llm.json` + `llm.DEFAULTS`） | 900 被思考全部吃掉、正文 0 token → 4096 留出足够正文空间 |
+| 新增 | `llm.chat()` 识别 `finish_reason == "length"` 并**自动把预算翻倍重试**（上限 `MAX_TOKEN_CAP=8192`） | 截断的半截 JSON 直接丢给上层 → 先加预算重来，加满仍不行才报错 |
+| 新增 | `LLMTruncated` 异常类型 + `_completion_stats()` / `_truncation_message()` | 截断和「模型不会写 JSON」共用「返回内容不是合法 JSON」→ 现在直接说「被 max_tokens=N 截断，其中推理占 X、正文 Y，请调到 4096 以上」 |
+| 变化 | `chat()` 返回值新增 `finish_reason` / `reasoning_tokens` / `max_tokens` | 只返回 `content`，事后无从判断为什么短 → 审计文件能记下真实原因 |
+| 修复 | 空正文不再写入对话历史 | 空 assistant 消息会让部分兼容接口返回 400，使「重问一次」变成「必然失败一次」 |
+| 修复 | `stale` 与 `errors` 分开计数，新增 `--max-errors`（默认 3） | 5 轮模型侧故障被报成「连续 5 轮没有进展」→ 现在明说「不是搜索瓶颈，是模型侧问题」并点名 max_tokens |
+| 新增 | `evaluate_stop()` 纯函数（可单测） | 三个刹车挤在循环里的 `if` → 抽出来，`deadline` / `errors` / `stale` 优先级可断言 |
+| 修复 | 上下文补 `search_space`（带 enum / min / max） | 只给 `allowed_train` 键名，模型只能猜 → 提出 `imgsz=1024`、`batch=2` 必然被拒 |
+| 修复 | `_comment` 等元数据键不再进 `allowed_top_level` / `search_space` | `allowed_top_level` 里写着 `_comment`，等于邀请模型去设一个注释字段 |
+| 修复 | `ping()` 捕获 `LLMTruncated` 仍报「连通正常」 | 自检只有 16 token，推理型模型必然截断；若报失败，用户会以为 Key 坏了 |
+| 新增 | 网页端「模型接口」增加 **max_tokens** 输入框 + 「连续失败就停」输入框 | 只能改配置文件 → 页面上就能调，且开跑时把实际值打进日志与事件 |
+| 变化 | 前端日志新增 `OUTPUT_TRUNCATED` 专属渲染与 `agent_stop` 事件 | 所有失败都显示 `[调用失败]`，看不出该改什么 → 截断直接提示「把 max_tokens 调到 4096 以上」 |
+
+**已验证**
+
+```powershell
+python run_all_tests.py                     # 47 项（v0.2.0 是 42 项），约 3 秒
+python 6-web\backend\tools\test_autoexp_api.py   # 15 项（原 13 项）
+node   6-web\frontend\tests\test_autoexp_fmt.mjs # 27 项
+node   6-web\frontend\tests\test_runsbar.mjs     # 28 项
+```
+
+新增用例直接对着这次事故：
+
+- `llm.chat 在 finish_reason=length 时自动加预算`：假 transport 第一次返回 `length`，
+  断言第二次请求的 `max_tokens` 更大、最终内容完整。
+- `预算加到上限仍被截断时，报「被截断」而不是「不是合法 JSON」`：断言消息含
+  `max_tokens` / `截断` / `4096`，且**不含**「不是合法 JSON」。
+- `llm.ping 遇到推理型模型截断时仍报「连通」`：防止修好截断后把自检弄坏。
+- `上下文必须给出允许的取值，不只是键名`：断言 `imgsz` 的 enum 含 960、不含 1024。
+- `停止判据：errors 与 stale 必须分开报`：断言模型侧故障的文案里不出现「没有进展」。
+- `max_tokens 可保存、会回显，并且太小/太大都被拒绝`（后端）。
+
+**已知限制**
+
+- 4096 是按 `deepseek-flash` 实测的（思考约 400~900 token）。换成思考更长的模型时，
+  可能每次都要走一次「翻倍重试」，即单轮花两次请求的钱。看 `round_NNNN.json` 的
+  `usages` 若经常出现 `completion_tokens == max_tokens`，就该把默认值直接调大。
+- 截断无法「抢救」半截 JSON：缺 `}` 的提议在语义上可能也缺 `train` 字段，
+  强行补括号会得到一条「看起来改了什么、其实没改」的提案，比失败更危险。
+
+### v0.2.2 (2026-11-10) — 修「5 轮全 DISCARD」暴露的三个问题
+
+**背景**：v0.2.1 修完截断后跑了一场 5 轮，模型侧 0 失败（目标达成），
+但结果里混着三个与模型无关的问题，全部修掉。
+
+**1. 继承 bug：模型以为在 960 上做实验，程序实际跑在 640（真 bug）**
+
+- 现象：`round_0003` 的 `changed` 写「imgsz 960 / batch 4 不变」，
+  `resolved_train` 却是 `imgsz=640, batch=8`。
+- 原因：`cur.json` 只写 `proposal.train`，而 `run` 是用 `base.json` 合并的。
+  模型没写的键一律落回基线。
+- 修法：
+  - `cmd_agent` 写 `cur.json` 时，`train = {**best.json 的 train, **本轮提议}`；
+  - `_ask_proposal` 新增 `inherit_train`，校验与 `resolved` 都基于「最优 + 本轮改动」；
+  - 每轮审计记 `inherited_from`，事后能查到起点是哪个 exp。
+- 影响：`exp_0017`（640 + warmup1 = 0.39062）的结论作废，需要在 960 基座上重试。
+
+**2. 噪声底按分辨率分组（这一条最后被实测部分推翻，见下）**
+
+- 现象：960 上三次实测 0.3919 / 0.4297 / 0.4586，跨度 0.067；
+  而判定用的 σ=0.0032 是**在 640 上**测的（640 跑 24 epoch，960 只跑 12）。
+- 当时的推断：960 的抖动远大于 640，0.4586 可能是幸运高点。
+- 修法：
+  - `noise` 结果按 `groups[imgsz|batch]` 分列保存；
+  - 新增 `noise_threshold_for()`，优先用该组实测 σ，其次用台账里**配置完全相同**
+    的重复实验的离散度，都没有才退回全局；
+  - 退回全局时 `calibrated=false`，`judge_round` 会把这句写进判定理由，
+    `agent_verdict` 事件和审计里也有 `threshold_source` / `threshold_calibrated`。
+
+**实测结论（2026-11-10 18:32，960/batch4 连跑 3 次）**
+
+| 次 | exp | mAP50-95 | 说明 |
+| --- | --- | --- | --- |
+| 1 | exp_0023 | 0.45984 | 11 epoch |
+| 2 | exp_0024 | 0.45789 | 11 epoch |
+| 3 | exp_0025 | 0.44183 | 12 epoch |
+
+**sigma = 0.008070，keep 阈值 2σ = 0.016139**（640 的对应值是 0.003184 / 0.006368）。
+
+所以 960 的抖动是 640 的 **2.5 倍**，不是当初推断的 6 倍。更重要的是：
+0.45862（exp_0006）落在这三次的分布里（均值 0.4532，+0.005 < 1σ），
+**它是可信的，不是幸运高点**。用正确的阈值重判那 5 轮：
+
+| 实验 | mAP50-95 | 与 0.45862 差 | 960 阈值 0.0161 下的判定 |
+| --- | --- | --- | --- |
+| exp_0016（+degrees 10） | 0.42967 | −0.02895 | DISCARD，**真实负向** |
+| exp_0019（+freeze 10） | 0.39189 | −0.06673 | DISCARD，**真实负向** |
+| exp_0017（实跑 640） | 0.39062 | — | 配置继承错误，整轮作废 |
+
+**结论修正：KEEP 0 次在正确阈值下依然成立。** 模型提的两个方向（旋转增强、
+冻结层）确实有害，判定逻辑没有冤枉它们。分组阈值的价值不在于「让 KEEP 变得可能」，
+而在于**两个方向都可能出错**：用 640 的 0.0064 判 960，既会把 −0.029 判对，
+也会把一个 +0.01 的真实噪声误判成 KEEP（960 的 1σ 就有 0.008）。
+
+**4. 唯一实测失败：降 batch 拦截漏了命令行路径**
+
+- 现象：测 960 噪声时日志出现 `Reducing to batch=2`，但程序继续跑。
+- 原因：`_exec_tee` 只在 `--events`（网页端）路径被调用；命令行 `run` / `noise`
+  走 `subprocess.run`，根本不经过这个拦截。
+- 修法：`_run_locked` 无条件走 `_exec_tee`。拦截必须是确定的，
+  不能取决于调用方有没有传 `--events`。
+
+**仍然需要人工注意的环境问题**
+
+960/batch4 训练时整卡占用约 5.5 GB。`6-web` 的 `infer_worker` 是**懒加载**的：
+浏览网页、点一下推理，它就会把模型加载进显存并常驻。训练期间一旦它被触发，
+5.5 GB + 1.7 GB 就会把 8 GB 撑爆，表现为「预检通过、跑到第一个 batch OOM，
+然后 Ultralytics 降 batch、再崩在主机内存上」（exp_0020~0022 连续三次就是这样）。
+
+跑长实验前先确认：
+
+```powershell
+nvidia-smi --query-gpu=memory.used,memory.free --format=csv
+# 空闲应接近 800 MB used / 7.2 GB free；若 used > 1.5 GB，先停掉网页端的推理 worker
+```
+
+**3. 硬拦截 Ultralytics 静默降 batch**
+
+- 现象：`exp_0015`（1152/batch4）30 秒内 OOM，日志里出现
+  `Reducing to batch=2 and retrying`，然后主机内存被吃光崩溃。
+  以前只靠事后比较 `batch_req` / `batch_eff`，等发现时已经白跑一整轮。
+- 修法：
+  - `_exec_tee` 逐行匹配 `Reducing to batch=N`，命中即写
+    `runs/autoexp/<exp>/batch_downgraded.json` 并**终止子进程**；
+  - 状态记为 `batch_downgraded`（新增），`fitness` 留空，不计 crash，
+    不污染 `current_best`；
+  - `space.json` 的 `imgsz` 枚举去掉 1152 / 1280（本机实测必 OOM），
+    提示词同步：「1152/1280 已移除，换大卡后可加回」。
+
+**新增测试（6 个）**
+
+- `判定：真实负向要说「下降」，不能一律说「无法与随机波动区分」`
+- `判定：阈值未校准时必须在理由里说清楚`
+- `噪声底分组：优先用实测 groups，其次用配置相同的重复实验，最后才借全局`
+- `噪声底分组：台账里配置完全相同的重复实验可作为校准依据`
+- `Ultralytics 的降 batch 提示必须能被识别（这是中止训练的触发条件）`
+- `提议继承：未写的键要取「当前最优」，不是「基线」`
+
+**验证结果**：`7-autoresearch-yolo` 53 / 53 通过，`test_autoexp_api.py` 15 / 15 通过。
+实测噪声数据见本节「实测结论」：960 的 σ = 0.008070（2σ = 0.016139），
+比 640 的 0.003184 大 2.5 倍，且 exp_0006 的 0.45862 落在其分布内 ——
+**KEEP 0 次是真实的科研结果，不是阈值冤枉了模型**。

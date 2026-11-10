@@ -169,3 +169,11 @@ docs/*.rar
 /7-autoresearch-yolo/noise.log
 # launcher 的物理备份（代码与权重，可由 tag yolo-stable-before-autoexp 复原）
 /7-autoresearch-yolo/_backup/
+
+# ---- 第 4 阶段：LLM 决策层（autoexp agent） ----
+# 单轮审计快照（含完整 prompt 与模型原文，体积随轮数线性增长，属运行产物）
+/7-autoresearch-yolo/experiments/agent/
+# 本地覆盖的模型接口配置（临时换地址/模型时用，不入库）
+/7-autoresearch-yolo/configs/llm.local.json
+# 手工改动前的备份（best.json / results.tsv 等，一次性快照，不入库）
+/7-autoresearch-yolo/**/*.preagent.bak

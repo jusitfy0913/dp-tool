@@ -23,6 +23,8 @@ const KIND_META = {
   "engine-build": { label: "引擎构建", tab: "engine" },
   "infer-batch": { label: "目录批量推理", tab: "infer" },
   "infer-video": { label: "视频推理", tab: "infer" },
+  // 自动实验循环：一跑就是几小时，必须能在顶栏看到并从这里点回去接管
+  "autoexp-agent": { label: "自动实验", tab: "autoexp" },
 };
 
 function metaOf(kind) {

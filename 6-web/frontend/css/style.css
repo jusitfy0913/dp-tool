@@ -1033,6 +1033,23 @@ details:not([open]) > :not(summary) {
 .log .warn { color: var(--amber); }
 .log .ok { color: var(--ok); }
 
+/* ---- 自动实验：决策块 ----
+ * 这些行是「模型想改什么 / 程序怎么判」的唯一出口，必须一眼区分开：
+ *   提议=品红（外部输入，尚不可信）；KEEP=绿（已被噪声阈值证实）；
+ *   DISCARD=次要灰（不是错误，只是没超过噪声，别用红色制造焦虑）。 */
+.log .ae-block { color: var(--cyan); font-weight: 600; margin-top: var(--sp-2); }
+.log .ae-propose { color: var(--magenta); font-weight: 600; }
+.log .ae-keep { color: var(--ok); font-weight: 600; }
+.log .ae-discard { color: var(--text-dim); }
+.log .hint { color: var(--text-dim); }
+/* 台账里的「模型提议」列会很长（一整句假设），限宽并省略，鼠标悬停看全文 */
+table.data-table td.ae-cell-change {
+  max-width: 380px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 /* ---- 4.7 表格 ---- */
 table.env { width: 100%; border-collapse: collapse; font-size: var(--fs-sm); }
 table.env td {

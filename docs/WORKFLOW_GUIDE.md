@@ -2502,9 +2502,30 @@ flowchart TD
 **为什么必须挡住「自动降 batch」**：Ultralytics 首轮 OOM 会自动把 batch 减半重来
 （`16→8→4→2`，每次从第 1 个 epoch 重头再来，日志里只有一行黄字）。batch 一变，
 `nbs` 归一化后的等效学习率、正则强度全跟着变，那次实验就与台账里其它实验**不是同一件事**，
-横比全是假的。`preflight_vram()` 在开训前比对可用显存与保守需求，不够直接拒绝，
-记 `preflight_blocked`（不污染 `crash` 统计），零训练时间消耗。台账另设 `batch_req` / `batch_eff`
-两列，万一被降过也能立刻看出来。
+横比全是假的。两层拦截：
+
+| 层 | 时机 | 行为 |
+| --- | --- | --- |
+| 预检 | 开训前 | `preflight_vram()` 比对可用显存与保守需求，不够直接拒绝，记 `preflight_blocked`（不污染 `crash`），零训练时间消耗 |
+| 硬拦截 | 训练中 | `_exec_tee` 逐行匹配 `Reducing to batch=N`，命中即**终止子进程**，记 `batch_downgraded`，`fitness` 留空，不计 crash、不污染 `current_best`，并在 run 目录写 `batch_downgraded.json` 留证 |
+
+预检是**估算**，会估错（2026-11-10 就放行了 `imgsz=1152 / batch=4`，30 秒后 OOM）；
+硬拦截是**确定**的，只要真降了就一定拦下。两者缺一不可。台账另设
+`batch_req` / `batch_eff` 两列作为第三道兜底。
+
+**噪声底必须按配置分组**：实测 640/batch8 的 σ = 0.003184，960/batch4 的 σ = **0.008070**
+（2.5 倍）。640 能跑 24 个 epoch、960 只能跑 12 个，末行 mAP 的抖动就是不一样。
+拿 640 的阈值判 960，两个方向都会错：会把一次 +0.01 的日常起伏误判成 KEEP，
+也会把 −0.008 的正常波动读成「明显退步」。现在的取值顺序：
+
+```mermaid
+flowchart TD
+    A["当前最优的参数<br/>(imgsz, batch)"] --> B{"_noise_summary.json<br/>的 groups 有这一组?"}
+    B -->|有| C["用它测过的 sigma<br/>calibrated = true"]
+    B -->|没有| D{"台账里有配置<br/>完全相同的重复实验?"}
+    D -->|有| E["用它们的离散度<br/>calibrated = true"]
+    D -->|没有| F["借全局 sigma<br/>calibrated = false<br/>判定理由里明写「没测过」"]
+```
 
 **与生产代码的关系：零文件改动**
 
@@ -2532,9 +2553,32 @@ git diff yolo-stable-before-autoexp -- 1-python-yolo/launcher    # 应为空
 | 配置 | 结果 |
 | --- | --- |
 | `batch=16 @640`，可用显存 5302 MB | **OOM**。自动降 16→8→4→2 后仍失败 |
+| `batch=4 @1152` | **OOM**，30 秒内崩（`exp_0015`）。主机内存随后也被吃光，报 `cv::OutOfMemoryError` |
 | `batch=8 @640` | 正常，峰值 1769.5 MB，约 24~26 秒/epoch，600 秒约 23~24 个 epoch |
-| 同配置 600 秒跑三次 | mAP50-95 = `0.40496` / `0.41109` / `0.40385`，**sigma 0.003184**，keep 阈值 2σ = **0.006368** |
+| `batch=4 @960` | 正常，峰值约 1958 MB，600 秒约 10~12 个 epoch |
+| 同配置 600 秒跑三次（640/b8） | mAP50-95 = `0.40496` / `0.41109` / `0.40385`，**sigma 0.003184**，keep 阈值 2σ = **0.006368** |
 | 同配置 120 秒跑两次 | mAP50-95 分别 `0.19745` / `0.19586`，差 0.0016（但整体只在 0.197，仍在爬坡期） |
+
+注意：**960 的噪声底已经补测**（2026-11-10 18:32，三次重复）：
+
+| 配置 | sigma | 2σ 阈值 | 样本 |
+| --- | --- | --- | --- |
+| `640 / batch8` | 0.003184 | 0.006368 | 0.40496 / 0.41109 / 0.40385 |
+| `960 / batch4` | **0.008070** | **0.016139** | 0.45984 / 0.45789 / 0.44183 |
+
+960 的抖动是 640 的 2.5 倍，所以判 KEEP 必须按配置分组（程序已实现，见上节）。
+`exp_0006` 的 0.45862 落在 960 三次的分布内（+0.005 < 1σ），说明它是可信的、
+不是幸运高点；后续实验追不上它，是因为提的方向确实有害。
+
+**跑长实验前必查显存**：`960/batch4` 训练时整卡占用约 5.5 GB，而 `6-web` 的
+`infer_worker` 是懒加载的——浏览网页、点一次推理就会把模型加载进显存并常驻。
+两者叠加会把 8 GB 撑爆，表现为「预检通过 → 第一个 batch OOM → 降 batch →
+崩在主机内存」。2026-11-10 的 `exp_0020~0022` 连续三次就是这样。
+
+```powershell
+nvidia-smi --query-gpu=memory.used,memory.free --format=csv
+# 空闲应约 800 MB used / 7.2 GB free
+```
 
 **首轮 5 个假设（600 秒基准）**
 
@@ -2572,6 +2616,8 @@ python autoexp.py run --config experiments/cur.json
 python autoexp.py report
 python autoexp.py noise --repeat 3
 python autoexp.py holdout --weights runs/autoexp/exp_0007/weights/best.pt
+# 让大模型提议下一组参数并连跑多轮（见 §7.17）
+python autoexp.py agent --rounds 30 --events
 ```
 
 完整参数说明、台账字段与应用场景见 `7-autoresearch-yolo/README.md`。
@@ -2623,6 +2669,173 @@ python 6-web\backend\gpulock.py status
 但 CPython 的 Windows 实现会把非控制台信号的 sig 直接交给
 `TerminateProcess(handle, sig)`——也就是**真的把那个进程杀掉**。现已改为
 Windows 走 `OpenProcess` + `GetExitCodeProcess`，POSIX 仍用 `os.kill(pid, 0)`。
+
+### 7.17 LLM 决策层：谁来决定下一次改什么参数（v1.33.0）
+
+**要解决什么**：§7.16 的循环能自动跑，但「下一组参数改什么」仍由人写在
+`experiments/cur.json` 里。一晚上几十轮，人不可能守着。这一版让**大模型来提议**，
+但**判定权仍留在代码里**。
+
+**职责切分（整个设计的前提，改代码前先读这段）**
+
+| 角色 | 由谁做 | 为什么 |
+| --- | --- | --- |
+| 提出下一组参数 | 大模型 | 这是它的强项：读台账、找模式、提假设 |
+| 判定 keep / discard | **代码，按该配置的 2σ 噪声阈值** | 这是它的弱项且危害最大。把数字交给模型，它几乎必然把噪声讲成趋势，然后沿错误方向持续加码。**阈值还必须按 `imgsz × batch` 分组**：实测 σ 在 640/batch8 是 0.0032、960/batch4 是 0.0081，差 2.5 倍；用同一个阈值判，等于拿一把尺子量两种东西 |
+| 能不能改某个字段 | **代码，冻结白名单** | 见下表 |
+| 写台账 / 更新 best.json | 代码 | 保证留痕格式与人手工跑实验时完全一致 |
+
+**冻结字段**（即使 `space.json` 声明了也不许改）
+
+| 字段 | 冻结原因 |
+| --- | --- |
+| `data` | **硬红线**。`space.json` 根本不校验它。一旦允许改，理论上可以把 `splits/pcb_tune.yaml` 换成 `pcb_holdout.yaml`——holdout 纪律当场作废，而台账上一切正常，看不出任何异常。代码里另有一道独立断言：`data` 必须落在 `splits/` 内且文件名含 `tune` |
+| `budget_seconds` / `epochs` / `task` / `name` | 改了就不再是「同一套方法跑同样的时间」，横比全部作废 |
+| `model` | 第一版刻意冻结：`n→s→m` 会显著改变 600 秒内跑得完的 epoch 数（m 可能只跑 3~4 轮），很容易整晚都在试大模型而没有进展。想放开只需把它从 `FROZEN_TOP` 删掉 |
+| `device` / `seed` / `deterministic` / `cache` / `workers` / `amp` / `patience` / `plots` | 影响可复现性或进程稳定性，不属于「研究变量」 |
+
+**流程**
+
+```mermaid
+flowchart TD
+    A["读 results.tsv<br/>+ 噪声阈值 + 冻结/可改清单"] --> B["组装上下文<br/>（不含任何 holdout 信息）"]
+    B --> C["llm.chat<br/>response_format=json_object"]
+    C --> D{"能解析成 JSON?"}
+    D -->|否| C2["带纠正说明再问一次<br/>（最多 2 次）"]
+    C2 --> C
+    D -->|是| E{"冻结字段 / 空间白名单<br/>/ data 断言 都通过?"}
+    E -->|否| C2
+    E -->|是| F["写 experiments/cur.json<br/>最优配置 + 本轮改动"]
+    F --> G["autoexp.py run<br/>600 秒硬预算 + 显存预检 + 降 batch 拦截"]
+    G --> H["读台账新增行"]
+    H --> I{"fitness - 当前最佳 > 该配置的 2σ?"}
+    I -->|是| J["KEEP：更新 best.json"]
+    I -->|否| K["DISCARD：best.json 不动"]
+    J --> L{"轮数/时间/连续无进展<br/>任一到达上限?"}
+    K --> L
+    L -->|否| A
+    L -->|是| M["写 experiments/agent/round_NNNN.json<br/>结束"]
+```
+
+**网页端「自动实验」页（推荐）**
+
+页签在顶栏最后一个之前。这一页是**外置模块**，与训练页完全隔离：
+
+| 隔离点 | 做法 |
+| --- | --- |
+| 接口 | 独立 `APIRouter`（`/api/autoexp/*`），不碰 `/api/train/yolo` |
+| 前端 | 独立 `js/autoexp.js`，不 import `train.js` 的任何状态 |
+| 事件类型 | 自定义事件用 `type: "agent"`。训练页只认 `type: "event"`，所以**即使同时打开训练页，它也不会渲染自动实验的内容** |
+| 任务类型 | 在 `runners` 里登记新 kind `autoexp-agent`（独占），复用顶栏「运行中」条与日志文件 |
+| GPU | 与训练页共用同一把 `gpulock`：一方在跑，另一方 409 / 退出码 5。锁**按 pid 委派**：后端把自己 pid 通过 `AUTOEXP_GPU_LOCK_PID` 传下去，子进程只在「持有者恰好是自家后端」时跳过检查，别的进程持锁照样退出码 5 |
+
+页面上三块内容：
+
+1. **模型接口**：`base_url` / `model` / `temperature` / `API Key`，带「测试连通性」与「预览提示词」。
+   Key 保存后只显示遮罩（`sk-****1a2b`），再次保存留空表示不修改。
+2. **运行方式**：轮数、时间上限、连续无进展就停、等显卡最长时间。
+3. **日志 + 台账**：日志里按「轮」分块，每轮依次出现
+   `[模型提议]`（假设 / 改动 / 参数 / 理由）→ 训练进度 → `[判定] KEEP 或 DISCARD`（带差值、阈值、连续无进展轮数）。
+   台账表把「模型提议」和「判定」分成两列，一眼能看出「提议合理但没超过噪声」。
+
+**轮数默认值 30（≈5.5 小时）**
+
+一轮 = 600 秒训练 + 约 60~90 秒启动与验证开销 ≈ 11 分钟。所以：
+
+| 轮数 | 墙钟时间 |
+| --- | --- |
+| 10 | ≈ 1.8 小时 |
+| **30（默认）** | **≈ 5.5 小时** |
+| 50 | ≈ 9 小时（会先撞 8 小时时间上限） |
+
+`--hours` 默认 8，与 `--rounds` **先到者生效**。两个上限都要有：只限制轮数的话，
+某几轮卡在等显卡上会拖到天亮；只限时间的话，模型调用连续失败可能浪费掉整晚的 API 费用。
+
+另外 `--max-stale 5`：连续 5 轮没有 KEEP 就停。一整晚几十轮、每轮都在噪声里打转，
+说明当前搜索空间已到瓶颈，继续问只会烧钱。
+
+**命令**
+
+```powershell
+cd 7-autoresearch-yolo
+
+# 1) 先看提示词（不调 API、不跑训练，不花一分钱）
+python autoexp.py agent --dry-run
+
+# 2) 测连通性（Key 只从环境变量读，不提供 --api-key 参数）
+$env:AUTOEXP_API_KEY = "sk-..."
+python autoexp.py llm-test
+
+# 3) 开跑
+python autoexp.py agent --rounds 30 --hours 8 --events
+
+# 4) 联网失败时换厂商：改 configs/llm.local.json（已 gitignore），不动入库文件
+#    {"base_url": "http://localhost:11434/v1", "model": "qwen2.5"}
+```
+
+| 参数 | 默认 | 说明 |
+| --- | --- | --- |
+| `--rounds` | 30 | 最多跑几轮 |
+| `--hours` | 8 | 时间上限（小时），0 表示不限 |
+| `--max-stale` | 5 | 连续多少轮没有 KEEP 就停（**搜索到瓶颈**） |
+| `--max-errors` | 3 | 连续多少轮拿不到有效提议就停（**模型侧故障**，v0.2.1 新增） |
+| `--lock-wait` | 3600 | 显卡被网页端占用时最多等多少秒，0 表示不等 |
+| `--dry-run` | — | 只打印第一轮完整提示词 |
+| `--events` | — | 向 stdout 输出 `TRTFORGE_JSON` 事件（网页端需要） |
+
+**`max_tokens` 必须给推理型模型留足预算（v0.2.1 血的教训）**
+
+`max_tokens` 是「思考 + 正文」的**共用预算**。`deepseek-flash` / `deepseek-reasoner` /
+o 系列会先思考再作答，思考 token 不出现在正文里，但照样计入。
+
+实测（`experiments/agent/round_0004.json`）：`completion_tokens=900`、
+`reasoning_tokens=900`，正文 **0 token**。表现就是两种看着毫不相关的错：
+「返回内容为空」和「JSON 半截」。旧版把它们都报成「返回内容不是合法 JSON」，
+于是人会去改提示词、换模型——方向完全错。
+
+现在：默认 4096，`llm.chat()` 认出 `finish_reason=length` 会自动把预算翻倍重试
+（上限 8192），仍不够才抛 `LLMTruncated` 并直说「被 max_tokens=N 截断：推理占 X、正文 Y，
+请调到 4096 以上」。网页端「模型接口」卡片上能直接改这个数字。
+
+自查一行：打开 `experiments/agent/round_NNNN.json`，看 `usages` 里
+`completion_tokens` 是否等于 `max_tokens` 且 `reasoning_tokens` 接近它。
+是，就加预算；不是，再怀疑别处。
+
+**换研究策略改 markdown，不改代码**：角色、机器事实、已证伪的方向、方法论约束
+全部写在 `prompts/experimenter.md`。想让它只搜增强、或专攻分辨率，改这一个文件即可。
+这是上游 autoresearch 最重要的一课——策略应该是一等公民，不是埋在代码里的常量。
+
+**API Key 的三条安全边界**
+
+1. 只存在 `6-web/runtime/autoexp_llm.json`（`6-web/runtime/` 已 gitignore）。
+2. GET 接口**永不返回原文**，只给 `has_key` 与遮罩值。改动 Key 留空 = 不修改。
+3. 传给子进程**只走环境变量**，绝不进 `argv`——命令行会出现在「运行中」条的
+   tooltip、`runtime/logs/*.log` 和 WebSocket 事件里。`llm.py` 另有 `mask_key()`，
+   所有对外文本都过它；`load_config()` 会主动剔除 `api_key` 字段，
+   防止 Key 随配置字典流进日志与审计快照。
+
+**配置优先级（v0.2.0 调整过，别按老顺序理解）**
+
+`内置默认 ← configs/llm.json ← configs/llm.local.json ← 环境变量 ← 本次显式指定`
+
+「本次显式指定」排最后（页面保存的值、`--model` 参数）。老版本把环境变量放在最后，
+结果 shell 里遗留一个 `AUTOEXP_MODEL` 就会让页面上的设置静默失效——这种问题在
+排查时几乎不可能一眼看出来。
+
+**一轮结束的那一刻（最容易踩的坑）**
+
+`run` 有两种执行方式：网页端走 tee（`_exec_tee`，边转发事件边落盘），命令行走
+`subprocess.run`。状态判定必须只用 `returncode`，不能碰 `Popen` 对象——tee 分支
+根本没有那个对象。已抽成 `derive_result_status(result, returncode)` 并有单测覆盖。
+症状是「训练明明跑完了，台账却记成 crash 或干脆没这行」。
+
+**为什么判定权必须留在代码里（本项目的核心结论）**
+
+首轮 5 个假设里，只有 `imgsz 640→960` 是真赢（tune +0.052，约 16σ，holdout 同向 +0.036）。
+其余四个的差值分别是 `+0.0037` / `+0.0001` / `-0.0031` / `-0.0164`——前三个都在
+2σ 阈值内。如果让模型自己判，它大概率会把 `+0.0037` 说成「小幅提升」并据此继续加码
+`close_mosaic` 方向，而那条路已经证明没有收益。**噪声区间内的一切解释都是自我欺骗**，
+这与模型多聪明无关。
 
 ---
 
@@ -2681,6 +2894,10 @@ Windows 走 `OpenProcess` + `GetExitCodeProcess`，POSIX 仍用 `os.kill(pid, 0)
 | 点「复制」没反应 | 用 `http://局域网IP` 打开（非安全上下文没有 clipboard API） | v1.25.3 起已自动退回 `textarea` 方案；若仍是旧页面请强刷（Ctrl+F5） |
 | 分类推理提示「分类引擎还没做」 | 选了 `.engine` / `.trt` / `.plan` | 改用分类 ONNX。这一版不编译分类引擎 |
 | 桌面版打不开某个 `.tfanno` | 工程是分类任务 | 用 Web 标注页打开。桌面版保存会把任务改成检测，所以直接拒绝 |
+| 自动实验报「返回内容不是合法 JSON：返回内容为空」或 JSON 只有半截 | **`max_tokens` 被推理型模型的思考阶段吃光**（v0.2.1 前默认 900，`reasoning_tokens` 就能占满 900） | 到「模型接口」把 **max_tokens 改到 4096**；v0.2.1 起默认就是 4096 且截断会自动翻倍。核对方法：`experiments/agent/round_NNNN.json` 的 `usages` 里 `completion_tokens == max_tokens` 且 `reasoning_tokens` 接近它 |
+| 自动实验报「提议被拒：`train.imgsz = 1024` 不在允许取值…」 | 模型在猜取值（v0.2.1 前上下文只给键名，不给取值） | 升级到 v0.2.1（上下文已带 `search_space`）；若仍发生，在 `configs/space.json` 里把该值加进 `enum`，别指望模型自己猜对 |
+| 自动实验连跑 5 轮后提示「连续 5 轮没有进展」但其实每轮都报错 | v0.2.1 前「没提议」也计入 `stale`，文案误导 | 升级到 v0.2.1：模型侧故障走独立的 `--max-errors`（默认 3），文案会明说「不是搜索瓶颈」 |
+| 自动实验点「测试连通性」说失败，但实际能跑 | 自检只有 16 token，推理型模型必然被截断 | v0.2.1 起 `ping()` 会把截断判为「连通正常（只有思考、没有正文）」；旧版请直接看日志里的真实请求结果 |
 
 ---
 

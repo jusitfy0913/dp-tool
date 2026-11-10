@@ -1,0 +1,9 @@
+{
+  "_comment": "模型接口配置。本文件入库但不含任何密钥——Key 只走环境变量 AUTOEXP_API_KEY（或 Web 页面上填写后存 6-web/runtime/），绝不写进这里。改 base_url 就能切厂商：DeepSeek=https://api.deepseek.com；OpenAI=https://api.openai.com/v1；本地 Ollama=http://localhost:11434/v1；vLLM=http://localhost:8000/v1。若只是临时换一下，别改本文件，新建 configs/llm.local.json（已被 .gitignore 排除）覆盖即可。max_tokens 说明：推理型模型（deepseek-flash / deepseek-reasoner / o 系列）把「思考」和「正文」算进同一个预算，900 会被思考全部吃掉、正文剩 0，表现为「返回内容为空」或 JSON 半截。所以默认 4096；用非推理型模型可以降到 1000 省点钱，但别低于 800。",
+  "base_url": "https://api.deepseek.com",
+  "model": "deepseek-chat",
+  "temperature": 0.7,
+  "max_tokens": 4096,
+  "timeout_seconds": 120,
+  "max_retries": 3
+}

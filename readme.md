@@ -22,7 +22,7 @@
 | `6-web/backend` | Web 版后端：启动 launcher 子进程、转发训练事件、ctypes 调推理 DLL |
 | `6-web/frontend` | Web 版前端：原生 HTML/JS，无 npm 构建步骤 |
 | `1-python-yolo/ultralytics-main` | YOLO 训练、验证、导出的 Python 开源工程来源 |
-| `7-autoresearch-yolo` | **YOLO 自主实验循环**：固定时间预算 + 单一适应度 + 台账留痕，在 PCB 数据集上做超参与增强的自动化实验。**对生产 launcher 零改动**，只 import 其纯函数；产物严格收敛在该目录内。用法与参数见 `7-autoresearch-yolo/README.md` |
+| `7-autoresearch-yolo` | **YOLO 自主实验循环**：固定时间预算 + 单一适应度 + 台账留痕，在 PCB 数据集上做超参与增强的自动化实验。v1.33.0 起含 **LLM 决策层**（`agent` 子命令）：大模型提议下一组参数，`keep / discard` 由代码按 2σ 噪声阈值判定。**对生产 launcher 零改动**，只 import 其纯函数；产物严格收敛在该目录内。用法与参数见 `7-autoresearch-yolo/README.md` |
 | `7-autoresearch-master` | Karpathy autoresearch 原始副本（LLM 预训练方法论来源），**仅供参考，不参与本工程构建** |
 | `docs` | 架构设计、推理流程、部署总结等中文文档。操作入口：[Web 操作手册](docs/TRTForge_Web操作手册.md)。发给使用人员、不附源码的安装包见 [packaging/package_web_user.ps1](packaging/package_web_user.ps1) |
 | `openspec` | 需求规格和变更提案 |
@@ -152,6 +152,126 @@ python tf_anomalib_launcher.py --mode check-env
 引擎构建页选择 ONNX 后会在后台线程自动识别第一个输入 tensor 的名称和维度，并弹出“ONNX 加载中”进度提示；识别完成后提供统一 `H/W` 输入，修改一次高度和宽度即可同步覆盖 `min / opt / max` 三组动态 shape。
 
 ## 版本更新记录
+
+### v1.33.2 — 2026-11-10（修「5 轮全 DISCARD」暴露的三个问题）
+
+**一句话**：模型侧 0 失败说明 v1.33.1 的截断修复生效了，但那一场 5 轮里混着三个**与模型无关**的问题：模型以为在 960 上做实验、程序实际跑在 640；用 640 的噪声底去判 960；显存预检放行了必然 OOM 的 1152，还让训练框架把 batch 偷偷减半。
+
+**现场**（`experiments/agent/round_0001..0005.json` + `results.tsv`）
+
+| 轮 | 实验 | 实际跑的配置 | mAP50-95 | 与最优差 | 判定 |
+| --- | --- | --- | --- | --- | --- |
+| 1 | exp_0015 | 1152 / b4 | — | — | crash（30 秒 OOM） |
+| 2 | exp_0016 | 960 / b4 + degrees10 | 0.42967 | −0.029 | DISCARD |
+| 3 | exp_0017 | **640 / b8** + warmup1 | 0.39062 | −0.068 | DISCARD（**整轮无效**） |
+| 4 | exp_0018 | 960 / b4 + cos_lr | — | — | crash（253 秒静默死） |
+| 5 | exp_0019 | 960 / b4 + freeze10 | 0.39189 | −0.067 | DISCARD |
+
+**三个改动**
+
+| 改动 | 老版本 | 新版本 |
+| --- | --- | --- |
+| 继承基准 | `cur.json` 只写本轮改动，`run` 用 `base.json` 合并 → **回落到 640** | `cur.json` 写「`best.json` 的 train + 本轮提议」；`_ask_proposal` 也按最优校验；审计记 `inherited_from` |
+| KEEP 阈值 | 全库一个 σ（640 实测 0.0032） | 按 `imgsz × batch` 分组：先查该组实测，再查台账里配置相同的重复实验，都没有才借全局并标 `calibrated=false` |
+| batch 降级 | 事后比较 `batch_req` / `batch_eff`，只打一行警告 | `_exec_tee` 匹配 `Reducing to batch=N` 即**终止子进程**，状态记 `batch_downgraded`，`fitness` 留空，不计 crash、不污染 `current_best` |
+
+**顺带**：`space.json` 的 `imgsz` 枚举去掉 1152 / 1280（本机 T1000 8GB 实测必 OOM），提示词同步说明「换大卡后可加回」。
+
+**这不是自动修复的部分**：960 的真实噪声底已补测完成：`sigma = 0.008070`、
+`2σ = 0.016139`（640 是 0.003184 / 0.006368）。用新阈值重判那 5 轮，
+两个 DISCARD 结论**依旧成立**——KEEP 0 次是真实的科研结果，
+不是阈值冤枉了模型（`exp_0006` 的 0.45862 落在三次重复的分布内）。
+
+**另一条环境教训**：`6-web` 的 `infer_worker` 懒加载会占约 1.7 GB 显存，
+960/batch4 需要 5.5 GB，两者叠加必然 OOM。跑长实验前先 `nvidia-smi` 看一眼。
+
+**测试**：autoexp `run_all_tests.py` **53 / 53**（新增 6 条：真实负向文案、未校准警告、分组噪声三种取值顺序、配置相同的重复实验、降 batch 提示识别、提议继承最优）；Web 后端 `tools/test_autoexp_api.py` **15 / 15**。
+
+详细复盘见 [7-autoresearch-yolo/README.md](7-autoresearch-yolo/README.md) v0.2.2。
+
+### v1.33.1 — 2026-11-10（修自动实验首个实测事故：推理型模型把输出预算吃光）
+
+**一句话**：`max_tokens` 是「思考 + 正文」的**共用预算**，900 会让推理型模型把预算全花在思考上、正文一个字都不剩。默认改 4096，并在截断时自动加倍重试；同时把「模型看不到取值」和「失败被误报成没有进展」两个坑一起补上。
+
+**事故现场（真实 30 轮计划，跑到第 2 轮就崩）**
+
+```text
+[autoexp] 返回内容不是合法 JSON：找不到 JSON 对象：'{"hypothesis": "分辨率收益在 640→800→960 上单调递增...
+[autoexp] 返回内容不是合法 JSON：返回内容为空
+[autoexp] 提议被拒：train.imgsz = 1024 不在允许取值 [640, 800, 960, 1152, 1280] 内
+[autoexp] 连续 5 轮没有进展，停止（省下无意义的 API 花费）
+```
+
+**真凶**（`experiments/agent/round_0004.json` 里存着 `usages`，直接可查）：
+
+| 轮次 | `completion_tokens` | `reasoning_tokens` | 正文实际拿到 |
+| --- | --- | --- | --- |
+| 1（成功） | 629 | 416 | 213 token → JSON 完整 |
+| 3 第 1 次 | **900** | **900** | **0** → 空 |
+| 4 第 1 次 | **900** | **900** | **0** → 半截 |
+
+「返回内容为空」和「JSON 突然半截」是**同一个原因**的两种表现，而日志把它们都写成「不是合法 JSON」——这句话会让人去改提示词、换模型，方向完全错。
+
+**四个改动**
+
+| 改动 | 老版本 | 新版本 |
+| --- | --- | --- |
+| 输出预算 | `max_tokens=900` | **4096**，页面上可调；截断时自动翻倍重试（上限 8192） |
+| 报错文案 | 一律「返回内容不是合法 JSON」 | 新增 `LLMTruncated`：「被 max_tokens=N 截断：其中推理占 X、正文只有 Y，请调到 4096 以上」 |
+| 上下文 | 只给可改参数的**键名** | 补 `search_space`（带 `enum` / `min` / `max`）→ 模型不再提出 `imgsz=1024`、`batch=2` 这种必然被拒的值 |
+| 停止判据 | 「没进展」和「没提议」共用一个计数器 | 拆成 `--max-stale`（搜索到瓶颈）与 `--max-errors`（模型侧故障，默认 3），文案不再互相冒充 |
+
+**其他**：空正文不再写入对话历史（部分兼容接口会对空 assistant 内容返回 400）；`llm.ping()` 遇到推理型模型截断时仍报「连通正常」（自检只有 16 token，必然截断，不能因此让用户以为 Key 坏了）；上下文里的 `_comment` 元数据键被滤掉（旧版 `allowed_top_level` 里赫然写着 `_comment`）。
+
+**测试**：autoexp `run_all_tests.py` **47 / 47**（新增 4 条直接对着这次事故：截断自动加预算、截断报错要点名 `max_tokens`、`ping` 容忍截断、上下文必须给取值、两种停止原因文案不能共用）；Web 后端 `tools/test_autoexp_api.py` **15 / 15**（新增 `max_tokens` 往返与 `--max-errors` 透传）；前端 `test_autoexp_fmt.mjs` 27 / 27、`test_runsbar.mjs` 28 / 28。
+
+详细复盘见 [7-autoresearch-yolo/README.md](7-autoresearch-yolo/README.md) §14.9 / §14.10 / v0.2.1。
+
+### v1.33.0 — 2026-11-10（自动实验第 4 阶段：让模型提议，让程序裁判）
+
+**一句话**：`7-autoresearch-yolo` 从「人改配置、人跑一轮」升级为「模型提议 → 程序校验 → 训练 → 按噪声阈值判 KEEP/DISCARD → 记账」的无人值守循环；网页端新增**独立「自动实验」页签**填 API Key 与看决策，**训练页老流程零改动**。
+
+**为什么要做这一层**：前三阶段解决了「怎么让一次实验可比」，但仍要人每轮想改什么。人连看 5 轮就会开始凭直觉加码（首轮实验里 4 个假设有 3 个落在噪声区间，靠人眼根本分不出「+0.0037 的提升」和随机波动）。
+
+**核心设计：提议与裁判彻底分离**
+
+| 角色 | 谁来做 | 为什么 |
+| --- | --- | --- |
+| 提议（`hypothesis` / `changed` / `train` 参数） | LLM | 它擅长在已知结论之上联想；而且策略写在 `prompts/experimenter.md` 一个 markdown 里，换方向不用改代码 |
+| 裁判（KEEP / DISCARD） | 确定性 Python | 判据是 `fitness - best > 2σ`（σ=0.003184，阈值 0.006368）。**模型说"显著提升"不算数**——它没有噪声底这个概念 |
+| 写入 | `best.json` 只在 KEEP 时更新 | DISCARD 的配置不会污染下一轮起点 |
+
+**硬约束（模型改不动的东西）**
+
+`data` / `task` / `budget_seconds` / `epochs` / `model` / `device` / `seed` / `deterministic` / `plots` / `workers` / `cache` / `patience` / `amp` 全部冻结；且 `data` 做路径断言——解析后若落在 `pcb_holdout.yaml` 上直接拒绝，防止用验证集调参。改动项还要过 `configs/space.json` 白名单与区间校验，越界即打回让模型重提（最多 2 次）。
+
+**默认值**：轮数 **30**（一轮约 11 分钟 ≈ 5.5 小时）、时间上限 8 小时、连续 5 轮无 KEEP 自动停。三者先到者生效。
+
+**网页端「自动实验」页签**（详见 [6-web/README.md](6-web/README.md) 的 v1.33.0）
+
+| 能力 | 说明 |
+| --- | --- |
+| 模型接口 | `base_url` / `model` / `temperature` / `API Key`，带「测试连通性」与「预览提示词」；Key 只显示遮罩，只存 `runtime/autoexp_llm.json` |
+| 运行方式 | 轮数 / 时间上限 / 连续无进展 / 等显卡时长 |
+| 日志 | 按轮分块：`[模型提议]`（假设·改动·参数·理由）→ 训练进度 → `[判定] KEEP|DISCARD`（差值、阈值、连续无进展轮数） |
+| 台账表 | 「模型提议」与「判定」分两列，一眼看出「提议看着合理但没超过噪声」 |
+
+**与训练页的隔离（本次重点，逐条验证过）**
+
+| 隔离点 | 做法 |
+| --- | --- |
+| 路由 | 独立 `APIRouter`（`/api/autoexp/*`），不碰 `/api/train/yolo` |
+| 前端 | 独立 `js/autoexp.js`，不 import `train.js` 的任何状态 |
+| 事件 | autoexp 发 `{"type": "agent"}`，训练发 `{"type": "event"}` → 训练页的 switch 没有 `agent` 分支，同开也不会串台 |
+| 接管 | `train.js` 的 `TRAIN_KINDS` 不含 `autoexp-agent` → 点「开始训练」遇 409 不会误接管自动实验的 run |
+| 显卡 | 共用 `gpu_lock.json`，按 **pid 委派**：后端把自己 pid 传给子进程，只在「持有者恰好是自家后端」时跳过，别的进程持锁照样退出码 5 |
+
+**本轮修掉的两个真实故障**
+
+1. `--events`（tee）分支下，一轮结束后状态判定用了未定义的 `Popen` 对象 → `NameError`。症状是「训练明明跑完了，台账却没这行」，极难联想到是记账代码的问题。现抽成 `derive_result_status(result, returncode)` 并加单测。
+2. `llm.load_config()` 的优先级把环境变量放在**显式指定之后**，导致 shell 里遗留的 `AUTOEXP_MODEL` 会让页面上的设置静默失效。现为「内置默认 ← 入库文件 ← `llm.local.json` ← 环境变量 ← 本次显式指定」。
+
+**测试**：autoexp 侧 `run_all_tests.py` 42 / 42；Web 后端 `tools/test_autoexp_api.py` 13 / 13；前端 `test_autoexp_fmt.mjs` 27 / 27、`test_runsbar.mjs` 28 / 28。另有一次真实 tee 链路冒烟（120 秒预算，`status=done`、mAP50-95=0.19586），确认网页端那一轮也能正确记账。
 
 ### v1.32.0 — 2026-11-10（YOLO 自主实验循环：把"调参"变成可留痕的实验）
 
