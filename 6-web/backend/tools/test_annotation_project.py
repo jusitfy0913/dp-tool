@@ -422,7 +422,8 @@ def test_fallbacks() -> None:
     check("回退：未知集合有警告", any("holdout" in w for w in warnings2), str(warnings2))
     check("回退：val 别名 valid 被识别", annotation.split_from_str("valid") == "val")
     check("回退：空集合默认 train", annotation.split_from_str("") == "train")
-    check("回退：未知任务降级为 detect", annotation.task_from_str("classify") == "detect")
+    check("回退：未知任务降级为 detect", annotation.task_from_str("nope") == "detect")
+    check("分类任务保持 classify", annotation.task_from_str("classify") == "classify")
 
     # 整份工程读取时也不能因为一条坏数据就失败
     project, warns = annotation.normalize_project(

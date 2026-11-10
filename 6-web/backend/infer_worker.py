@@ -40,6 +40,54 @@ PIPE_ENV = "TRTFORGE_INFER_PIPE"
 KEY_ENV = "TRTFORGE_INFER_KEY"
 TEST_HOOKS_ENV = "TRTFORGE_TEST_HOOKS"
 
+#: 小于这个体积的二进制仍然随消息 pickle 回传：为 20~45 KB 的 mask 单开一次共享内存
+#: 反而不划算（建段 + 附着 + 拷贝的固定开销约 0.3 ms）。
+BLOB_MIN_BYTES = 64 * 1024
+
+
+class _SharedOut:
+    """把大体量二进制（结果图）放进共享内存回传，而不是 pickle 过管道。
+
+    为什么：Anomalib 一次要回 overlay JPEG（约 0.8 MB）+ heatmap PNG（约 1 MB），
+    pickle 走管道实测 155 ms，比模型本身（64 ms）还贵。放进共享内存只剩一次
+    内存拷贝（2.6 MB 约 2 ms），Web 侧附着后直接读出。
+
+    缓冲区由**本进程**创建并复用：Web 侧只附着读取，读完立刻 close，不 unlink，
+    所以同一块内存可以在下一次请求里继续写。名字和偏移随消息返回。
+    """
+
+    def __init__(self) -> None:
+        self._shm: shared_memory.SharedMemory | None = None
+        self._size = 0
+
+    def put(self, blobs: list[bytes]) -> tuple[str, list[list[int]]]:
+        """写入一批二进制，返回（共享内存名，[[offset, length], ...]）。"""
+        total = sum(len(blob) for blob in blobs)
+        if self._shm is None or self._size < total:
+            self.close()
+            # 按 1 MB 向上取整；一次分配后通常不再扩容（同一模型出图尺寸稳定）
+            mib = 1024 * 1024
+            self._shm = shared_memory.SharedMemory(create=True, size=max(mib, -(-total // mib) * mib))
+            self._size = self._shm.size
+        layout = []
+        offset = 0
+        for blob in blobs:
+            self._shm.buf[offset:offset + len(blob)] = blob
+            layout.append([offset, len(blob)])
+            offset += len(blob)
+        return self._shm.name, layout
+
+    def close(self) -> None:
+        if self._shm is None:
+            return
+        try:
+            self._shm.close()
+            self._shm.unlink()
+        except (BufferError, FileNotFoundError, OSError):
+            pass
+        self._shm = None
+        self._size = 0
+
 
 class _SharedImage:
     """按名字附着 Web 进程创建的共享内存；名字变了（扩容）才重新附着。"""
@@ -93,6 +141,9 @@ def _handle(message: dict, images: _SharedImage) -> object:
     if op == "anomalib":
         image = images.view(message["shm"], message["shape"])
         return infer.run_anomalib(image=image, **message["kwargs"])
+    if op == "classify":
+        image = images.view(message["shm"], message["shape"])
+        return infer.run_classify(image=image, **message["kwargs"])
     if op == "ocr":
         image = images.view(message["shm"], message["shape"])
         return ocr_infer.run(image, message["options"])
@@ -111,6 +162,31 @@ def _handle(message: dict, images: _SharedImage) -> object:
         if op == "pid":
             return os.getpid()
     raise ValueError(f"未知操作：{op}")
+
+
+def _pack_blobs(reply: dict, store: _SharedOut) -> dict:
+    """把响应里的大二进制搬进共享内存，消息里只留偏移。
+
+    约定（Web 侧 `inferproxy._unpack_blobs` 对应实现）：
+    ``reply["blobs"] = {"shm": 名字, "items": {字段名: [offset, length]}}``，
+    被搬走的字段在 ``result`` 里留 ``None``。
+    """
+    result = reply.get("result")
+    if not isinstance(result, dict):
+        return reply
+    keys: list[str] = []
+    blobs: list[bytes] = []
+    for key, value in result.items():
+        if isinstance(value, (bytes, bytearray)) and len(value) >= BLOB_MIN_BYTES:
+            keys.append(key)
+            blobs.append(bytes(value))
+    if not blobs:
+        return reply
+    for key in keys:
+        result[key] = None
+    name, layout = store.put(blobs)
+    reply["blobs"] = {"shm": name, "items": {key: layout[i] for i, key in enumerate(keys)}}
+    return reply
 
 
 def _error_reply(exc: BaseException) -> dict:
@@ -136,6 +212,7 @@ def main(argv: list[str] | None = None) -> int:
 
     infer.load_libraries()
     images = _SharedImage()
+    out_blobs = _SharedOut()
     with Listener(address, family="AF_PIPE", authkey=bytes.fromhex(key)) as listener:
         with listener.accept() as conn:
             conn.send({"ok": True, "result": _backend_status(), "pid": os.getpid()})
@@ -149,11 +226,13 @@ def main(argv: list[str] | None = None) -> int:
                     break
                 try:
                     reply = {"ok": True, "result": _handle(message, images)}
+                    reply = _pack_blobs(reply, out_blobs)
                 except Exception as exc:  # noqa: BLE001 - 原样回传给 Web 侧
                     reply = _error_reply(exc)
                 conn.send(reply)
 
     images.close()
+    out_blobs.close()
     infer.release_handles()
     ocr_infer.release_handles()
     return 0

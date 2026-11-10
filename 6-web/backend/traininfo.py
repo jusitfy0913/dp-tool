@@ -66,7 +66,7 @@ def parse_scalars(text: str) -> dict[str, str]:
     缩进行（``names:`` 下面那种）与注释行直接跳过。之所以手写而不引入 PyYAML：
     本项目的 ``dataset.py`` 已经用同一套手写解析，多一个依赖不值当。
     """
-    wanted = {"path", "train", "val", "test", "nc"}
+    wanted = {"path", "train", "val", "test", "nc", "task"}
     found: dict[str, str] = {}
     for raw in text.splitlines():
         line = raw.split("#", 1)[0].rstrip() if not raw.lstrip().startswith("#") else ""
@@ -157,6 +157,7 @@ def resolve_splits(yaml_path: str | Path) -> dict[str, Any]:
         "text": text,
         "classes": classes,
         "nc": nc,
+        "task": scalars.get("task", ""),
         "splits": splits,
     }
 
@@ -474,6 +475,89 @@ def build_warnings(result: dict) -> list[dict]:
     return warnings
 
 
+def _scan_classify(path: Path, resolved: dict, file_stat, started: float, use_cache: bool) -> dict:
+    """分类目录没有 labels/*.txt。按类别文件夹数张数，不当成缺标签。"""
+    classes = resolved["classes"]
+    name_to_id = {str(item["name"]): int(item["id"]) for item in classes}
+    splits: dict[str, dict] = {}
+    total: dict[str, int] = {str(item["id"]): 0 for item in classes}
+    unknown: list[str] = []
+    # 分辨率统计要的是图片路径列表。分类数据集动辄上万张，全存下来太占内存，
+    # 只留等距抽样所需的量（比 _sample 的采样数多留一些余量）。
+    size_candidates: list[Path] = []
+    size_candidate_limit = MAX_SIZE_SAMPLES * 2
+    for name in SPLITS:
+        per_class = {str(item["id"]): 0 for item in classes}
+        images = 0
+        dirs = resolved["splits"][name]
+        for root in dirs:
+            if not root.is_dir():
+                continue
+            for child in sorted((item for item in root.iterdir() if item.is_dir()), key=lambda item: item.name.lower()):
+                collected = _collect_files(child)
+                count = len(collected)
+                images += count
+                if len(size_candidates) < size_candidate_limit:
+                    size_candidates.extend(collected[: size_candidate_limit - len(size_candidates)])
+                class_id = name_to_id.get(child.name)
+                if class_id is None:
+                    unknown.append(child.name)
+                    continue
+                key = str(class_id)
+                per_class[key] = per_class.get(key, 0) + count
+                total[key] = total.get(key, 0) + count
+        splits[name] = {
+            "split": name,
+            "configured": bool(dirs),
+            "dirs": [str(item) for item in dirs],
+            "missing_dirs": [str(item) for item in dirs if not item.is_dir()],
+            "images": images,
+            "labels": images,
+            "empty_labels": 0,
+            "missing_labels": 0,
+            "missing_examples": [],
+            "orphan_labels": 0,
+            "orphan_examples": [],
+            "duplicate_labels": 0,
+            "malformed_lines": 0,
+            "instances": images,
+            "class_instances": per_class,
+            "label_coverage": 1.0 if images else 0.0,
+        }
+    warnings = []
+    if unknown:
+        warnings.append({
+            "level": "warn",
+            "code": "unknown_class_dir",
+            "text": "这些文件夹不在 names 里，没有计入类别张数：" + "、".join(unknown[:10]),
+        })
+    result = {
+        "yaml": resolved["yaml"],
+        "base": str(resolved["base"]),
+        "nc": resolved["nc"],
+        "task": "classify",
+        "classes": classes,
+        "splits": splits,
+        "counts": {
+            "total": sum(item["images"] for item in splits.values()),
+            "train": splits["train"]["images"],
+            "val": splits["val"]["images"],
+            "test": splits["test"]["images"],
+            "instances": sum(total.values()),
+        },
+        "class_instances": dict(sorted(total.items(), key=lambda kv: int(kv[0]))),
+        "resolutions": resolution_profile(size_candidates),
+        "elapsed_ms": int((time.perf_counter() - started) * 1000),
+        "cached": False,
+        "warnings": warnings,
+    }
+    if use_cache:
+        key = str(path.resolve())
+        with _cache_lock:
+            _cache[key] = (time.time(), {**result, "_stamp": (file_stat.st_mtime_ns, file_stat.st_size)})
+    return result
+
+
 # ---------------------------------------------------------------------------
 # 对外入口
 # ---------------------------------------------------------------------------
@@ -497,6 +581,8 @@ def scan(yaml_path: str | Path, *, use_cache: bool = True) -> dict:
 
     started = time.perf_counter()
     resolved = resolve_splits(path)
+    if str(resolved.get("task") or "").lower() == "classify":
+        return _scan_classify(path, resolved, stat, started, use_cache)
     yaml_dir = resolved["yaml_dir"]
 
     splits: dict[str, dict] = {}

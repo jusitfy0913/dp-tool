@@ -38,6 +38,33 @@ SUPPORTED_YOLO_TASKS = ("detect", "obb")
 BACKEND_YOLO = "onnxruntime-fallback"
 BACKEND_ANOMALIB = "onnxruntime-fallback"
 
+#: 异常区域示意图的配色（BGR）：纯红，与 DLL 路径（infer.ANOMALIB_REGION_BGR）一致，
+#: 这样切换后端时前端看到的配色不变。
+REGION_BGR = (40, 40, 255)
+
+#: 异常区域判定的固定边界，与 DLL 内部口径一致（anomalib_post.hpp: threshold(displayMap, 0.5)）。
+REGION_THRESHOLD = 0.5
+
+#: 区域最多覆盖画面的比例；像素阈值标定失效时改为只标最热的一段（与 DLL 路径一致）。
+REGION_MAX_COVERAGE = 0.6
+
+#: 区域图最大边长，与 `infer.ANOMALIB_REGION_MAX_SIDE` 保持一致。
+REGION_MAX_SIDE = 1024
+
+
+def _map_range(meta: dict) -> tuple[float, float]:
+    """取 metadata 里 anomaly map 的归一化范围，兼容嵌套与扁平两种写法。"""
+    lo = meta.get("anomaly_maps.min")
+    hi = meta.get("anomaly_maps.max")
+    if lo is None or hi is None:
+        nested = meta.get("anomaly_maps") or {}
+        lo = nested.get("min", 0.0)
+        hi = nested.get("max", 1.0)
+    try:
+        return float(lo), float(hi)
+    except (TypeError, ValueError):
+        return 0.0, 1.0
+
 # 缓存 session，避免每次请求重新加载模型（PatchCore ONNX 有 300MB）
 _yolo_sessions: dict[str, object] = {}
 _anom_sessions: dict[str, object] = {}
@@ -461,8 +488,12 @@ def run_anomalib(
             "postprocess_ms": 0.0,
             "total_ms": float(infer_ms),
         },
-        "overlay_png": None,
+        "overlay_jpg": None,
+        "overlay_mime": None,
         "mask_png": None,
+        "heatmap_png": None,
+        "image_width": int(image.shape[1]),
+        "image_height": int(image.shape[0]),
     }
 
     if want_overlay and map_2d is not None:
@@ -474,13 +505,50 @@ def run_anomalib(
         heat = cv2.resize(heat, (image.shape[1], image.shape[0]), interpolation=cv2.INTER_LINEAR)
         overlay = cv2.addWeighted(image, 0.6, heat, 0.4, 0)
 
-        # 掩码：按像素阈值二值化后放大回原图尺寸
-        mask_small = (norm >= pixel_threshold).astype(np.uint8) * 255
-        mask = cv2.resize(mask_small, (image.shape[1], image.shape[0]), interpolation=cv2.INTER_NEAREST)
-        mask_rgb = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
+        # 异常区域：口径与 DLL 路径完全一致——先把 map 按 metadata 归一化到 0..1
+        # （(map - pixel_threshold) / (map_max - map_min) + 0.5），再取 > 0.5，
+        # 等价于「原始 map 超过 pixel_threshold」。
+        # 旧写法直接拿 0..1 的相对值去比 pixel_threshold（原始分数阈值），
+        # 两个量纲混着比，判定出来的区域和 DLL 会差一大截。
+        map_min, map_max = _map_range(meta)
+        if map_max - map_min > 1e-12:
+            normalized_map = (map_2d - pixel_threshold) / (map_max - map_min) + 0.5
+        else:
+            normalized_map = np.zeros_like(map_2d)
+        normalized_map = np.clip(normalized_map, 0.0, 1.0)
 
-        payload["overlay_png"] = _encode_png(overlay)
-        payload["mask_png"] = _encode_png(mask_rgb)
+        # 放大到原图比例再判定（与 DLL 一致：先插值再取阈值，边界才平滑）。
+        # 最长边按 REGION_MAX_SIDE 封顶——区域来自低分辨率 map，存 3000+ 边长
+        # 不增加信息，只增加构图像素与 PNG 编码时间（与 infer._region_from_map 同口径）。
+        target_w, target_h = image.shape[1], image.shape[0]
+        scale = min(1.0, REGION_MAX_SIDE / float(max(target_w, target_h) or 1))
+        if scale < 1.0:
+            target_w = max(1, int(round(target_w * scale)))
+            target_h = max(1, int(round(target_h * scale)))
+        big = cv2.resize(normalized_map.astype(np.float32), (target_w, target_h),
+                         interpolation=cv2.INTER_LINEAR)
+        region = (big > REGION_THRESHOLD).astype(np.uint8) * 255
+        if float((region > 0).mean()) > REGION_MAX_COVERAGE:
+            # 像素阈值标定失效（跨数据集套模型时常见）：改为只标最热的一段
+            hot_cut = max(REGION_THRESHOLD,
+                          float(np.quantile(big, 1.0 - REGION_MAX_COVERAGE)))
+            region = (big > hot_cut).astype(np.uint8) * 255
+            if int(region.max(initial=0)) == 0:
+                # 大片像素同值（整块被打成同一个最高分）时没有可分的高热区，
+                # 退回包含等值像素，至少把这一整片标出来
+                region = (big >= hot_cut).astype(np.uint8) * 255
+
+        # 与 DLL 路径一致的字段契约：overlay 用 JPEG，mask 是"透明底 + 红色区域"的 RGBA PNG，
+        # 由前端半透明叠在本地原图上显示。
+        payload["overlay_jpg"] = _encode_jpeg(overlay)
+        payload["overlay_mime"] = "image/jpeg"
+        if int(region.max(initial=0)):
+            area = np.zeros((region.shape[0], region.shape[1], 4), np.uint8)
+            blue, green, red = REGION_BGR
+            area[region > 0] = (blue, green, red, 255)
+            payload["mask_png"] = _encode_png(area)
+        else:
+            payload["mask_png"] = None
 
     return payload
 
@@ -497,6 +565,16 @@ def _encode_png(image: np.ndarray) -> bytes:
     ok, buffer = cv2.imencode(".png", image)
     if not ok:
         raise FallbackError("PNG 编码失败")
+    return buffer.tobytes()
+
+
+def _encode_jpeg(image: np.ndarray, quality: int = 90) -> bytes:
+    """编码成 JPEG 原始字节（与 DLL 路径的 overlay_jpg 同样的口径）。"""
+    import cv2
+
+    ok, buffer = cv2.imencode(".jpg", image, [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)])
+    if not ok:
+        raise FallbackError("JPEG 编码失败")
     return buffer.tobytes()
 
 

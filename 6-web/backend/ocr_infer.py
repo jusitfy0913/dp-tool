@@ -131,7 +131,11 @@ _creates = 0
 
 
 def _mkl_dirs() -> list[Path]:
-    """mklml.dll 不在 bin 里，Paddle 运行时仍会按名字加载它。"""
+    """mklml.dll 所在目录。
+
+    安装包把 mklml.dll 和 ocr_infer.dll 放在一起（bin 根），源码树里它留在
+    飞桨包的 third_party/install/mklml/lib 下。两处都要能认出来。
+    """
     roots = [
         BIN_DIR / "paddle_inference",
         REPO_ROOT / "ocr" / "ocr_infer" / "third_party" / "paddle_inference",
@@ -141,17 +145,36 @@ def _mkl_dirs() -> list[Path]:
         lib = root / "third_party" / "install" / "mklml" / "lib"
         if (lib / "mklml.dll").is_file():
             found.append(lib)
+    if (BIN_DIR / "mklml.dll").is_file():
+        found.append(BIN_DIR)
     return found
 
 
-def _prepare_dll_search_path() -> None:
-    if not hasattr(os, "add_dll_directory"):
+def _prepend_path(directory: Path) -> None:
+    """把一个目录插到进程 PATH 最前面，已存在就跳过。"""
+    text = str(directory)
+    parts = [p for p in os.environ.get("PATH", "").split(os.pathsep) if p]
+    if text.lower() in {p.lower() for p in parts}:
         return
-    for directory in list(DLL_DIRS) + _mkl_dirs():
+    os.environ["PATH"] = text + os.pathsep + os.environ.get("PATH", "")
+
+
+def _prepare_dll_search_path() -> None:
+    """准备 DLL 搜索路径。这里有两个 Windows 坑，缺一个都不行：
+
+    1. Python 3.8+ 加载依赖 DLL 不再看 PATH，必须先 add_dll_directory；
+    2. 飞桨 2.6 的 dynamic_loader 是自己 LoadLibrary("mklml.dll") 找 MKL 的，
+       只认 PATH，add_dll_directory 对它无效（实测 error code 126）。
+       所以 mklml 目录必须同时进 PATH，否则 CPU/GPU 创建预测器都会失败。
+    """
+    dirs = list(DLL_DIRS) + _mkl_dirs()
+    for directory in dirs:
         try:
             _dll_dirs.append(os.add_dll_directory(str(directory)))
-        except OSError:
+        except (AttributeError, OSError):
             continue
+    for directory in [BIN_DIR] + _mkl_dirs():
+        _prepend_path(directory)
 
 
 def _bind(lib: ctypes.WinDLL) -> None:

@@ -95,6 +95,12 @@ public:
     const std::vector<TensorInfo>& outputs() const { return outputs_; }
     const std::string& provider() const { return provider_; }
 
+    /*
+     * 读取模型的 custom metadata（例如 Ultralytics 写入的 `names`）。
+     * 取不到时返回空串，不视为错误：老模型或非常规导出本来就没有这项。
+     */
+    std::string custom_metadata(const char* key) const;
+
 private:
     bool create_session(const std::wstring& model_path, bool with_cuda, std::string& err);
     void close();

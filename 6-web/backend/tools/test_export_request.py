@@ -92,10 +92,18 @@ def main() -> int:
 
     # ---- 4. 非法 task 被拒绝 ---------------------------------------------
     try:
-        app.build_export_command(make(task="classify"), "python.exe")
+        app.build_export_command(make(task="nope"), "python.exe")
         check("非法 task 被拒绝", False, "没有抛异常")
     except ValueError as exc:
-        check("非法 task 被拒绝", "classify" in str(exc), str(exc))
+        check("非法 task 被拒绝", "nope" in str(exc), str(exc))
+
+    classify_cmd = app.build_export_command(make(task="classify", make_transd=True), "python.exe")
+    classify_pairs = {}
+    for index, token in enumerate(classify_cmd):
+        if token.startswith("--") and index + 1 < len(classify_cmd):
+            classify_pairs[token] = classify_cmd[index + 1]
+    check("分类任务可以导出", classify_pairs.get("--task") == "classify", str(classify_cmd))
+    check("分类不生成检测转置", classify_pairs.get("--make-transd") == "false", str(classify_pairs))
 
     # ---- 5. opset 越界由 pydantic 拦（不是我们自己写 if） ------------------
     try:

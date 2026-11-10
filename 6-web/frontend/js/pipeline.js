@@ -89,6 +89,8 @@ export function initPipeline() {
   dom.btnStart.addEventListener("click", onStart);
   dom.btnStop.addEventListener("click", onStop);
   dom.kind.addEventListener("change", syncKind);
+  document.getElementById("yoloTask")?.addEventListener("change", syncClassifyNote);
+  syncClassifyNote();
   dom.precision.addEventListener("change", syncCalib);
   dom.skipTrain.addEventListener("change", syncSkipTrain);
   dom.anomalySkipTrain.addEventListener("change", syncSkipTrain);
@@ -112,6 +114,14 @@ function value(id) {
 }
 
 /// 任务类型切换：只换参数区和按钮文案，阶段列表/产物/历史沿用同一套渲染。
+function syncClassifyNote() {
+  const note = document.getElementById("pipeClassifyNote");
+  if (!note) return;
+  const classify = (document.getElementById("yoloTask")?.value || "") === "classify";
+  const yolo = (document.getElementById("pipeKind")?.value || "yolo") === "yolo";
+  note.hidden = !(classify && yolo);
+}
+
 function syncKind() {
   const kind = dom.kind.value;
   dom.yoloOptions.hidden = kind !== "yolo";

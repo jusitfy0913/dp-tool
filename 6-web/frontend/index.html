@@ -46,7 +46,7 @@
 
         <label>训练类型
           <select id="trainKind">
-            <option value="yolo">YOLO 目标检测 / 分割 / 姿态 / OBB</option>
+            <option value="yolo">YOLO 检测 / 分割 / 姿态 / 旋转框 / 分类</option>
             <option value="anomalib">Anomalib 异常检测</option>
           </select>
         </label>
@@ -67,6 +67,7 @@
               <option value="segment">segment 分割</option>
               <option value="pose">pose 姿态</option>
               <option value="obb">obb 旋转框</option>
+              <option value="classify">classify 分类（整张图一个类别）</option>
             </select>
           </label>
           <label>模型 / 权重
@@ -409,6 +410,7 @@
               <p class="hint">从文件夹或验证集里均匀抽图，默认 100 张，最多 500 张。异常检测不能用 INT8。</p>
             </div>
             <label class="check-row"><input type="checkbox" id="pipeRunVal" checked> 编译后用引擎做精度验证</label>
+            <p class="hint hidden" id="pipeClassifyNote">分类会训练并导出 ONNX。编译引擎和检测用的精度验证会跳过，分类引擎还没做。</p>
             <label class="check-row"><input type="checkbox" id="pipeSkipTrain"> 跳过训练（用已有 .pt）</label>
           </div>
 
@@ -575,6 +577,7 @@
               <option value="segment">segment</option>
               <option value="pose">pose</option>
               <option value="obb">obb</option>
+              <option value="classify">classify 分类</option>
             </select>
           </label>
 
@@ -710,9 +713,10 @@
               <input type="number" id="ocrThreads" value="8" min="1" max="64" step="1">
             </label>
             <label>识别 batch
-              <input type="number" id="ocrBatch" value="6" min="1" max="64" step="1">
+              <input type="number" id="ocrBatch" value="24" min="1" max="64" step="1" title="CPU 建议 24，GPU 建议 6">
             </label>
           </div>
+          <p class="hint" id="ocrBatchHint">识别 batch：CPU 建议 24（16~32 都行，用 6 会慢约 15%）；GPU 建议 6（GPU 上加大反而更慢）。</p>
           <label class="check-row">
             <input type="checkbox" id="ocrMkldnn" checked>
             <span>CPU 下启用 MKLDNN（关掉会慢很多）</span>
@@ -1081,6 +1085,7 @@
               <option value="segment">segment 分割</option>
               <option value="pose">pose 姿态</option>
               <option value="obb">obb 旋转框</option>
+              <option value="classify">classify 分类</option>
             </select>
           </label>
           <label>导出格式
@@ -1152,6 +1157,15 @@
                   title="新建工程（另存为）">新建…</button>
         </div>
         <div class="anno-row">
+          <label class="anno-field">任务
+            <select id="annoTask" title="新建工程时生效。分类是整张图点一个类别，不画框">
+              <option value="detect">检测（画框）</option>
+              <option value="segment">分割</option>
+              <option value="pose">姿态</option>
+              <option value="obb">旋转框</option>
+              <option value="classify">分类（整张图）</option>
+            </select>
+          </label>
           <button type="button" class="primary" id="annoOpen">打开</button>
           <button type="button" id="annoCreate">新建</button>
           <button type="button" id="annoSaveNow" title="Ctrl+S">保存</button>
@@ -1217,7 +1231,7 @@
       <!-- 中：画布 -->
       <section class="anno-center">
         <div class="anno-toolbar">
-          <div class="anno-group" role="group" aria-label="绘制工具">
+          <div class="anno-group anno-detect-only" role="group" aria-label="绘制工具">
             <button type="button" class="mini tool active" data-tool="select" title="选择 (V)">选择</button>
             <button type="button" class="mini tool" data-tool="rectangle" title="矩形 (R)">矩形</button>
             <button type="button" class="mini tool" data-tool="rotated_rect" title="旋转矩形 (O)。画完后拖上方圆点旋转">旋转框</button>
@@ -1249,7 +1263,7 @@
             <span class="anno-zoom" id="annoZoom">—</span>
           </div>
           <div class="anno-group anno-group-last">
-            <button type="button" class="mini accent" id="annoAutoLabel" title="用自有引擎生成预标注草稿">预标注</button>
+            <button type="button" class="mini accent anno-detect-only" id="annoAutoLabel" title="用自有引擎生成预标注草稿">预标注</button>
           </div>
         </div>
 
@@ -1270,9 +1284,10 @@
           <button type="button" class="mini" id="annoClassAdd">加</button>
         </div>
 
-        <h2>标注框 <span class="anno-count" id="annoBoxCount">0</span></h2>
-        <p class="anno-hint">当前图片的框。点一行，图上对应的框会高亮。</p>
-        <div class="anno-boxtable-wrap">
+        <h2 class="anno-detect-only">标注框 <span class="anno-count" id="annoBoxCount">0</span></h2>
+        <p class="anno-hint anno-detect-only">当前图片的框。点一行，图上对应的框会高亮。</p>
+        <p class="anno-hint anno-classify-only" hidden>分类不画框。点右边的类别，就是给整张图打上这个标签，并跳到下一张还没标的图。</p>
+        <div class="anno-boxtable-wrap anno-detect-only">
           <table class="anno-boxtable" id="annoBoxTable">
             <thead>
               <tr>
@@ -1286,17 +1301,17 @@
           </table>
         </div>
 
-        <h2>预标注草稿 <span class="anno-count" id="annoDraftCount">0</span></h2>
-        <div class="anno-row">
+        <h2 class="anno-detect-only">预标注草稿 <span class="anno-count" id="annoDraftCount">0</span></h2>
+        <div class="anno-row anno-detect-only">
           <button type="button" class="mini" id="annoAcceptAll">全部接受</button>
           <button type="button" class="mini" id="annoRejectAll">全部丢弃</button>
         </div>
-        <div class="anno-row">
+        <div class="anno-row anno-detect-only">
           <button type="button" class="mini accent" id="annoAcceptOne" title="接受当前草稿 (A)">接受当前 A</button>
           <button type="button" class="mini" id="annoRejectOne" title="丢弃当前草稿 (D)">丢弃当前 D</button>
         </div>
-        <p class="anno-hint">A 接受 / D 丢弃 / 空格 下一张（未选中时按置信度从高到低处理）</p>
-        <ul class="anno-draftlist" id="annoDraftList"></ul>
+        <p class="anno-hint anno-detect-only">A 接受 / D 丢弃 / 空格 下一张（未选中时按置信度从高到低处理）</p>
+        <ul class="anno-draftlist anno-detect-only" id="annoDraftList"></ul>
 
         <h2>审核 <span class="anno-count" id="annoReviewCount">0/0</span></h2>
         <div class="anno-row">

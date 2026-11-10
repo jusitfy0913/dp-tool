@@ -32,7 +32,7 @@ from pathlib import Path
 
 CURRENT_VERSION = 1
 
-TASKS = ("detect", "segment", "pose", "obb")
+TASKS = ("detect", "segment", "pose", "obb", "classify")
 SHAPES = ("rectangle", "rotated_rect", "polygon", "line", "point", "keypoints")
 SPLITS = ("train", "val", "test")
 
@@ -45,6 +45,9 @@ TASK_ALIASES = {
     "keypoint": "pose",
     "keypoints": "pose",
     "obb": "obb",
+    "classify": "classify",
+    "classification": "classify",
+    "cls": "classify",
 }
 
 SPLIT_ALIASES = {
@@ -200,8 +203,9 @@ def new_image(
     height: int = 0,
     split: str = "train",
     annotations: list | None = None,
+    class_id: int | None = None,
 ) -> dict:
-    return {
+    image = {
         "id": str(image_id) or Path(path).stem,
         "path": str(path),
         "width": int(width or 0),
@@ -209,6 +213,10 @@ def new_image(
         "split": split_to_str(split),
         "annotations": list(annotations or []),
     }
+    # 只有分类工程才写这个键。缺省表示还没标，不能默认成 0，否则「未标注」会变成第一类。
+    if class_id is not None:
+        image["class_id"] = int(class_id)
+    return image
 
 
 def new_project(task: str = "detect", classes: list | None = None, images: list | None = None) -> dict:
@@ -393,7 +401,7 @@ def normalize_image(raw: dict, warnings: list[str] | None = None) -> dict:
         except AnnotationError as exc:
             if warnings is not None:
                 warnings.append(f"图片「{image_id}」有一条标注被跳过：{exc}")
-    return new_image(
+    image = new_image(
         image_id,
         path,
         as_int(raw.get("width"), 0),
@@ -401,6 +409,9 @@ def normalize_image(raw: dict, warnings: list[str] | None = None) -> dict:
         split_from_str(str(raw.get("split") or "train"), warnings),
         annotations,
     )
+    if "class_id" in raw and raw.get("class_id") is not None and raw.get("class_id") != "":
+        image["class_id"] = as_int(raw.get("class_id"), 0)
+    return image
 
 
 def normalize_project(raw: dict) -> tuple[dict, list[str]]:
@@ -438,6 +449,9 @@ def normalize_project(raw: dict) -> tuple[dict, list[str]]:
 
     version = as_int(raw.get("version", CURRENT_VERSION), CURRENT_VERSION)
     rev = max(0, as_int(raw.get("rev"), 0))
+
+    if task == "classify" and any(image.get("annotations") for image in images):
+        raise AnnotationError("分类工程不能保存画框。请只给整张图选一个类别。")
 
     project = {
         "version": version if version > 0 else CURRENT_VERSION,
@@ -479,7 +493,7 @@ def object_to_json(obj: dict) -> dict:
 
 
 def image_to_json(image: dict) -> dict:
-    return {
+    out = {
         "id": image.get("id", ""),
         "path": image.get("path", ""),
         "width": int(image.get("width", 0)),
@@ -487,6 +501,9 @@ def image_to_json(image: dict) -> dict:
         "split": split_to_str(image.get("split", "train")),
         "annotations": [object_to_json(obj) for obj in image.get("annotations") or []],
     }
+    if image.get("class_id") is not None:
+        out["class_id"] = int(image["class_id"])
+    return out
 
 
 def project_to_json(project: dict) -> dict:
@@ -797,6 +814,8 @@ def to_dataset_project(project: dict, source: str | Path | None = None):
             points = [(float(p[0]), float(p[1])) for p in obj.get("points") or []]
             visibility = [int(v) for v in obj.get("keypoint_visibility") or []]
             objects.append(DatasetObject(int(obj.get("class_id", 0)), points, visibility))
+        raw_label = item.get("class_id", None)
+        label_id = None if raw_label is None or raw_label == "" else int(raw_label)
         images.append(
             DatasetImage(
                 index=index,
@@ -806,6 +825,7 @@ def to_dataset_project(project: dict, source: str | Path | None = None):
                 height=height,
                 objects=objects,
                 current_split=split_to_str(item.get("split", "train")),
+                label_id=label_id,
             )
         )
 
@@ -837,6 +857,13 @@ def validate(project: dict) -> list[str]:
 
         width = int(image.get("width") or 0)
         height = int(image.get("height") or 0)
+        if str(project.get("task") or "") == "classify":
+            if image.get("annotations"):
+                issues.append(f"分类图片「{image_id}」不能带画框")
+            label_id = image.get("class_id", None)
+            if label_id is not None and int(label_id) not in class_ids:
+                issues.append(f"图片「{image_id}」的类别 {label_id} 不在类别表里")
+
         seen_object_ids: set[str] = set()
         for obj in image.get("annotations") or []:
             object_id = str(obj.get("id") or "")
@@ -870,10 +897,16 @@ def validate(project: dict) -> list[str]:
 def stats(project: dict) -> dict:
     """给前端图片列表用的汇总：每图标注数与全局计数。"""
     images = project.get("images") or []
+    classify = str(project.get("task") or "") == "classify"
     per_image = []
     total = 0
+    labeled = 0
     for image in images:
-        count = len(image.get("annotations") or [])
+        if classify:
+            count = 0 if image.get("class_id") is None else 1
+            labeled += count
+        else:
+            count = len(image.get("annotations") or [])
         total += count
         per_image.append(
             {
@@ -892,13 +925,18 @@ def stats(project: dict) -> dict:
         "total_objects": total,
         "split_counts": counts,
         "class_counts": {
-            int(item.get("id", 0)): sum(
-                1
-                for image in images
-                for obj in image.get("annotations") or []
-                if int(obj.get("class_id", 0)) == int(item.get("id", 0))
+            int(item.get("id", 0)): (
+                sum(1 for image in images if image.get("class_id") is not None and int(image.get("class_id")) == int(item.get("id", 0)))
+                if classify
+                else sum(
+                    1
+                    for image in images
+                    for obj in image.get("annotations") or []
+                    if int(obj.get("class_id", 0)) == int(item.get("id", 0))
+                )
             )
             for item in project.get("classes") or []
         },
+        "labeled_images": labeled if classify else None,
         "now": int(time.time()),
     }

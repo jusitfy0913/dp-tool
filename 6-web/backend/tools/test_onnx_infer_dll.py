@@ -8,10 +8,11 @@
 
 覆盖：
 1. 加载与版本：DLL 可加载，provider / ort_version 可读；
-2. 错误路径：空路径、文件不存在、任务与模型不匹配、空句柄，都要返回失败码且不崩溃；
+2. 错误路径：空路径、文件不存在、任务与模型不匹配、空句柄、句柄类型不匹配，都要返回失败码且不崩溃；
 3. 四个任务：detect / segment / pose / obb 各跑一次，检查掩码、关键点、旋转框字段；
 4. 三个异常模型：PatchCore / PaDiM / EfficientAd，检查分数、归一化图范围、判定；
-5. 耗时字段：preprocess / inference / postprocess / total 必须为正且大致自洽。
+5. 分类（v1.30.6）：现场构造确定性模型，检查分数、top1、metadata names、耗时段；
+6. 耗时字段：preprocess / inference / postprocess / total 必须为正且大致自洽。
 
 用法：
     python 6-web/backend/tools/test_onnx_infer_dll.py
@@ -20,12 +21,15 @@
 from __future__ import annotations
 
 import ctypes
+import os
 import sys
 from pathlib import Path
 
 BACKEND = Path(__file__).resolve().parents[1]
 REPO = BACKEND.parents[1]
-BIN = REPO / "4-qt-studio" / "bin"
+# 允许指向临时编译目录，便于在 Web 服务占用 bin\onnx_infer.dll 时先验证新构建：
+#   $env:TRTFORGE_ONNX_DLL_DIR="build\tmp_onnx_infer\$tmp"
+BIN = Path(os.environ.get("TRTFORGE_ONNX_DLL_DIR") or (REPO / "4-qt-studio" / "bin"))
 sys.path.insert(0, str(BACKEND))
 
 import cv2  # noqa: E402
@@ -36,6 +40,7 @@ FAILED: list[str] = []
 SKIPPED: list[str] = []
 
 OI_DETECT, OI_SEGMENT, OI_POSE, OI_OBB = 0, 1, 2, 3
+OI_CLASSIFY = 4
 
 
 def check(name: str, ok: bool, detail: str = "") -> None:
@@ -104,7 +109,22 @@ class OiInfo(ctypes.Structure):
     ]
 
 
+class OiClassifyResult(ctypes.Structure):
+    """对应 onnx_infer_c.h 的 oi_classify_result（v1.30.6 新增）。"""
+    _fields_ = [
+        ("num_classes", ctypes.c_int), ("top1", ctypes.c_int), ("top1_score", ctypes.c_float),
+        ("scores", ctypes.POINTER(ctypes.c_float)),
+        ("input_w", ctypes.c_int), ("input_h", ctypes.c_int),
+        ("names_utf8", ctypes.c_char_p),
+    ]
+
+
 def load() -> ctypes.WinDLL:
+    # onnx_infer.dll 用显式加载找 onnxruntime.dll（DLL 同目录优先），但本进程自己
+    # 加载 onnx_infer.dll 时，依赖解析仍走系统搜索路径；显式加上同目录，保证
+    # TRTFORGE_ONNX_DLL_DIR 指向临时构建目录时也能找到配套的 ORT。
+    if hasattr(os, "add_dll_directory"):
+        os.add_dll_directory(str(BIN))
     dll = ctypes.WinDLL(str(BIN / "onnx_infer.dll"))
     dll.oi_create_yolo.restype = ctypes.c_void_p
     dll.oi_create_yolo.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_float, ctypes.c_float]
@@ -126,6 +146,21 @@ def load() -> ctypes.WinDLL:
     ]
     dll.oi_get_info.restype = ctypes.c_int
     dll.oi_get_info.argtypes = [ctypes.c_void_p, ctypes.POINTER(OiInfo)]
+
+    # 分类入口是 v1.30.6 新加的：旧 DLL 取不到符号时把绑定跳过，
+    # 让分类用例走 skip，而不是让整个脚本在加载阶段就 AttributeError。
+    create_classify = getattr(dll, "oi_create_classify", None)
+    infer_classify = getattr(dll, "oi_infer_classify", None)
+    if create_classify is not None and infer_classify is not None:
+        create_classify.restype = ctypes.c_void_p
+        create_classify.argtypes = [ctypes.c_char_p]
+        infer_classify.restype = ctypes.c_int
+        infer_classify.argtypes = [
+            ctypes.c_void_p, ctypes.POINTER(ctypes.c_ubyte), ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.POINTER(ctypes.POINTER(OiClassifyResult)),
+            ctypes.POINTER(OiFrameStat),
+        ]
+
     dll.oi_destroy.restype = None
     dll.oi_destroy.argtypes = [ctypes.c_void_p]
     dll.oi_last_error.restype = ctypes.c_char_p
@@ -331,6 +366,160 @@ def run_anomaly_case(dll, model: Path, metadata: Path, image: np.ndarray, label:
         dll.oi_destroy(handle)
 
 
+# ---------------------------------------------------------------------------
+# 5. 分类（v1.30.6）
+# ---------------------------------------------------------------------------
+
+def build_probe_classifier(path: Path) -> bool:
+    """现场构造一个确定性分类模型（GAP + Gemm），返回是否构造成功。
+
+    为什么不复用仓库里的模型：仓库当前没有任何分类 ONNX。
+    现场构造的好处是"期望值可以手算"——输出就是各通道均值乘固定权重加偏置，
+    DLL 与 onnxruntime 的分数必须逐位一致，预处理差一个像素立刻就能看出来。
+    """
+    try:
+        import onnx
+        from onnx import TensorProto, helper
+    except ImportError:
+        return False
+
+    classes = 3
+    side = 224
+    inp = helper.make_tensor_value_info("images", TensorProto.FLOAT, [1, 3, side, side])
+    out = helper.make_tensor_value_info("probs", TensorProto.FLOAT, [1, classes])
+    weights = np.zeros((3, classes), dtype=np.float32)
+    weights[0, 0] = 1.0
+    weights[1, 1] = 1.0
+    weights[2, 2] = 1.0
+    bias = np.array([0.3, -0.2, 0.1], dtype=np.float32)
+    nodes = [
+        helper.make_node("GlobalAveragePool", ["images"], ["gap"]),
+        helper.make_node("Flatten", ["gap"], ["flat"], axis=1),
+        helper.make_node("Gemm", ["flat", "W", "B"], ["probs"], alpha=1.0, beta=1.0, transB=0),
+    ]
+    graph = helper.make_graph(
+        nodes, "cls_probe", [inp], [out],
+        [helper.make_tensor("W", TensorProto.FLOAT, list(weights.shape), weights.ravel()),
+         helper.make_tensor("B", TensorProto.FLOAT, [classes], bias)],
+    )
+    model = helper.make_model(graph, producer_name="probe",
+                             opset_imports=[helper.make_opsetid("", 13)])
+    model.ir_version = 8
+    entry = model.metadata_props.add()
+    entry.key = "names"
+    entry.value = "{0: 'alpha', 1: 'beta', 2: 'gamma'}"
+    onnx.save(model, str(path))
+    return True
+
+
+def test_classify(dll) -> dict | None:
+    if not hasattr(dll, "oi_create_classify"):
+        skip("分类", "当前 onnx_infer.dll 没有分类入口（需要重新编译）")
+        return None
+
+    import tempfile
+
+    workdir = Path(tempfile.mkdtemp(prefix="cls_dll_case_"))
+    model = workdir / "probe_cls.onnx"
+    if not build_probe_classifier(model):
+        skip("分类", "缺 onnx 包，无法现场构造探针模型")
+        return None
+
+    handle = dll.oi_create_classify(b"")
+    check("分类错误：空路径返回 nullptr", not handle and last_error(dll) != "", last_error(dll))
+
+    handle = dll.oi_create_classify(str(workdir / "nope.onnx").encode("utf-8"))
+    check("分类错误：文件不存在返回 nullptr", not handle and last_error(dll) != "", last_error(dll))
+
+    handle = dll.oi_create_classify(str(model).encode("utf-8"))
+    if not handle:
+        check("分类：创建句柄", False, last_error(dll))
+        return None
+
+    try:
+        info = OiInfo()
+        code = dll.oi_get_info(handle, ctypes.byref(info))
+        check(
+            "分类：信息可读",
+            code == 0 and info.task == OI_CLASSIFY and info.input_w == 224 and info.input_h == 224
+            and info.num_classes == 3,
+            f"task={info.task} input={info.input_w}x{info.input_h} classes={info.num_classes} "
+            f"provider={info.provider.decode('utf-8', 'replace')}",
+        )
+
+        # 非正方形图：走"短边等比缩放 + 中心裁剪"，最容易和 Python 侧走偏。
+        height, width = 528, 1792
+        yy = np.linspace(0, 1, height, dtype=np.float32)[:, None]
+        xx = np.linspace(0, 1, width, dtype=np.float32)[None, :]
+        bgr = np.empty((height, width, 3), dtype=np.uint8)
+        bgr[:, :, 0] = np.clip(yy * 255.0, 0, 255).astype(np.uint8)
+        bgr[:, :, 1] = np.clip(xx * 255.0, 0, 255).astype(np.uint8)
+        bgr[:, :, 2] = np.clip(yy * xx * 255.0, 0, 255).astype(np.uint8)
+
+        holder, pointer, stride = to_bytes(bgr)
+        result = ctypes.POINTER(OiClassifyResult)()
+        stat = OiFrameStat()
+        code = dll.oi_infer_classify(
+            handle, pointer, holder.shape[1], holder.shape[0], stride,
+            ctypes.byref(result), ctypes.byref(stat),
+        )
+        check("分类：推理成功", code == 0, last_error(dll))
+        if code != 0:
+            return None
+
+        item = result.contents
+        scores = [float(item.scores[i]) for i in range(item.num_classes)]
+        names = item.names_utf8.decode("utf-8", "replace") if item.names_utf8 else ""
+        check(
+            "分类：分数与 top1 自洽",
+            len(scores) == 3 and max(range(3), key=lambda i: scores[i]) == item.top1
+            and abs(scores[item.top1] - float(item.top1_score)) < 1e-6,
+            f"scores={[round(s, 4) for s in scores]} top1={item.top1}",
+        )
+        check(
+            "分类：metadata names 可读",
+            "alpha" in names and "beta" in names and "gamma" in names,
+            names or "(空)",
+        )
+        check(
+            "分类：耗时字段自洽",
+            stat.total_ms > 0 and stat.inference_ms >= 0
+            and abs(stat.total_ms - (stat.preprocess_ms + stat.inference_ms + stat.postprocess_ms)) < 1.0,
+            f"pre={stat.preprocess_ms:.2f} inf={stat.inference_ms:.2f} "
+            f"post={stat.postprocess_ms:.2f} total={stat.total_ms:.2f}",
+        )
+        check(
+            "分类：输入尺寸回填",
+            item.input_w == 224 and item.input_h == 224,
+            f"{item.input_w}x{item.input_h}",
+        )
+
+        # 类型不匹配：拿分类句柄当 YOLO 用必须失败而不是崩
+        boxes = ctypes.POINTER(OiBox)()
+        count = ctypes.c_int(0)
+        frame = OiFrameStat()
+        code = dll.oi_infer_yolo(
+            handle, pointer, holder.shape[1], holder.shape[0], stride,
+            ctypes.byref(boxes), ctypes.byref(count), ctypes.byref(frame),
+        )
+        check("分类：句柄类型不匹配返回失败码", code != 0, f"code={code}")
+
+        result2 = ctypes.POINTER(OiClassifyResult)()
+        code = dll.oi_infer_classify(None, pointer, holder.shape[1], holder.shape[0], stride,
+                                     ctypes.byref(result2), ctypes.byref(frame))
+        check("分类：空句柄返回失败码", code != 0, f"code={code}")
+
+        return {
+            "top1": int(item.top1),
+            "scores": [round(s, 4) for s in scores],
+            "input": (int(item.input_w), int(item.input_h)),
+            "total_ms": float(stat.total_ms),
+            "provider": info.provider.decode("utf-8", "replace"),
+        }
+    finally:
+        dll.oi_destroy(handle)
+
+
 def main() -> int:
     dll_path = BIN / "onnx_infer.dll"
     if not dll_path.is_file():
@@ -385,6 +574,10 @@ def main() -> int:
         if result:
             timings[f"anomalib-{label}"] = result
 
+    classify_result = test_classify(dll)
+    if classify_result:
+        timings["classify"] = classify_result
+
     print()
     if timings:
         print("耗时参考（毫秒）")
@@ -394,6 +587,13 @@ def main() -> int:
                     f"  {name:<18} 预处理 {item['preprocess_ms']:6.2f}  "
                     f"推理 {item['inference_ms']:7.2f}  后处理 {item['postprocess_ms']:6.2f}  "
                     f"合计 {item['total_ms']:7.2f}  输入 {item['input'][0]}x{item['input'][1]}"
+                    f"  provider={item['provider']}"
+                )
+            elif "scores" in item:
+                print(
+                    f"  {name:<18} 合计 {item['total_ms']:7.2f}  "
+                    f"输入 {item['input'][0]}x{item['input'][1]}"
+                    f"  top1={item['top1']}  scores={item['scores']}"
                     f"  provider={item['provider']}"
                 )
             else:

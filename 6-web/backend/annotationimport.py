@@ -44,7 +44,7 @@ MODES = ("new", "merge")
 #: 同名图片的三种处理策略
 DUPLICATES = ("skip", "replace", "append")
 #: 允许的任务类型（与 .tfanno 的 task 字段一致）
-IMPORT_TASKS = ("detect", "segment", "pose", "obb")
+IMPORT_TASKS = ("detect", "segment", "pose", "obb", "classify")
 
 #: 归一化坐标允许的越界容差。超出这个范围的整条标签会被丢弃。
 COORD_TOLERANCE = 0.05
@@ -269,6 +269,15 @@ def build(
     if task != "auto" and task not in IMPORT_TASKS:
         raise AnnotationImportError(f"未知任务类型：{task}")
     limit = max(1, min(int(limit or MAX_IMAGES), MAX_IMAGES))
+    if task == "classify":
+        return _build_classify(
+            source,
+            project_path=project_path,
+            base_project=base_project,
+            mode=mode,
+            duplicate=duplicate,
+            limit=limit,
+        )
 
     resolved = resolve_dataset(source)
     requested_splits = _pick_splits(resolved, splits)
@@ -693,3 +702,102 @@ def _build_warnings(report: dict, orphan_samples: list[str], entries: list[dict]
             "存成旋转框会让再次导出的 YOLO 标签丢掉角度"
         )
     return warnings
+
+
+def _build_classify(
+    source: str | Path,
+    *,
+    project_path: str,
+    base_project: dict | None,
+    mode: str,
+    duplicate: str,
+    limit: int,
+) -> tuple[dict, dict]:
+    """从「类别文件夹」导入整图标签。检测用的 labels 目录直接拒绝。"""
+    root = Path(source).expanduser()
+    if not root.exists():
+        raise AnnotationImportError(f"数据源不存在：{root}")
+    if root.is_file():
+        if root.suffix.lower() in {".yaml", ".yml"}:
+            root = root.parent
+        else:
+            raise AnnotationImportError("分类导入请选类别文件夹，或选里面有 train/类别名 的目录。")
+    if (root / "images").is_dir() and (root / "labels").is_dir():
+        raise AnnotationImportError("这是检测数据集（有 labels 目录），不能导入分类工程。")
+
+    found: list[tuple[str, str, Path]] = []
+    split_names = [name for name in ("train", "val", "test") if (root / name).is_dir()]
+    if split_names:
+        for split in split_names:
+            for class_dir in sorted((p for p in (root / split).iterdir() if p.is_dir()), key=lambda p: p.name.lower()):
+                found.extend(_classify_files(class_dir, split, class_dir.name))
+    else:
+        class_dirs = [p for p in root.iterdir() if p.is_dir()]
+        if not class_dirs:
+            raise AnnotationImportError("没有找到类别文件夹。期望 良品/图片.jpg，或 train/良品/图片.jpg。")
+        for class_dir in sorted(class_dirs, key=lambda p: p.name.lower()):
+            found.extend(_classify_files(class_dir, "train", class_dir.name))
+    if not found:
+        raise AnnotationImportError("类别文件夹里没有图片。")
+
+    truncated = len(found) > limit
+    found = found[:limit]
+    classes: list[dict] = []
+    name_to_id: dict[str, int] = {}
+    if mode == "merge" and base_project:
+        for item in base_project.get("classes") or []:
+            classes.append(dict(item))
+            name_to_id[str(item.get("name"))] = int(item.get("id", len(name_to_id)))
+    for _split, class_name, _path in found:
+        if class_name not in name_to_id:
+            class_id = len(classes)
+            name_to_id[class_name] = class_id
+            classes.append(annotation.new_class(class_id, class_name))
+
+    images = []
+    if mode == "merge" and base_project:
+        images = [dict(item) for item in base_project.get("images") or []]
+    existing = {str(item.get("path")) for item in images}
+    added = 0
+    skipped_existing = 0
+    for split, class_name, path in found:
+        key = str(path)
+        if key in existing:
+            skipped_existing += 1
+            if duplicate != "replace":
+                continue
+            for item in images:
+                if str(item.get("path")) == key:
+                    item["class_id"] = name_to_id[class_name]
+                    item["split"] = split
+                    item["annotations"] = []
+            continue
+        images.append(
+            annotation.new_image(path.stem, str(path), split=split, class_id=name_to_id[class_name])
+        )
+        existing.add(key)
+        added += 1
+
+    project = annotation.new_project("classify", classes, images)
+    report = {
+        "task": "classify",
+        "classes": [{"id": item["id"], "name": item["name"]} for item in classes],
+        "images": len(found),
+        "objects": added,
+        "added_images": added,
+        "added_objects": added,
+        "skipped_existing": skipped_existing,
+        "per_split": {},
+        "warnings": ["分类导入按文件夹名作为整图类别，不读取检测框。"],
+        "path_mode": "absolute",
+        "truncated": truncated,
+    }
+    return project, report
+
+
+def _classify_files(folder: Path, split: str, class_name: str) -> list[tuple[str, str, Path]]:
+    rows = []
+    for path in sorted(folder.rglob("*"), key=lambda item: item.as_posix().lower()):
+        if path.is_file() and path.suffix.lower() in dataset.IMAGE_EXTS:
+            rows.append((split, class_name, path))
+    return rows

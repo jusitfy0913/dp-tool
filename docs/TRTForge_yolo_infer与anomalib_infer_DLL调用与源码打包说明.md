@@ -56,6 +56,12 @@ yi_create → （循环）yi_infer_bgr → yi_destroy
 ### 2.5 线程
 
 - 与 `anomalib_infer` 相同：**单个 `yi_handle` 不要多线程并发调用 `yi_infer_bgr`**；多路并行请 **每路一个 handle**。
+- **实测（2026-11-10）**：同一句柄 4 线程并发 → 20/20 次结果错乱，另一次直接 `0xC0000409`。
+- **v1.1.0（2026-11-10）起每句柄私有 `cudaStreamNonBlocking`**：多句柄多线程从旧版的 1.02× 提升到
+  detect 1.10×、segment 1.25×。单线程耗时与结果不变，ABI 不变。
+- 为何仍不是线性：4 路并发时每次调用自己的流内耗时从 7.7 ms 涨到约 27 ms，kernel 确实在交错，
+  但 960 输入的检测引擎在 T1000 上已把 GPU 算力吃满，上限是算力而不是流数量。
+  详见 `3-cpp-tensorrt/yolo_infer/README.md` 第 4 节。
 
 ### 2.6 源码与构建
 
@@ -109,6 +115,9 @@ const char* ai_last_error(void);
 ### 3.5 线程
 
 - **一个 `ai_handle` 不要多线程同时 `ai_infer_rgb`**；多路请多 handle。
+- **实测（2026-11-10）**：同一句柄 4 线程 → 稳定崩溃 `0xC0000409`；多 handle 多线程是三个库里唯一能拿到
+  近线性加速的（每句柄私有 `cudaStream`，4 句柄 4 线程 **1.80×**）。
+  并发数按显存定，8GB 卡上 PatchCore 建议 ≤ 4 路。详见 `3-cpp-tensorrt/anomalib_infer/README.md` 第 6 节。
 
 ### 3.6 示例与说明
 

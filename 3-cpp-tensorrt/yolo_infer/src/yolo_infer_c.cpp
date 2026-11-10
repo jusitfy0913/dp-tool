@@ -10,10 +10,15 @@
 #include <chrono>
 #include <cstring>
 
+// 私有 CUDA 流：yolo.cu 的 forward/preprocess/decode 都已按传入的 stream 工作，
+// 这里只需要为每个句柄建一条 cudaStreamNonBlocking，多句柄才能真正并行。
+#include <cuda_runtime.h>
+
 static thread_local std::string g_last_error;
 
 struct YoloContext {
     std::shared_ptr<yolo::Infer> infer;
+    cudaStream_t                 stream = nullptr; // 本句柄私有流，不与其他句柄共用
     yi_task                      task;
     std::vector<yi_box>          boxes_buf;
     std::vector<std::shared_ptr<yolo::InstanceSegmentMap>> seg_hold;
@@ -41,6 +46,14 @@ YI_API yi_handle yi_create(const char* engine_path, yi_task task,
         auto* ctx  = new YoloContext();
         ctx->infer = infer;
         ctx->task  = task;
+
+        // 每个句柄一条非阻塞流：不与 CUDA 默认流互相等待，多句柄多线程才能真并行
+        cudaError_t cerr = cudaStreamCreateWithFlags(&ctx->stream, cudaStreamNonBlocking);
+        if (cerr != cudaSuccess) {
+            set_error(std::string("cudaStreamCreate failed: ") + cudaGetErrorString(cerr));
+            delete ctx;
+            return nullptr;
+        }
         return static_cast<yi_handle>(ctx);
     } catch (const std::exception& e) {
         set_error(std::string("yi_create exception: ") + e.what());
@@ -66,7 +79,8 @@ YI_API int yi_infer_bgr(yi_handle h,
         auto t1 = std::chrono::high_resolution_clock::now();
 
         yolo::Image img(bgr, w, height, line_size);
-        yolo::BoxArray results = ctx->infer->forward(img);
+        // 用句柄私有流推理；forward 内部会在这条流上同步完成，返回即结果可用
+        yolo::BoxArray results = ctx->infer->forward(img, ctx->stream);
 
         auto t2 = std::chrono::high_resolution_clock::now();
 
@@ -184,6 +198,11 @@ YI_API void yi_destroy(yi_handle h)
 {
     if (h) {
         auto* ctx = static_cast<YoloContext*>(h);
+        // 先释放私有流（已完成的流销毁是即时返回的；若仍有工作在跑，驱动会在完成后再回收）
+        if (ctx->stream) {
+            cudaStreamDestroy(ctx->stream);
+            ctx->stream = nullptr;
+        }
         delete ctx;
     }
 }

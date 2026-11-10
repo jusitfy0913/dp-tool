@@ -283,10 +283,10 @@ function setDefaultRunName() {
 /** 按 YOLO 任务类型改写默认权重名。只改默认别名，用户自定义路径不动。 */
 function syncYoloModel() {
   const task = formValue("yoloTask");
-  const suffix = { detect: "", segment: "-seg", pose: "-pose", obb: "-obb" }[task] ?? "";
+  const suffix = { detect: "", segment: "-seg", pose: "-pose", obb: "-obb", classify: "-cls" }[task] ?? "";
   const current = (document.getElementById("yoloModel").value || "").trim();
   // 只有当前值是纯别名（yolov8n / yolov8n.pt 之类）时才改写，避免覆盖用户填的真实路径
-  if (!current || /^yolo[\w]*n?(-seg|-pose|-obb)?\.pt$/i.test(current)) {
+  if (!current || /^yolo[\w]*n?(-seg|-pose|-obb|-cls)?\.pt$/i.test(current)) {
     document.getElementById("yoloModel").value = `yolov8n${suffix}.pt`;
   }
 }
@@ -1211,7 +1211,14 @@ function appendLog(text, cls = "") {
   logActions?.markText();
 }
 
+/** 指标名的中文显示：分类只有 top1，别直接怼一串英文给用户 */
+const METRIC_LABELS = {
+  accuracy_top1: "top1 准确率",
+  "metrics/accuracy_top1": "top1 准确率",
+};
+
 function setMetric(name, value) {
+  const label = METRIC_LABELS[name] || name;
   const id = `metric-${name}`;
   let chip = document.getElementById(id);
   if (!chip) {
@@ -1221,7 +1228,7 @@ function setMetric(name, value) {
     chip.dataset.name = name;
     dom.metrics.appendChild(chip);
   }
-  chip.innerHTML = `${escapeHtml(name)} <b>${escapeHtml(String(value))}</b>`;
+  chip.innerHTML = `${escapeHtml(label)} <b>${escapeHtml(String(value))}</b>`;
 }
 
 function escapeHtml(text) {
@@ -1351,9 +1358,10 @@ function renderOverview(data) {
   dom.overviewBody.hidden = false;
 
   const splits = data.splits || {};
+  const classify = data.task === "classify";
   const cells = [
     ["图片总数", data.counts.total],
-    ["标注框总数", data.counts.instances],
+    [classify ? "已分类图片" : "标注框总数", data.counts.instances],
     ["类别数", (data.classes || []).length],
   ];
   for (const name of ["train", "val", "test"]) {
@@ -1361,7 +1369,9 @@ function renderOverview(data) {
     if (!stat) continue;
     cells.push([
       name,
-      stat.configured ? `${stat.images} 图 / ${stat.instances} 框` : "未配置",
+      stat.configured
+        ? (classify ? `${stat.images} 张` : `${stat.images} 图 / ${stat.instances} 框`)
+        : "未配置",
     ]);
   }
 

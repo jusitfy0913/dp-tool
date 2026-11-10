@@ -15,8 +15,8 @@
 | `4-qt-studio/installer` | Windows 安装包脚本（Inno Setup）：递归打包 `4-qt-studio/bin` 内已编译的 exe 与全部运行库，详见 `4-qt-studio/README.md` 中「制作 Windows 安装包」 |
 | `3-cpp-tensorrt/trtexec` | 命令行版 `trtexec` 封装（TensorRT C++ 采样工具、profiler/tracer 脚本） |
 | `3-cpp-tensorrt/trtexec/package_devkit.ps1` | 打给二次开发用的开发包：含 GUI 源码、YOLO/Anomalib 训练工程和预编译推理 DLL，**不含**封装后的推理实现源码 |
-| `3-cpp-tensorrt/yolo_infer` | YOLO TensorRT 推理 DLL，提供 `yi_*` C API（检测/分割/姿态/OBB） |
-| `3-cpp-tensorrt/anomalib_infer` | Anomalib TensorRT 推理 DLL，提供 `ai_*` C API，可供 TRTForge、外部 C++ 和 Python ctypes 调用 |
+| `3-cpp-tensorrt/yolo_infer` | YOLO TensorRT 推理 DLL，提供 `yi_*` C API（检测/分割/姿态/OBB），参数与并发契约见 `3-cpp-tensorrt/yolo_infer/README.md` |
+| `3-cpp-tensorrt/anomalib_infer` | Anomalib TensorRT 推理 DLL，提供 `ai_*` C API，可供 TRTForge、外部 C++ 和 Python ctypes 调用，见该目录 `README.md` |
 | `ocr/ocr_infer` | PaddleOCR C++ 推理 DLL，提供 `oi_*` C API，返回文本行多边形、文本、分数和原始 JSON |
 | `1-python-yolo/launcher` | 给 Qt/C++ 调用的 Python 训练脚本入口 |
 | `6-web/backend` | Web 版后端：启动 launcher 子进程、转发训练事件、ctypes 调推理 DLL |
@@ -150,6 +150,275 @@ python tf_anomalib_launcher.py --mode check-env
 引擎构建页选择 ONNX 后会在后台线程自动识别第一个输入 tensor 的名称和维度，并弹出“ONNX 加载中”进度提示；识别完成后提供统一 `H/W` 输入，修改一次高度和宽度即可同步覆盖 `min / opt / max` 三组动态 shape。
 
 ## 版本更新记录
+
+### v1.31.0 — 2026-11-10（网页端推理改成进程池：多人同时用不再排队）
+
+**一句话**：DLL 层的并发契约是「一句柄一线程」，所以网页端要并行只有多句柄或多进程两条路。这一版把 `inferproxy` 从「单个工作进程 + 一把锁」改成**进程池**：多个 `infer_worker` 各自有一套 DLL 与句柄，请求分发到空闲进程；OCR 固定留在 0 号进程（Paddle 常驻 1.7 GB，不随池扩散）；熔断分两层——单进程崩 3 次只停它自己，全池 60 秒累计崩 6 次才全池熔断。
+
+**默认值不拍脑袋**：推理路径本身（4 客户端并发）1 个进程 88.65 QPS / P95 139.8 ms，2 个 113.31 / **19.3 ms**，4 个 115.61 / 48.7 ms —— 4 个进程吞吐不再增长、尾延迟反而变差（小卡核心数撑不住更多并发上下文）。
+
+**但要看清端到端**：真实 HTTP 4 并发下，YOLO 检测 3034×1586 在 1 个与 2 个进程时都是约 200 ms（**无差别**）——因为一次请求 90 ms 里模型只占 11 ms，其余是 Web 进程解码/渲染/编码/base64，池化改不到这一段。而 Anomalib PatchCore 的 4 并发最慢从约 680 ms 降到约 460 ms（**1.45×**），因为它的模型与后处理占绝对多数。所以：**吞吐收益与「推理占整条请求的比例」成正比**，两个任务都吃得到的收益是稳定性（单进程崩溃不再连坐、OCR 加载不再堵住检测）。
+
+默认值仍按显存自动定：≥6 GB 开 2，否则 1；显式设 `TRTFORGE_INFER_WORKERS` 则以它为准。详情见 `6-web/README.md` 的 v1.31.0 变更点与 `docs/WORKFLOW_GUIDE.md` §7.15。
+
+```yaml
+version_diff:
+  component: web-infer-pool
+  old_version: "1.30.6"
+  new_version: "1.31.0"
+  symptom:
+    question: "接着做上层并行，你要怎么修改打算"
+    measured: "同步 def 路由本可并发，但 inferproxy 一把 RLock 包住整条管道、infer_worker 单连接单循环，请求只能排队"
+    tail_latency: "4 个并发请求时最后一个要等前三个跑完，P95 139.8 ms"
+  root_cause:
+    handle_contract: "同一个 DLL 句柄不能被两个线程同时用（显存写乱 / 0xC0000409）"
+    lock_layer: "inferproxy._Worker.call 全程持 RLock；infer_worker.main 只 accept 一个连接"
+  old:
+    workers: "单个 infer_worker 进程"
+    distribution: "无，所有请求串行"
+    ocd_block: "OCR 首次加载最多 180 秒，这期间检测请求一起被堵"
+    breaker: "单进程 60 秒崩 3 次 → 全部推理不可用"
+    handles: "全局句柄缓存上限 4"
+  new:
+    workers: "进程池，TRTFORGE_INFER_WORKERS（1~8，默认按显存自动：≥6GB 开 2）"
+    distribution: "空闲进程令牌队列，取一个用一次放回；等不到按 QUEUE_TIMEOUT（默认 30s）报 503"
+    ocr: "固定 0 号进程；其加载期间其余进程照常服务"
+    breaker: "两层：单进程 3 次只停它自己（0 号行为与 1.28 一致）；全池累计 6 次才全池熔断"
+    handles: "每进程 4 个槽，合计 4×N"
+    diagnostics: "worker_state 新增 pool_size / workers[] / pool_tripped / pool_error，顶层字段保持兼容"
+  measured:
+    qps: "T1000 8GB、4 客户端：1→88.65，2→113.31（1.28×），4→115.61（1.30×）"
+    p95: "1→139.8 ms，2→19.3 ms，4→48.7 ms"
+    end_to_end_http: "4 并发最慢一个：YOLO 3034×1586 约 200ms（1 与 2 进程相同）；YOLO 1280 约 67ms（相同）；anomalib 约 680→460ms（1.45×）"
+    bottleneck: "YOLO 请求 90ms 里模型只占 11ms，其余是 Web 进程解码/渲染/编码/base64，池化改不到这一段"
+    tests: "test_infer_pool.py 20/20；test_infer_worker.py 26/26（WORKERS=1 与 2 各一遍）"
+    consistency: "WORKERS=1 与 2 的框逐位一致（5 张图，15 框）"
+  not_done:
+    - "infer_batch.py / infer_video.py 仍是单进程串行（第二期）"
+  unchanged:
+    - "所有推理路由、请求/响应字段、参数与判定口径"
+    - "TRTFORGE_INFER_ISOLATION=0 直通模式的行为"
+```
+
+### v1.30.6 — 2026-11-09（分类也算进了 DLL）
+
+**一句话**：有用户问"推理部分所有代码和算法是不是都能通过 DLL 调用"，盘点后发现**只剩分类没有**——`detect / segment / pose / obb` 与 anomalib 三模型早就走 `onnx_infer.dll` / `yolo_infer.dll` / `anomalib_infer.dll`，OCR 走 `ocr_infer.dll`，只有 `classify` 还在 Web 进程里 `import onnxruntime`。这一版给 `onnx_infer.dll` 加了 `OI_CLASSIFY`、`oi_create_classify`、`oi_infer_classify`、`oi_classify_result`，分类从此也走 C++（含 CUDA provider 自动探测）、走 `infer_worker` 进程隔离，网页单图 / 批量 / 视频三条路径统一 DLL 优先、Python 兜底。
+
+DLL 刻意**只回原始分数和 `names` 元数据**，`softmax`、置信度门槛、中文名映射仍留在 `classifyinfer.interpret()`：那套解释逻辑已经兼容"导出的模型带 softmax 或不带"，在 C++ 里再写一份，同一个模型走两条路会得出不同结论。分类预处理（短边缩放 + 中心裁剪 + Python 同款 `round`）与 `classifyinfer.preprocess` 逐位一致，静态/动态 batch 共 16 例（含 1792×528 长图）原始分数最大绝对差 **0.0**。详情见 `6-web/README.md` 的 v1.30.6 变更点与 `docs/WORKFLOW_GUIDE.md` §7.13。
+
+```yaml
+version_diff:
+  component: infer-classify-dll
+  old_version: "1.30.5"
+  new_version: "1.30.6"
+  symptom:
+    question: "现在推理部分所有代码和算法是否都能通过 DLL 调用"
+    measured: "11 类推理路径里 10 类已在 DLL 内执行；classify 仍在 Web 进程内用 Python onnxruntime"
+  root_cause:
+    classify: "分类是 v1.30.0 新增任务，当时只接到 classifyinfer.run()，没进 C ABI"
+    isolation: "不进 infer_worker，长任务会占住 Web 进程；也拿不到 CUDA execution provider"
+  old:
+    classify_onnx: "Python onnxruntime，进程内 CPU"
+    worker_op: "无 classify 分支"
+    backend_field: "分类永远显示 python"
+  new:
+    abi_added: "OI_CLASSIFY / oi_classify_result / oi_create_classify / oi_infer_classify（仅追加，旧调用方不受影响）"
+    classify_onnx: "onnx_infer.dll，EP 自动探测（CUDA → CPU）"
+    worker_op: "infer_worker op=classify，共享内存传 BGR，结果走同一条 pipe"
+    backend_field: "单图 / 批量 / 视频三条路径 DLL 优先，backend 显示 onnx_infer.dll，降级时记录原因"
+    contract: "DLL 只回原始分数 + names；softmax/门槛/中文名映射保留在 classifyinfer.interpret()"
+    version: "onnx_infer 1.0.0 → 1.1.0（abi 仅追加）"
+  measured:
+    preprocessing: "静态 + 动态 batch 共 16 例（含 1792×528），DLL 与 Python 原始分数最大绝对差 0.0"
+    tests: "后端 44 个脚本全绿；test_onnx_infer_dll 46 项（分类 11 项）；test_classify 45/45"
+  verify:
+    http: "POST /api/infer/yolo task=classify，8094/8060 均返回 backend=onnx_infer.dll，label 与降级路径一致"
+    fallback: "删掉 onnx_infer.dll 后分类仍可用，backend 回落 python 并记录降级原因"
+  unchanged: "分类的响应字段、判定口径与模型格式；检测/分割/姿态/OBB/anomalib/OCR 全部路径；分类仍无 TRT 引擎"
+```
+
+### v1.30.5 — 2026-11-09（OCR 往返拆解 + 识别 batch 按设备取值）
+
+**一句话**：OCR 的「含往返 215 ms」一直被当成"传输慢"，这一版把服务端继续拆成**解码 / 进程往返 / 模型 / 响应组装**四段并显示在页面上——结论是 OCR 的 182 ms 就是模型（检测 + 逐行识别），Python 侧只有 33 ms，而且 OCR 本来就没图要传（响应体 9.5 KB）。同时顺手做了三件事：`_finish_infer` 不再为报体积序列化两次（2.5 MB 响应省约 30 ms）；识别 batch 默认值按设备分开取（**CPU 24 / GPU 6**，实测 CPU 上 24 比 6 快约 18%，GPU 上 6 才是最优）；新增 15 项计时自洽测试。详情见 `6-web/README.md` 的 v1.30.5 变更点与 `docs/WORKFLOW_GUIDE.md` §7.12。
+
+```yaml
+version_diff:
+  component: web-infer-timing
+  old_version: "1.30.4"
+  new_version: "1.30.5"
+  symptom:
+    question: "OCR 推理的往返还是很高（215 ms），为什么目标检测和异常检测都好了"
+    measured: "服务端 214.9 ms / DLL 182.1 ms；OCR 响应体 9.5 KB，没有可压缩的图片回传"
+  root_cause:
+    ocr: "OCR 的时间就是「检测 + 逐行识别」本身；v1.30.3 的 PNG→JPEG 只对回传大图的 YOLO/Anomalib 有效"
+    visibility: "timing 只有 server_ms，用户无法看出服务端内部各段占比"
+    batch: "识别 batch 固定默认 6，CPU 上偏小 18%；而 GPU 上 6 恰好最优（'GPU 更大更快'是单次测量的错觉）"
+  old:
+    timing_fields: "server_ms / payload_bytes"
+    payload_bytes_impl: "填 0 序列化一次量长度、再填真值序列化一次"
+    ocr_batch_default: "6"
+    legend: "只有「服务端总计」与「含往返」"
+  new:
+    timing_fields: "新增 decode_ms / ipc_ms / encode_ms，server_ms = decode + ipc + DLL + encode"
+    payload_bytes_impl: "只序列化一次，原地替换 \"payload_bytes\":0 回填真实 body 长度"
+    ocr_batch_default: "CPU 24 / GPU 6，切换设备自动跟随（用户手改过的值不覆盖）"
+    legend: "新增「服务端拆解 ＝ 模型 ＋ 解码 ＋ 进程往返 ＋ 响应组装」"
+  measured:
+    yolo: "服务端 53.6 ms = 解码 21.3 + 往返 1.3 + 模型 13.7 + 组装 17.3（响应体 1484 KB）"
+    anomalib: "服务端 246.0 ms = 解码 21.7 + 往返 154.7 + 模型 64.4 + 组装 5.2（响应体 2504 KB）"
+    ocr: "服务端 3083 ms = 解码 6.7 + 往返 3.2 + 模型 3070.6 + 组装 2.5（响应体 15.5 KB，75 行）"
+    cpu_batch: "batch 6 → 3466 ms，24 → 2828 ms，48 → 3732 ms"
+    gpu_batch: "batch 6 → 576 ms，16 → 621 ms"
+  verify:
+    payload_bytes: "与真实响应体逐字节一致（test_infer_timing.py 新增断言）"
+    tests: "后端 44 个脚本全绿、前端 6 套全绿"
+  unchanged: "三种任务的响应字段与识别结果、DLL、OCR raw_json（openspec 规定必须回传）"
+```
+
+### v1.30.4 — 2026-11-09（OCR 文字醒目化 + 异常检测回到「区域」）
+
+**一句话**：两处判读体验修复。OCR 识别结果的文字标签原来是白色，叠在白底/浅底图上直接糊掉，现改成琥珀色加深色描边（任何底色都能读）；Anomalib 的第四个窗口原来叫「异常轮廓」，v1.30.3 为了压体积把它二值化成黑底白线，用户反馈**区域比轮廓可靠**，这一版改成真正的**填充异常区域**（RGBA 红区，前端半透明叠到本地原图上），并顺手修掉"铜/黄铜工件被整圈误判成异常"的颜色判定问题。体积仍是 20~45 KB（v1.30.2 是 7.1 MB）。详情见 `6-web/README.md` 的 v1.30.4 变更点。
+
+```yaml
+version_diff:
+  component: web-infer-readability
+  old_version: "1.30.3"
+  new_version: "1.30.4"
+  symptom:
+    ocr_label: "识别到的文字是白色（#f4f7fb），浅底图上不可读"
+    anomalib_mask: "异常面板从「红色区域」变成「黑底白线轮廓」，且环形铜件整圈被标成异常"
+  root_cause:
+    ocr_label: "文字只有 fill，没有描边/背景，深色字与浅色字都会在某类底色上失效"
+    anomalib_mask: "mask_rgb 是 DLL 用 drawContours(thickness=2) 画的描边，本身只有轮廓；v1.30.3 靠偏红判定抠线，铜/黄铜天然偏红会误判"
+  old:
+    ocr_label: "fill=#f4f7fb"
+    anomalib_mask: "抠红色 → 二值白线（单通道 PNG）"
+    onnx_mask: "norm >= pixel_threshold（0~1 相对值 vs 原始分数阈值，量纲不一致）"
+    window_title: "异常轮廓"
+  new:
+    ocr_label: "fill=#ffd54a（琥珀）+ stroke=#0b1016 + paint-order=stroke"
+    anomalib_mask: "normalized_map > 0.5 生成填充区域（与 DLL 内部 mask 同口径），RGBA：异常处不透明纯红，其余透明"
+    saturation_guard: "覆盖率超过 60% 视为阈值标定失效，退回只标最热一段"
+    compose: "前端把红区以 0.45 透明度叠到本地原图（URL.createObjectURL）上显示"
+    onnx_mask: "先按 metadata 归一化到 0..1 再判 0.5，与 DLL 口径一致"
+    window_title: "异常区域"
+  verify:
+    region_coverage: "bottle 异常图 0.7%~1.5%；跨数据集饱和样本触发兜底 60%"
+    payload: "RGBA PNG 20~45 KB"
+    tests: "test_onnx_fallback 64 项、test_infer_worker 26 项、前端 6 套全绿"
+  unchanged: "DLL 本体与 C API、响应字段名（仍叫 mask_png）、overlay_jpg / heatmap_png 策略、YOLO 与 OCR 计算链路"
+```
+
+### v1.30.3 — 2026-11-09（推理页往返耗时优化）
+
+**一句话**：推理页「含往返」很长，但 DLL 的 `preprocess/inference/postprocess` 只有几毫秒——差额全在**编图、base64、JSON 和传输**。这一版把 YOLO 标注图从 PNG 改成 JPEG、Anomalib 不再回传原图并把轮廓图压成二值、OCR 提前预热句柄，本机实测 YOLO 388→约 210 ms（9.9→约 1.6 MB）、Anomalib 1077→约 180 ms（28→约 2.1 MB）。同时响应里补了 `timing.server_ms` 与 `timing.payload_bytes`，前端把往返拆成「上传 / 服务端 / 下载」三段，下次不会再误判成模型慢。详情见 `6-web/README.md` 的 v1.30.3 变更点与 `docs/WORKFLOW_GUIDE.md` §7.10。
+
+```yaml
+version_diff:
+  component: web-infer-roundtrip
+  old_version: "1.30.2"
+  new_version: "1.30.3"
+  symptom: "DLL 计时 5~74 ms，页面「含往返」却是 388~1077 ms；OCR 首次还要多等约 1.3 s"
+  root_cause: "DLL 只计内核；PNG 编码、base64、JSON 序列化、传输都不在计时内，且全尺寸原图重复回传"
+  old:
+    yolo_image: "annotated_png（3034x1586 约 155 ms / 5.8 MB）"
+    anomalib_image: "overlay_png + mask_png + source_png + heatmap_png 四张全尺寸 PNG（28 MB）"
+    ocr_warm: "首次推理才 oi_create，加载飞桨 1.7 GB 约 1.3 s，不在 timing 里"
+    ocr_cache: "每次 preflight 重新解析 inference.yml（character_dict 6000+ 项）"
+    upload: "上传先写一份临时文件，三个调用方都没读过它"
+    timing: "响应只有 DLL 三段计时，看不出服务端与传输各占多少"
+  new:
+    yolo_image: "annotated_jpg（JPEG q=90，约 12 ms / 0.78 MB）+ annotated_mime"
+    anomalib_image: "overlay_jpg + 二值 mask_png + heatmap_png；不再回传 source_png"
+    ocr_warm: "POST /api/ocr/warm 后台预热；前端模型列表加载完自动触发"
+    ocr_cache: "inspect_dir 按目录 + 关键文件 mtime + 飞桨主版本缓存"
+    upload: "_read_upload 只读字节不落盘，保留后缀与大小校验"
+    timing: "timing.server_ms / payload_bytes，前端拆成 上传 / 服务端 / 下载 三段"
+  verify:
+    yolo: "本机 388 ms / 9.92 MB → 约 210 ms / 约 1.6 MB"
+    anomalib: "本机 1077 ms / 28.45 MB → 约 180 ms / 约 2.1 MB"
+    ocr: "首次 2446 ms 的句柄创建被预热吃掉，后续约 290 ms"
+    tests: "run_all_tests.py 全绿；test_ocr_api 新增缓存与预热断言"
+  unchanged: "DLL 本体与 C API、检测/异常/OCR 的结果数值、导出 CSV/JSON 结构"
+```
+
+### v1.30.2 — 2026-11-09（OCR `mklml.dll` 加载修复）
+
+**一句话**：OCR 推理点「开始推理」就报 `mklml.dll` 错误码 126，CPU 和 GPU 都不可用。根因不是缺文件，而是**飞桨 2.6.2 用普通 `LoadLibrary("mklml.dll")` 找 MKL，只认 PATH**，网页侧只 `add_dll_directory` 对它无效。现在 `ocr_infer.py` 会把 `bin` 和 `mklml/lib` 同时前置到进程 PATH；CMake 也补上了 `mklml.dll` 的自动复制。页面实测 CPU 75 行 4529 ms、GPU 75 行 9446 ms。详情见 `6-web/README.md` 的 v1.30.2 变更点与 `docs/WORKFLOW_GUIDE.md` §7.7.1。
+
+```yaml
+version_diff:
+  component: web-ocr-runtime
+  old_version: "1.30.1"
+  new_version: "1.30.2"
+  symptom: "创建 OCR 句柄失败：PreconditionNotMetError ... (mklml.dll) ... (error code is 126)"
+  root_cause: "AddDllDirectory 只影响 LoadLibraryEx 的 USER_DIRS，飞桨内部用普通 LoadLibrary，看不到"
+  old:
+    runtime: "ocr_infer.py 只调 os.add_dll_directory(bin, mklml/lib)"
+    build: "ocr_infer 的 POST_BUILD 依赖清单漏 mklml.dll，bin 里没有它"
+    qt_cmake: "只在 bin/paddle_inference 下找 mklml，源码树该目录为空"
+    tests: "没有覆盖 DLL 搜索路径"
+  new:
+    runtime: "bin 与 mklml 目录同时前置到进程 PATH，再加载 ocr_infer.dll"
+    build: "POST_BUILD 把 mklml.dll 和 libiomp5md.dll 一起拷到 4-qt-studio/bin"
+    qt_cmake: "回退到 ocr/ocr_infer/third_party/paddle_inference"
+    tests: "test_ocr_api.py 增加 3 项回归"
+  verify:
+    page_cpu_mkldnn: "75 行，4529 ms"
+    api_cpu: "75 行，5209 ms"
+    api_gpu0: "75 行，9446 ms"
+    tests: "test_ocr_api 13 项、test_ocr_infer_dll 10 项全绿"
+  unchanged: "ocr_infer.dll 本体、模型兼容策略、视频/摄像头不支持 OCR"
+```
+
+### v1.30.1 — 2026-11-09（分类真机闭环）
+
+**一句话**：Web Studio **1.30.1** 用官方 `yolov8n-cls.pt` 和 `imagenette160` 把分类跑通了。训练不再因为传 `dataset.yaml` 报错，推理的输入和官方 `classify_transforms` 逐像素一致，类别顺序以模型自带的 `names` 为准。两套数据集逐张对比都是 20/20 一致。分类引擎仍然不做。详情见 `6-web/README.md` 的 v1.30.1 变更点。
+
+```yaml
+version_diff:
+  component: web-yolo-classify
+  old_version: "1.30.0"
+  new_version: "1.30.1"
+  old:
+    train_data: "dataset.yaml 直接交给 Ultralytics，报 must be a directory"
+    train_metric: "训练结束没有 top-1"
+    preprocess: "cv2.resize 直接拉伸，非正方形图变形"
+    class_order: "按 dataset.yaml 的顺序，中文排序不一致就错位"
+    overview: "分类分辨率恒为 0"
+  new:
+    train_data: "yaml 解析成目录，路径不对时给中文报错"
+    train_metric: "训练结束发 accuracy_top1，页面显示「top1 准确率」"
+    preprocess: "短边等比缩放 + 中心裁剪，和官方逐像素一致"
+    class_order: "优先用 ONNX metadata 的 names，冲突时提示"
+    overview: "分类补分辨率统计；视频逐帧明细写类别和分数"
+  verify:
+    cn2: "10 轮 top1 0.95，逐张对比 20/20 一致"
+    multi: "3 轮 top1 0.84，逐张对比 20/20 一致"
+  note: 仍只支持 ONNX 分类推理，TensorRT 分类引擎未做。
+```
+
+### v1.30.0 — 2026-11-08（YOLO 整图分类）
+
+**一句话**：Web Studio **1.30.0** 可以做整图分类。标注页点一个类别给整张图打标，训练用分类权重，推理用 ONNX 给出类别和分数。分类引擎这一版不做。检测画框流程不变。详情见 `6-web/README.md` 的 v1.30.0 变更点。
+
+```yaml
+version_diff:
+  component: web-yolo-classify
+  old_version: "1.29.0"
+  new_version: "1.30.0"
+  old:
+    web_classify: false
+    annotation_task: detect
+    infer: "只画框"
+  new:
+    web_classify: true
+    annotation: "整张图一个类别，导出类别文件夹"
+    train: "classify 权重，准确率 + 混淆矩阵"
+    infer: "ONNX 整图类别；.engine 返回 400"
+    pipeline: "训练并导出 ONNX，跳过编译引擎和检测验证"
+  note: 桌面版不能打开分类工程。TensorRT 分类引擎未做。
+```
 
 ### v1.29.0 — 2026-11-06（检测验证报告 + YOLO INT8）
 

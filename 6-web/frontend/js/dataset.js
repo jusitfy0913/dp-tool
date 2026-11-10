@@ -99,8 +99,9 @@ export function initDataset() {
 
     // 表头用 th 而不是 td：语义正确，读屏会把列名关联到单元格。
     // 数值列加 num 类右对齐，等宽字体让位数相同的数字纵向对齐。
+    const classify = data.task === "classify";
     const headRow = document.createElement("tr");
-    for (const [title, numeric] of [["图片", false], ["现有划分", false], ["新划分", false], ["标注数", true], ["尺寸", true]]) {
+    for (const [title, numeric] of [["图片", false], ["现有划分", false], ["新划分", false], [classify ? "类别" : "标注数", !classify], ["尺寸", true]]) {
       const th = document.createElement("th");
       th.textContent = title;
       if (numeric) th.style.textAlign = "right";
@@ -124,8 +125,8 @@ export function initDataset() {
       tr.appendChild(assigned);
 
       const objects = document.createElement("td");
-      objects.className = "num";
-      objects.textContent = image.objects;
+      objects.className = classify ? "" : "num";
+      objects.textContent = classify ? (image.label || "未标注") : image.objects;
       tr.appendChild(objects);
 
       const size = document.createElement("td");
@@ -236,6 +237,20 @@ export function initDataset() {
       btnExport.disabled = false;
     }
   });
+
+  function syncTaskFormat() {
+    const classify = task.value === "classify";
+    for (const option of format.options) {
+      option.disabled = classify && option.value !== "yolo";
+    }
+    if (classify && format.value !== "yolo") format.value = "yolo";
+    const yolo = format.querySelector('option[value="yolo"]');
+    if (yolo) yolo.textContent = classify
+      ? "分类文件夹（train/类别名/图片）"
+      : "YOLO（images/labels + dataset.yaml）";
+  }
+  task.addEventListener("change", syncTaskFormat);
+  syncTaskFormat();
 
   refreshRatioHint();
 }

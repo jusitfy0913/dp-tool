@@ -184,7 +184,7 @@ def test_anomalib_consistency() -> None:
         direct = [inferproxy.run_anomalib(str(engine), str(metadata), a) for a in arrays]
     finally:
         os.environ["TRTFORGE_INFER_ISOLATION"] = "1"
-    fields = ("score", "is_anomaly", "heatmap_png", "mask_png", "overlay_png")
+    fields = ("score", "is_anomaly", "heatmap_png", "mask_png", "overlay_jpg")
     diffs = [k for x, y in zip(isolated, direct) for k in fields if x.get(k) != y.get(k)]
     check("Anomalib 一致性：分数、判定与热力图字节相同", not diffs, f"{len(arrays)} 张，不一致字段 {sorted(set(diffs))}")
 

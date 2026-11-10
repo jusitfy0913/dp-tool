@@ -53,6 +53,7 @@ set(ONNX_INFER_SRC
     src/ort_session.cpp
     src/yolo_onnx.cpp
     src/anomalib_onnx.cpp
+    src/classify_onnx.cpp
     src/onnx_infer_c.cpp
 )
 

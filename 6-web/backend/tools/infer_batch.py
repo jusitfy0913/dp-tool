@@ -74,6 +74,20 @@ class EngineRunner:
         status = infer.status()
         is_onnx = infer.is_onnx_model(args.engine)
 
+        if self.kind == "yolo" and args.task == "classify":
+            import classifyinfer
+            try:
+                classifyinfer.reject_engine(args.engine)
+            except classifyinfer.ClassifyError as exc:
+                raise RuntimeError(str(exc)) from exc
+            if not Path(args.engine).is_file():
+                raise RuntimeError(f"ONNX 模型不存在：{args.engine}")
+            # 分类优先走 onnx_infer.dll（v1.30.6），旧 DLL 或加载失败时退回 onnxruntime。
+            self.use_dll = infer.classify_available()
+            self.onnx_path = args.engine
+            self.backend = "onnx_infer.dll" if self.use_dll else "onnxruntime"
+            return
+
         if self.kind == "yolo":
             self.use_dll = status.onnx_ok if is_onnx else status.yolo_ok
             self.onnx_path = ""
@@ -129,6 +143,14 @@ class EngineRunner:
                 "det_unclip_ratio": args.det_unclip_ratio,
                 "rec_score_thresh": args.rec_score_thresh,
             })
+        if self.kind == "yolo" and args.task == "classify":
+            import classifyinfer
+
+            if self.use_dll:
+                raw = infer.run_classify(args.engine, array)
+                result, _warning = classifyinfer.result_from_raw(raw, self.classes, args.conf)
+                return result
+            return classifyinfer.run(self.onnx_path or args.engine, array, self.classes, args.conf)
         if self.kind == "yolo":
             if self.use_dll:
                 return infer.run_yolo(args.engine, args.task, array, conf=args.conf, nms=args.nms)
@@ -153,7 +175,6 @@ class EngineRunner:
         )
         # 降级路径没有 C++ 侧渲染，补齐字段让下游只有一条分支
         result.setdefault("heatmap_png", None)
-        result.setdefault("source_png", None)
         return result
 
 
@@ -172,7 +193,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--det-unclip-ratio", type=float, default=1.5)
     parser.add_argument("--rec-score-thresh", type=float, default=0.0)
     parser.add_argument("--no-mkldnn", action="store_true")
-    parser.add_argument("--task", default="detect", choices=("detect", "segment", "pose", "obb"))
+    parser.add_argument("--task", default="detect", choices=("detect", "segment", "pose", "obb", "classify"))
     parser.add_argument("--labels", default="", help="labels_*.json；留空则用 cls{id}")
     parser.add_argument("--conf", type=float, default=0.25)
     parser.add_argument("--nms", type=float, default=0.45)
@@ -194,6 +215,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 YOLO_COLUMNS = ["index", "file", "count", "top_class", "max_conf", "elapsed_ms", "output", "error"]
+CLASSIFY_COLUMNS = ["index", "file", "class_name", "score", "uncertain", "elapsed_ms", "output", "error"]
 OCR_COLUMNS = ["index", "file", "count", "text", "avg_score", "elapsed_ms", "output", "error"]
 ANOMALIB_COLUMNS = [
     "index", "file", "raw_score", "normalized_score", "is_anomaly",
@@ -283,7 +305,9 @@ def _ocr_record(index: int, file: Path, result: dict, elapsed_ms: float, output:
 
 def _flush(job: Path, args: argparse.Namespace, records: list[dict], extra: dict) -> tuple[Path, Path]:
     """把结果写成 JSON + CSV，返回 (json 路径, csv 路径)。"""
-    if args.kind == "yolo":
+    if args.kind == "yolo" and args.task == "classify":
+        columns = CLASSIFY_COLUMNS
+    elif args.kind == "yolo":
         columns = YOLO_COLUMNS
     elif args.kind == "ocr":
         columns = OCR_COLUMNS
@@ -381,7 +405,7 @@ def main(argv: list[str] | None = None) -> int:
                 if args.kind == "yolo":
                     infer.attach_labels(result, label_info["classes"])
                 out_name = inferjobs.annotated_name(
-                    index, file, ".jpg" if args.kind == "yolo" else ".png"
+                    index, file, ".jpg" if args.kind in ("yolo", "anomalib") else ".png"
                 )
             except Exception as exc:  # noqa: BLE001 - 单张失败不影响整批
                 failed += 1
@@ -405,6 +429,25 @@ def main(argv: list[str] | None = None) -> int:
                         "src_h": result.get("src_h"),
                     })
                     record = _ocr_record(index, file, result, elapsed_ms, relative)
+                elif args.kind == "yolo" and args.task == "classify":
+                    import classifyinfer
+                    canvas = classifyinfer.draw_label(array, result.get("classify") or {})
+                    (job / "annotated" / out_name).write_bytes(
+                        infer.encode_image(canvas, ".jpg", args.jpeg_quality)
+                    )
+                    verdict = result.get("classify") or {}
+                    record = {
+                        "index": index,
+                        "file": str(file),
+                        "class_name": verdict.get("label", ""),
+                        "score": verdict.get("score", 0),
+                        "uncertain": "是" if verdict.get("uncertain") else "否",
+                        "elapsed_ms": elapsed_ms,
+                        "output": relative,
+                        "error": "",
+                    }
+                    key = str(verdict.get("label") or "")
+                    class_counter[key] = class_counter.get(key, 0) + 1
                 elif args.kind == "yolo":
                     canvas = infer.render_yolo(array, result.get("boxes") or [], result.get("class_colors"))
                     (job / "annotated" / out_name).write_bytes(
@@ -415,7 +458,14 @@ def main(argv: list[str] | None = None) -> int:
                         key = str(box.get("label_name") or box.get("class_label", ""))
                         class_counter[key] = class_counter.get(key, 0) + 1
                 else:
-                    overlay = result.get("overlay_png")
+                    # 批量产物要落盘，统一转成 JPEG：overlay 本身就是 JPEG，
+                    # 万一某个后端只给了 PNG（老版本兼容），这里再编一次
+                    overlay = result.get("overlay_jpg")
+                    if overlay is None and result.get("overlay_png"):
+                        import cv2
+                        overlay = cv2.imencode(".jpg", cv2.imdecode(
+                            np.frombuffer(result["overlay_png"], np.uint8), cv2.IMREAD_COLOR
+                        ), [int(cv2.IMWRITE_JPEG_QUALITY), args.jpeg_quality])[1].tobytes()
                     if overlay:
                         (job / "annotated" / out_name).write_bytes(overlay)
                     record = _anomalib_record(index, file, result, elapsed_ms, relative)

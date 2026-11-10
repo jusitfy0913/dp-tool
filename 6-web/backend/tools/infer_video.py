@@ -50,7 +50,7 @@ def emit(payload: dict) -> None:
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="视频推理，输出带框的 mp4")
     parser.add_argument("--engine", required=True)
-    parser.add_argument("--task", default="detect", choices=("detect", "segment", "pose", "obb"))
+    parser.add_argument("--task", default="detect", choices=("detect", "segment", "pose", "obb", "classify"))
     parser.add_argument("--labels", default="")
     parser.add_argument("--conf", type=float, default=0.25)
     parser.add_argument("--nms", type=float, default=0.45)
@@ -165,13 +165,27 @@ def main(argv: list[str] | None = None) -> int:
     label_info = labels_mod.load_labels(args.labels)
     if args.labels and not label_info["ok"]:
         emit({"type": "warning", "code": "LABELS_UNUSED", "message": label_info["error"]})
+    if args.task == "classify" and not infer.is_onnx_model(args.engine):
+        emit({
+            "type": "error",
+            "code": "ENGINE_UNAVAILABLE",
+            "message": "分类引擎还没做，请改用 ONNX。",
+        })
+        capture.release()
+        return 1
 
     backend = "yolo_infer.dll"
     onnx_path = ""
     status = infer.status()
     is_onnx = infer.is_onnx_model(args.engine)
     dll_ok = status.onnx_ok if is_onnx else status.yolo_ok
-    if dll_ok:
+    if args.task == "classify":
+        # 分类只有 .onnx 一条路（TensorRT 分类未做），但要区分是 DLL 还是 onnxruntime。
+        if infer.classify_available() and Path(args.engine).is_file():
+            backend = "onnx_infer.dll"
+        else:
+            backend = "onnxruntime"
+    elif dll_ok:
         backend = "onnx_infer.dll" if is_onnx else "yolo_infer.dll"
     else:
         if is_onnx:
@@ -253,15 +267,36 @@ def main(argv: list[str] | None = None) -> int:
                 continue
 
             try:
-                boxes = infer.run_yolo(args.engine, args.task, frame, conf=args.conf, nms=args.nms) \
-                    if backend in ("yolo_infer.dll", "onnx_infer.dll") \
-                    else onnx_fallback.run_yolo(
-                        onnx_path, args.task, frame, conf=args.conf, nms=args.nms,
-                        num_classes=len(label_info["classes"]) or None,
-                    )
-                result_boxes = infer.attach_labels(boxes, label_info["classes"])
-                items = result_boxes.get("boxes") or []
-                canvas = infer.render_yolo(frame, items, result_boxes.get("class_colors"))
+                frame_classify: dict | None = None
+                if args.task == "classify":
+                    import classifyinfer
+
+                    if backend == "onnx_infer.dll":
+                        raw = infer.run_classify(args.engine, frame)
+                        classified, _warning = classifyinfer.result_from_raw(
+                            raw, label_info["classes"], args.conf
+                        )
+                    else:
+                        classified = classifyinfer.run(
+                            args.engine, frame, label_info["classes"], args.conf,
+                        )
+                    verdict = classified.get("classify") or {}
+                    frame_classify = verdict
+                    items = []
+                    canvas = classifyinfer.draw_label(frame, verdict)
+                    label_key = str(verdict.get("label") or "")
+                    class_counter[label_key] = class_counter.get(label_key, 0) + 1
+                    detections += 1
+                else:
+                    boxes = infer.run_yolo(args.engine, args.task, frame, conf=args.conf, nms=args.nms) \
+                        if backend in ("yolo_infer.dll", "onnx_infer.dll") \
+                        else onnx_fallback.run_yolo(
+                            onnx_path, args.task, frame, conf=args.conf, nms=args.nms,
+                            num_classes=len(label_info["classes"]) or None,
+                        )
+                    result_boxes = infer.attach_labels(boxes, label_info["classes"])
+                    items = result_boxes.get("boxes") or []
+                    canvas = infer.render_yolo(frame, items, result_boxes.get("class_colors"))
             except Exception as exc:  # noqa: BLE001 - 单帧失败不能中断整段视频
                 warn_count += 1
                 if warn_count <= 20:
@@ -283,11 +318,22 @@ def main(argv: list[str] | None = None) -> int:
                 key = str(box.get("label_name") or box.get("class_label", ""))
                 class_counter[key] = class_counter.get(key, 0) + 1
             if args.save_detections:
-                frame_records.append({
-                    "frame": read_index,
-                    "count": len(items),
-                    "boxes": items,
-                })
+                if frame_classify is not None:
+                    # 分类没有框，「逐帧明细」给的是这一帧判成了什么、多少分。
+                    frame_records.append({
+                        "frame": read_index,
+                        "classify": {
+                            "label": frame_classify.get("label", ""),
+                            "score": frame_classify.get("score", 0.0),
+                            "uncertain": bool(frame_classify.get("uncertain")),
+                        },
+                    })
+                else:
+                    frame_records.append({
+                        "frame": read_index,
+                        "count": len(items),
+                        "boxes": items,
+                    })
 
             now = time.perf_counter()
             if now - last_emit >= 0.5 or (args.max_frames and processed >= args.max_frames):

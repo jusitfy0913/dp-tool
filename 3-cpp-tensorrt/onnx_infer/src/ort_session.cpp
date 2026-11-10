@@ -451,6 +451,29 @@ bool Session::set_input_dimensions(size_t index, const std::vector<int64_t>& dim
     return true;
 }
 
+std::string Session::custom_metadata(const char* key) const {
+    if (!session_ || !api_ || !key || !*key) {
+        return std::string();
+    }
+    OrtModelMetadata* meta = nullptr;
+    if (api_->SessionGetModelMetadata(session_, &meta) != nullptr || !meta) {
+        return std::string();
+    }
+    std::string value;
+    OrtAllocator* allocator = nullptr;
+    char* raw = nullptr;
+    if (api_->GetAllocatorWithDefaultOptions(&allocator) == nullptr &&
+        api_->ModelMetadataLookupCustomMetadataMap(meta, allocator, key, &raw) == nullptr && raw) {
+        value = raw;
+    }
+    // 查找失败时 ORT 会把 raw 置空，成功时由分配器释放，两种情况都要处理。
+    if (raw && allocator) {
+        api_->AllocatorFree(allocator, raw);
+    }
+    api_->ReleaseModelMetadata(meta);
+    return value;
+}
+
 bool Session::run(const std::vector<std::vector<float>>& inputs,
                   std::vector<std::vector<float>>& outputs,
                   std::string& err) {

@@ -138,6 +138,9 @@ results/
 # 推理 DLL 的 CMake 构建目录
 build/infer_dlls/
 
+# 测试临时目录：验证脚本会用 1 字节的假图片/假模型造现场，跑完不清理
+6-web/backend/tools/_int8_tmp/
+
 # 本地参考资料 / 研究草稿，不属于交付链路，不入库
 /7-autoresearch-master/
 

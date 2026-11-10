@@ -2112,6 +2112,12 @@ input[type="range"]:disabled { cursor: not-allowed; }
   background: var(--cyan-a14);
   box-shadow: inset 2px 0 0 var(--cyan);
 }
+.anno-imagelist li.is-unlabeled .meta {
+  color: #f5c16c;
+}
+.anno-classlist li.is-current {
+  box-shadow: inset 2px 0 0 var(--cyan);
+}
 /* 未保存标记：一个圆点，比在行尾写"未保存"三个字省地方 */
 .anno-imagelist li.dirty .name::after {
   content: " ●";

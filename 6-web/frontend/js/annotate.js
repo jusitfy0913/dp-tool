@@ -1092,11 +1092,17 @@ async function createProject() {
     return;
   }
 
+  const task = document.getElementById("annoTask")?.value || "detect";
   const project = {
     version: 1,
-    task: "detect",
+    task,
     rev: 0,
-    classes: [{ id: 0, name: "object", color: [31, 182, 255] }],
+    classes: task === "classify"
+      ? [
+          { id: 0, name: "良品", color: defaultColor(0) },
+          { id: 1, name: "不良", color: defaultColor(1) },
+        ]
+      : [{ id: 0, name: "object", color: [31, 182, 255] }],
     images: [],
   };
 
@@ -1333,7 +1339,31 @@ function resizeCanvas() {
   ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
 }
 
+function isClassify() {
+  return state.project?.task === "classify";
+}
+
+function applyTaskChrome() {
+  const classify = isClassify();
+  document.querySelectorAll("#panel-annotate .anno-detect-only").forEach((node) => {
+    node.hidden = classify;
+  });
+  document.querySelectorAll("#panel-annotate .anno-classify-only").forEach((node) => {
+    node.hidden = !classify;
+  });
+  const task = document.getElementById("annoTask");
+  if (task && state.project?.task) task.value = state.project.task;
+  if (el.exportFormat) {
+    for (const option of el.exportFormat.options) {
+      option.disabled = classify && option.value !== "yolo";
+    }
+    if (classify) el.exportFormat.value = "yolo";
+  }
+  document.getElementById("annoAutoLabelBox")?.toggleAttribute("hidden", classify);
+}
+
 function renderAll() {
+  applyTaskChrome();
   renderClassList();
   renderBoxTable();
   renderDraftList();
@@ -1702,7 +1732,20 @@ function paintCanvas(options = {}) {
     );
   }
 
-  if (state.opts.showShapes) {
+  if (isClassify()) {
+    const unlabeled = image.class_id === undefined || image.class_id === null;
+    const caption = unlabeled
+      ? "未标注"
+      : (state.project.classes.find((item) => item.id === image.class_id)?.name || "未标注");
+    ctx.font = "700 28px sans-serif";
+    const textWidth = ctx.measureText(caption).width;
+    ctx.fillStyle = "rgba(8,12,16,0.72)";
+    ctx.fillRect(state.view.offset.x + 12, state.view.offset.y + 12, textWidth + 28, 44);
+    ctx.fillStyle = unlabeled ? "#f5c16c" : "#d7fff2";
+    ctx.fillText(caption, state.view.offset.x + 24, state.view.offset.y + 44);
+  }
+
+  if (state.opts.showShapes && !isClassify()) {
     for (const obj of image.annotations) {
       if (state.hidden.has(obj.id)) continue;
       drawShape(ctx, obj, { selected: obj.id === state.selectedId });
@@ -3076,10 +3119,20 @@ function renderImageList() {
     flag.className = `review-flag ${state.review.has(image.id) ? "checked" : "pending"}`;
     flag.textContent = state.review.has(image.id) ? "✓" : "○";
     flag.title = state.review.has(image.id) ? "已审核 (K 取消用 Shift+K)" : "未审核 (K 标为已审核)";
+    if (isClassify() && (image.class_id === undefined || image.class_id === null)) {
+      li.classList.add("is-unlabeled");
+    }
     const meta = document.createElement("span");
     meta.className = "meta";
     const draftCount = (state.drafts.get(image.id) || []).length;
-    meta.textContent = `${image.annotations.length}${draftCount ? `+${draftCount}草` : ""}`;
+    if (isClassify()) {
+      const named = image.class_id === undefined || image.class_id === null
+        ? "未标注"
+        : (state.project.classes.find((item) => item.id === image.class_id)?.name || "未标注");
+      meta.textContent = named;
+    } else {
+      meta.textContent = `${image.annotations.length}${draftCount ? `+${draftCount}草` : ""}`;
+    }
     const split = document.createElement("span");
     split.className = `split ${image.split}`;
     split.textContent = image.split;
@@ -3109,7 +3162,13 @@ function renderClassList() {
   if (el.classCount) el.classCount.textContent = String(classes.length);
   const counts = new Map();
   for (const image of state.project?.images || []) {
-    for (const obj of image.annotations) counts.set(obj.class_id, (counts.get(obj.class_id) || 0) + 1);
+    if (isClassify()) {
+      if (image.class_id !== undefined && image.class_id !== null) {
+        counts.set(image.class_id, (counts.get(image.class_id) || 0) + 1);
+      }
+    } else {
+      for (const obj of image.annotations) counts.set(obj.class_id, (counts.get(obj.class_id) || 0) + 1);
+    }
   }
 
   classes.forEach((cls) => {
@@ -3132,8 +3191,12 @@ function renderClassList() {
       event.stopPropagation();
       deleteClass(cls.id);
     });
+    if (isClassify() && currentImage()?.class_id === cls.id) li.classList.add("is-current");
     li.append(swatch, label, count, del);
-    li.addEventListener("click", () => applyClassToSelection(cls.id));
+    li.addEventListener("click", () => {
+      if (isClassify()) assignImageClass(cls.id);
+      else applyClassToSelection(cls.id);
+    });
     el.classList.appendChild(li);
   });
 }
@@ -3492,6 +3555,29 @@ function renderProps() {
 // ---------------------------------------------------------------------------
 // 类别管理
 // ---------------------------------------------------------------------------
+function assignImageClass(classId) {
+  const image = currentImage();
+  if (!image || !state.project) {
+    setStatus("先选一张图片", "bad");
+    return;
+  }
+  pushHistory();
+  if (classId === null) delete image.class_id;
+  else image.class_id = classId;
+  image.annotations = [];
+  afterEdit();
+  const next = state.project.images.findIndex(
+    (item, index) => index > state.currentIndex && (item.class_id === undefined || item.class_id === null),
+  );
+  if (classId !== null && next >= 0) {
+    switchImage(next);
+    return;
+  }
+  renderAll();
+  renderCanvas();
+  setStatus(classId === null ? "已清空这张图的类别" : "后面没有未标注的图");
+}
+
 function applyClassToSelection(classId) {
   const obj = selectedObject();
   if (!obj) {
@@ -3518,10 +3604,10 @@ function addClass() {
 
 function deleteClass(classId) {
   if (!state.project) return;
-  const used = (state.project.images || []).reduce(
-    (sum, image) => sum + image.annotations.filter((obj) => obj.class_id === classId).length,
-    0,
-  );
+  const used = (state.project.images || []).reduce((sum, image) => {
+    if (isClassify()) return sum + (image.class_id === classId ? 1 : 0);
+    return sum + image.annotations.filter((obj) => obj.class_id === classId).length;
+  }, 0);
   if (used > 0) {
     // 直接删会让这些标注变成"引用了不存在的类别"，导出时才炸。
     // 在入口处拒绝，并把数量说清楚。
@@ -3722,6 +3808,7 @@ function importPayload(dryRun) {
     splits: importSplits(),
     mode,
     duplicate: el.importDuplicate?.value || "skip",
+    task: state.project?.task || document.getElementById("annoTask")?.value || "detect",
     dry_run: Boolean(dryRun),
   };
 }
@@ -3733,7 +3820,7 @@ function formatImportReport(report, issues) {
     .join("　");
   lines.push(
     `任务 ${report.task} ｜ ${(report.classes || []).length} 类 ｜ ` +
-      `${report.images} 图 / ${report.objects} 框`,
+      `${report.images} 图 / ${report.objects} ${report.task === "classify" ? "张" : "框"}`,
   );
   if (splitText) lines.push(splitText);
 
@@ -4092,7 +4179,17 @@ function onKeyDown(event) {
   }
   if (event.key === "Delete" || event.key === "Backspace") {
     event.preventDefault();
-    deleteSelected();
+    if (isClassify()) assignImageClass(null);
+    else deleteSelected();
+    return;
+  }
+  if (isClassify() && /^[1-9]$/.test(event.key)) {
+    const classes = state.project?.classes || [];
+    const picked = classes[Number(event.key) - 1];
+    if (picked) {
+      event.preventDefault();
+      assignImageClass(picked.id);
+    }
     return;
   }
   if (event.key === "Enter") {
@@ -4139,6 +4236,7 @@ function onKeyDown(event) {
     renderCanvas();
     return;
   }
+  if (isClassify()) return;
   if (TOOL_SHORTCUTS[lower]) setTool(TOOL_SHORTCUTS[lower]);
 }
 

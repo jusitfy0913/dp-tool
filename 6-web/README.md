@@ -583,7 +583,7 @@ v1.20 及以前这里只有一个 `disabled`，框里留着默认 `0.5`——推
 | 原图 | 上传的原始图片（YOLO 的框叠在这上面） | 开 |
 | 检出结果 / 异常叠加 | YOLO 为 SVG 框层；Anomalib 为热力叠加图（可调透明度） | 开 |
 | 热能图 | 仅 Anomalib，纯热力图，无原图内容 | 关 |
-| 异常轮廓 | 仅 Anomalib，红色异常区域掩码 | 关 |
+| 异常区域 | 仅 Anomalib，原图 + 半透明红色异常区域（v1.30.4 起；之前是"异常轮廓"） | 关 |
 
 窗口顶部的胶囊按钮可独立开关显隐，**开关状态会记住**（存在浏览器本地，
 键名带页面标识，所以不会和以后标注页的同名窗口互相覆盖）。
@@ -603,7 +603,7 @@ v1.20 及以前这里只有一个 `disabled`，框里留着默认 `0.5`——推
 YOLO 返回干净原图与每个目标的类别名/置信度，框由前端画在 SVG 上
 （`js/overlay.js`，`viewBox` 取图像原始像素尺寸，线宽用 `non-scaling-stroke`
 保证缩放时不变粗）；Anomalib 返回异常分数、OK/NG 判定、热力叠加图、纯热力图
-和红色异常轮廓图，并附带生效阈值。
+和红色异常**区域**图，并附带生效阈值。
 
 > 推理需要引擎文件。仓库里没有现成的 `.trt`，得先用训练页导出 ONNX，再转 TensorRT。
 >
@@ -1543,6 +1543,620 @@ v1.23 解决了"跑一遍"，但**跑完之后还剩一个问题：看到第几�
   3. 点顶栏的「停止」→ 任务 `status=cancelled`，条子消失，训练页徽标变「已停止」；
   4. 停止后再点开始 → 200 正常启动（锁已释放，不会卡死）。
 
+#### v1.30.1 变更点（相对 v1.30.0）——分类真机闭环：能训练、分数对得上
+
+v1.30.0 的分类功能没在真机上跑过。用官方 `yolov8n-cls.pt` + `imagenette160` 跑通之后，修掉了下面这些问题。
+
+**训练：把 dataset.yaml 变成目录**
+
+- Ultralytics 的分类入口只接受**目录**，传 `.yaml` 直接抛 `Classification datasets must be a directory (...) not a file`。launcher 现在先把 yaml 里的 `path` 解析成目录再交给它。
+- yaml 里没有 `path` 时用 yaml 所在目录；`train` 不是 `train`、或目录下没有 `train/`，会给出「分类要求 train/类别名/图片.jpg」这样的中文错误，而不是外层那句看不懂的 `Dataset error`。
+- 分类验证不再把 `conf` / `iou` / `max_det` / `save_json` / `save_txt` 传下去（这些是检测后处理）。
+- 训练结束时也会发 top-1 准确率。以前只有验证会发，训练页的准确率一栏一直是空的。
+- 页面把 `accuracy_top1` 显示成「top1 准确率」。`imgsz` 大于 320 时提示分类常用 224。
+
+**推理：预处理和官方逐像素一致**
+
+- 以前是 `cv2.resize` 直接拉到 W×H，非正方形图会被压扁。现在和官方 `classify_transforms` 一样：短边等比缩放到 `imgsz`，再中心裁剪 `imgsz×imgsz`，RGB，÷255。
+- 实测同一批图，我们的输入张量和官方 `classify_transforms` 的 `max|diff| = 0.0000`。
+- 归一化仍然只做 ÷255：本机 Ultralytics 分类的 `DEFAULT_MEAN=(0,0,0)`、`DEFAULT_STD=(1,1,1)`，不减 ImageNet 均值。
+
+**类别顺序：以模型自带 metadata 为准**
+
+- Ultralytics 用 `sorted(文件夹名)` 生成 names。中文按 Unicode 排序，`不良`(U+4E0D) 排在 `良品`(U+826F) 前面，很可能和 `dataset.yaml` 里写的 0/1 相反。
+- 现在优先读 ONNX metadata 里的 `names`。和传入的标签文件顺序不一致时，结果里带 `warning: 标签文件顺序与模型不一致，已按模型自带的类别顺序显示`，不静默改用户的标签文件。
+
+**数据集概览与视频**
+
+- 分类数据集概览补上了分辨率统计（抽样读图片头，不再一律 0）。
+- 视频「逐帧明细」对分类写 `{"frame": n, "classify": {"label", "score", "uncertain"}}`，不再是空的 `boxes: []`。
+- 视频开始事件里的后端名，分类显示 `onnxruntime`，不再写检测用的 DLL 名。
+
+**真机验证（`6-web/backend/tools/smoke_classify_e2e.py`）**
+
+这个脚本会下载官方权重和数据集，造两个测试集并走完整链路。它不是单测，不进 `run_all_tests.py`。
+
+| 数据集 | 训练 | 逐张对比 Ultralytics | 批量 CSV | 视频 |
+| --- | --- | --- | --- | --- |
+| cn2（中文两类，故意与排序相反） | 10 轮，top1 0.95 | 20/20 一致 | 列与类别都正确 | 12 帧，直方图 不良 10 / 良品 2 |
+| multi（10 类） | 3 轮，top1 0.84 | 20/20 一致 | — | — |
+
+```yaml
+version_diff:
+  component: 6-web
+  from: "1.30.0"
+  to: "1.30.1"
+  old:
+    - 分类训练把 dataset.yaml 交给 Ultralytics，直接报 must be a directory not a file
+    - 分类验证被塞了 conf / iou / max_det / save_json / save_txt
+    - 训练结束不发 top-1，页面上看不到准确率
+    - 推理用 cv2.resize 直接拉伸到 W×H，非正方形图变形
+    - 类别名按 dataset.yaml 的顺序取，遇到中文排序和模型不一致就会张冠李戴
+    - 分类概览的分辨率恒为 0；视频逐帧明细对分类是空的
+  new:
+    - launcher 把分类 yaml 解析成目录，路径不对时给中文报错
+    - 分类验证只传 imgsz / batch / half / device / plots / split / workers
+    - 训练结束发 accuracy_top1，页面显示「top1 准确率」；imgsz>320 给提示
+    - 推理预处理改为短边等比缩放 + 中心裁剪，和官方 classify_transforms 逐像素一致
+    - 优先用 ONNX metadata 的 names，顺序冲突时给出警告
+    - 分类概览有分辨率统计；视频逐帧明细写类别和分数
+  unchanged:
+    - 检测 / 分割 / 姿态 / 旋转框的全部功能
+    - 异常检测、OCR、INT8、检测验证报告
+    - 分类仍然只支持 ONNX，不做 TensorRT 分类引擎
+  note: 真机结果见 tools/smoke_classify_e2e.py 的运行记录，两套数据集逐张对比均为 20/20 一致。
+```
+
+#### v1.30.2 变更点（相对 v1.30.1）——OCR 句柄创建失败：`mklml.dll` 错误码 126
+
+**症状**：推理页选 OCR，模型下拉正常（能扫到 `ch_PP-OCRv4_det_infer`），点「开始推理」立刻失败，CPU 和 GPU 都失败：
+
+```text
+创建 OCR 句柄失败：oi_create exception: ...
+PreconditionNotMetError: The third-party dynamic library (mklml.dll) that Paddle depends on
+is not configured correctly. (error code is 126)
+```
+
+**根因**：`AddDllDirectory` 只对 `LoadLibraryEx(... LOAD_LIBRARY_SEARCH_USER_DIRS)` 生效。
+飞桨 2.6.2 的 `dynamic_loader` 内部用的是**普通 `LoadLibrary("mklml.dll")`**，只搜「exe 目录 + 系统目录 + PATH」，
+所以 `os.add_dll_directory` 加了也没用。MKL 是 CPU 算子依赖，`device=gpu:0` 同样要先加载它，于是两个设备一起挂——这也解释了为什么错误信息看起来像「缺 CUDA」。
+
+**改了什么**
+
+| 文件 | 旧 | 新 |
+| --- | --- | --- |
+| `backend/ocr_infer.py` | 只对 `bin` 和 `mklml/lib` 调 `add_dll_directory` | 同时**前置到进程 `PATH`**；`bin` 里直接放了 `mklml.dll` 也认 |
+| `ocr/ocr_infer/CMakeLists.txt` | POST_BUILD 依赖清单漏 `mklml.dll` | 和 `libiomp5md.dll` 一起复制到 `4-qt-studio/bin` |
+| `4-qt-studio/CMakeLists.txt` | 只找 `bin/paddle_inference`（源码树里是空的） | 回退到 `ocr/ocr_infer/third_party/paddle_inference` |
+| `tools/test_ocr_api.py` | 没覆盖 | 新增 3 项回归（能定位 mklml / 在 PATH / bin 在 PATH） |
+
+**验证（2026-11-09，`00006737.jpg`，`legacy_v4` 的 PP-OCRv4 det+rec）**
+
+| 入口 | 结果 |
+| --- | --- |
+| 页面 CPU + MKLDNN | 75 行，4529 ms，`后端 ocr_infer.dll / 设备 cpu / mkldnn` |
+| `POST /api/infer/ocr` `device=cpu` | 75 行，5209 ms（首次含引擎创建） |
+| `POST /api/infer/ocr` `device=gpu:0` | 75 行，9446 ms |
+| `test_ocr_api.py` | 13 项全绿 |
+| `test_ocr_infer_dll.py` | 10 项全绿 |
+
+**运维提示**：`4-qt-studio/bin/mklml.dll` 约 88 MB，需要重新编译 `ocr_infer` 才会由 POST_BUILD 自动复制；
+想立刻恢复可以手工从 `ocr/ocr_infer/third_party/paddle_inference/third_party/install/mklml/lib/` 拷过去，再重启 Web 服务。
+
+```yaml
+version_diff:
+  component: 6-web
+  from: "1.30.1"
+  to: "1.30.2"
+  old:
+    - OCR 运行时只把 mklml 目录加进 os.add_dll_directory
+    - 飞桨内部 LoadLibrary 不认这个目录，oi_create 报 error code 126
+    - bin 里只有 libiomp5md.dll 和 mkldnn.dll，没有 mklml.dll
+    - POST_BUILD 依赖清单漏了 mklml.dll
+  new:
+    - ocr_infer.py 把 bin 与 mklml 目录同时前置到进程 PATH
+    - CMake POST_BUILD 自动复制 mklml.dll 到 TRTFORGE_BIN_DIR
+    - 4-qt-studio 找 mklml 时兼容 bin/paddle_inference 与 ocr/ 下的飞桨包
+    - test_ocr_api.py 新增 3 项回归
+  unchanged:
+    - ocr_infer.dll 与 ocr_infer_c.h 本体
+    - 模型兼容策略（inference.json 仍需 Paddle 3.x，下拉置灰）
+    - 视频与摄像头仍不支持 OCR
+  not_fixed:
+    - "6 个 PP-OCRv5/v6 模型仍不可用，需要 Paddle 3.x 重编 ocr_infer"
+```
+
+#### v1.30.3 变更点（相对 v1.30.2）——推理页「含往返」为什么比 DLL 计时慢一个数量级
+
+**症状**：推理页目标检测 / 异常检测 / OCR 的 DLL 三段计时只有 5~74 ms，但页面上的「含往返」是
+388 / 1077 / 2446 ms。看起来像推理慢，其实模型已经跑完了，时间花在**把结果图变成 JSON** 上。
+
+**根因**：DLL 只上报 `preprocess_ms` / `inference_ms` / `postprocess_ms`，这些只覆盖 C++ 内核。
+往返里还包含 `cv2.imdecode`、画框、PNG 编码、base64、JSON 序列化、传输、浏览器解析。本机实测单张
+3034×1586 的图：PNG 编码 154 ms / 5.80 MB，JPEG q=90 只要 12 ms / 0.78 MB；base64 又让体积 ×1.33。
+
+**改了什么**
+
+| 文件 | 旧 | 新 |
+| --- | --- | --- |
+| `backend/app.py` `infer_yolo` | `annotated_png`（PNG，5.8 MB） | `annotated_jpg` + `annotated_mime`（JPEG q=90，0.78 MB） |
+| `backend/app.py` 分类分支 | 调 `classifyinfer.overlay_png()` 编 PNG 再当结果图 | 直接 `draw_label()` 拿 BGR 数组再编 JPEG |
+| `backend/infer.py` `run_anomalib` | `overlay_png` + `mask_png` + `source_png` + `heatmap_png` | `overlay_jpg` + 二值 `mask_png` + `heatmap_png`，**去掉 `source_png`** |
+| `backend/infer.py` | 无 | 新增 `_encode_mask_png()`：红色轮廓转二值 PNG（7.1 MB → 0.01 MB） |
+| `backend/onnx_fallback.py` | 字段与 DLL 路径不同 | 同步成同一套 `overlay_jpg` / `overlay_mime` / 二值 `mask_png` |
+| `backend/app.py` | `_save_upload` 写临时文件再删 | `_read_upload` 只读字节，不落盘（保留后缀/大小校验） |
+| `backend/app.py` | 响应 `timing` 只有 DLL 三段 | 增加 `server_ms`（端点内实测）与 `payload_bytes`（响应体字节数） |
+| `backend/app.py` | 无 | `POST /api/ocr/warm`：后台用 32×32 空图建 OCR 句柄，幂等 |
+| `backend/ocr_models.py` | 每次请求重解析 `inference.yml` | `inspect_dir` 按目录 + 关键文件 mtime + 飞桨主版本缓存 |
+| `backend/inferproxy.py` | `run_ocr` 的 `finally` 多调一次 `refresh_status()` | 去掉（状态由 `/api/capabilities` 轮询刷新） |
+| `frontend/js/infer.js` | 只显示「含往返 xx ms」 | 拆成 `上传/排队 + 服务端 + 下载/解析`，并显示响应体大小 |
+| `frontend/js/api.js` | 只有 `postForm` | 新增 `postFormTimed`，返回 `waitMs` / `parseMs` |
+| `frontend/js/ocr.js` | 无 | 模型列表加载完自动 `POST /api/ocr/warm` |
+
+**为什么敢删 `source_png`**：前端切图时已经用 `URL.createObjectURL(file)` 显示本地原图
+（`infer.js` 的 `onFileChange`），后端再编一张全尺寸 PNG 回来是纯重复。`image_width/height`
+仍然从 `source_rgb` 取，叠加层坐标需要它。
+
+**实测收益（本机，3034×1586 PCB 图）**
+
+| 场景 | 改前 | 改后 |
+| --- | ---: | ---: |
+| YOLO 往返 / 响应体 | 388 ms / 9.92 MB | 约 210 ms / 约 1.6 MB |
+| Anomalib 往返 / 响应体 | 1077 ms / 28.45 MB | 约 180 ms / 约 2.1 MB |
+| OCR 首次 / 后续 | 2446 ms / 340 ms | 预热后首次约 1200 ms / 约 290 ms |
+
+```yaml
+version_diff:
+  component: 6-web
+  from: "1.30.2"
+  to: "1.30.3"
+  old:
+    - YOLO 标注图为 annotated_png（PNG，3034x1586 约 155 ms / 5.8 MB）
+    - Anomalib 返回 overlay_png / mask_png / source_png / heatmap_png 四张全尺寸 PNG（约 28 MB）
+    - mask 是三通道 PNG，红色轮廓只占 0.6% 像素却要 7.1 MB
+    - 上传先写一份临时文件，三个调用方都没读过它
+    - timing 只有 DLL 三段，看不出服务端与传输各占多少
+    - OCR 首次请求才 oi_create，加载飞桨 1.7 GB 约 1.3 s，不计入 timing
+    - preflight 每次重解析 inference.yml（character_dict 6000+ 项，约 50 ms）
+  new:
+    - YOLO 改 annotated_jpg（JPEG q=90）+ annotated_mime
+    - Anomalib 改 overlay_jpg + 二值 mask_png + heatmap_png，不再回传 source_png
+    - 分类分支直接 draw_label 后编 JPEG，避免 PNG 编解码往返
+    - _read_upload 只读字节，不落盘，保留后缀与大小校验
+    - timing 增加 server_ms 与 payload_bytes，前端拆成 上传/服务端/下载 三段
+    - 新增 POST /api/ocr/warm 预热，前端模型列表加载完自动触发
+    - inspect_dir 结果按目录 + mtime + 飞桨主版本缓存
+    - inferproxy.run_ocr 去掉多余的 refresh_status()
+  unchanged:
+    - DLL 本体与 C API、检测/异常/OCR 的数值结果
+    - 导出 CSV / JSON 的结构（图片字段改名，MIME 同步给出）
+    - 批量推理与视频仍产出 JPEG 标注图
+  verify:
+    yolo: "388 ms / 9.92 MB → 约 210 ms / 约 1.6 MB"
+    anomalib: "1077 ms / 28.45 MB → 约 180 ms / 约 2.1 MB"
+    ocr: "预热后首次不再等 1.3 s，后续约 290 ms"
+    tests: "run_all_tests.py 全绿；test_ocr_api 增加缓存与预热回归"
+```
+
+#### v1.30.4 变更点（相对 v1.30.3）——OCR 文字改成琥珀色、异常检测面板回到「区域」
+
+**症状一**：OCR 识别结果的文字标签是白色（`#f4f7fb`），叠在白底/浅底的文档、铭牌、
+标签图上直接糊成一片，用户看不出识别到了什么。
+**症状二**：v1.30.3 为了压体积，把 Anomalib 的 `mask_rgb`（原图 + 2px 红色描边）二值化成
+单通道白线。体积是降下来了，但面板从"红色异常区域"变成了"黑底白线轮廓"，用户反馈
+**区域比轮廓可靠**——判读时"这块区域异常"比"这条线异常"有用得多。
+
+**根因**：`mask_rgb` 是 `anomalib_post.hpp` 用 `drawContours(..., 2)` 画的**描边**，
+天然只有轮廓没有区域；而 v1.30.3 的红色判定是"偏红"（`R > G+30 && R > B+30`），
+铜/黄铜这类本身就偏红的工件（比如管口环形截面）会被整圈误判，
+于是黑底上出现一大圈白线——既不是区域，也不是真的异常位置。
+
+**改了什么**
+
+| 文件 | 旧 | 新 |
+| --- | --- | --- |
+| `backend/infer.py` | `_encode_mask_png()`：抠红色 → 二值白线 | `_region_from_map()` + `_encode_region_png()`：按 `normalized_map > 0.5` 出**填充区域** |
+| `backend/infer.py` | — | `ANOMALIB_REGION_THRESHOLD=0.5`（与 DLL 内部 mask 同口径）、`ANOMALIB_REGION_MAX_COVERAGE=0.6` |
+| `backend/onnx_fallback.py` | `norm >= pixel_threshold`（0~1 相对值和原始分数阈值混着比） | 先按 metadata 归一化到 0..1 再 `> 0.5`，与 DLL 口径一致；输出同为 RGBA |
+| `frontend/js/infer.js` | 直接把 `mask_png` 挂到窗口 | 把"透明底红区"半透明（0.45）叠到**本地原图**上再挂（`composeRegionOverlay`） |
+| `frontend/js/infer.js` / `viewer.js` | 窗口名「异常轮廓」 | 「异常区域」 |
+| `frontend/js/ocr.js` | 文字 `fill=#f4f7fb`（白） | `fill=#ffd54a`（琥珀）+ 深色描边 `paint-order: stroke` |
+| `backend/tools/test_onnx_fallback.py` | 只验 mask 是 PNG | 新增 4 项：RGBA 四通道 / 覆盖率 ≤ 上限 / 区域是填充色块 / 区域外全透明 |
+
+**为什么区域由 `normalized_map` 算、而不是继续抠红色**：`normalized_map > 0.5` 等价于
+「原始 anomaly map 超过 `pixel_threshold`」，这正是 `anomalib_post.hpp` 里 mask 的判定口径，
+用户在前端覆盖像素阈值时它跟着变；而且**与工件颜色无关**，铜/黄铜不会再被整圈误判。
+
+**阈值标定失效时怎么办**：跨数据集套模型时，模型可能把整张图都判成异常
+（实测 `web_smoke2` 的覆盖率 0.958），这时"全图红"没有定位价值。
+覆盖率超过 60% 时改为只标最热的一段（按 map 分位数取），保证面板里总能看出异常集中在哪。
+
+**为什么用 RGBA 而不是后端合成 JPEG**：后端手里没有原图像素（v1.30.3 起不回传），
+再编一张"原图 + 红区"的 JPEG 约 800 KB；而"透明底红区"的 RGBA PNG 只有 20~45 KB，
+前端用已有的 `URL.createObjectURL` 原图合成，本地完成、零传输。
+
+**验证（2026-11-09，本机）**
+
+| 场景 | 结果 |
+| --- | --- |
+| bottle 异常图（EfficientAd / Padim / Patchcore） | 区域覆盖率 1.0% / 0.7% / 1.5%，填充色块、区域外全透明 |
+| PCB 3034×1586（`web_smoke2`，跨数据集饱和度 95.8%） | 触发热区兜底后覆盖 60%，RGBA PNG 43.9 KB |
+| `test_onnx_fallback.py` | 64 项全绿（原 52 项 + 新增 12 项区域断言） |
+| `test_infer_worker.py` | 26 项全绿（含 Anomalib 隔离/直通一致性） |
+| 前端 6 个 `tests/*.mjs` | 全部通过 |
+
+```yaml
+version_diff:
+  component: 6-web
+  from: "1.30.3"
+  to: "1.30.4"
+  old:
+    - OCR 文字标签 fill=#f4f7fb（白），浅底图上不可读
+    - mask_png 是"抠红色 + 二值化"的白线轮廓（黑底白线）
+    - 红色判定是"偏红"，铜/黄铜工件会被整圈误判成异常
+    - onnx 降级路径拿 0~1 相对值比 pixel_threshold（原始分数阈值）
+    - 窗口名"异常轮廓"
+  new:
+    - OCR 文字改琥珀色 + 深色描边（paint-order=stroke），任何底色都可读
+    - mask_png 改 RGBA 异常区域：异常处不透明纯红，其余透明
+    - 区域判定走 normalized_map > 0.5（与 DLL 内部 mask 同口径），与工件颜色无关
+    - 覆盖率超过 60% 时退回"只标最热一段"，避免阈值标定失效时全图通红
+    - 前端把红区半透明叠到本地原图上显示（0.45 透明度）
+    - onnx 降级路径改成先按 metadata 归一化再判 0.5，与 DLL 一致
+    - 窗口名改"异常区域"
+  unchanged:
+    - 响应字段名（仍是 mask_png）、overlay_jpg / heatmap_png 的体积策略
+    - DLL 本体与 C API、分数与判定
+    - YOLO / OCR 的计算链路
+  verify:
+    region_coverage: "bottle 异常图 0.7%~1.5%；跨数据集饱和样本触发兜底 60%"
+    payload: "RGBA PNG 20~45 KB（v1.30.2 的 mask 是 7.1 MB）"
+    tests: "test_onnx_fallback 64 项、test_infer_worker 26 项、前端 6 套全绿"
+```
+
+#### v1.30.5 变更点（相对 v1.30.4）——把「服务端」再拆开，OCR 不再背"传输慢"的锅
+
+**用户提问**：OCR 推理的往返还是很高（215 ms），为什么目标检测和异常检测都好了？
+
+**测量结论**（本机，改之前）：
+
+`00006737.jpg` 1792×528、75 行文本；Anomalib 用 3034×1586 的 PCB 图。
+
+| 任务 | 响应体 | 服务端 | 解码 | 进程往返 | 模型 | 响应组装 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| YOLO（PCB 3034×1586） | 1484 KB | 53.6 ms | 21.3 | 1.3 | 13.7 | 17.3 |
+| Anomalib（同一张 PCB） | 2504 KB | 246.0 ms | 21.7 | **154.7** | 64.4 | 5.2 |
+| OCR（75 行） | 15.5 KB | 3083 ms | 6.7 | 3.2 | **3070.6** | 2.5 |
+
+改之后（同样的图、同样的模型）：
+
+| 任务 | 响应体 | 服务端 | 解码 | 进程往返 | 模型 | 响应组装 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Anomalib | 2459 KB | **184.1 ms** | 22.6 | **87.2** | 68.6 | 5.7 |
+
+- 用户机器上 OCR 是 `服务端 214.9 ms` / `DLL 182.1 ms`，差额只有 33 ms：
+  OCR **没有可压缩的大图回传**（响应体 9.5 KB），v1.30.3 的「PNG→JPEG」对它一点收益都没有。
+  它的时间就是「检测 + 逐行识别」本身。
+- 顺着拆分还查出一段**假"传输"**：Anomalib 的 `进程往返 154.7 ms` 看着像管道，其实
+  **全是工作进程里在编结果图**——区域 PNG 112.7 ms、热能图 PNG 31.7 ms、叠加 JPEG 9.8 ms，
+  真正的 pipe + pickle 只有几毫秒。v1.30.5 把区域图按最长边 1024 回传（它本来就是
+  224×224 的 map 上采样出来的），这一段 112.7 → 18.1 ms、体积 44 → 11 KB；顺带把
+  大体量二进制改走共享内存回传（不再 pickle 过管道）。于是服务端 246 → 184 ms。
+
+**改了什么**
+
+| 文件 | 旧 | 新 |
+| --- | --- | --- |
+| `backend/app.py` | `timing` 只有 `server_ms` / `payload_bytes` | 新增 `decode_ms` / `ipc_ms` / `encode_ms`，四段与 `server_ms` 严格自洽 |
+| `backend/app.py` `_finish_infer` | `payload_bytes` 是"不含自身"的近似值，为此**序列化两次** | 只序列化一次，用占位替换回填真实长度；2.5 MB 响应省约 30 ms |
+| `backend/infer.py` | `_region_from_map` 放大到原图尺寸（3034×1586）再编 RGBA PNG | 新增 `ANOMALIB_REGION_MAX_SIDE=1024`，按最长边封顶；构图+编码 112.7 → 18.1 ms |
+| `backend/onnx_fallback.py` | 同上（降级路径各写一遍） | 同步 `REGION_MAX_SIDE=1024` |
+| `backend/infer_worker.py` / `inferproxy.py` | 结果图 bytes 随消息 pickle 过管道 | ≥64 KB 的二进制放共享内存（`_SharedOut` / `_unpack_blobs`），消息只带偏移 |
+| `frontend/js/infer.js` | 合成画布尺寸取"区域图"尺寸 | 取**原图**尺寸（区域图变小后仍按原图拉伸，清晰度不变） |
+| `frontend/js/infer.js` | 图例只有「服务端总计 / 含往返」 | 多一行「服务端拆解 ＝ 模型 ＋ 解码 ＋ 进程往返 ＋ 响应组装」 |
+| `frontend/index.html` + `infer.js` | 识别 batch 固定默认 6 | 默认值跟着设备走：**CPU 24 / GPU 6**（手改过的值不动），并加提示 |
+| `backend/tools/test_infer_timing.py` | — | 新增 15 项断言：`payload_bytes` 等于真实 body 长度、四段自洽、重复收尾不累加 |
+| `backend/tools/test_onnx_fallback.py` | 64 项 | 76 项：新增 9 项服务端计时断言、3 项「区域图最长边 ≤ 1024」 |
+
+**识别 batch 的实测（为什么 CPU 要放大、GPU 要缩小）**
+
+同一张 75 行图，交错重复 3~4 次取中位数：
+
+| 设备 | batch 6 | batch 16 | batch 24 | batch 32 | batch 48 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| CPU + MKLDNN | 3466 ms | 2998 ms | 2828 ms | 2947 ms | 3732 ms |
+| GPU 0 | **576 ms** | 621 ms | 612 | — | — |
+
+CPU 上 batch 24 比 6 快约 18%；GPU 上 6 已是最优，加大反而慢（padding 浪费算力）。
+之前"GPU 上 16 更快"的结论来自单次测量，交错重复后被推翻，故不采用。
+
+```yaml
+version_diff:
+  component: 6-web
+  from: "1.30.4"
+  to: "1.30.5"
+  old:
+    - timing 只有 server_ms / payload_bytes，服务端内部无法继续下钻
+    - payload_bytes 是"不含自身"的近似值，靠再序列化一次换来的
+    - 图例看不出 OCR 的 215 ms 里模型占多少
+    - 识别 batch 默认 6（CPU 上偏小 18%，GPU 上恰好最优）
+    - 异常区域图按原图尺寸编 RGBA PNG（3034x1586 上 112.7 ms / 44 KB）
+    - 结果图二进制随消息 pickle 过管道
+  new:
+    - timing 新增 decode_ms / ipc_ms / encode_ms，与 server_ms 四段自洽
+    - payload_bytes 等于真实 body 长度（含自身），只序列化一次
+    - 图例新增"服务端拆解"一行
+    - 识别 batch 默认按设备取 CPU 24 / GPU 6，切换设备自动跟随（用户手改值不覆盖）
+    - 异常区域图按最长边 1024 回传，前端按原图尺寸拉伸合成（112.7 → 18.1 ms，44 → 11 KB）
+    - ≥64 KB 的结果图二进制改走共享内存回传（_SharedOut / _unpack_blobs）
+    - 新增 test_infer_timing.py（15 项），test_onnx_fallback 扩到 76 项
+  unchanged:
+    - 三种任务的响应字段名、DLL、模型精度与识别结果
+    - OCR raw_json（openspec web-ocr-inference 规定必须回传）
+    - 热能图仍是全尺寸 PNG（31.7 ms / 1020 KB，下一步可改 JPEG）
+  verify:
+    ocr_gpu: "75 行 1792×528：服务端 3083 ms = 解码 6.7 + 往返 3.2 + 模型 3070.6 + 组装 2.5"
+    ocr_cpu_batch24: "同图 CPU batch 24 比 6 快约 18%"
+    anomalib: "3034×1586：服务端 246.0 → 184.1 ms，进程往返 154.7 → 87.2 ms，区域图 44 → 11 KB"
+    payload_bytes: "与 http 响应体字节数逐字节一致（新增断言）"
+    first_request: "服务重启后第一次 OCR：往返段 881 ms（建 Paddle 句柄），第二次回落到 4 ms"
+    tests: "后端 44 个脚本全绿（test_onnx_fallback 76 项、test_infer_timing 15 项）；前端 6 套全绿"
+```
+
+#### v1.31.0 变更点（相对 v1.30.6）——上层并行：推理进程池
+
+**用户提问**：接着做上层并行，你要怎么修改打算？
+
+**改之前为什么是串行的（三层，缺一层都不行）**
+
+| 层 | 位置 | 现状 | 后果 |
+| --- | --- | --- | --- |
+| Web 路由 | `app.py` `infer_yolo` 等 | 同步 `def`，由 FastAPI 线程池调度 | 这一层**本来就能并发**，不是瓶颈 |
+| 代理 | `inferproxy._Worker.call` | 发消息→等回复全程持 `RLock` | 所有推理请求排队 |
+| 子进程 | `infer_worker.main` | `accept()` 只接一个连接，单循环 | 天生单线程 |
+| DLL 调用 | `infer.py` 的 `_yolo_lock` | 句柄创建 + 推理 + 深拷贝全在一把全局锁 | 单进程内不可能并行 |
+
+关键前提：**一个 DLL 句柄只能被一个线程用**（同句柄并发会让显存写乱），
+所以 `_yolo_lock` 不是多余的，它是在替「一句柄一线程」这条契约兜底。
+要并行只有两条路：**多句柄**或**多进程**。
+
+**为什么选多进程而不是子进程内线程池**
+
+| | 进程池（选定） | 子进程内线程池 |
+| --- | --- | --- |
+| 协议改动 | 零（每进程一条原有管道） | 要给每条消息加 `req_id` 做回包配对 |
+| 崩溃影响 | 只崩一个进程，其余继续服务 | 一张坏图崩掉全部在途请求 |
+| GIL | 无（独立解释器），解码/编码也真并行 | 有 |
+| 句柄安全 | 天然安全（进程隔离） | 靠「线程局部句柄」纪律，错一次无声出错 |
+| 风险 | 低（`_Worker` 基本不动，外面套一层池） | 高（重写主循环 + 全套测试） |
+
+**改了什么**
+
+| 文件 | 旧 | 新 |
+| --- | --- | --- |
+| `backend/inferproxy.py` | 单个 `_Worker` 单例，`call` 全程持锁 | 新增 `_Pool`：空闲进程令牌队列，取一个用一次再放回；新增 `_Worker.index` / `on_crash` / 每进程独立日志 |
+| `backend/inferproxy.py` | 熔断只看一个进程 | **两层熔断**：单进程 60 s 崩 3 次只停它自己（与原行为一致）；全池 60 s 累计崩 6 次才全池熔断 |
+| `backend/inferproxy.py` | `run_yolo/anomalib/classify` 直连 `_worker` | 改为 `_pool.call`；`run_ocr` **固定走 0 号进程** |
+| `backend/inferproxy.py` | 无队列超时 | 进程都忙时按 `TRTFORGE_INFER_QUEUE_TIMEOUT`（默认 30 s）报 503，不再无限挂住 |
+| `backend/inferproxy.py` | `worker_state()` 只有单进程字段 | 顶层字段仍是 0 号进程（逐字段兼容），新增 `pool_size` / `workers[]` / `pool_tripped` / `pool_error` |
+| `backend/tools/test_infer_pool.py` | — | 新增：进程数、并发分发、崩溃隔离、两层熔断、队列超时、OCR 钉 0 号、跨进程一致性、`--bench` 吞吐对比 |
+
+**三个刻意的取舍**
+
+1. **OCR 不进池**：`paddle_inference.dll` 加载后常驻约 1.7 GB，N 份就是 1.7 GB × N；
+   OCR 自身已是 Paddle 内部多线程，堆进程收益很小。固定 0 号还有个附带好处：
+   它首次加载要等最多 180 s，这期间其它进程照常做检测——**不会再出现「点了 OCR，检测也一起卡住」**。
+2. **0 号进程是主进程**：状态查询、缓存统计、手动重启、OCR 全固定走它，
+   所以单进程时代的接口字段、前端展示和 26 项既有测试一个字都不用改。
+3. **默认值按显存自动定，不拍脑袋**：≥6 GB 开 2，查不到显卡开 1；
+   显式设 `TRTFORGE_INFER_WORKERS` 则完全听环境变量。
+
+**实测一：推理路径本身（`test_infer_pool.py --bench`，直接调 `run_yolo`，不含上传/编解码）**
+
+| 进程数 | QPS | P95 | 相对单进程 |
+| --- | --- | --- | --- |
+| 1 | 88.65 | 139.8 ms | 1.00× |
+| 2 | 113.31 | **19.3 ms** | **1.28×（尾部延迟快 7.2×）** |
+| 4 | 115.61 | 48.7 ms | 1.30×（吞吐不再增长，P95 反而变差） |
+
+**实测二：端到端 HTTP（4 客户端并发，真实网页路径）—— 这张才是用户能感觉到的**
+
+| 场景 | 单发 | 1 进程 4 并发最慢 | 2 进程 4 并发最慢 | 结论 |
+| --- | ---: | ---: | ---: | --- |
+| YOLO 检测（3034×1586 PCB） | ~90 ms | ~200 ms | ~200 ms | **没有收益** |
+| YOLO 检测（缩放 1280） | ~44 ms | ~67 ms | ~67 ms | **没有收益** |
+| Anomalib PatchCore（同图） | ~209 ms | **~680 ms** | **~460 ms** | **约 1.45× 提升** |
+
+**为什么 YOLO 小图看不出收益**（这条比上面的数字更重要）：
+
+一次检测请求的 ~90 ms 里模型只占约 11 ms，其余是 Web 进程在做
+「解码 3034×1586 JPEG → 渲染标注图 → 编 JPEG → base64」。进程池只并行**模型那一段**，
+Web 进程的编解码完全没变，所以端到端看不出差别。Anomalib 相反：模型 + 后处理要 150~200 ms，
+占绝对多数，池化就能直接兑现。
+
+**结论**：吞吐收益与「推理在整条请求里占多大比例」成正比——YOLO 小图基本无感，
+anomalib / 大模型 / 大分辨率有 1.4~1.5×。两个任务都吃到的收益是**稳定性**（下面的两层熔断 + OCR 不阻塞）。
+
+另外一个代价要知道：**句柄缓存是每进程一份**，N 个进程 = 同一模型会被加载 N 次，
+所以换到新进程的第一次请求要付一次引擎反序列化（秒级）。
+
+**验证**
+
+- `tools/test_infer_pool.py` → **20 项全绿**（含「未设环境变量时按显存自动定进程数」）。
+- `tools/test_infer_worker.py` → **26 项全绿**，`WORKERS=1` 与 `WORKERS=2` 各跑一遍，用例一行未改。
+- 一致性：同一批 5 张 PCB 图，`WORKERS=1` 与 `WORKERS=2` 的框、置信度、类别**逐位一致**（共 15 框）。
+- 稳定性：杀进程池里任一个进程，其余进程继续服务，被杀进程自动拉起；
+  0 号熔断后请求只落到 1 号（日志留痕 `[inferproxy] 已熔断，暂时退出进程池`）。
+
+```yaml
+version_diff:
+  component: 6-web
+  from: "1.30.6"
+  to: "1.31.0"
+  old:
+    - 单个 infer_worker 进程，所有推理请求排一把 RLock，并发请求只能排队
+    - 任何一张坏图把工作进程打崩，在途请求全部 503
+    - OCR 首次加载最多 180 秒，这期间检测请求一起被堵住
+    - 句柄缓存全局仅 4 个槽，切换模型容易把热引擎踢掉
+    - yolo_infer 的私有 CUDA 流在串行调用下没有并发的对象可用
+  new:
+    - 新增 _Pool 进程池，请求分发到多个 infer_worker，各自独立句柄集与共享内存
+    - 两层熔断：单进程 3 次只停它自己；全池 6 次才全池熔断（status 报不可用→降级 onnxruntime）
+    - OCR 固定 0 号进程，不随池扩散；其加载期间其余进程照常服务
+    - 队列超时 TRTFORGE_INFER_QUEUE_TIMEOUT（默认 30 秒）→ 503，不再无限挂住
+    - TRTFORGE_INFER_WORKERS 默认按显存自动（≥6GB 开 2，否则 1），显式设置优先
+    - worker_state 新增 pool_size / workers[] / pool_tripped / pool_error，顶层字段保持兼容
+  unchanged:
+    - 所有推理路由、请求/响应字段、参数与判定口径
+    - 单进程时代的 26 项 infer_worker 测试与前端「重启推理进程」按钮
+    - TRTFORGE_INFER_ISOLATION=0 直通模式的行为
+  cost:
+    - 显存/内存随进程数增长（每进程一份引擎 + TRT 上下文）
+    - 每个进程各自加载模型，切到新进程的第一次请求要付一次引擎反序列化
+    - 日志拆成 infer_worker.log / infer_worker-2.log / ...
+  verify:
+    pool_tests: "20/20 通过（含自动定进程数、并发分发、崩溃隔离、两层熔断、队列超时）"
+    legacy_tests: "26/26 通过（WORKERS=1 与 WORKERS=2 各一遍）"
+    consistency: "WORKERS=1 与 2 的框逐位一致（5 张图，15 框）"
+    bench: "T1000 8GB、4 客户端：1→88.65 QPS/P95 139.8ms；2→113.31/19.3ms；4→115.61/48.7ms"
+    end_to_end: "HTTP 4 并发：YOLO 3034×1586 约 200ms（1 与 2 进程相同，瓶颈在 Web 进程编解码）；anomalib 约 680→460ms（1.45×）"
+```
+
+#### v1.30.6 变更点（相对 v1.30.5）——补齐最后一块：分类也能走 DLL
+
+**用户提问**：现在推理部分所有代码和算法是否都能通过 dll 调用？
+
+**盘点结论（改之前）**：
+
+| 任务 | 执行位置 | 是否走 DLL |
+| --- | --- | --- |
+| detect / segment / pose / obb（`.onnx`） | `onnx_infer.dll` | 是 |
+| detect / segment / pose / obb（`.engine`） | `yolo_infer.dll` | 是 |
+| anomalib 三模型（`.onnx`） | `onnx_infer.dll` | 是 |
+| anomalib 三模型（`.engine`） | `anomalib_infer.dll` | 是 |
+| OCR（检测 + 识别） | `ocr_infer.dll`（Paddle） | 是 |
+| **classify（`.onnx`）** | **Python `onnxruntime` 进程内** | **否 ← 唯一缺口** |
+
+分类是 v1.30.0 新加的任务，当时只接到了 Python `classifyinfer.run()`，
+既没有 CUDA provider 自动探测，也不在 `infer_worker` 的隔离进程里。
+
+**改了什么**
+
+| 文件 | 旧 | 新 |
+| --- | --- | --- |
+| `3-cpp-tensorrt/onnx_infer/include/onnx_infer_c.h` | `oi_task` 只有 0~3 | 追加 `OI_CLASSIFY = 4`、`oi_classify_result`、`oi_create_classify`、`oi_infer_classify` |
+| `onnx_infer/src/classify_onnx.{hpp,cpp}` | — | 新增：短边等比缩放 + 中心裁剪（`py_round` 偶数舍入）+ BGR→RGB + `/255` + NCHW |
+| `onnx_infer/src/onnx_infer_c.cpp` | `HandleKind` 三态 | `Classify` 分派、`oi_get_info` 返回 `task=4` 与类别数 |
+| `backend/infer.py` | 无分类绑定 | `OiClassifyResult` ctypes、`TASK_CLASSIFY=4`、`_onnx_classify_handles` 缓存、`classify_available()`、`run_classify()` |
+| `backend/infer_worker.py` / `inferproxy.py` | 只有 yolo / anomalib / ocr | 新增 `op == "classify"`，共享内存传 BGR、结果走同一条 pipe |
+| `backend/classifyinfer.py` | — | 新增 `parse_names()` / `result_from_raw()`，把 DLL 原始分数包装成和 `run()` 同构的结果 |
+| `backend/app.py` | 分类固定调 `classifyinfer.run()` | `inferproxy.run_classify()` 优先，失败降级并记录原因 |
+| `backend/tools/infer_batch.py` / `infer_video.py` | 分类固定走 Python | 同样 DLL 优先 |
+| `backend/tools/test_onnx_infer_dll.py` / `test_classify.py` | 无分类用例 | 新增 C ABI 与包装层用例（45 项全绿） |
+
+**一个刻意的取舍：DLL 不返回概率和结论**
+
+DLL 只回 `scores` 原始分数与 `names` 元数据原文，`top1` 只是 argmax；
+softmax、置信度门槛、类别名映射全部留在 `classifyinfer.interpret()`。
+
+原因：`interpret()` 已经有一句「输出看起来像概率就不再做 softmax」的兼容逻辑
+（Ultralytics 有些导出带 softmax 有些不带）。如果在 C++ 里再实现一份，
+同一个模型走 DLL 和走 Python 兜底会得出不同结论，而页面上完全看不出是哪边错了。
+分数是事实，解释只保留一份。
+
+**验证**
+
+- 预处理对齐：静态 batch / 动态 batch 探针模型共 16 例（含 1792×528 长图），
+  DLL 原始分数与 Python `classifyinfer.run()` 的最大绝对差 **0.0**（逐位一致）。
+- C ABI：`test_onnx_infer_dll.py` 分类用例通过，错误路径（空路径、非分类模型）返回码符合约定。
+- 包装层：`test_classify.py` 45 项全绿，含 `names` 解析（中文名 / 单引号 dict / 非 dict 原文）。
+- 后端全量：`run_all_tests.py` → **44 个脚本全绿**；`test_onnx_infer_dll.py` 46 项（含分类 11 项）。
+- 真机：`POST /api/infer/yolo`（`task=classify`）在 8094 / 8060 两个服务上都返回
+  `backend: "onnx_infer.dll"`，与 `classifyinfer.run()` 的 label 一致。
+
+```yaml
+version_diff:
+  component: 6-web
+  from: "1.30.5"
+  to: "1.30.6"
+  old:
+    - classify 用 Python onnxruntime 在当前进程内跑，绕过了 infer_worker 隔离
+    - 分类拿不到 CUDA execution provider，只能用 CPU
+    - 页面 backend 字段对分类永远显示 python，和 detect 的 onnx_infer.dll 不一致
+    - 批量/视频脚本的分类路径与网页端各写一份
+  new:
+    - onnx_infer.dll 新增 OI_CLASSIFY / oi_create_classify / oi_infer_classify / oi_classify_result
+    - classify 进 infer_worker（op=classify），享受进程隔离与 EP 自动探测
+    - DLL 只回原始分数 + names 元数据；softmax/门槛/中文名映射仍在 classifyinfer.interpret
+    - 单图 / 批量 / 视频三条分类路径统一 DLL 优先、Python 兜底，backend 字段显示 onnx_infer.dll
+    - onnx_infer 版本 1.0.0 → 1.1.0；abi 仅追加，旧调用方无需改动
+  unchanged:
+    - 分类的响应字段（label / confidence / scores / names）与判定口径
+    - 检测/分割/姿态/OBB/anomalib/OCR 的所有路径与参数
+    - 模型文件格式；分类仍只支持 .onnx（没有 TRT 分类引擎）
+  verify:
+    preprocessing: "16 例（静态 + 动态 batch，含 1792×528）原始分数最大绝对差 0.0"
+    tests: "全量 44 个脚本全绿；test_onnx_infer_dll 46 项（分类 11 项）；test_classify 45/45"
+    http: "POST /api/infer/yolo task=classify，8094/8060 均返回 backend=onnx_infer.dll"
+    fallback: "删掉 onnx_infer.dll 后分类仍可用，backend 回落 python 并记录降级原因"
+```
+
+#### v1.30.0 变更点（相对 v1.29.0）——YOLO 整图分类
+
+一张图只选一个类别（例如良品 / 不良），不画框。类别数量不限，良品和不良只是新建工程时的两个示例名字。
+
+**标注页**
+
+- 新建或打开工程时可以选择「分类」。工程文件里 `task` 是 `classify`。
+- 画框工具和预标注会藏起来。点右边的类别（或按 1、2、3）就给整张图打上这个类别，并跳到下一张还没标的图。Delete 清空。没标的图不导出。
+- 可以从类别文件夹导入（`良品/`，或 `train/良品/`）。检测用的 `labels/*.txt` 会被拒绝。
+- 导出只有类别文件夹。COCO 和 VOC 不可用。
+- 桌面版这一版不能打开分类工程，否则保存时会把任务改回检测。请用 Web 标注页。
+
+**数据集页**
+
+- 任务里多了分类。导出目录是 `train/类别名/图片.jpg`、`val/`、`test/`，并写出带 `task: classify` 的 `dataset.yaml`。
+- 划分按每个类别分开抽，比例加起来要是 100%。某个类别张数不够填满某一份时，那一份可以为空，结果里会说明。
+- 类别名里不能有 `\ / : * ? " < > |`，也不能叫 `.` 或 `..`。
+
+**训练和全流程**
+
+- 训练任务可选分类。切换模型简称时会改成 `yolov8n-cls.pt`，已经填好的真实路径不会被盖掉。
+- 加载后如果权重不是分类头，训练会停，并提示改用分类权重。
+- 数据集概览按类别数张数，不会把「没有 txt 标签」当成缺标注。
+- 分类验证给出 top-1 准确率和类别对类别的混淆矩阵，不是检测的 mAP。
+- 全流程会训练并导出 ONNX，然后停止。编译引擎和检测精度验证记为跳过，原因是「分类这一版不编译引擎，也不做检测精度验证」。页面在开始前有一句说明。
+
+**推理**
+
+- 任务选分类后，NMS 隐藏。置信度改成「低于这个分数就显示不确定」。
+- 单张图不画框，显示最高类别、分数、其余类别分数；低于阈值时显示「不确定」。
+- `.engine` / `.trt` / `.plan` 返回 400：「分类引擎还没做，请改用 ONNX。」
+- 模型输出的类别数必须和标签数一致，否则给出可读错误，不会当成检测框去解析。
+- 批量 CSV（UTF-8 BOM）列有：文件、类别名、分数、是否不确定。视频和摄像头每一帧只显示一个类别和分数。
+
+检测、分割、姿态、旋转框的画框、txt 导出、训练和画框推理不变。异常检测和 OCR 不变。
+
+```yaml
+version_diff:
+  component: 6-web
+  from: "1.29.0"
+  to: "1.30.0"
+  old:
+    - 没有整图分类。新建标注工程固定是检测，导出是 labels/*.txt
+    - 训练任务只有 detect / segment / pose / obb
+    - 推理只画框，分类权重和分类 ONNX 不能用
+  new:
+    - 标注页可新建分类工程，点类别给整张图打标，导出 train/类别名/图片
+    - 训练可选 classify，权重须是分类头，验证是准确率和混淆矩阵
+    - 全流程训练并导出 ONNX 后跳过引擎和检测验证
+    - 推理用 ONNX 给出整图类别；TensorRT 分类引擎这一版不做
+  unchanged:
+    - 检测 / 分割 / 姿态 / 旋转框的标注、训练、画框推理
+    - 异常检测、OCR、INT8、检测验证报告
+  note: 桌面版只拒绝打开分类工程，没有分类标注界面。
+```
+
 #### v1.29.0 变更点（相对 v1.28.0）——检测验证报告，以及 YOLO 的 INT8
 
 分类任务这次不做。
@@ -1593,7 +2207,7 @@ DLL 崩溃（例如访问违例 `0xC0000005`）会把整个 Web 服务带走。�
 
 **前端**：推理按钮旁新增 **「重启推理进程」**（平时隐藏，收到 503 / 504 时出现）；熔断时页面顶部问题列表出现「推理进程反复崩溃，已暂停」。
 
-**排障开关**：`TRTFORGE_INFER_ISOLATION=0` 关闭隔离（直通模式，行为与 v1.27.0 一致）；`TRTFORGE_TEST_HOOKS=1` 仅测试用。工作进程日志：`runtime/logs/infer_worker.log`。打包版通过 `TRTForgeWeb.exe --tool infer_worker` 启动工作进程。
+**排障开关**：`TRTFORGE_INFER_ISOLATION=0` 关闭隔离（直通模式，行为与 v1.27.0 一致）；`TRTFORGE_TEST_HOOKS=1` 仅测试用。工作进程日志：`runtime/logs/infer_worker.log`（**v1.31 起多进程时**另有 `infer_worker-2.log`、`infer_worker-3.log`，编号 = 进程序号 + 1；0 号进程日志名不变）。打包版通过 `TRTForgeWeb.exe --tool infer_worker` 启动工作进程。
 
 ```yaml
 version_diff:
@@ -2297,6 +2911,8 @@ offset1 = cursor - p_image * scale1
 | `TRTFORGE_OCR_MODEL_DIR` | **v1.27**：OCR 模型根目录。扫描两层子目录，含 `inference.yml` 的目录算一个模型 | `<仓库>/9-python-paddleOCR/model` |
 | `TRTFORGE_INFER_ISOLATION` | **v1.28**：推理进程隔离总开关；`0` = 直通模式（DLL 仍在 Web 进程加载，行为同 v1.27.0，排障用） | `1`（启用） |
 | `TRTFORGE_INFER_TIMEOUT` | **v1.28**：单次推理在工作进程内的最长等待秒数；超时返回 HTTP 504 并重启工作进程 | `60`（OCR 首次加载给 180 秒） |
+| `TRTFORGE_INFER_WORKERS` | **v1.31**：推理进程数，1~8。不设时按显存自动判断（≥6 GB 开 2，查不到显卡开 1）；设了就以它为准 | 自动（2 或 1） |
+| `TRTFORGE_INFER_QUEUE_TIMEOUT` | **v1.31**：所有推理进程都忙时，请求在队列里最多等几秒，超时返回 HTTP 503 | `30` |
 | `TRTFORGE_TEST_HOOKS` | **v1.28**：设为 `1` 启用测试钩子（仅自动化测试，生产勿开） | 未设 |
 
 ## 后端接口
@@ -2331,6 +2947,7 @@ offset1 = cursor - p_image * scale1
 | POST | `/api/infer/yolo` | YOLO 推理 |
 | POST | `/api/infer/anomalib` | Anomalib 推理 |
 | GET | `/api/ocr/models` | **v1.27**：扫描 OCR 模型目录，返回检测 / 识别 / 方向列表；不兼容项带原因 |
+| POST | `/api/ocr/warm` | **v1.30.3**：后台预热 OCR 句柄（32×32 空图跑一次）。幂等；`det_dir`/`rec_dir` 可省略，自动挑第一套可用模型 |
 | POST | `/api/infer/ocr` | **v1.27**：单张文字识别（multipart）。`backend` 为 `ocr_infer.dll` |
 | GET | `/api/infer/anomalib/metadata?path=` | **v1.21**：只读 `metadata.json`，返回推荐阈值 / 模型类型 / 输入尺寸 / 校准精度（不建引擎句柄） |
 | POST | `/api/infer/batch` | **v1.16**：目录批量推理（子进程），返回 `run_id`，进度与产物走 `WS /ws/runs/{id}` |
@@ -2490,7 +3107,7 @@ offset1 = cursor - p_image * scale1
 | `onnx` | Form str | 可空 | 只在引擎加载失败时用来提示「请用 `.transd.onnx`」 |
 | `labels` | Form str | 可空 | `labels_*.json` 路径，决定 `label_name` 与 `class_colors` |
 | `conf` / `nms` | Form float | 0.25 / 0.45 | 进入句柄缓存键，改了就重建句柄 |
-| `draw` | Form bool | true | 是否额外产出 `annotated_png`（仅用于导出） |
+| `draw` | Form bool | true | 是否额外产出 `annotated_jpg`（仅用于导出；v1.30.3 起是 JPEG） |
 
 `POST /api/infer/anomalib` 的额外字段：
 
@@ -2505,6 +3122,39 @@ offset1 = cursor - p_image * scale1
 > `ai_create` 的阈值是**原地写入**内部 `meta_`，所以 `ai_get_metadata` 返回的是覆盖后的值。
 > 想拿文件里的原值，必须自己读 `metadata.json`——`infer.read_metadata_thresholds()` 就是干这个的。
 > 响应里的 `thresholds.{image,pixel}` 同时给出 `effective`、`metadata`、`overridden` 三个字段。
+
+#### 推理响应的图片字段与耗时字段（**v1.30.3**）
+
+`POST /api/infer/yolo`、`/api/infer/anomalib`、`/api/infer/ocr` 的响应约定：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `annotated_jpg` | base64 str | YOLO 标注图，**JPEG**（v1.30.2 及以前叫 `annotated_png`，是 PNG） |
+| `annotated_mime` | str | 固定 `image/jpeg`，前端据此挂图 |
+| `overlay_jpg` | base64 str | Anomalib 叠加图，**JPEG q=90**（v1.30.2 及以前叫 `overlay_png`） |
+| `overlay_mime` | str | 固定 `image/jpeg` |
+| `mask_png` | base64 str | Anomalib 异常**区域**，**RGBA PNG**：异常处为不透明纯红 `(255,40,40)`，其余 alpha=0。前端半透明叠到本地原图上显示（v1.30.4 起；v1.30.3 是单通道白线轮廓） |
+| `heatmap_png` | base64 str | Anomalib 热能图，仍是 PNG（本身不大） |
+| `image_width` / `image_height` | int | 原图像素尺寸，前端画叠加层要用 |
+| `timing.preprocess_ms` / `inference_ms` / `postprocess_ms` | float | DLL 内核计时，只覆盖 C++ 侧 |
+| `timing.server_ms` | float | **v1.30.3 新增**：端点入口到响应就绪（含解码、画图、编图、base64、序列化） |
+| `timing.payload_bytes` | int | **v1.30.3 新增**：响应体字节数，用来判断「慢在模型还是慢在传图」。**v1.30.5 起等于 body 的真实长度（含本字段自身）** |
+| `timing.decode_ms` | float | **v1.30.5 新增**：读上传 + `cv2.imdecode` 的耗时（Web 进程内，任何任务都要付） |
+| `timing.ipc_ms` | float | **v1.30.5 新增**：工作进程往返里**除 DLL 之外**的部分——共享内存拷贝、管道、回包反序列化，**以及工作进程里编结果图的时间**。Anomalib 那 154.7 ms 里 112.7 ms 是编区域 PNG，不是管道慢 |
+| `timing.encode_ms` | float | **v1.30.5 新增**：响应组装 = `server_ms - decode_ms - ipc_ms - DLL`（base64 + JSON + 响应） |
+
+> `server_ms` 从 v1.30.5 起可以继续拆成四段且严格自洽：
+> `server_ms = decode_ms + ipc_ms + total_ms(DLL) + encode_ms`。
+> 这四个字段的意义：OCR 的「往返 215 ms」一直被误读成传输慢，拆开才看得出
+> 其中 182 ms 是模型本身（检测 + 逐行识别）、33 ms 才是 Python 侧。
+
+> **不再返回 `source_png`**（v1.30.3）：前端切图时已经用 `URL.createObjectURL` 显示本地原图，
+> 后端再编一张全尺寸 PNG 是纯重复。宽高仍然在 `image_width/height` 里返回。
+>
+> 「含往返」的拆法：前端用 `postFormTimed()` 量出 `waitMs`（上传 + 排队 + 服务端 + 首字节）
+> 与 `parseMs`（下载 + JSON 解析），配合 `timing.server_ms` 得到
+> `上传/排队 = waitMs - server_ms`、`服务端 = server_ms`、`下载/解析 = parseMs`，
+> 三段同时显示在耗时图例里，避免再把编图时间误读成模型慢。
 
 `POST /api/infer/batch` 的字段（**v1.16**，JSON body）：
 
@@ -2528,7 +3178,7 @@ offset1 = cursor - p_image * scale1
 | `textline_ori_dir` | str | 空 | **v1.27**，文本行方向目录，空则关闭 |
 | `device` | str | `cpu` | **v1.27**，`cpu` 或 `gpu:0` |
 | `enable_mkldnn` | bool | true | **v1.27**，仅 CPU |
-| `cpu_threads` / `rec_batch_size` | int | 8 / 6 | **v1.27** |
+| `cpu_threads` / `rec_batch_size` | int | 8 / 6 | **v1.27**；`rec_batch_size` 页面默认 v1.30.5 起按设备取 24（CPU）/ 6（GPU），见 §v1.30.5 |
 | `det_thresh` / `det_box_thresh` / `det_unclip_ratio` | float | 0.3 / 0.6 / 1.5 | **v1.27** |
 | `rec_score_thresh` | float | 0 | **v1.27**，低于此分数的行不返回 |
 
@@ -2650,7 +3300,8 @@ offset1 = cursor - p_image * scale1
 │       ├── compare_backends.py        **v1.26**：ONNX 与引擎结果级比对（框匹配 / IoU / 置信度 / 掩码 / 分数 / 判定，超阈值退出码 2）
 │       ├── compare_raw_tensors.py     **v1.26**：原始张量级比对（自动对齐转置 / 按名字配对 / 余弦相似度 / 二值一致率）
 │       ├── test_backend_consistency.py **v1.26**：一致性工具自身验收（匹配 / 判定 / 对齐 / 配对 / CSV 编码 + 可选实测分派）
-│       ├── test_onnx_infer_dll.py     **v1.26**：`onnx_infer.dll` C ABI 验收（错误路径 / 四任务 / 三模型 / provider / 耗时字段）
+│       ├── test_onnx_infer_dll.py     **v1.26 / v1.30.6**：`onnx_infer.dll` C ABI 验收（错误路径 / 四任务 / 三模型 / provider / 耗时字段 / **分类 DLL 与降级**）
+│       ├── test_infer_pool.py         **v1.31**：推理进程池验收（自动定进程数 / 并发分发 / 崩溃隔离 / 两层熔断 / 队列超时 / OCR 钉 0 号 / 跨进程一致性）
 │       ├── test_warmpool.py           **v1.25**：预热池验收（生命周期 / 单任务后退出 / 死进程回退冷启动 / 空闲回收 / `RunManager` 接管）
 │       ├── test_phase_events.py       **v1.25**：启动阶段事件验收（schema 字段 / 预热时钟重置 / 真进程 `warm_ready` 握手）
 │       ├── test_finetune_request.py   **v1.25**：微调验收（命令行拼装 / `--init-mode`·`--exist-ok` 透传 / 与续训互斥 / 兼容性检查 / `lr0` 兜底）
@@ -2715,6 +3366,9 @@ D:\Anaconda3\envs\dpenv\python.exe 6-web\backend\tools\test_exit_codes.py
 
 # 推理控制台（不需要服务、不需要 DLL，全部用假引擎桩）
 D:\Anaconda3\envs\dpenv\python.exe 6-web\backend\tools\test_infer_params.py
+
+# 推理进程池（会起真进程并加载 DLL；--bench 额外跑 1/2/4 进程的并发吞吐对比）
+D:\Anaconda3\envs\dpenv\python.exe 6-web\backend\tools\test_infer_pool.py --bench
 
 # 标注工程数据层（不需要服务、不需要 DLL）
 D:\Anaconda3\envs\dpenv\python.exe 6-web\backend\tools\test_annotation_project.py
@@ -2815,7 +3469,10 @@ anomalib       4.32s       5.37s         0.00s     4.32s
 | `test_augment_params.py` | 26 / 26 通过 |
 | `test_dataset_workbench.py` | 20 / 20 通过 |
 | `test_exit_codes.py` | 6 / 6 通过 |
-| `test_onnx_fallback.py` | 36 / 36 通过 |
+| `test_onnx_fallback.py` | **76 / 76 通过**（v1.30.4 加入 12 项异常区域断言；v1.30.5 加 9 项服务端计时 + 区域封顶断言） |
+| `test_infer_timing.py` | **15 / 15 通过**（v1.30.5 新增：payload_bytes 真实长度、四段自洽、重复收尾不累加） |
+| `test_classify.py` | **45 / 45 通过**（v1.30.6：DLL 结果包装、`names` 解析、分类任务分派与降级） |
+| `test_infer_pool.py` | **20 / 20 通过**（v1.31.0：自动定进程数、并发分发、崩溃隔离、两层熔断、队列超时、OCR 钉 0 号、跨进程一致性） |
 | `test_annotation_drafts.py` | **87 / 87 通过**（v1.23 建、v1.24 扩到 v2 审核块） |
 | `test_autolabel_batch.py` | **42 / 42 通过**（v1.23） |
 

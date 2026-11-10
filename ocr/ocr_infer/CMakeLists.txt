@@ -184,6 +184,9 @@ if(EXISTS "${PADDLE_LIB}")
         "${PADDLE_LIB}/paddle/lib/common.dll"
         "${PADDLE_LIB}/third_party/install/mkldnn/lib/mkldnn.dll"
         "${PADDLE_LIB}/third_party/install/mklml/lib/libiomp5md.dll"
+        # mklml.dll 必须和 ocr_infer.dll 同目录：飞桨用它自己的 LoadLibrary 找 MKL，
+        # 只搜 exe 目录和 PATH，找不到就报 error code 126（CPU/GPU 都起不来）。
+        "${PADDLE_LIB}/third_party/install/mklml/lib/mklml.dll"
     )
     foreach(_dep IN LISTS _OCR_RUNTIME_DEPS)
         if(EXISTS "${_dep}")

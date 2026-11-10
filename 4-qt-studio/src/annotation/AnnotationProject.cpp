@@ -175,6 +175,14 @@ bool AnnotationProject::load(const QString& path, QString* error)
     }
 
     QJsonObject root = doc.object();
+    const QString taskText = root.value("task").toString().trimmed().toLower();
+    if (taskText == QLatin1String("classify") || taskText == QLatin1String("classification")) {
+        if (error) {
+            *error = QStringLiteral(
+                "这是分类工程（整张图一个类别）。桌面版这一版不能打开，否则保存时会把任务改成检测。请用 Web 标注页打开。");
+        }
+        return false;
+    }
     version = root.value("version").toInt(CurrentVersion);
     task = taskFromString(root.value("task").toString());
     projectPath = path;

@@ -17,17 +17,19 @@
 #include <string>
 
 #include "anomalib_onnx.hpp"
+#include "classify_onnx.hpp"
 #include "ort_session.hpp"
 #include "yolo_onnx.hpp"
 
 namespace {
 
-enum class HandleKind { Yolo, Anomalib };
+enum class HandleKind { Yolo, Anomalib, Classify };
 
 struct Handle {
     HandleKind kind = HandleKind::Yolo;
     std::unique_ptr<oi::YoloOnnx> yolo;
     std::unique_ptr<oi::AnomalibOnnx> anomalib;
+    std::unique_ptr<oi::ClassifyOnnx> classify;
 };
 
 oi::YoloOnnx* as_yolo(oi_handle handle) {
@@ -40,6 +42,12 @@ oi::AnomalibOnnx* as_anomalib(oi_handle handle) {
     if (!handle) return nullptr;
     auto* impl = static_cast<Handle*>(handle);
     return impl->kind == HandleKind::Anomalib ? impl->anomalib.get() : nullptr;
+}
+
+oi::ClassifyOnnx* as_classify(oi_handle handle) {
+    if (!handle) return nullptr;
+    auto* impl = static_cast<Handle*>(handle);
+    return impl->kind == HandleKind::Classify ? impl->classify.get() : nullptr;
 }
 
 void copy_text(char* dst, size_t size, const std::string& text) {
@@ -207,6 +215,85 @@ int oi_infer_anomalib(oi_handle handle, const unsigned char* rgb, int width, int
     }
 }
 
+/*
+ * 创建分类句柄。
+ *
+ * 没有 conf 参数：阈值只影响"是否标记为不确定"，属于展示逻辑，
+ * 放在 Python 侧能让 DLL 路径与降级路径共用同一套判定。
+ */
+oi_handle oi_create_classify(const char* onnx_path_utf8) {
+    oi::set_last_error("");
+    try {
+        if (!onnx_path_utf8 || !*onnx_path_utf8) {
+            oi::set_last_error("ONNX 模型路径为空。");
+            return nullptr;
+        }
+
+        oi::Runtime& runtime = oi::Runtime::get();
+        if (!runtime.available()) {
+            oi::set_last_error("ONNX Runtime 不可用：" + runtime.error());
+            return nullptr;
+        }
+
+        const std::wstring path = oi::utf8_to_wide(onnx_path_utf8);
+        if (path.empty()) {
+            oi::set_last_error("ONNX 模型路径不是合法的 UTF-8 字符串。");
+            return nullptr;
+        }
+
+        auto handle = std::make_unique<Handle>();
+        handle->kind = HandleKind::Classify;
+        handle->classify = std::make_unique<oi::ClassifyOnnx>();
+
+        std::string err;
+        if (!handle->classify->open(path, err)) {
+            oi::set_last_error(err);
+            return nullptr;
+        }
+        return handle.release();
+    } catch (const std::exception& e) {
+        oi::set_last_error(std::string("创建分类句柄时发生异常：") + e.what());
+        return nullptr;
+    } catch (...) {
+        oi::set_last_error("创建分类句柄时发生未知异常。");
+        return nullptr;
+    }
+}
+
+int oi_infer_classify(oi_handle handle, const unsigned char* bgr, int width, int height, int stride,
+                      const oi_classify_result** out_result, oi_frame_stat* out_stat) {
+    if (out_result) *out_result = nullptr;
+    if (out_stat) std::memset(out_stat, 0, sizeof(*out_stat));
+
+    if (!out_result) {
+        oi::set_last_error("oi_infer_classify 的 out_result 不能为空。");
+        return OI_ERR_INVALID_ARGUMENT;
+    }
+
+    try {
+        oi::ClassifyOnnx* classify = as_classify(handle);
+        if (!classify) {
+            oi::set_last_error("句柄无效，或不是分类句柄。");
+            return OI_ERR_INVALID_ARGUMENT;
+        }
+
+        std::string err;
+        if (!classify->infer(bgr, width, height, stride, out_stat, err)) {
+            oi::set_last_error(err);
+            return OI_ERR_INFERENCE;
+        }
+
+        *out_result = classify->result();
+        return OI_OK;
+    } catch (const std::exception& e) {
+        oi::set_last_error(std::string("分类推理时发生异常：") + e.what());
+        return OI_ERR_INFERENCE;
+    } catch (...) {
+        oi::set_last_error("分类推理时发生未知异常。");
+        return OI_ERR_INFERENCE;
+    }
+}
+
 int oi_get_info(oi_handle handle, oi_info* out_info) {
     if (!out_info) {
         oi::set_last_error("oi_get_info 的 out_info 不能为空。");
@@ -238,6 +325,15 @@ int oi_get_info(oi_handle handle, oi_info* out_info) {
         out_info->num_classes = 0;
         out_info->num_keypoints = 0;
         copy_text(out_info->provider, sizeof(out_info->provider), impl->anomalib->provider());
+        return OI_OK;
+    }
+    if (impl->kind == HandleKind::Classify && impl->classify) {
+        out_info->task = OI_CLASSIFY;
+        out_info->input_w = impl->classify->input_w();
+        out_info->input_h = impl->classify->input_h();
+        out_info->num_classes = impl->classify->num_classes();
+        out_info->num_keypoints = 0;
+        copy_text(out_info->provider, sizeof(out_info->provider), impl->classify->provider());
         return OI_OK;
     }
 

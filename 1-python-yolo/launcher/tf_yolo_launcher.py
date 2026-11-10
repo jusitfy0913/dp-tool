@@ -23,7 +23,7 @@ from typing import Any, Dict, Iterable, List, Optional
 
 
 JSON_PREFIX = "TRTFORGE_JSON "
-SUPPORTED_TASKS = {"detect", "segment", "pose", "obb"}
+SUPPORTED_TASKS = {"detect", "segment", "pose", "obb", "classify"}
 SUPPORTED_MODES = {"check-env", "probe-model", "train", "val", "export", "warm"}
 PLOT_FILES = {
     "BoxF1_curve": ["BoxF1_curve.png", "F1_curve.png"],
@@ -197,6 +197,29 @@ def flatten_metrics(prefix: str, obj: Any) -> Dict[str, float]:
         if isinstance(value, (int, float)):
             result[f"{prefix}{key}"] = float(value)
     return result
+
+
+def _emit_classify_metrics(metrics_obj: Any) -> None:
+    """分类只报准确率和混淆矩阵，不把检测 mAP 当成结果。
+
+    训练结束（``model.train()`` 的返回值）和单独验证（``model.val()``）都走这里，
+    两者返回的对象不完全一样：验证返回带 ``top1`` 属性的指标对象，
+    训练有时返回 ``results_dict`` 字典。两种都要能取到值。
+    """
+    results = metrics_obj if isinstance(metrics_obj, dict) else getattr(metrics_obj, "results_dict", None)
+    top1 = to_float(getattr(metrics_obj, "top1", None))
+    if top1 is None and isinstance(results, dict):
+        for key in ("metrics/accuracy_top1", "accuracy_top1", "top1"):
+            if key in results:
+                top1 = to_float(results[key])
+                break
+    matrix = None
+    confusion = getattr(metrics_obj, "confusion_matrix", None)
+    raw = getattr(confusion, "matrix", None) if confusion is not None else None
+    if raw is not None and hasattr(raw, "tolist"):
+        matrix = raw.tolist()
+    emit({"type": "metric", "name": "accuracy_top1", "value": top1 if top1 is not None else 0.0, "step": 0})
+    emit({"type": "event", "name": "classify_val", "top1": top1, "confusion_matrix": matrix})
 
 
 def emit_metrics(metrics_obj: Any, step: int = 0) -> None:
@@ -406,6 +429,59 @@ def read_dataset_names(data_path: str) -> List[str]:
             return [item.strip().strip("'\"") for item in inline.group(1).split(",") if item.strip()]
         pairs = re.findall(r"^\s*(\d+)\s*:\s*['\"]?([^'\"\n]+)['\"]?\s*$", text, re.M)
         return [name.strip() for _, name in sorted(pairs, key=lambda pair: int(pair[0]))]
+
+
+def resolve_classify_data(data_path: str) -> str:
+    """把分类任务的 ``dataset.yaml`` 还原成它描述的目录。
+
+    Ultralytics 的分类路径（``BaseTrainer.get_dataset`` 与 ``BaseValidator.__call__``）
+    都直接调用 ``check_cls_dataset(data)``，而它只接受**目录**：
+    传 ``.yaml`` 会被当成 ``<datasets>/xxx.yaml``，后缀非空即抛
+    ``Classification datasets must be a directory (...) not a file``。
+    我们的 ``dataset.yaml`` 已经用 ``path/train/val/test`` 写了同样的目录结构，
+    所以这里把 yaml 解析成根目录再交给 Ultralytics；非 yaml 原样返回。
+
+    出错时抛 ``ValueError``，文案直接说明该改哪里，避免只看到
+    ``RuntimeError: Dataset '...' error`` 这种看不出原因的外层错误。
+    """
+    raw = str(data_path or "").strip()
+    if not raw:
+        return raw
+    path = Path(raw).expanduser()
+    if path.suffix.lower() not in {".yaml", ".yml"}:
+        return raw
+    try:
+        import yaml
+
+        doc = yaml.safe_load(path.read_text(encoding="utf-8", errors="replace")) or {}
+    except Exception as exc:  # noqa: BLE001
+        raise ValueError(f"分类数据集 yaml 读不了：{path}（{type(exc).__name__}: {exc}）") from exc
+    if not isinstance(doc, dict):
+        raise ValueError(f"分类数据集 yaml 格式不对，应是「键: 值」：{path}")
+
+    root = str(doc.get("path") or "").strip()
+    if root and root != ".":
+        candidate = Path(root).expanduser()
+        base = candidate if candidate.is_absolute() else (path.parent / candidate)
+    else:
+        base = path.parent
+    base = base.resolve()
+
+    train_value = doc.get("train") or "train"
+    if isinstance(train_value, (list, tuple)):
+        train_value = train_value[0] if train_value else "train"
+    train_name = str(train_value).strip().rstrip("/\\")
+    if train_name not in {"train", "."}:
+        raise ValueError(
+            f"分类数据集 yaml 里 train 写的是「{train_name}」，但分类要求 {base} 下有 train 目录"
+            "（每类一个子文件夹）。请把 train 改成 train，或改用 train/类别名/图片 的结构。"
+        )
+    if not (base / "train").is_dir():
+        raise ValueError(
+            f"分类数据集目录不完整：{base} 下没有 train 目录。"
+            "分类要求 train/类别名/图片.jpg，val 和 test 可选。"
+        )
+    return str(base)
 
 
 def safe_filename_part(value: str) -> str:
@@ -671,6 +747,7 @@ def default_model_for_task(task: str) -> str:
         "segment": "yolov8n-seg.pt",
         "pose": "yolov8n-pose.pt",
         "obb": "yolov8n-obb.pt",
+        "classify": "yolov8n-cls.pt",
     }.get(task, "yolov8n.pt")
 
 
@@ -694,7 +771,11 @@ def build_train_kwargs(args: argparse.Namespace) -> Dict[str, Any]:
         project_dir = str(Path(project_dir).resolve())
 
     kwargs: Dict[str, Any] = {
-        "data": args.data,
+        # 分类要走 check_cls_dataset，它只认目录；yaml 在这里换成目录，
+        # 否则训练启动就会抛「must be a directory ... not a file」。
+        "data": (
+            resolve_classify_data(args.data) if args.task == "classify" else args.data
+        ),
         "epochs": args.epochs,
         "imgsz": args.imgsz,
         "batch": parse_batch(args.batch),
@@ -916,6 +997,15 @@ def mode_train(args: argparse.Namespace) -> int:
     else:
         model_path = args.model or default_model_for_task(args.task)
     model = load_yolo(model_path)
+    model_task = str(getattr(model, "task", "") or "").strip()
+    if args.task == "classify" and model_task and model_task != "classify":
+        emit_error(
+            "UNSUPPORTED_TASK",
+            f"当前权重是{model_task}，分类训练要换分类权重，例如 yolov8n-cls.pt",
+            weights=model_path,
+            model_task=model_task,
+        )
+        return 2
     add_train_callbacks(model, args)
     # 微调：起点是自己训好的 best.pt，参数按表单走（优化器与轮次重置）。
     # 单独发一条事件而不是只打普通日志，Web 端才能把「这次接着谁的权重」显示成结构化信息。
@@ -932,10 +1022,32 @@ def mode_train(args: argparse.Namespace) -> int:
         )
         print(f"微调模式：从 {model_path} 继续训练（优化器与轮次重置）", flush=True)
     emit({"type": "event", "name": "launcher_train", "task": args.task, "model": model_path})
-    results = model.train(**build_train_kwargs(args))
+    if args.task == "classify" and int(args.imgsz or 0) > 320:
+        # 分类网络默认 224 训练；直接用 640 会慢一个量级且收益很小。
+        # 不强制改，只提醒一句，避免用户以为程序卡住。
+        emit(
+            {
+                "type": "warn",
+                "code": "CLASSIFY_IMGSZ_LARGE",
+                "message": f"分类常用 imgsz=224，当前 {args.imgsz} 会明显变慢且精度收益很小",
+            }
+        )
+    try:
+        train_kwargs = build_train_kwargs(args)
+    except ValueError as exc:
+        # classify 的 yaml 解析失败是用户配置问题，给专用错误码，
+        # 比落到最外层 UNHANDLED_EXCEPTION 更容易看懂。
+        emit_error("CLASSIFY_DATA_INVALID", str(exc), data=args.data)
+        return 2
+    results = model.train(**train_kwargs)
     save_dir = getattr(getattr(model, "trainer", None), "save_dir", None)
     emit_training_artifacts(save_dir)
-    emit_metrics(results, step=args.epochs)
+    if args.task == "classify":
+        # 分类没有 mAP，emit_metrics 只会把 loss 和速度当指标发出去，
+        # 训练页的「准确率」一栏永远是空的。这里改发 top-1 和混淆矩阵。
+        _emit_classify_metrics(results)
+    else:
+        emit_metrics(results, step=args.epochs)
     emit({"type": "event", "name": "finished", "exit": 0})
     return 0
 
@@ -950,24 +1062,47 @@ def mode_val(args: argparse.Namespace) -> int:
         emit_error("DATA_NOT_FOUND", "dataset.yaml 不存在或未选择", path=args.data)
         return 2
     model = load_yolo(weight)
-    kwargs = {
-        "data": optional_path(args.data),
-        "imgsz": args.imgsz,
-        "batch": parse_batch(args.batch),
-        "conf": args.conf,
-        "iou": args.iou,
-        "max_det": args.max_det,
-        "half": args.half,
-        "device": args.device,
-        "plots": args.plots,
-        "save_json": args.save_json,
-        "save_txt": args.save_txt,
-        "split": args.split,
-        "workers": args.workers,
-        "verbose": True,
-    }
+    if args.task == "classify":
+        try:
+            classify_data = resolve_classify_data(args.data) if args.data else None
+        except ValueError as exc:
+            emit_error("CLASSIFY_DATA_INVALID", str(exc), data=args.data)
+            return 2
+        # 分类验证只认这些参数：conf/iou/max_det 是检测后处理，save_json/save_txt
+        # 是检测结果落盘，传给分类验证要么被忽略，要么直接报参数不合法。
+        kwargs = {
+            "data": classify_data,
+            "imgsz": args.imgsz,
+            "batch": parse_batch(args.batch),
+            "half": args.half,
+            "device": args.device,
+            "plots": args.plots,
+            "split": args.split,
+            "workers": args.workers,
+            "verbose": True,
+        }
+    else:
+        kwargs = {
+            "data": optional_path(args.data),
+            "imgsz": args.imgsz,
+            "batch": parse_batch(args.batch),
+            "conf": args.conf,
+            "iou": args.iou,
+            "max_det": args.max_det,
+            "half": args.half,
+            "device": args.device,
+            "plots": args.plots,
+            "save_json": args.save_json,
+            "save_txt": args.save_txt,
+            "split": args.split,
+            "workers": args.workers,
+            "verbose": True,
+        }
     metrics = model.val(**{k: v for k, v in kwargs.items() if v is not None})
-    emit_metrics(metrics)
+    if args.task == "classify":
+        _emit_classify_metrics(metrics)
+    else:
+        emit_metrics(metrics)
     emit({"type": "event", "name": "finished", "exit": 0})
     return 0
 
@@ -1014,6 +1149,11 @@ def mode_export(args: argparse.Namespace) -> int:
         emit_error("EXPORT_FAILED", "ONNX 导出失败，未找到导出文件")
         return 1
     emit({"type": "artifact", "kind": "onnx", "path": onnx_path})
+    if args.task == "classify":
+        # 分类输出是类别分数，检测用的转置文件套上去会得到错误布局。
+        emit({"type": "event", "name": "transd_skipped", "reason": "分类这一版不生成 .transd.onnx"})
+        emit({"type": "event", "name": "finished", "exit": 0, "transd": False})
+        return 0
     if str_to_bool(args.make_transd):
         try:
             transd = make_transd_onnx(onnx_path, task)

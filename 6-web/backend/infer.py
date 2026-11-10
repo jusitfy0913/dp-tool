@@ -145,11 +145,31 @@ class OiInfo(ctypes.Structure):
     ]
 
 
+class OiClassifyResult(ctypes.Structure):
+    """对应 onnx_infer_c.h 的 oi_classify_result（v1.30.6 新增）。
+
+    `scores` 是模型原始输出，不是概率；`names_utf8` 是模型 metadata 里
+    `names` 的原文（可能是空指针）。两者都由句柄持有，必须在下一次推理前拷走。
+    """
+
+    _fields_ = [
+        ("num_classes", ctypes.c_int),
+        ("top1", ctypes.c_int),
+        ("top1_score", ctypes.c_float),
+        ("scores", ctypes.POINTER(ctypes.c_float)),
+        ("input_w", ctypes.c_int),
+        ("input_h", ctypes.c_int),
+        ("names_utf8", ctypes.c_char_p),
+    ]
+
+
 # 任务枚举，与 yi_task 一致
 TASK_DETECT = 0
 TASK_SEGMENT = 1
 TASK_POSE = 2
 TASK_OBB = 3
+# onnx_infer 独有：yolo_infer.dll 没有分类任务（见 onnx_infer_c.h 的 oi_task）。
+TASK_CLASSIFY = 4
 
 TASK_NAMES = {
     "detect": TASK_DETECT,
@@ -188,6 +208,9 @@ _onnx_lib: ctypes.WinDLL | None = None
 _load_error: str = ""
 _onnx_load_error: str = ""
 _onnx_provider: str = ""
+# onnx_infer.dll 是否带分类入口（v1.30.6 起才有）。旧 DLL 取不到符号时为 False，
+# 分类自动退回 classifyinfer 的 onnxruntime 路径。
+_onnx_classify_ok: bool = False
 _dll_handles: list = []
 
 
@@ -310,6 +333,28 @@ def _bind_onnx(lib: ctypes.WinDLL) -> None:
 
     lib.oi_get_info.restype = ctypes.c_int
     lib.oi_get_info.argtypes = [ctypes.c_void_p, ctypes.POINTER(OiInfo)]
+
+    # 分类入口是 v1.30.6 新加的。按存在性绑定，而不是直接访问：
+    # 现场的 bin 里可能还是旧 DLL，直接取属性会抛 AttributeError 把整个
+    # _bind_onnx 打断，连检测都用不了。取不到就退回 Python 分类路径。
+    global _onnx_classify_ok
+    create_classify = getattr(lib, "oi_create_classify", None)
+    infer_classify = getattr(lib, "oi_infer_classify", None)
+    if create_classify is not None and infer_classify is not None:
+        create_classify.restype = ctypes.c_void_p
+        create_classify.argtypes = [ctypes.c_char_p]
+
+        infer_classify.restype = ctypes.c_int
+        infer_classify.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_ubyte),
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.POINTER(ctypes.POINTER(OiClassifyResult)),
+            ctypes.POINTER(YiFrameStat),
+        ]
+        _onnx_classify_ok = True
 
     lib.oi_destroy.restype = None
     lib.oi_destroy.argtypes = [ctypes.c_void_p]
@@ -516,12 +561,117 @@ def _encode_png(image: np.ndarray) -> bytes:
     return buffer.tobytes()
 
 
+def _region_from_map(result: AiResult) -> np.ndarray | None:
+    """用 `normalized_map` 算出「填充的异常区域」单通道掩码（255=异常）。
+
+    先放大再判定（而不是先把 224x224 判成二值再放大）：
+        与 DLL 内部的 mask 口径一致，边界是平滑的阈值线，不会出现马赛克方块。
+    """
+    import cv2
+
+    if not result.normalized_map or result.map_w <= 0 or result.map_h <= 0:
+        return None
+
+    count = int(result.map_w) * int(result.map_h)
+    raw = ctypes.string_at(ctypes.cast(result.normalized_map, ctypes.c_void_p), count * 4)
+    values = np.frombuffer(raw, dtype=np.float32).reshape(int(result.map_h), int(result.map_w))
+
+    target_w = int(result.source_w) if result.source_w > 0 else int(result.map_w)
+    target_h = int(result.source_h) if result.source_h > 0 else int(result.map_h)
+    # 只按原图比例定尺寸还不够：区域本身是从低分辨率 map 上采样出来的，
+    # 放大到 3000+ 边长不增加任何信息，只增加构图与 PNG 编码时间（v1.30.5）。
+    scale = min(1.0, ANOMALIB_REGION_MAX_SIDE / float(max(target_w, target_h) or 1))
+    if scale < 1.0:
+        target_w = max(1, int(round(target_w * scale)))
+        target_h = max(1, int(round(target_h * scale)))
+    if (target_w, target_h) != (int(result.map_w), int(result.map_h)):
+        values = cv2.resize(
+            np.ascontiguousarray(values, dtype=np.float32),
+            (target_w, target_h),
+            interpolation=cv2.INTER_LINEAR,
+        )
+    region = (np.asarray(values) > ANOMALIB_REGION_THRESHOLD).astype(np.uint8) * 255
+    coverage = float((region > 0).mean())
+    if coverage > ANOMALIB_REGION_MAX_COVERAGE:
+        # 像素阈值标定失效的典型症状：模型对这张图几乎每个像素都判异常
+        # （跨数据集套用模型时很常见），此时"全图红"没有任何定位价值。
+        # 退回按热区取最热的一段，保证面板里总能看出"异常集中在哪"。
+        hot_cut = float(np.quantile(np.asarray(values, dtype=np.float32), 1.0 - ANOMALIB_REGION_MAX_COVERAGE))
+        hot_cut = max(ANOMALIB_REGION_THRESHOLD, hot_cut)
+        region = (np.asarray(values) > hot_cut).astype(np.uint8) * 255
+        if int(region.max(initial=0)) == 0:
+            # 大片像素同值（模型把整块都打成同一个最高分）时没有可分的高热区，
+            # 退回包含等值像素，至少把这整片异常标出来——这时"标多大"没有更优解。
+            region = (np.asarray(values) >= hot_cut).astype(np.uint8) * 255
+    return region if int(region.max(initial=0)) else None
+
+
+def _region_from_contour(mask_bgr: np.ndarray | None) -> np.ndarray | None:
+    """没有 `normalized_map` 时，退回从 DLL 的红色描边反推区域（把闭合轮廓填满）。
+
+    只做兜底：颜色判定会把铜/黄铜这类本身偏红的工件整圈误判成异常，
+    所以正常路径一律走 `_region_from_map`。
+    """
+    import cv2
+
+    if mask_bgr is None or mask_bgr.ndim != 3 or mask_bgr.shape[2] < 3:
+        return None
+
+    mask_bgr = np.ascontiguousarray(mask_bgr)
+    blue = mask_bgr[:, :, 0].astype(np.int16)
+    green = mask_bgr[:, :, 1].astype(np.int16)
+    red = mask_bgr[:, :, 2].astype(np.int16)
+    binary = ((red > 100) & (red > green + 30) & (red > blue + 30)).astype(np.uint8) * 255
+    if int(binary.max(initial=0)) == 0:
+        return None
+
+    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None
+    filled = np.zeros(binary.shape, np.uint8)
+    cv2.drawContours(filled, contours, -1, 255, thickness=-1)
+    return filled if int(filled.max(initial=0)) else None
+
+
+def _encode_region_png(result: AiResult, mask_bgr: np.ndarray | None = None) -> bytes | None:
+    """编码「异常区域」图：透明底 + 红色填充区域（RGBA PNG）。
+
+    为什么不再透传 DLL 的 `mask_rgb`：
+        那是「原图 + 2px 红色描边」的成品图，一是体积大（PNG 7.1 MB），
+        二是只有轮廓没有区域——用户判读时"这块区域异常"比"这条线异常"可靠得多。
+
+    为什么不继续靠抠红色求轮廓：
+        DLL 的描边判定是"偏红"，铜/黄铜这类工件本身偏红会被整圈误判，
+        结果就是黑底上一圈白线，既不是区域也不是真的异常位置。
+
+    为什么是 RGBA 而不是黑底红区：
+        前端手里已经有本地原图（object URL），把区域半透明叠在原图上才看得清
+        "异常在工件的哪个位置"。带 alpha 的 PNG 只有 20 KB 左右，
+        比后端再编一张"原图 + 红区"的 JPEG（约 800 KB）划算得多。
+    """
+    import cv2
+
+    region = _region_from_map(result)
+    if region is None:
+        region = _region_from_contour(mask_bgr)
+    if region is None:
+        return None
+
+    area = np.zeros((region.shape[0], region.shape[1], 4), np.uint8)
+    blue, green, red = ANOMALIB_REGION_BGR
+    area[region > 0] = (blue, green, red, 255)
+    ok, buffer = cv2.imencode(".png", area)
+    if not ok:
+        raise InferError("异常区域图编码失败")
+    return buffer.tobytes()
+
+
 def encode_image(image: np.ndarray, suffix: str = ".jpg", quality: int = 92) -> bytes:
     """按扩展名编码图片字节。
 
     批量推理默认要 JPEG：同样的 PCB 图，PNG 约 1.8MB、JPEG(q=92) 约 220KB，
     一次跑 5000 张时这个差别决定了「能不能一次性打包下载」。
-    单图接口仍然用 PNG——只有一张，无损更划算。
+    单图接口也用 JPEG——那张图只用于导出，查看时前端用的是原图 + SVG 叠加层。
     """
     import cv2
 
@@ -590,6 +740,9 @@ def _destroy_onnx(handle: ctypes.c_void_p) -> None:
 # 混在一个字典里会让「换了后缀却命中旧句柄」这种错误直接表现为推理结果不对。
 _onnx_yolo_handles = _HandleCache(HANDLE_CACHE_LIMIT, _destroy_onnx)
 _onnx_anom_handles = _HandleCache(HANDLE_CACHE_LIMIT, _destroy_onnx)
+# 分类句柄单独一份：同一个模型的检测与分类是两个不同的会话对象，
+# 混在一起会出现「换任务却命中旧句柄」——表现就是分类结果返回了一排框。
+_onnx_classify_handles = _HandleCache(HANDLE_CACHE_LIMIT, _destroy_onnx)
 
 
 def _remember_provider(handle: ctypes.c_void_p) -> None:
@@ -633,6 +786,44 @@ def _onnx_yolo_handle(
 
     _remember_provider(handle)
     _onnx_yolo_handles.put(key, handle)
+    return handle
+
+
+def classify_available() -> bool:
+    """onnx_infer.dll 是否带分类入口（v1.30.6+）。
+
+    单独成一个函数而不是让调用方读模块变量：以后若支持 TensorRT 分类，
+    判定条件会变，收在一处才不会漏改。
+    """
+    if not onnx_available():
+        return False
+    return bool(_onnx_classify_ok)
+
+
+def _onnx_classify_handle(onnx_path: str) -> ctypes.c_void_p:
+    """取（或创建）分类的 ONNX 句柄。
+
+    缓存键只要路径：分类句柄里没有阈值，conf 只在 Python 侧决定 uncertain。
+    """
+    key = (os.path.abspath(onnx_path),)
+    handle = _onnx_classify_handles.get(key)
+    if handle:
+        return handle
+
+    lib = _onnx_lib
+    if lib is None:
+        raise InferError(f"onnx_infer.dll 未加载：{_onnx_load_error or '未知原因'}")
+
+    model_file = Path(onnx_path)
+    if not model_file.is_file():
+        raise InferError(f"ONNX 模型不存在：{onnx_path}")
+
+    handle = lib.oi_create_classify(str(model_file).encode("utf-8"))
+    if not handle:
+        raise InferError(_onnx_error(lib, "oi_create_classify"))
+
+    _remember_provider(handle)
+    _onnx_classify_handles.put(key, handle)
     return handle
 
 
@@ -768,6 +959,63 @@ def run_yolo(
     }
 
 
+def run_classify(onnx_path: str, image: np.ndarray) -> dict:
+    """用 onnx_infer.dll 做一次整图分类，返回**原始分数**。
+
+    为什么不在 DLL 里算 softmax + top1 + uncertain：
+        那套判定在 `classifyinfer.interpret` 里已经有一份，而且降级路径必须用它。
+        在 C++ 再写一遍，两条路径就会在"输出已经是概率"和"输出是 logits"
+        这两种模型上给出不同结论，而页面上完全看不出是哪边错了。
+        所以 DLL 只回答"模型吐了哪些数"，解释权留在一处。
+    """
+    harness = _onnx_lib
+    if harness is None:
+        raise InferError(f"onnx_infer.dll 未加载：{_onnx_load_error or '未知原因'}")
+    if not _onnx_classify_ok:
+        raise InferError("当前 onnx_infer.dll 不支持分类（缺少 oi_create_classify）")
+
+    height, width = image.shape[:2]
+    stride = int(image.strides[0])
+    buffer = image.ctypes.data_as(ctypes.POINTER(ctypes.c_ubyte))
+
+    with _yolo_lock:
+        result_ptr = ctypes.POINTER(OiClassifyResult)()
+        stat = YiFrameStat()
+        handle = _onnx_classify_handle(onnx_path)
+        code = harness.oi_infer_classify(
+            handle, buffer, width, height, stride,
+            ctypes.byref(result_ptr), ctypes.byref(stat),
+        )
+        if code != 0:
+            raise InferError(_onnx_error(harness, "oi_infer_classify"))
+
+        result = result_ptr.contents
+        count = int(result.num_classes)
+        # 指针只在下一次推理前有效，当场拷成 Python 列表。
+        scores = [float(result.scores[i]) for i in range(count)] if count > 0 and result.scores else []
+        names_raw = result.names_utf8 or b""
+        names_text = names_raw.decode("utf-8", errors="replace") if names_raw else ""
+        timing = {
+            "preprocess_ms": float(stat.preprocess_ms),
+            "inference_ms": float(stat.inference_ms),
+            "postprocess_ms": float(stat.postprocess_ms),
+            "total_ms": float(stat.total_ms),
+        }
+
+    return {
+        "backend": "onnx_infer.dll",
+        "image_width": width,
+        "image_height": height,
+        "input_width": int(result.input_w),
+        "input_height": int(result.input_h),
+        "top1": int(result.top1),
+        "scores": scores,
+        # 模型 metadata 里 names 的原文；空串表示模型没写，交给调用方回退标签文件。
+        "names": names_text,
+        "timing": timing,
+    }
+
+
 def attach_labels(result: dict, classes: list[str] | None) -> dict:
     """给推理结果补上类别名与统一配色，返回同一个 dict。
 
@@ -874,6 +1122,31 @@ _anom_handles = _HandleCache(HANDLE_CACHE_LIMIT, _destroy_anom)
 
 # 默认色带：TURBO 的色差感知比 JET 均匀，异常强度的层次不会在黄绿段挤成一片。
 DEFAULT_COLORMAP = "TURBO"
+
+#: Anomalib 叠加图（overlay）的 JPEG 质量。这张图是「原图 + 热力叠加」，
+#: 只用于判读，q=90 在 3034x1586 上已经看不出压缩痕迹，体积却只有 PNG 的 1/7。
+ANOMALIB_JPEG_QUALITY = 90
+
+#: 异常区域判定的固定边界，口径与 DLL 内部一致
+#: （anomalib_post.hpp 里 mask = threshold(displayMap, 0.5, ...)）。
+#: normalized_map > 0.5 等价于「原始 anomaly map 超过 pixel_threshold」，
+#: 用户在前端覆盖像素阈值时，这个边界会跟着一起变，不需要另存一份阈值。
+ANOMALIB_REGION_THRESHOLD = 0.5
+
+#: 异常区域的示意图配色（BGR）：纯红，和热力图高亮、检出框同一色系。
+#: 区域以半透明形式叠到原图上（前端合成），因此这里只需要颜色本身。
+ANOMALIB_REGION_BGR = (40, 40, 255)
+
+#: 异常区域最多覆盖画面的比例。像素阈值标定失效（跨数据集套模型时常见）会让
+#: "异常像素"铺满整张图，此时改为只标最热的一段，保证面板里仍然看得出异常位置。
+ANOMALIB_REGION_MAX_COVERAGE = 0.6
+
+#: 异常区域图的最大边长（v1.30.5）。
+#: 区域是从 224x224 的 anomaly map 上采样出来的，回传原图尺寸（如 3034x1586）
+#: 只是把插值结果再存一遍：构图 45 ms + PNG 编码 19 ms + 44 KB。
+#: 限到 1024 后前端仍按原图尺寸拉伸显示（`composeRegionOverlay` 画布用原图大小），
+#: 肉眼无差别，而构图像素降到 1/9、体积降到 3~6 KB。
+ANOMALIB_REGION_MAX_SIDE = 1024
 _FALLBACK_COLORMAPS = ("TURBO", "JET", "INFERNO", "VIRIDIS")
 
 
@@ -1267,21 +1540,22 @@ def run_anomalib(
                 "postprocess_ms": float(stat.postprocess_ms),
                 "total_ms": float(stat.total_ms),
             },
-            "overlay_png": None,
+            "overlay_jpg": None,
+            "overlay_mime": None,
             "mask_png": None,
             "heatmap_png": None,
-            "source_png": None,
             "image_width": width,
             "image_height": height,
         }
 
-        # 叠加图 / 轮廓图 / 原图 / 热能图都是 DLL 持有的指针，
-        # 只在下一次推理前有效，所以必须在这里立刻拷贝成 PNG。
+        # 叠加图 / 异常区域图 / 原图 / 热能图都是 DLL 持有的指针，
+        # 只在下一次推理前有效，所以必须在这里立刻拷贝成图片字节。
+        #
+        # 为什么不回传原图（不要 source_png）：
+        # 前端切图时已经用 URL.createObjectURL 显示了本地原图，后端再编一张
+        # 3034x1586 的 PNG 要 155 ms、7.1 MB，纯属重复。
+        # 宽高仍然从 source_rgb 取，前端要靠它算叠加层坐标。
         if result.source_rgb and result.source_w > 0 and result.source_h > 0:
-            source = _pointer_to_array(
-                result.source_rgb, result.source_h, result.source_w, result.source_stride
-            )
-            payload["source_png"] = _encode_png(cv2.cvtColor(source, cv2.COLOR_RGB2BGR))
             payload["image_width"] = int(result.source_w)
             payload["image_height"] = int(result.source_h)
 
@@ -1289,13 +1563,23 @@ def run_anomalib(
             overlay = _pointer_to_array(
                 result.overlay_rgb, result.overlay_h, result.overlay_w, result.overlay_stride
             )
-            payload["overlay_png"] = _encode_png(cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR))
-
-        if want_overlay and result.mask_rgb and result.mask_w > 0 and result.mask_h > 0:
-            mask = _pointer_to_array(
-                result.mask_rgb, result.mask_h, result.mask_w, result.mask_stride
+            # JPEG 而不是 PNG：同一张图上 12 ms / 0.78 MB vs 155 ms / 5.8 MB，
+            # 这是结果图，允许有损。
+            payload["overlay_jpg"] = encode_image(
+                cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR), ".jpg", ANOMALIB_JPEG_QUALITY
             )
-            payload["mask_png"] = _encode_png(cv2.cvtColor(mask, cv2.COLOR_RGB2BGR))
+            payload["overlay_mime"] = "image/jpeg"
+
+        if want_overlay:
+            # 异常区域图优先由 normalized_map 判定（口径与 DLL 一致、不受工件颜色影响），
+            # mask_rgb 只在极端情况下作为兜底来源。
+            mask_bgr = None
+            if result.mask_rgb and result.mask_w > 0 and result.mask_h > 0:
+                mask_bgr = cv2.cvtColor(
+                    _pointer_to_array(result.mask_rgb, result.mask_h, result.mask_w, result.mask_stride),
+                    cv2.COLOR_RGB2BGR,
+                )
+            payload["mask_png"] = _encode_region_png(result, mask_bgr)
 
         colormap_name = DEFAULT_COLORMAP
         if want_heatmap:
@@ -1395,6 +1679,7 @@ def release_handles() -> None:
     with _yolo_lock:
         _yolo_handles.clear()
         _onnx_yolo_handles.clear()
+        _onnx_classify_handles.clear()
     with _anom_lock:
         _anom_handles.clear()
         _onnx_anom_handles.clear()
@@ -1408,8 +1693,10 @@ def cache_stats() -> dict:
         "anomalib": len(_anom_handles),
         "onnx_yolo": len(_onnx_yolo_handles),
         "onnx_anomalib": len(_onnx_anom_handles),
+        "onnx_classify": len(_onnx_classify_handles),
         "yolo_keys": [list(map(str, k)) for k in _yolo_handles.keys()],
         "anomalib_keys": [list(map(str, k)) for k in _anom_handles.keys()],
         "onnx_yolo_keys": [list(map(str, k)) for k in _onnx_yolo_handles.keys()],
         "onnx_anomalib_keys": [list(map(str, k)) for k in _onnx_anom_handles.keys()],
+        "onnx_classify_keys": [list(map(str, k)) for k in _onnx_classify_handles.keys()],
     }

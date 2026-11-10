@@ -409,8 +409,19 @@ endif()
 # PaddleOCR CPU/MKLDNN 运行时依赖。paddle_inference 目录会随 bin 一起打包，
 # 但 Windows 加载 mkldnn.dll 时不会自动搜索嵌套的 mklml/lib 目录，因此把
 # mklml.dll 与 libiomp5md.dll 同步放到 TRTForge.exe 同目录。
+# 飞桨用 LoadLibrary 按名字找 mklml.dll，只会看 exe 目录和 PATH，
+# 放同目录是最稳的做法；源码树没把飞桨包拷进 bin 时，回退到 ocr/ 下的完整包。
 set(_paddle_runtime_dlls_to_copy "")
-set(_paddle_runtime_root "${CMAKE_CURRENT_SOURCE_DIR}/bin/paddle_inference")
+set(_paddle_runtime_roots
+    "${CMAKE_CURRENT_SOURCE_DIR}/bin/paddle_inference"
+    "${TRTFORGE_REPO_ROOT}/ocr/ocr_infer/third_party/paddle_inference"
+)
+set(_paddle_runtime_root "")
+foreach(_cand IN LISTS _paddle_runtime_roots)
+    if(NOT _paddle_runtime_root AND EXISTS "${_cand}/third_party/install/mklml/lib/mklml.dll")
+        set(_paddle_runtime_root "${_cand}")
+    endif()
+endforeach()
 foreach(_n mklml.dll libiomp5md.dll)
     if(EXISTS "${_paddle_runtime_root}/third_party/install/mklml/lib/${_n}")
         list(APPEND _paddle_runtime_dlls_to_copy

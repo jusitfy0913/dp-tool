@@ -29,12 +29,14 @@ extern "C" {
 
 typedef void* oi_handle;
 
-/* 任务类型，与 yi_task 取值一致，便于适配层按同一张表分派。 */
+/* 任务类型。0~3 与 yi_task 取值一致，便于适配层按同一张表分派。
+ * OI_CLASSIFY 是 v1.1.0 追加的第五项：只在本 DLL 存在，yolo_infer.dll 没有对应任务。 */
 typedef enum {
-    OI_DETECT  = 0,
-    OI_SEGMENT = 1,
-    OI_POSE    = 2,
-    OI_OBB     = 3
+    OI_DETECT   = 0,
+    OI_SEGMENT  = 1,
+    OI_POSE     = 2,
+    OI_OBB      = 3,
+    OI_CLASSIFY = 4
 } oi_task;
 
 /* 返回码。0 表示成功，其余可用 oi_last_error() 取可读原因。 */
@@ -116,6 +118,34 @@ typedef struct {
 } oi_info;
 
 /*
+ * 分类结果（v1.1.0 新增）。
+ *
+ * scores 是模型输出的**原始分数**，不是概率：是否做 softmax、阈值多少、
+ * 怎么取 top-k 全部交给调用方。这样同一份"分数 → 类别"的判定逻辑只存在于
+ * 一处（Python 的 classifyinfer.interpret），DLL 路径与 onnxruntime 降级路径
+ * 不会因为两套归一化实现而在边界样本上给出不同结论。
+ *
+ * 指针由句柄持有，只在下一次 oi_infer_classify 或 oi_destroy 之前有效。
+ */
+typedef struct {
+    int   num_classes;   /* 类别数，等于 scores 的长度 */
+    int   top1;          /* 原始分数最大的下标 */
+    float top1_score;    /* 对应原始分数 */
+    const float* scores; /* num_classes 个 float32 原始分数 */
+    int   input_w;       /* 实际喂给网络的分辨率 */
+    int   input_h;
+    /*
+     * 模型 metadata 里的 `names` 原文（Ultralytics 写的是 Python dict 字面量，
+     * 例如 "{0: '良品', 1: '不良'}"）；老模型可能为空。
+     *
+     * 为什么把它传出来而不是只在 Python 侧用 onnxruntime 读：主路径不应该为了
+     * 读一行 metadata 而依赖 onnxruntime。调用方拿到后按自己的方言解析，
+     * 判决"以模型自带顺序为准"的逻辑仍然只有一份。
+     */
+    const char* names_utf8;
+} oi_classify_result;
+
+/*
  * 创建 YOLO ONNX 句柄。
  *
  * 参数：
@@ -174,6 +204,39 @@ OI_API int oi_infer_yolo(oi_handle h,
 OI_API int oi_infer_anomalib(oi_handle h,
                              const unsigned char* rgb, int width, int height, int stride,
                              const oi_anomaly_result** out_result,
+                             oi_frame_stat* out_stat);
+
+/*
+ * 创建分类 ONNX 句柄（v1.1.0 新增）。
+ *
+ * 参数：
+ * - onnx_path_utf8：Ultralytics 导出的分类 ONNX（`yolov8n-cls.onnx` 之类），UTF-8。
+ *
+ * 返回：
+ * - 成功返回非空句柄；失败返回 nullptr，用 oi_last_error() 取原因。
+ *
+ * 说明：
+ * - 输入必须是 4 维 NCHW、通道 3。batch 维是动态时自动固定成 1；
+ *   高宽是动态时按 224×224 处理（与 Python 侧 `_input_hw` 的默认值一致）。
+ * - 不接收置信度阈值：阈值只影响"是否标记为不确定"，属于调用方的展示逻辑。
+ */
+OI_API oi_handle oi_create_classify(const char* onnx_path_utf8);
+
+/*
+ * 分类推理。输入 BGR888（与 oi_infer_yolo 相同通道顺序）。
+ *
+ * 预处理与 Ultralytics 的 classify_transforms 对齐：
+ *   短边等比缩放到目标边长 → 中心裁剪 → BGR2RGB → ÷255 → NCHW。
+ * 非正方形输入时直接 resize 到目标尺寸，这一点与 Python 侧完全一致。
+ *
+ * 返回：
+ * - OI_OK 时 out_result 指向句柄内部结构，scores 指针同样由句柄持有。
+ * - 其余返回值表示失败，用 oi_last_error() 取原因。
+ * - out_stat 可为 nullptr。
+ */
+OI_API int oi_infer_classify(oi_handle h,
+                             const unsigned char* bgr, int width, int height, int stride,
+                             const oi_classify_result** out_result,
                              oi_frame_stat* out_stat);
 
 /* 读取句柄信息。out_info 必须非空。 */

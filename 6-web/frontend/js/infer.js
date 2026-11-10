@@ -1,7 +1,7 @@
 // 推理页：上传图片 → 调后端 → 展示结果。
 //
 // 数据流：
-//   后端返回 base64 图（原图 / 检出图 / 热能图 / 轮廓图）+ 结构化 boxes。
+//   后端返回 base64 图（原图 / 检出图 / 热能图 / 异常区域图）+ 结构化 boxes。
 //   图片直接挂到查看器；框由前端用 SVG 叠加层重绘，因此在任意倍率下都锐利。
 //
 // 关键设计：
@@ -11,7 +11,7 @@
 //     实时推理会让拖动滑块变成卡顿，而且每次都要重建引擎句柄。
 //   · 结果表、分布图、导出三者都从同一份 `lastResult` 生成，不会出现"导出的和看到的不一样"。
 
-import { anomalyMetadataInfo, getJSON, postForm, postJSON } from "./api.js";
+import { anomalyMetadataInfo, getJSON, postFormTimed, postJSON } from "./api.js";
 import {
   bindOcrPicks,
   buildOcrOverlay,
@@ -91,7 +91,7 @@ export function initInfer() {
     overlayOpacity: document.getElementById("anomOverlayOpacity"),
   };
 
-  // 四个窗口：原图 / 检出图 / 热能图 / 异常轮廓。
+  // 四个窗口：原图 / 检出图 / 热能图 / 异常区域。
   // 后两个默认关闭且标记为"暂无内容"——YOLO 模式下它们永远不会有图，
   // 一上来就占满一屏只会挤掉真正要看的东西。
   viewers = createViewerStrip({
@@ -101,7 +101,7 @@ export function initInfer() {
       { id: "source", title: "原图", enabled: true },
       { id: "result", title: "检出结果", enabled: true },
       { id: "heatmap", title: "热能图", enabled: false },
-      { id: "mask", title: "异常轮廓", enabled: false },
+      { id: "mask", title: "异常区域", enabled: false },
     ],
     emptyText: "全部窗口已关闭，点击上方开关重新显示",
   });
@@ -109,6 +109,8 @@ export function initInfer() {
   bindSliders();
   bindOcrPicks();
   dom.kind.addEventListener("change", syncKind);
+  document.getElementById("inferTask")?.addEventListener("change", syncClassifyInfer);
+  syncClassifyInfer();
   dom.form.addEventListener("submit", onSubmit);
   dom.btnWorkerRestart?.addEventListener("click", restartWorker);
   dom.file.addEventListener("change", onFileChange);
@@ -208,6 +210,26 @@ function bindSliders() {
   bindSlider("anomOverlayOpacity", "anomOverlayOpacityRange");
   bindSlider("ocrDetThresh", "ocrDetThreshRange");
   bindSlider("ocrBoxThresh", "ocrBoxThreshRange");
+  bindOcrBatchAuto();
+}
+
+/** 识别 batch 跟着设备走：CPU 24 / GPU 6。用户手改过的值不动。
+ *
+ * 实测（00006737.jpg，75 行，i7 + T1000，交错重复取中位数）：
+ * CPU 上 batch 6 → 3466 ms，24 → 2828 ms，32 → 2947 ms，48 → 3732 ms；
+ * GPU 上 batch 6 → 576 ms，16 → 621 ms。所以 CPU 要放大、GPU 反而要小。
+ */
+function bindOcrBatchAuto() {
+  const device = document.getElementById("ocrDevice");
+  const batch = document.getElementById("ocrBatch");
+  if (!device || !batch) return;
+  const AUTO = { cpu: 24, "gpu:0": 6 };
+  device.addEventListener("change", () => {
+    const previous = Object.values(AUTO).find((value) => String(value) !== String(AUTO[device.value]));
+    if (String(batch.value) !== String(previous)) return; // 用户自己设了别的数，尊重它
+    const next = AUTO[device.value];
+    if (next) batch.value = String(next);
+  });
 }
 
 /** "沿用 metadata 默认值"开关：关掉后才允许编辑两个阈值。 */
@@ -569,7 +591,7 @@ function syncKind() {
   document.getElementById("btnCopyOcr")?.classList.toggle("hidden", !isOcr);
   document.getElementById("btnExportTxt")?.classList.toggle("hidden", !isOcr);
   if (isYolo || isOcr) {
-    // YOLO 永远不产出热能图与轮廓图，直接标记为"无内容"并关掉，
+    // YOLO 永远不产出热能图与异常区域图，直接标记为"无内容"并关掉，
     // 免得用户点开一个永远空着的窗口
     viewers.setAvailable("heatmap", false);
     viewers.setAvailable("mask", false);
@@ -590,7 +612,7 @@ function onFileChange() {
   sourceObjectUrl = URL.createObjectURL(file);
 
   // 本地预览用 object URL，比等后端回传快得多；
-  // 推理完成后如果后端回了 source_png，会换成它（两者像素一致）
+  // 后端从 v1.30.3 起不再回传原图，所以这里就是最终显示的那一份。
   viewers.viewer("source").setImage(sourceObjectUrl);
   viewers.viewer("result").clear();
   viewers.viewer("heatmap").clear();
@@ -673,7 +695,9 @@ async function onSubmit(event) {
 
   const started = performance.now();
   try {
-    const result = await postForm(url, form);
+    // 用带分段的版本：waitMs = 上传+排队+服务端，parseMs = 下载+解析。
+    // 只有总时长的话，分不清是模型慢还是图太大，容易误判。
+    const { payload: result, waitMs, parseMs } = await postFormTimed(url, form);
     lastResult = result;
     lastKind = kind;
     lastParamKey = paramKey;
@@ -681,7 +705,11 @@ async function onSubmit(event) {
     // 不能只 hide：点按钮会让数字框失焦并触发一次 change，事件顺序不同就会把提示重新点亮，
     // 这里统一收敛到 markParamsDirty 里的同一套判断，结果与事件顺序无关。
     markParamsDirty();
-    renderResult(result, kind, performance.now() - started);
+    renderResult(result, kind, {
+      totalMs: performance.now() - started,
+      waitMs,
+      parseMs,
+    });
     setBadge("完成", "done");
   } catch (error) {
     setHint(error.message);
@@ -716,14 +744,45 @@ async function restartWorker() {
 // 结果渲染
 // ---------------------------------------------------------------------------
 
-function renderResult(result, kind, roundTripMs) {
-  if (result.warning) setMetric("降级提示", result.warning);
+function syncClassifyInfer() {
+  const classify = (document.getElementById("inferTask")?.value || "") === "classify";
+  document.querySelector('[data-param="nms"]')?.toggleAttribute("hidden", classify);
+  const confName = document.querySelector('[data-param="conf"] .param-name');
+  if (confName) confName.textContent = classify ? "低于这个分数就显示不确定" : "conf 置信度阈值";
+}
+
+function renderClassify(result) {
+  const verdict = result.classify || {};
+  if (sourceObjectUrl) viewers.viewer("result").setImage(sourceObjectUrl);
+  viewers.setAvailable("result", true);
+  viewers.setAvailable("heatmap", false);
+  viewers.setAvailable("mask", false);
+  setMetric("类别", verdict.uncertain ? `${verdict.label}（不确定）` : (verdict.label || "—"));
+  setMetric("分数", Number(verdict.score || 0).toFixed(3));
+  setMetric("后端", result.backend || "onnxruntime");
+  const lines = (verdict.scores || [])
+    .map((item) => `${item.name} ${Number(item.score).toFixed(3)}`)
+    .join(" ｜ ");
+  if (lines) setMetric("各类分数", lines);
+}
+
+function renderResult(result, kind, transfer) {
+  // 分类的提示不是「DLL 降级」，而是标签顺序之类的问题，别用错的标题吓人。
+  if (result.warning) setMetric(kind === "yolo" && result.classify ? "提示" : "降级提示", result.warning);
+
+  if (kind === "yolo" && result.classify) {
+    renderClassify(result);
+    renderTiming(result.timing, transfer);
+    dom.toolbar.classList.remove("hidden");
+    dom.detail.classList.add("hidden");
+    return;
+  }
 
   if (kind === "yolo") renderYolo(result);
   else if (kind === "ocr") renderOcr(result);
   else renderAnomalib(result);
 
-  renderTiming(result.timing, roundTripMs);
+  renderTiming(result.timing, transfer);
   dom.toolbar.classList.remove("hidden");
 
   if (kind === "yolo") {
@@ -747,9 +806,9 @@ function renderResult(result, kind, roundTripMs) {
 function renderYolo(result) {
   const boxes = result.boxes || [];
 
-  // 结果窗口显示"原图 + SVG 叠加层"，而不是后端烧录好框的 annotated_png。
+  // 结果窗口显示"原图 + SVG 叠加层"，而不是后端烧录好框的 annotated_jpg。
   // 原因：两份画框会叠在一起（双重描边、标签互相盖住），而且烧录图放大后必然模糊。
-  // annotated_png 仍然保留在 lastResult 里，只用于导出。
+  // annotated_jpg 仍然保留在 lastResult 里，只用于导出。
   if (sourceObjectUrl) {
     viewers.viewer("result").setImage(sourceObjectUrl);
   }
@@ -774,11 +833,12 @@ function renderYolo(result) {
 }
 
 function renderAnomalib(result) {
-  if (result.source_png) {
-    viewers.viewer("source").setImage(`data:image/png;base64,${result.source_png}`);
-  }
-  if (result.overlay_png) {
-    viewers.viewer("result").setImage(`data:image/png;base64,${result.overlay_png}`);
+  // 原图不回来后端了：切图时已经用本地 object URL 显示，这里保持不动即可。
+  // 叠加图是 JPEG（体积只有 PNG 的 1/7），用后端给的 mime 挂载。
+  if (result.overlay_jpg) {
+    viewers.viewer("result").setImage(
+      `data:${result.overlay_mime || "image/jpeg"};base64,${result.overlay_jpg}`,
+    );
     viewers.setAvailable("result", true);
   }
   if (result.heatmap_png) {
@@ -790,9 +850,22 @@ function renderAnomalib(result) {
     viewers.setAvailable("heatmap", false);
   }
   if (result.mask_png) {
-    viewers.viewer("mask").setImage(`data:image/png;base64,${result.mask_png}`);
+    const regionUrl = `data:image/png;base64,${result.mask_png}`;
     viewers.setAvailable("mask", true);
     viewers.setEnabled("mask", true);
+    // 后端只回"透明底 + 红色异常区域"的小图（~20 KB），原图用本地 object URL，
+    // 在浏览器里合成"原图 + 半透明红区"。既保住了工件上下文，又不用回传 800 KB 的合成图。
+    const baseUrl = sourceObjectUrl;
+    if (baseUrl) {
+      composeRegionOverlay(baseUrl, regionUrl)
+        .then((url) => {
+          if (baseUrl !== sourceObjectUrl) return; // 用户已经换图，丢掉过期结果
+          viewers.viewer("mask").setImage(url);
+        })
+        .catch(() => viewers.viewer("mask").setImage(regionUrl));
+    } else {
+      viewers.viewer("mask").setImage(regionUrl);
+    }
   } else {
     viewers.setAvailable("mask", false);
   }
@@ -831,6 +904,42 @@ function fmtThreshold(value) {
   return value === null || value === undefined ? "—" : Number(value).toFixed(4);
 }
 
+/** 载入一张图片（本地 object URL / data URL），onload 之后才能读 naturalWidth。 */
+function loadImageElement(src) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => resolve(img);
+    img.onerror = () => reject(new Error("区域图载入失败"));
+    img.src = src;
+  });
+}
+
+/** 把"透明底 + 红色区域"半透明叠到原图上，返回查看器可直接用的 data URL。
+ *
+ * 画布尺寸取**原图**而不是区域图：区域图从 v1.30.5 起按最长边 1024 回传
+ * （它本来就是从 224x224 的 map 上采样出来的，存全尺寸没意义），
+ * 这里拉伸回原图尺寸，预览清晰度和以前一致，但整体小了 9 倍以上。
+ */
+async function composeRegionOverlay(baseSrc, regionSrc) {
+  const [base, region] = await Promise.all([loadImageElement(baseSrc), loadImageElement(regionSrc)]);
+  const width = base.naturalWidth || base.width;
+  const height = base.naturalHeight || base.height;
+  if (!width || !height) throw new Error("原图为空");
+
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) throw new Error("画布不可用");
+
+  ctx.drawImage(base, 0, 0, width, height);
+  // 0.45 是"看得见区域、也看得见底下缺陷纹理"的折中；纯色填充会把细节盖死
+  ctx.globalAlpha = 0.45;
+  ctx.drawImage(region, 0, 0, width, height);
+  ctx.globalAlpha = 1;
+  return canvas.toDataURL("image/jpeg", 0.92);
+}
+
 /** 把像素阈值画到 0~1 色阶刻度上。 */
 function renderPixelThresholdLegend(threshold) {
   const legend = document.getElementById("anomLegend");
@@ -848,8 +957,8 @@ function renderPixelThresholdLegend(threshold) {
   legend.classList.remove("hidden");
 }
 
-/** 三级耗时分解条。 */
-function renderTiming(timing, roundTripMs) {
+/** 三级耗时分解条，外加「含往返」的三段拆解。 */
+function renderTiming(timing, transfer) {
   if (!timing) {
     dom.timing.classList.add("hidden");
     return;
@@ -884,18 +993,59 @@ function renderTiming(timing, roundTripMs) {
 
   const totalItem = document.createElement("div");
   totalItem.className = "timing-item timing-total";
-  totalItem.innerHTML = `合计 <b>${total.toFixed(2)} ms</b>`;
+  totalItem.innerHTML = `DLL 合计 <b>${total.toFixed(2)} ms</b>`;
   dom.timingLegend.appendChild(totalItem);
 
-  if (Number.isFinite(roundTripMs)) {
+  // 含往返 = 上传/排队 + 服务端 + 下载/解析。
+  // 这三段就是过去被误当成"模型慢"的部分：编图、base64、JSON、传输。
+  const serverMs = Number(timing.server_ms);
+  if (Number.isFinite(serverMs)) {
+    const serverItem = document.createElement("div");
+    serverItem.className = "timing-item";
+    serverItem.innerHTML = `<span class="timing-dot seg-post"></span>服务端总计 <b>${serverMs.toFixed(0)} ms</b>`;
+    dom.timingLegend.appendChild(serverItem);
+
+    // 「服务端」再往下拆：解码 / 工作进程往返 / 响应组装。
+    // OCR 的往返一直显得高，拆开才看得出 182 ms 是模型在算、33 ms 才是 Python。
+    const decode = Number(timing.decode_ms);
+    const ipc = Number(timing.ipc_ms);
+    const encode = Number(timing.encode_ms);
+    if ([decode, ipc, encode].some((value) => Number.isFinite(value))) {
+      const parts = [];
+      if (Number.isFinite(decode)) parts.push(`解码 ${decode.toFixed(0)}`);
+      if (Number.isFinite(ipc)) parts.push(`进程往返 ${ipc.toFixed(0)}`);
+      if (Number.isFinite(encode)) parts.push(`响应组装 ${encode.toFixed(0)}`);
+      const detail = document.createElement("div");
+      detail.className = "timing-item timing-net";
+      detail.innerHTML = `服务端拆解 ＝ 模型 <b>${(Number(timing.total_ms) || 0).toFixed(0)}</b>`
+        + ` ＋ ${parts.join(" ＋ ")} ms`;
+      dom.timingLegend.appendChild(detail);
+    }
+  }
+
+  if (transfer && Number.isFinite(transfer.totalMs)) {
+    const server = Number.isFinite(serverMs) ? serverMs : 0;
+    // waitMs 里含上传 + 排队 + 服务端计算 + 首字节，扣掉服务端就是网络与排队
+    const upload = Math.max(0, (Number(transfer.waitMs) || 0) - server);
+    const download = Number(transfer.parseMs) || 0;
+    const size = Number(timing.payload_bytes) || 0;
     const net = document.createElement("div");
     net.className = "timing-item timing-net";
-    // 往返耗时与后端计时之差 = 上传 + 编码 + 传输，用来解释"为什么感觉比 40ms 慢"
-    net.innerHTML = `含往返 <b>${roundTripMs.toFixed(0)} ms</b>`;
+    net.innerHTML = `含往返 <b>${transfer.totalMs.toFixed(0)} ms</b>`
+      + ` ＝ 上传/排队 ${upload.toFixed(0)}`
+      + ` ＋ 服务端 ${server.toFixed(0)}`
+      + ` ＋ 下载/解析 ${download.toFixed(0)} ms`
+      + (size ? `（响应体 ${formatPayloadSize(size)}）` : "");
     dom.timingLegend.appendChild(net);
   }
 
   dom.timing.classList.remove("hidden");
+}
+
+function formatPayloadSize(bytes) {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
 }
 
 // ---------------------------------------------------------------------------
@@ -1169,7 +1319,11 @@ function exportJson() {
     class_names: lastResult.class_names || [],
     boxes: lastResult.boxes || [],
     thresholds: lastResult.thresholds || null,
-    annotated_png: lastResult.annotated_png || null,
+    annotated_jpg: lastResult.annotated_jpg || null,
+    annotated_mime: lastResult.annotated_mime || null,
+    overlay_jpg: lastResult.overlay_jpg || null,
+    overlay_mime: lastResult.overlay_mime || null,
+    mask_png: lastResult.mask_png || null,
     heatmap_png: lastResult.heatmap_png || null,
   };
   download(`infer_${stamp()}.json`, JSON.stringify(payload, null, 2), "application/json");

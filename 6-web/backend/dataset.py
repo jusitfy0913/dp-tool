@@ -31,7 +31,7 @@ from pathlib import Path
 SALT = "_2026"
 IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".bmp", ".webp")
 SPLITS = ("train", "val", "test")
-TASKS = ("detect", "segment", "pose", "obb")
+TASKS = ("detect", "segment", "pose", "obb", "classify")
 # COCO 17 关键点的左右翻转配对，Ultralytics 导出 pose 时需要
 FLIP_IDX = [0, 2, 1, 4, 3, 6, 5, 8, 7, 10, 9, 12, 11, 14, 13, 16, 15]
 
@@ -87,6 +87,37 @@ def assign_splits(count: int, train: int, val: int) -> list[str]:
     return result
 
 
+def assign_splits_stratified(
+    labels: list[int | None], train: int, val: int
+) -> tuple[list[str], list[str]]:
+    """按类别分别划分，避免某一类被整组分进同一个子集。
+
+    返回 (每张图的 split, 说明)。某个类别张数太少、按比例分不出要求的子集时，
+    允许该子集为空，并在说明里写出来。
+    """
+    splits = ["test"] * len(labels)
+    notes: list[str] = []
+    groups: dict[int | None, list[int]] = {}
+    for index, label in enumerate(labels):
+        groups.setdefault(label, []).append(index)
+    test_ratio = 100 - train - val
+    for label, indexes in groups.items():
+        local = assign_splits(len(indexes), train, val)
+        for offset, split in zip(indexes, local):
+            splits[offset] = split
+        if label is None:
+            continue
+        got = {name: sum(1 for item in local if item == name) for name in SPLITS}
+        short = [
+            name
+            for name, ratio in (("train", train), ("val", val), ("test", test_ratio))
+            if ratio > 0 and got[name] == 0
+        ]
+        if short:
+            notes.append(f"类别 {label} 只有 {len(indexes)} 张，按当前比例分不出 {', '.join(short)}")
+    return splits, notes
+
+
 # ---------------------------------------------------------------------------
 # 数据模型
 # ---------------------------------------------------------------------------
@@ -108,6 +139,8 @@ class DatasetImage:
     height: int
     objects: list[DatasetObject] = field(default_factory=list)
     current_split: str = "train"
+    #: 分类任务的整图类别。None 表示还没标，导出时跳过。
+    label_id: int | None = None
 
 
 @dataclass
@@ -454,6 +487,8 @@ def load_tfanno(source: Path) -> DatasetProject:
         if split_name not in SPLITS:
             split_name = "train"
 
+        raw_label = item.get("class_id", None)
+        label_id = None if raw_label is None or raw_label == "" else int(raw_label)
         images.append(
             DatasetImage(
                 index=len(images),
@@ -463,6 +498,7 @@ def load_tfanno(source: Path) -> DatasetProject:
                 height=height,
                 objects=objects,
                 current_split=split_name,
+                label_id=label_id,
             )
         )
 
@@ -495,29 +531,44 @@ def split_counts(splits: list[str]) -> dict:
 
 def preview(project: DatasetProject, train: int, val: int, limit: int = 200) -> dict:
     """给前端预览用：不落盘，只算分配结果。"""
-    splits = assign_splits(len(project.images), train, val)
+    notes: list[str] = []
+    if project.task == "classify":
+        splits, notes = assign_splits_stratified([img.label_id for img in project.images], train, val)
+    else:
+        splits = assign_splits(len(project.images), train, val)
     counts = split_counts(splits)
     counts["total"] = len(project.images)
-    counts["empty"] = sum(1 for img in project.images if not img.objects)
+    if project.task == "classify":
+        counts["empty"] = sum(1 for img in project.images if img.label_id is None)
+    else:
+        counts["empty"] = sum(1 for img in project.images if not img.objects)
 
     class_counter = {item["id"]: 0 for item in project.classes}
-    for img in project.images:
-        for obj in img.objects:
-            class_counter[obj.class_id] = class_counter.get(obj.class_id, 0) + 1
+    if project.task == "classify":
+        for img in project.images:
+            if img.label_id is None:
+                continue
+            class_counter[img.label_id] = class_counter.get(img.label_id, 0) + 1
+    else:
+        for img in project.images:
+            for obj in img.objects:
+                class_counter[obj.class_id] = class_counter.get(obj.class_id, 0) + 1
 
     images = []
     for img, split in list(zip(project.images, splits))[:limit]:
-        images.append(
-            {
-                "index": img.index,
-                "rel": img.rel,
-                "width": img.width,
-                "height": img.height,
-                "objects": len(img.objects),
-                "current_split": img.current_split,
-                "split": split,
-            }
-        )
+        row = {
+            "index": img.index,
+            "rel": img.rel,
+            "width": img.width,
+            "height": img.height,
+            "objects": len(img.objects),
+            "current_split": img.current_split,
+            "split": split,
+        }
+        if project.task == "classify":
+            row["label"] = "未标注" if img.label_id is None else project.class_name(img.label_id)
+            row["objects"] = 0 if img.label_id is None else 1
+        images.append(row)
 
     return {
         "kind": project.kind,
@@ -528,7 +579,7 @@ def preview(project: DatasetProject, train: int, val: int, limit: int = 200) -> 
         "counts": counts,
         "images": images,
         "truncated": len(project.images) > limit,
-        "warnings": project.warnings,
+        "warnings": list(project.warnings) + notes,
     }
 
 
@@ -620,7 +671,59 @@ def _copy_image(src: Path, dst_dir: Path) -> Path:
 # ---------------------------------------------------------------------------
 # 导出：YOLO
 # ---------------------------------------------------------------------------
+def _class_dir_name(name: str) -> str:
+    """类别名直接当文件夹名。含路径分隔符时拒绝，避免写出数据源外面。"""
+    text = (name or "").strip()
+    if not text or text in {".", ".."} or any(ch in text for ch in '\\/:*?"<>|'):
+        raise DatasetError(f"类别名不能作为文件夹名：{name}")
+    return text
+
+
+def export_yolo_classify(project: DatasetProject, output: Path, splits: list[str], overwrite: bool) -> dict:
+    """导出 Ultralytics 分类目录：train/<类别名>/图片.jpg，不写 labels/*.txt。"""
+    _prepare_output(output, overwrite, project.source)
+    names = {int(item["id"]): _class_dir_name(str(item["name"])) for item in project.classes}
+    written: dict[str, int] = {name: 0 for name in SPLITS}
+    skipped: list[str] = []
+    for image, split in zip(project.images, splits):
+        if image.label_id is None:
+            skipped.append(f"未标注，已跳过：{image.path.name}")
+            continue
+        if image.label_id not in names:
+            skipped.append(f"类别 {image.label_id} 不在类别表里，已跳过：{image.path.name}")
+            continue
+        if not image.path.is_file():
+            skipped.append(f"图片不存在：{image.path}")
+            continue
+        folder = output / split / names[image.label_id]
+        folder.mkdir(parents=True, exist_ok=True)
+        _copy_image(image.path, folder)
+        written[split] += 1
+
+    yaml_lines = [
+        f"path: {output.as_posix()}",
+        "train: train",
+        "val: val",
+        "test: test",
+        "task: classify",
+        "names:",
+    ]
+    for item in project.classes:
+        yaml_lines.append(f"  {item['id']}: {names[int(item['id'])]}")
+    (output / "dataset.yaml").write_text("\n".join(yaml_lines) + "\n", encoding="utf-8")
+    return {
+        "format": "yolo",
+        "output": str(output),
+        "counts": written,
+        "skipped": skipped,
+        "skipped_unlabeled": sum(1 for line in skipped if line.startswith("未标注")),
+        "extra_files": ["dataset.yaml"],
+    }
+
+
 def export_yolo(project: DatasetProject, output: Path, splits: list[str], overwrite: bool) -> dict:
+    if project.task == "classify":
+        return export_yolo_classify(project, output, splits, overwrite)
     _prepare_output(output, overwrite, project.source)
     for name in SPLITS:
         (output / "images" / name).mkdir(parents=True, exist_ok=True)
@@ -670,6 +773,8 @@ def export_yolo(project: DatasetProject, output: Path, splits: list[str], overwr
 # 导出：COCO
 # ---------------------------------------------------------------------------
 def export_coco(project: DatasetProject, output: Path, splits: list[str], overwrite: bool) -> dict:
+    if project.task == "classify":
+        raise DatasetError("分类只导出类别文件夹，不支持 COCO")
     if project.task == "obb":
         raise DatasetError("标准 COCO 不支持旋转框，请改用 YOLO OBB 导出")
     _prepare_output(output, overwrite, project.source)
@@ -793,6 +898,8 @@ def _voc_xml(image: DatasetImage, objects: list[DatasetObject], project: Dataset
 
 
 def export_voc(project: DatasetProject, output: Path, splits: list[str], overwrite: bool) -> dict:
+    if project.task == "classify":
+        raise DatasetError("分类只导出类别文件夹，不支持 VOC")
     if project.task != "detect":
         raise DatasetError(
             f"VOC 只支持标准水平矩形检测，当前任务是 {project.task}。"
@@ -839,7 +946,11 @@ def run_export(
         raise DatasetError("请填写输出目录")
 
     project = load_project(source, task)
-    splits = assign_splits(len(project.images), train, val)
+    split_notes: list[str] = []
+    if project.task == "classify":
+        splits, split_notes = assign_splits_stratified([img.label_id for img in project.images], train, val)
+    else:
+        splits = assign_splits(len(project.images), train, val)
     target = Path(output).expanduser()
 
     if fmt == "yolo":
@@ -854,7 +965,7 @@ def run_export(
             "task": project.task,
             "source_kind": project.kind,
             "split_counts": split_counts(splits),
-            "warnings": project.warnings,
+            "warnings": list(project.warnings) + split_notes,
         }
     )
     # 比例向下取整后可能出现空集（例如 3 张图配 33% 的 train 会算成 0 张），

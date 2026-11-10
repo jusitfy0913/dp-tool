@@ -167,20 +167,50 @@ def test_anomalib() -> None:
             continue
         ok_fields = set(result) >= {
             "backend", "raw_score", "normalized_score", "is_anomaly",
-            "metadata", "timing", "overlay_png", "mask_png",
+            "metadata", "timing", "overlay_jpg", "overlay_mime", "mask_png",
+            "image_width", "image_height",
         }
         check(f"{name} 返回结构完整", ok_fields)
         check(
             f"{name} normalized_score 在 0~1（{result['normalized_score']:.4f}）",
             0.0 <= result["normalized_score"] <= 1.0,
         )
-        check(f"{name} 生成叠加图与掩码", bool(result["overlay_png"]) and bool(result["mask_png"]))
-        # 必须是原始 PNG 字节，而不是 base64 字符串（app.py 统一做编码）
+        check(f"{name} 生成叠加图与掩码", bool(result["overlay_jpg"]) and bool(result["mask_png"]))
+        # overlay 走 JPEG（体积换速度），mask 走单通道 PNG；都必须是原始字节，不是 base64
         check(
-            f"{name} overlay 为 PNG 字节（非 base64 字符串）",
-            isinstance(result["overlay_png"], (bytes, bytearray))
-            and bytes(result["overlay_png"][:8]) == b"\x89PNG\r\n\x1a\n",
+            f"{name} overlay 为 JPEG 字节（非 base64 字符串）",
+            isinstance(result["overlay_jpg"], (bytes, bytearray))
+            and bytes(result["overlay_jpg"][:2]) == b"\xff\xd8",
         )
+        check(
+            f"{name} overlay_mime 是 image/jpeg",
+            result["overlay_mime"] == "image/jpeg",
+        )
+        check(
+            f"{name} mask 为 PNG 字节",
+            isinstance(result["mask_png"], (bytes, bytearray))
+            and bytes(result["mask_png"][:8]) == b"\x89PNG\r\n\x1a\n",
+        )
+        # 掩码是"透明底 + 红色异常区域"：RGBA、区域纯红不透明、其余全透明，
+        # 前端拿它半透明叠到本地原图上，所以通道数/颜色都不能变
+        mask_img = cv2.imdecode(np.frombuffer(result["mask_png"], np.uint8), cv2.IMREAD_UNCHANGED)
+        check(f"{name} mask 为 RGBA 四通道", mask_img is not None and mask_img.shape[2] == 4,
+              "" if mask_img is None else str(mask_img.shape))
+        if mask_img is not None and mask_img.shape[2] == 4:
+            alpha = mask_img[:, :, 3]
+            marked = alpha > 0
+            coverage = float(marked.mean())
+            check(f"{name} 区域覆盖率 {coverage:.3f} 不超过上限 {F.REGION_MAX_COVERAGE}",
+                  coverage <= F.REGION_MAX_COVERAGE + 0.05)
+            check(f"{name} 区域是填充色块（不是描边）",
+                  float(marked.sum()) > 0 and mask_img[:, :, 2][marked].min() == 255)
+            check(f"{name} 区域外完全透明", int(alpha[~marked].max(initial=0)) == 0)
+            # v1.30.5：区域图按最长边封顶回传（它本来就是低分辨率 map 上采样出来的），
+            # 前端按原图尺寸拉伸显示，这条断言防止以后又把全尺寸 PNG 存一遍
+            check(f"{name} 区域图最长边不超过 {F.REGION_MAX_SIDE}",
+                  max(mask_img.shape[:2]) <= F.REGION_MAX_SIDE,
+                  str(mask_img.shape))
+        check(f"{name} 不再回传原图", "source_png" not in result)
 
     # .engine 必须明确拒绝
     fake_engine = BACKEND_DIR / "dummy.engine"
@@ -263,7 +293,23 @@ def test_api_fallback() -> None:
                 body = resp.json()
                 check("响应标注了降级后端", body.get("backend") == F.BACKEND_YOLO, str(body.get("backend")))
                 check("带 warning 说明降级原因", "降级" in str(body.get("warning", "")))
-                check("仍返回标注图", bool(body.get("annotated_png")))
+                check("标注图是 JPEG", bool(body.get("annotated_jpg")) and body.get("annotated_mime") == "image/jpeg")
+                check("不再返回 annotated_png", "annotated_png" not in body)
+                timing = body.get("timing") or {}
+                check("YOLO timing 带 server_ms", isinstance(timing.get("server_ms"), (int, float)))
+                check("YOLO timing 带 payload_bytes", (timing.get("payload_bytes") or 0) > 0)
+                # v1.30.5：服务端要能继续往下拆，且四段与 server_ms 自洽
+                check("YOLO timing 带 decode_ms", isinstance(timing.get("decode_ms"), (int, float)))
+                check("YOLO timing 带 ipc_ms", isinstance(timing.get("ipc_ms"), (int, float)))
+                check("YOLO timing 带 encode_ms", isinstance(timing.get("encode_ms"), (int, float)))
+                parts = (timing.get("decode_ms", 0) + timing.get("ipc_ms", 0)
+                         + timing.get("total_ms", 0) + timing.get("encode_ms", 0))
+                check("YOLO 四段之和等于 server_ms",
+                      abs(parts - timing.get("server_ms", 0)) < 0.5,
+                      f"{parts:.1f} vs {timing.get('server_ms')}")
+                check("payload_bytes 等于响应体真实长度",
+                      timing.get("payload_bytes") == len(resp.content),
+                      f"{timing.get('payload_bytes')} vs {len(resp.content)}")
 
             # 4b. 给 .engine 且同目录没有 .onnx —— 应 503 并说清怎么修
             fake_engine = BACKEND_DIR / "no_such_engine.engine"
@@ -297,7 +343,18 @@ def test_api_fallback() -> None:
                 if resp.status_code == 200:
                     body = resp.json()
                     check("Anomalib 标注降级后端", body.get("backend") == F.BACKEND_ANOMALIB)
-                    check("Anomalib 返回 base64 叠加图", isinstance(body.get("overlay_png"), str))
+                    check("Anomalib 返回 base64 叠加图", isinstance(body.get("overlay_jpg"), str))
+                    check("Anomalib 叠加图 MIME 为 jpeg", body.get("overlay_mime") == "image/jpeg")
+                    check("Anomalib 不再回传原图", "source_png" not in body)
+                    timing = body.get("timing") or {}
+                    check("Anomalib timing 带 server_ms", isinstance(timing.get("server_ms"), (int, float)))
+                    check("Anomalib timing 带 payload_bytes", (timing.get("payload_bytes") or 0) > 0)
+                    check("Anomalib timing 带 decode_ms", isinstance(timing.get("decode_ms"), (int, float)))
+                    check("Anomalib timing 带 ipc_ms", isinstance(timing.get("ipc_ms"), (int, float)))
+                    check("Anomalib timing 带 encode_ms", isinstance(timing.get("encode_ms"), (int, float)))
+                    check("Anomalib payload_bytes 等于响应体真实长度",
+                          timing.get("payload_bytes") == len(resp.content),
+                          f"{timing.get('payload_bytes')} vs {len(resp.content)}")
                     check("Anomalib 带 warning", "降级" in str(body.get("warning", "")))
             else:
                 print("  [SKIP] 没有 anomalib 模型")

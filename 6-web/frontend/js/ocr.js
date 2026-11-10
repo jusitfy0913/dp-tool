@@ -1,7 +1,7 @@
 // OCR 结果：多边形叠加、文本列表、复制与导出。
 // 推理本身在 ocr_infer.dll 里，这里只负责把返回的行画出来。
 
-import { getJSON } from "./api.js";
+import { getJSON, postJSON } from "./api.js";
 import { setOverlayHighlight } from "./overlay.js";
 
 const SVG_NS = "http://www.w3.org/2000/svg";
@@ -31,6 +31,11 @@ export async function loadOcrModels() {
   if (hint) {
     hint.textContent = `飞桨 ${version}。共 ${entries.length} 个模型，${bad} 个当前不可用。`;
   }
+  // 模型列表出来后顺手预热一次：oi_create 首次要 1.3 s（加载 1.7 GB 的
+  // paddle_inference.dll + 解析模型），这段时间不计入 DLL 的 timing，
+  // 不预热的话用户第一次点推理会莫名卡住。
+  // 失败不提示：预热只是优化，真正推理时该报的错还是会报。
+  postJSON("/api/ocr/warm", {}).catch(() => {});
 }
 
 function fillPick(selectId, inputId, entries, optional) {
@@ -99,8 +104,15 @@ export function buildOcrOverlay({ lines, width, height, showBoxes, showLabels, h
       const label = document.createElementNS(SVG_NS, "text");
       label.setAttribute("x", String(poly[0][0]));
       label.setAttribute("y", String(Math.max(12, poly[0][1] - 4)));
-      label.setAttribute("fill", "#f4f7fb");
+      // 不要白字：OCR 处理的图多是白底/浅底（文档、标签、铭牌），白字会直接糊成一片。
+      // 用琥珀色 + 深色描边（paint-order 把描边压在文字下面当"光晕"），任何底色都能读。
+      label.setAttribute("fill", "#ffd54a");
+      label.setAttribute("stroke", "#0b1016");
+      label.setAttribute("stroke-width", "3");
+      label.setAttribute("stroke-linejoin", "round");
+      label.setAttribute("paint-order", "stroke");
       label.setAttribute("font-size", "14");
+      label.setAttribute("font-weight", "600");
       label.textContent = `${index + 1} ${line.text || ""}`;
       group.appendChild(label);
     }

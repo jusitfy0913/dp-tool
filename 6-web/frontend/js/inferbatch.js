@@ -625,6 +625,19 @@ function drawOverlay(cam, result, width, height) {
   }
   overlayCtx.clearRect(0, 0, width, height);
 
+  if (result.classify) {
+    const verdict = result.classify;
+    const text = `${verdict.label || ""} ${Number(verdict.score || 0).toFixed(2)}${verdict.uncertain ? " 不确定" : ""}`;
+    const fontSize = Math.max(18, Math.round(Math.min(width, height) / 18));
+    overlayCtx.font = `700 ${fontSize}px "Segoe UI", sans-serif`;
+    const textWidth = overlayCtx.measureText(text).width;
+    overlayCtx.fillStyle = "rgba(12, 14, 18, 0.72)";
+    overlayCtx.fillRect(12, 12, textWidth + 20, fontSize + 16);
+    overlayCtx.fillStyle = "#ffffff";
+    overlayCtx.fillText(text, 22, 12 + fontSize);
+    return;
+  }
+
   const colors = result.class_colors || {};
   const thickness = Math.max(2, Math.round(Math.min(width, height) / 320));
   const showLabels = $("cameraDrawLabels")?.checked ?? true;
@@ -703,11 +716,14 @@ function updateCameraStat(cam, result, roundTripMs) {
   const timing = result.timing || {};
   const node = $("cameraStat");
   if (node) {
+    const classifyText = result.classify
+      ? `${result.classify.label} ${Number(result.classify.score || 0).toFixed(2)}`
+      : `检出 ${result.count}`;
     node.textContent =
-      `${fps.toFixed(1)} fps｜检出 ${result.count}｜推理 ${fmtMs(timing.inference_ms)}` +
+      `${fps.toFixed(1)} fps｜${classifyText}｜推理 ${fmtMs(timing.inference_ms)}` +
       `｜往返 ${fmtMs(roundTripMs)}｜累计 ${cam.frames} 帧`;
   }
-  badge(`摄像头运行中 · ${result.count} 个目标`, "run");
+  badge(result.classify ? `摄像头运行中 · ${result.classify.label}` : `摄像头运行中 · ${result.count} 个目标`, "run");
 }
 
 function stopCamera(message) {

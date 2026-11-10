@@ -10,7 +10,7 @@
    一张坏图必须记进 CSV 的 error 列并继续，不能整批退出。
 3. 摄像头接口回传整图：单图接口带 base64 标注图，摄像头若照抄，
    1080p 每帧 400KB、10fps 就是 4MB/s，页面会直接卡死。
-   这里断言 `/api/infer/frame` 的响应里**没有** annotated_png。
+   这里断言 `/api/infer/frame` 的响应里**没有** annotated_jpg / annotated_png。
 
 用法：
     python 6-web/backend/tools/test_infer_batch.py
@@ -341,7 +341,8 @@ def main() -> int:
         response = app.infer_frame(image=upload, engine=str(engine), task="detect", conf=0.25, nms=0.45, labels=str(labels))
         payload = json.loads(response.body)
         check("单帧接口返回框", payload.get("count") == 1, str(payload.get("count")))
-        check("单帧接口不回传标注图", "annotated_png" not in payload, str(list(payload.keys())))
+        check("单帧接口不回传标注图", "annotated_jpg" not in payload and "annotated_png" not in payload,
+              str(list(payload.keys())))
         check("单帧接口带配色", payload.get("class_colors", {}).get("0") == [34, 211, 238])
         check("单帧接口带耗时", payload.get("timing", {}).get("inference_ms") == 3.2)
 

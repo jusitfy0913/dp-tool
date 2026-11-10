@@ -16,6 +16,7 @@ import argparse
 import os
 import re
 import sys
+import threading
 from pathlib import Path
 
 import config
@@ -132,8 +133,54 @@ def _yml_path(directory: Path) -> Path | None:
 
 
 def inspect_dir(directory: Path, paddle_major: int | None) -> dict:
-    """检查一个模型目录，返回给下拉框和预检共用的条目。"""
+    """检查一个模型目录，返回给下拉框和预检共用的条目。
+
+    结果按「目录 + 关键文件 mtime + 飞桨主版本」缓存：识别的 inference.yml 里
+    `character_dict` 有 6000+ 条，解析一次约 50 ms，而 `/api/ocr/models`
+    和每次推理前的 preflight 都会调用它。缓存键带上 mtime，用户换了模型文件
+    时会自动失效，不需要重启服务。
+    """
     directory = directory.resolve()
+    key = (str(directory), paddle_major, _dir_stamp(directory))
+    with _INSPECT_LOCK:
+        cached = _INSPECT_CACHE.get(key)
+    if cached is not None:
+        return dict(cached)
+    entry = _inspect_dir_uncached(directory, paddle_major)
+    with _INSPECT_LOCK:
+        if len(_INSPECT_CACHE) >= _INSPECT_CACHE_LIMIT:
+            # 模型目录数量本来就是个位数，满了直接清空，不做 LRU 记账
+            _INSPECT_CACHE.clear()
+        _INSPECT_CACHE[key] = dict(entry)
+    return entry
+
+
+#: 参与缓存失效判断的文件。pdiparams 有几百 MB，取 mtime 不读内容，代价可以忽略。
+_STAMP_FILES = (
+    "inference.pdmodel",
+    "inference.json",
+    "inference.pdiparams",
+    "inference.yml",
+    "inference.yaml",
+)
+
+_INSPECT_CACHE: dict[tuple, dict] = {}
+_INSPECT_CACHE_LIMIT = 64
+_INSPECT_LOCK = threading.Lock()
+
+
+def _dir_stamp(directory: Path) -> tuple:
+    """取关键文件的 mtime；文件不存在记 None（新建/删除同样会改变元组）。"""
+    stamps = []
+    for name in _STAMP_FILES:
+        try:
+            stamps.append((directory / name).stat().st_mtime_ns)
+        except OSError:
+            stamps.append(None)
+    return tuple(stamps)
+
+
+def _inspect_dir_uncached(directory: Path, paddle_major: int | None) -> dict:
     yml = _yml_path(directory)
     fmt = model_format(directory)
     entry = {

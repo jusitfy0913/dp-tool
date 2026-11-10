@@ -85,12 +85,24 @@ oi_create -> oi_infer_file / oi_infer_bgr -> oi_destroy
 
 浏览器推理页不直接链接这个 DLL。`6-web/backend/ocr_infer.py` 用 ctypes 按 `ocr_infer_c.h` 声明 `oi_create`、`oi_infer_bgr`、`oi_destroy`，和 `onnx_infer.dll` 分开放，因为两边都有 `oi_` 前缀。
 
-加载是懒的：第一次文字识别请求才 `WinDLL`。Windows 上会把下面两个目录加进 `os.add_dll_directory`：
+加载是懒的：第一次文字识别请求才 `WinDLL`。Windows 上必须先准备两套搜索路径：
 
-- `4-qt-studio/bin`（`ocr_infer.dll`、`paddle_inference.dll`）
-- `ocr/ocr_infer/third_party/paddle_inference/third_party/install/mklml/lib`（`mklml.dll`）
+| 路径 | 加到哪里 | 为什么 |
+| --- | --- | --- |
+| `4-qt-studio/bin` | `os.add_dll_directory` + `PATH` | `ocr_infer.dll`、`paddle_inference.dll` 所在目录 |
+| `ocr/ocr_infer/third_party/paddle_inference/third_party/install/mklml/lib`（或安装包的 `bin`） | **必须同时进 `PATH`** | 飞桨 2.6.2 的 `dynamic_loader` 自己调 `LoadLibrary("mklml.dll")`，只认 PATH |
 
-少了第二个目录时，CPU 创建预测器会报 `mklml.dll` 错误码 126。安装包用 `package_web_user.ps1 -WithOcr` 时，会把 `mklml.dll` 拷进安装目录的 `bin`，并把 `version.txt` 写成 `bin/paddle_inference_version.txt`。
+**这里有个坑（v1.30.2 修）**：只 `add_dll_directory` 是不够的。`AddDllDirectory` 只对 `LoadLibraryEx(... LOAD_LIBRARY_SEARCH_USER_DIRS)` 生效，
+而飞桨内部用的是普通 `LoadLibrary`——实测只加 `add_dll_directory` 时 `oi_create` 直接报
+`PreconditionNotMetError: The third-party dynamic library (mklml.dll) ... (error code is 126)`，
+**CPU 和 GPU 都起不来**（MKL 是 CPU 算子依赖，`device=gpu:0` 也要先加载）。
+
+`6-web/backend/ocr_infer.py` 现在会把 `bin` 和 `mklml` 目录**同时** `add_dll_directory` 并前置到进程 `PATH`，
+顺序是「先加目录、再加载 DLL」。安装包用 `package_web_user.ps1 -WithOcr` 时会把 `mklml.dll` 拷进安装目录的 `bin`，
+并把 `version.txt` 写成 `bin/paddle_inference_version.txt`，那是双保险（`bin` 本来就在启动脚本的 PATH 里）。
+
+编译产物也要自带 `mklml.dll`：`ocr/ocr_infer/CMakeLists.txt` 的 POST_BUILD 会把它和 `libiomp5md.dll`
+一起拷到 `4-qt-studio/bin`，`TRTForge.exe` 因此不用改任何环境变量。
 
 `oi_result` 的指针在下一次推理或销毁后失效，Python 侧在返回前把文字、分数、角度和多边形都拷进普通字典。句柄最多缓存 2 个；正在推理的句柄不会被淘汰。
 
@@ -143,6 +155,33 @@ version_diff:
 ```
 
 官方 `ch_PP-OCRv4_*` 与 `ch_ppocr_mobile_v2.0_cls` 压缩包没有 `inference.yml`。Web 用 `6-web/backend/tools/gen_legacy_ocr_yml.py` 生成，已有文件默认不覆盖。方向模型的 yml 把输入写成宽 192、高 48，类别列表是 `0_degree` 与 `180_degree`。
+
+```yaml
+version_diff:
+  component: ocr_infer_runtime
+  old_version: "1.30.1"
+  new_version: "1.30.2"
+  symptom:
+    - "推理页点开始推理，CPU 和 GPU 都失败"
+    - "错误：PreconditionNotMetError: The third-party dynamic library (mklml.dll) ... (error code is 126)"
+    - "模型下拉正常，说明 ocr_infer.dll 本身加载成功，挂在 oi_create"
+  root_cause: "飞桨 2.6.2 的 dynamic_loader 用普通 LoadLibrary(\"mklml.dll\") 找 MKL；AddDllDirectory 只影响 LoadLibraryEx 的 USER_DIRS，对它无效"
+  old_behaviour:
+    - "6-web/backend/ocr_infer.py 只对 mklml/lib 调 os.add_dll_directory"
+    - "4-qt-studio/bin 里只有 libiomp5md.dll 和 mkldnn.dll，没有 mklml.dll"
+    - "ocr/ocr_infer/CMakeLists.txt 的 POST_BUILD 依赖清单漏了 mklml.dll"
+  new_behaviour:
+    - "ocr_infer.py 把 bin 与 mklml 目录同时 add_dll_directory 并前置到进程 PATH"
+    - "ocr/ocr_infer/CMakeLists.txt 的 POST_BUILD 复制 mklml.dll 到 TRTFORGE_BIN_DIR"
+    - "4-qt-studio/CMakeLists.txt 找 mklml 时兼容 bin/paddle_inference 与 ocr/ 下的完整飞桨包"
+    - "test_ocr_api.py 增加 3 项回归：能定位 mklml、mklml 目录在 PATH、bin 在 PATH"
+  verification_2026_11_09:
+    image: "ocr/PaddleOCR-main/docs/version2.x/ppocr/images/ch_ppocr_mobile_v2.0/00006737.jpg"
+    models: "9-python-paddleOCR/model/legacy_v4（ch_PP-OCRv4_det/rec）"
+    cpu_mkldnn: "75 行，4529 ms（页面）/ 5209 ms（接口首次）"
+    gpu0: "75 行，9446 ms（接口首次）"
+    tests: "test_ocr_api 13 项、test_ocr_infer_dll 10 项全绿"
+```
 
 ## 首版说明
 

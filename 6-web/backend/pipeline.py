@@ -78,6 +78,8 @@ class StagePlan:
     #: 在第二次训练时就错）。入参是整条记录，返回
     #: `{"command": [...], "expect_file": ..., "report_file": ...}`。
     resolve: Callable[[dict[str, Any]], dict[str, Any]] | None = None
+    #: 非空时这一段不执行，直接标成跳过，并把这句话显示在阶段上。
+    skip_reason: str = ""
 
 
     def run_kind(self, pipeline_id: str) -> str:
@@ -277,10 +279,19 @@ class PipelineManager:
                     self._finish(record, CHAIN_CANCELLED, "已按要求停止")
                     return
 
+                stage_state = record["stages"][index]
+                if stage.skip_reason:
+                    stage_state["status"] = SKIPPED
+                    stage_state["error"] = stage.skip_reason
+                    stage_state["started_at"] = time.time()
+                    stage_state["finished_at"] = stage_state["started_at"]
+                    stage_state["elapsed"] = 0
+                    self._persist(record)
+                    continue
+
                 record["stage_index"] = index
                 record["stage"] = stage.name
                 record["run_id"] = None
-                stage_state = record["stages"][index]
                 stage_state["status"] = RUNNING
                 stage_state["started_at"] = time.time()
                 self._persist(record)

@@ -76,9 +76,9 @@ def main(argv: list[str]) -> int:
         confs = [round(float(b.get("confidence", 0)), 4) for b in boxes]
         labels = [int(b.get("class_label", -1)) for b in boxes]
 
-        png = base64.b64decode(data["annotated_png"])
-        dst = OUT_DIR / f"{img.stem}_pred.png"
-        dst.write_bytes(png)
+        jpg = base64.b64decode(data["annotated_jpg"])
+        dst = OUT_DIR / f"{img.stem}_pred.jpg"
+        dst.write_bytes(jpg)
 
         summary.append(
             {"image": img.name, "boxes": len(boxes), "labels": labels, "confs": confs, "out": str(dst)}

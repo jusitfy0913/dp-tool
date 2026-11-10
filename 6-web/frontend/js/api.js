@@ -15,21 +15,25 @@ export class ApiError extends Error {
   }
 }
 
-async function request(url, options = {}) {
-  const response = await fetch(url, options);
+async function readPayload(response) {
   const contentType = response.headers.get("content-type") || "";
 
-  let payload = null;
   if (contentType.includes("application/json")) {
-    payload = await response.json().catch(() => null);
-  } else {
-    payload = await response.text().catch(() => null);
+    return response.json().catch(() => null);
   }
+  return response.text().catch(() => null);
+}
 
-  if (!response.ok) {
-    const detail = (payload && (payload.detail || payload.message)) || payload || response.statusText;
-    throw new ApiError(typeof detail === "string" ? detail : JSON.stringify(detail), response.status, payload);
-  }
+function throwIfFailed(response, payload) {
+  if (response.ok) return;
+  const detail = (payload && (payload.detail || payload.message)) || payload || response.statusText;
+  throw new ApiError(typeof detail === "string" ? detail : JSON.stringify(detail), response.status, payload);
+}
+
+async function request(url, options = {}) {
+  const response = await fetch(url, options);
+  const payload = await readPayload(response);
+  throwIfFailed(response, payload);
   return payload;
 }
 
@@ -48,6 +52,27 @@ export function postJSON(url, body) {
 export function postForm(url, formData) {
   // 不设置 Content-Type，交给浏览器自动带 multipart boundary
   return request(url, { method: "POST", body: formData });
+}
+
+/**
+ * 上传表单并返回分段耗时，供推理页把「含往返」拆成三段。
+ *
+ * 为什么要单独一个函数：`fetch` 的 `await` 在「响应头到达」时就返回了，
+ * 后面的 `json()` 才是真正的下载 + 解析。两段耗时恰好对应「上传+排队+服务端」
+ * 和「下载+解析」，配合响应里的 `timing.server_ms` 就能算出网络那一段。
+ *
+ * 返回 `{ payload, waitMs, parseMs }`：
+ * - waitMs：发出请求到收到响应头（上传 + 排队 + 服务端计算 + 首字节）
+ * - parseMs：收到响应头到 JSON 解析完（下载 + 解析，体积大时非常明显）
+ */
+export async function postFormTimed(url, formData) {
+  const started = performance.now();
+  const response = await fetch(url, { method: "POST", body: formData });
+  const headersAt = performance.now();
+  const payload = await readPayload(response);
+  const parsedAt = performance.now();
+  throwIfFailed(response, payload);
+  return { payload, waitMs: headersAt - started, parseMs: parsedAt - headersAt };
 }
 
 export function getCapabilities() {

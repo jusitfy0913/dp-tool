@@ -653,7 +653,7 @@ export function createViewerStrip(options) {
     syncLayout();
   }
 
-  /** 无内容可显示的窗口（如尚未产生异常轮廓图）应从布局中移除，但保留其开关状态。 */
+  /** 无内容可显示的窗口（如尚未产生异常区域图）应从布局中移除，但保留其开关状态。 */
   function setAvailable(viewerId, available) {
     if (!availableMap.has(viewerId)) return;
     availableMap.set(viewerId, available);

@@ -24,7 +24,6 @@ import re
 import shlex
 import shutil
 import sys
-import tempfile
 import threading
 import time
 from pathlib import Path
@@ -65,7 +64,12 @@ from runners import manager
 
 #: 应用版本号。前端顶栏与 /api/health 都读它，方便一眼看出「页面连的是哪个后端」。
 #: 起因：改了代码但 8060 上跑的是几小时前的旧进程，排查很久才发现。
-APP_VERSION = "1.29.0"
+APP_VERSION = "1.31.0"
+
+#: 单图推理返回的标注图 JPEG 质量。
+#: 这张图只用于导出（查看时前端用本地原图 + SVG 叠加层），所以让体积优先：
+#: 3034x1586 的 PCB 图上 q=90 是 0.78 MB / 12 ms，q=100 也只到 2.4 MB 却慢一倍。
+ANNOTATED_JPEG_QUALITY = 90
 
 #: 本文件所在目录（6-web/backend）。子进程脚本路径都以它为基准，
 #: 不依赖启动时的工作目录——从仓库根启动和从 backend 启动必须都能跑。
@@ -374,6 +378,8 @@ def build_train_command(request: "YoloTrainRequest", python: str) -> list[str]:
     两边各写一份的后果是"页面上训练用的增强参数，串联时被悄悄丢掉"——
     跑出来的模型和用户以为的不是同一个，而日志里一切正常。
     """
+    if request.task not in {"detect", "segment", "pose", "obb", "classify"}:
+        raise ValueError(f"不支持的任务类型：{request.task}")
     command = [
         python, str(config.YOLO_LAUNCHER),
         "--mode", "train",
@@ -640,8 +646,10 @@ def build_export_command(request: "YoloExportRequest", python: str) -> list[str]
         raise ValueError(
             f"imgsz 必须是 32 的倍数且在 32~2048 之间，当前为 {request.imgsz}"
         )
-    if request.task not in {"detect", "segment", "pose", "obb"}:
+    if request.task not in {"detect", "segment", "pose", "obb", "classify"}:
         raise ValueError(f"不支持的任务类型：{request.task}")
+    # 分类输出不是检测框，不能再生成给 TensorRT 检测解码用的转置文件。
+    make_transd = bool(request.make_transd) and request.task != "classify"
 
     command = [
         python, str(config.YOLO_LAUNCHER),
@@ -654,7 +662,7 @@ def build_export_command(request: "YoloExportRequest", python: str) -> list[str]
         # 注意：--simplify 是 BooleanOptionalAction，只接受 --simplify / --no-simplify，
         # 写成 `--simplify true` 会被 argparse 判成「多余的参数」直接退出 2。
         "--simplify" if request.simplify else "--no-simplify",
-        "--make-transd", "true" if request.make_transd else "false",
+        "--make-transd", "true" if make_transd else "false",
     ]
     if request.opset is not None:
         command += ["--opset", str(request.opset)]
@@ -1234,7 +1242,8 @@ def pipeline_yolo(request: PipelineYoloRequest) -> dict:
     if not data_yaml.is_file():
         raise HTTPException(status_code=400, detail=f"dataset.yaml 不存在：{request.data}")
     _ensure_allowed_path(str(data_yaml))
-    if request.task != "detect" and request.run_val:
+    is_classify = request.task == "classify"
+    if not is_classify and request.task != "detect" and request.run_val:
         raise HTTPException(
             status_code=400,
             detail="精度评估目前只支持 detect；请关闭「完成后验证」，或把任务类型改为 detect",
@@ -1242,12 +1251,14 @@ def pipeline_yolo(request: PipelineYoloRequest) -> dict:
     if request.precision not in ("fp16", "fp32", "int8"):
         raise HTTPException(status_code=400, detail="precision 只能是 fp16 / fp32 / int8")
 
-    trtexec = config.resolve_trtexec()
-    if not trtexec:
-        raise HTTPException(
-            status_code=500,
-            detail="找不到 trtexec.exe（设置 TRTFORGE_TRTEXEC 或确认 CUDA\\bin 下有它）",
-        )
+    trtexec = ""
+    if not is_classify:
+        trtexec = config.resolve_trtexec()
+        if not trtexec:
+            raise HTTPException(
+                status_code=500,
+                detail="找不到 trtexec.exe（设置 TRTFORGE_TRTEXEC 或确认 CUDA\\bin 下有它）",
+            )
 
     python = _resolve_python(request.python)
     name = request.name.strip() or f"exp_{time.strftime('%Y%m%d_%H%M%S')}"
@@ -1302,7 +1313,7 @@ def pipeline_yolo(request: PipelineYoloRequest) -> dict:
         weights=str(weights),
         task=request.task,
         imgsz=request.imgsz,
-        make_transd=True,
+        make_transd=not is_classify,
         simplify=True,
     )
     stages.append(
@@ -1311,18 +1322,31 @@ def pipeline_yolo(request: PipelineYoloRequest) -> dict:
             label="导出 ONNX",
             command=build_export_command(export_request, python),
             cwd=str(config.YOLO_LAUNCHER_DIR),
-            expect_file=str(transd_onnx),
+            expect_file=str(onnx_file if is_classify else transd_onnx),
             meta={"weights": str(weights)},
         )
     )
-    stages.append(
-        pipeline_mod.StagePlan(
-            name="probe",
-            label="校验转置布局",
-            callable=lambda: _pipeline_probe_transd(transd_onnx),
+    if is_classify:
+        reason = "分类这一版不编译引擎，也不做检测精度验证"
+        stages.append(pipeline_mod.StagePlan(name="probe", label="校验转置布局", skip_reason=reason))
+        stages.append(pipeline_mod.StagePlan(name="build", label="编译引擎", skip_reason=reason))
+        stages.append(
+            pipeline_mod.StagePlan(
+                name="labels",
+                label="生成标签文件",
+                callable=lambda: _ensure_labels_json(str(data_yaml), run_dir, name),
+            )
         )
-    )
-    if request.precision == "int8":
+        stages.append(pipeline_mod.StagePlan(name="val", label="引擎精度验证", skip_reason=reason))
+    if not is_classify:
+        stages.append(
+            pipeline_mod.StagePlan(
+                name="probe",
+                label="校验转置布局",
+                callable=lambda: _pipeline_probe_transd(transd_onnx),
+            )
+        )
+    if not is_classify and request.precision == "int8":
         import int8calib
 
         if request.calib_dir.strip():
@@ -1358,7 +1382,7 @@ def pipeline_yolo(request: PipelineYoloRequest) -> dict:
             "--workspace", str(request.workspace_mb),
             "--input-name", "images",
         ]
-    else:
+    elif not is_classify:
         build_command = [
             trtexec,
             f"--onnx={transd_onnx}",
@@ -1368,24 +1392,25 @@ def pipeline_yolo(request: PipelineYoloRequest) -> dict:
             build_command.append("--fp16")
         build_command.append(f"--workspace={request.workspace_mb}")
 
-    stages.append(
-        pipeline_mod.StagePlan(
-            name="build",
-            label=f"编译引擎（{request.precision}）",
-            command=build_command,
-            cwd=str(config.REPO_ROOT),
-            expect_file=str(engine_path),
-            meta={"precision": request.precision, "imgsz": request.imgsz},
+    if not is_classify:
+        stages.append(
+            pipeline_mod.StagePlan(
+                name="build",
+                label=f"编译引擎（{request.precision}）",
+                command=build_command,
+                cwd=str(config.REPO_ROOT),
+                expect_file=str(engine_path),
+                meta={"precision": request.precision, "imgsz": request.imgsz},
+            )
         )
-    )
-    stages.append(
-        pipeline_mod.StagePlan(
-            name="labels",
-            label="生成标签文件",
-            callable=lambda: _ensure_labels_json(str(data_yaml), run_dir, name),
+        stages.append(
+            pipeline_mod.StagePlan(
+                name="labels",
+                label="生成标签文件",
+                callable=lambda: _ensure_labels_json(str(data_yaml), run_dir, name),
+            )
         )
-    )
-    if request.run_val:
+    if not is_classify and request.run_val:
         report_dir = run_dir / "val"
         stages.append(
             pipeline_mod.StagePlan(
@@ -2253,8 +2278,16 @@ def browse_cancel(request: Request) -> dict:
 # ---------------------------------------------------------------------------
 # 推理
 # ---------------------------------------------------------------------------
-def _save_upload(upload: UploadFile) -> tuple[bytes, Path]:
-    """读取上传文件到临时目录，并限制大小。"""
+def _read_upload(upload: UploadFile) -> bytes:
+    """把上传的图片读进内存，并校验后缀与大小。
+
+    v1.30.3 起不再落临时文件：以前 `_save_upload` 会写一份到 `UPLOAD_DIR`，
+    但三个调用方都只是拿它的字节去 `decode_image`，文件从头到尾没被读过，
+    最后在 `finally` 里删掉。白写一次盘（大图几 MB）还多一套清理逻辑。
+
+    为什么要自己读 `upload.file` 而不是 `await upload.read()`：
+    这几个端点都是同步 `def`，FastAPI 会丢到线程池里跑，读 `file` 可以直接读。
+    """
     suffix = Path(upload.filename or "image.png").suffix or ".png"
     if suffix.lower() not in config.IMAGE_SUFFIXES:
         raise HTTPException(status_code=400, detail=f"不支持的图片格式：{suffix}")
@@ -2265,14 +2298,69 @@ def _save_upload(upload: UploadFile) -> tuple[bytes, Path]:
             status_code=413,
             detail=f"图片超过 {config.MAX_UPLOAD_BYTES // (1024 * 1024)} MB 限制",
         )
+    if not data:
+        raise HTTPException(status_code=400, detail="上传的图片是空的")
+    return data
 
-    config.ensure_dirs()
-    handle = tempfile.NamedTemporaryFile(
-        dir=config.UPLOAD_DIR, suffix=suffix, delete=False
-    )
-    handle.write(data)
-    handle.close()
-    return data, Path(handle.name)
+
+def _note_server_stages(result: dict, decode_ms: float, call_ms: float) -> None:
+    """把服务端的阶段耗时写进 `timing`，让「服务端 xx ms」可以继续往下拆。
+
+    为什么需要这三个数：DLL 只上报 pre/inference/post，用户看到的「服务端」里
+    还包含图片解码、工作进程往返、base64 与 JSON 组装。不拆开就只能猜，
+    「OCR 往返 215 ms 是不是传图慢」这类问题每次都要重新量一遍。
+
+    - `decode_ms`：读上传 + 图像解码（Web 进程内，任何任务都要付）
+    - `ipc_ms`：工作进程往返中除掉 DLL 的部分（共享内存拷贝 + 管道 + 回包反序列化）
+    - `encode_ms`：由 `_finish_infer` 反推（base64 + JSON + 响应组装）
+    """
+    timing = result.get("timing")
+    if not isinstance(timing, dict):
+        return
+    timing["decode_ms"] = round(float(decode_ms), 1)
+    dll_ms = float(timing.get("total_ms") or 0.0)
+    timing["ipc_ms"] = round(max(0.0, float(call_ms) - dll_ms), 1)
+
+
+def _finish_infer(result: dict, started: float) -> Response:
+    """补齐 `timing.server_ms` / `payload_bytes` / `encode_ms` 后返回响应。
+
+    为什么要有这些字段：DLL 只回 pre/inference/post 三个内核计时，用户在页面上
+    看到的却是「含往返」。编图、base64、JSON 序列化和传输都不在那三个数里，
+    于是出现「推理 5 ms、往返 388 ms」这种看起来像 bug 的对比。这里把服务端那段
+    和响应体体积明确标出来，一眼能看出时间花在模型还是传输。
+
+    `payload_bytes` 是**响应体的真实字节数（含本字段自身）**。只序列化一次：
+    先把字段填 0 编码，再把 `"payload_bytes":0` 原地替换成真实长度。
+    以前的做法是「填 0 编一次量长度、填真值再编一次」，对 2.5 MB 的异常检测响应
+    等于白花一次 JSON 序列化（约 30 ms）。
+    """
+    timing = result.get("timing")
+    if not isinstance(timing, dict):
+        return JSONResponse(result)
+
+    timing["server_ms"] = round((time.perf_counter() - started) * 1000.0, 1)
+    # 响应组装 = 服务端总计 - 解码 - 工作进程往返；base64 与 JSON 都在这一段里
+    decode_ms = float(timing.get("decode_ms") or 0.0)
+    ipc_ms = float(timing.get("ipc_ms") or 0.0)
+    dll_ms = float(timing.get("total_ms") or 0.0)
+    timing["encode_ms"] = round(max(0.0, timing["server_ms"] - decode_ms - ipc_ms - dll_ms), 1)
+
+    timing["payload_bytes"] = 0
+    body = json.dumps(result, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    placeholder = b'"payload_bytes":0'
+    if placeholder in body:
+        # 真实长度 = 占位体长度 - 1（'0'）+ 数字位数；位数变了要再算一次才收敛
+        size = len(body)
+        for _ in range(2):
+            size = len(body) - 1 + len(str(size))
+        body = body.replace(placeholder, b'"payload_bytes":' + str(size).encode(), 1)
+        timing["payload_bytes"] = size
+    else:
+        # 理论上不会走到这里（字段是自己填的）；保底给个近似值，不要让字段空着
+        timing["payload_bytes"] = len(body)
+        body = json.dumps(result, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return Response(content=body, media_type="application/json")
 
 
 def _check_yolo_output_sane(result: dict, img_w: int, img_h: int) -> None:
@@ -2388,9 +2476,47 @@ def _run_yolo_once(
     输出结构。摄像头每秒调 10 次，如果它是"另一条实现"，两边框的顺序、
     字段名、降级行为迟早对不上，而屏幕上看起来都"能出框"，极难发现。
     """
-    use_dll, onnx_path, warning = _select_yolo_backend(engine)
-
     label_info = labels_mod.load_labels(labels)
+    if task == "classify":
+        import classifyinfer
+
+        # 分类优先走 onnx_infer.dll（v1.30.6），失败或旧 DLL 才退回 onnxruntime。
+        # 两条路径共用 classifyinfer.interpret 做「分数 → 类别」的判定，
+        # 差别只在算分数的地方，不在解释分数的规则。
+        result = None
+        warning = None
+        if infer.is_onnx_model(engine) and infer.classify_available():
+            try:
+                raw = inferproxy.run_classify(engine, array, source=source)
+                result, warning = classifyinfer.result_from_raw(
+                    raw, label_info["classes"], conf
+                )
+            except (infer.InferError, inferproxy.WorkerError) as exc:
+                # DLL 不可用不能让分类直接失败：退回 Python 路径，并说明原因，
+                # 否则用户只会看到"分类用不了"，不知道是 DLL 的问题。
+                warning = f"onnx_infer.dll 分类不可用（{exc}），已退回 onnxruntime"
+                result = None
+
+        if result is None:
+            try:
+                result = classifyinfer.run(engine, array, label_info["classes"], conf)
+            except classifyinfer.ClassifyError as exc:
+                raise infer.InferError(str(exc)) from exc
+            # 分类自己也会产生提示（标签顺序和模型 metadata 不一致），
+            # 这里要原样交给调用方，否则前端只能看到「结果对了但不知道为什么」。
+            python_warning = result.pop("warning", None)
+            warning = warning or python_warning
+
+        result["labels"] = {
+            "path": labels or None,
+            "ok": label_info["ok"],
+            "name": label_info["name"],
+            "count": len(label_info["classes"]),
+            "error": label_info["error"],
+        }
+        return result, warning
+
+    use_dll, onnx_path, warning = _select_yolo_backend(engine)
     try:
         if use_dll:
             result = inferproxy.run_yolo(engine, task, array, conf=conf, nms=nms, source=source)
@@ -2423,29 +2549,45 @@ def infer_yolo(
     nms: float = Form(0.45),
     labels: str = Form(""),
 ) -> JSONResponse:
-    """YOLO 推理：返回检测框、类别名与标注后的结果图（base64）。
+    """YOLO 推理：返回检测框、类别名与标注后的结果图（base64 JPEG）。
 
     DLL 优先；DLL 不可用时自动降级到 onnxruntime，返回结构完全一致。
     `labels` 是标签文件路径，缺失时框上只有 `cls{id}`，不报错。
+
+    标注图用 JPEG 而不是 PNG：一张 3034x1586 的 PCB 图，PNG 编码 155 ms、5.8 MB，
+    JPEG(q=90) 只要 12 ms、0.78 MB，画面差异肉眼看不出来。这张图只用于导出，
+    查看时前端用的是本地原图 + SVG 叠加层。
     """
-    data, temp_path = _save_upload(image)
+    started = time.perf_counter()
+    data = _read_upload(image)
     try:
+        decoded_at = time.perf_counter()
         array = infer.decode_image(data)
+        decode_ms = (time.perf_counter() - decoded_at) * 1000.0
+        called_at = time.perf_counter()
         result, warning = _run_yolo_once(engine, task, array, conf, nms, labels, source=image.filename or "")
-        # 先补标签再画图：draw_yolo 要读 label_name 才能把类别名烧进去
-        annotated = infer.draw_yolo(array, result["boxes"], result["class_colors"])
+        call_ms = (time.perf_counter() - called_at) * 1000.0
+        _note_server_stages(result, decode_ms, call_ms)
+        if result.get("classify"):
+            import classifyinfer
+            # 直接拿 BGR 数组再编 JPEG，不要先用 overlay_png 编成 PNG 再解码
+            canvas = classifyinfer.draw_label(array, result["classify"])
+        else:
+            # 先补标签再画图：render_yolo 要读 label_name 才能把类别名烧进去
+            # 用 render_yolo（返回 BGR 数组）而不是 draw_yolo（返回 PNG 字节），
+            # 省掉「编 PNG 再解码成数组编 JPEG」的往返。
+            canvas = infer.render_yolo(array, result["boxes"], result["class_colors"])
+        annotated = infer.encode_image(canvas, ".jpg", ANNOTATED_JPEG_QUALITY)
     except infer.InferError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    finally:
-        with contextlib.suppress(OSError):
-            temp_path.unlink()
 
     import base64
 
-    result["annotated_png"] = base64.b64encode(annotated).decode("ascii")
+    result["annotated_jpg"] = base64.b64encode(annotated).decode("ascii")
+    result["annotated_mime"] = "image/jpeg"
     if warning:
         result["warning"] = warning
-    return JSONResponse(result)
+    return _finish_infer(result, started)
 
 
 def _require_model_dir(raw: str, field: str) -> Path:
@@ -2467,6 +2609,106 @@ def list_ocr_models() -> dict:
         raise HTTPException(status_code=500, detail=f"扫描 OCR 模型失败：{exc}") from exc
 
 
+class OcrWarmRequest(BaseModel):
+    """OCR 预热参数。都可以省略：省略时自动挑根目录下第一套可用的 det/rec。"""
+
+    det_dir: str = ""
+    rec_dir: str = ""
+    textline_ori_dir: str = ""
+    device: str = "cpu"
+    enable_mkldnn: int = 1
+    cpu_threads: int = 8
+
+
+#: 预热状态。前端不需要轮询它，留着方便排查"到底热没热上"。
+_OCR_WARM_LOCK = threading.Lock()
+_OCR_WARM_STATE: dict[str, Any] = {"running": False, "ok": None, "ms": None, "error": "", "source": ""}
+
+
+def _pick_ocr_models() -> tuple[str, str, str]:
+    """从扫描结果里挑一套可用的 det/rec（有 textline_ori 就一起带上）。"""
+    scan = ocr_models.scan_models()
+    det = rec = textline = ""
+    for entry in scan.get("entries") or []:
+        if not entry.get("compatible"):
+            continue
+        kind = entry.get("kind")
+        if kind == "det" and not det:
+            det = entry["path"]
+        elif kind == "rec" and not rec:
+            rec = entry["path"]
+        elif kind == "textline_ori" and not textline:
+            textline = entry["path"]
+    return det, rec, textline
+
+
+def _ocr_warm_worker(options: dict) -> None:
+    """后台跑一次 32x32 空图，把 oi_create（加载飞桨 + 解析模型）提前做掉。
+
+    为什么值得单独加个接口：`oi_create` 首次要 1.3 s 左右，且不计入 DLL 返回的
+    timing。用户看到的是「点推理 -> 卡一秒多 -> 出结果」，会误判成模型慢。
+    """
+    import numpy as np
+
+    started = time.perf_counter()
+    try:
+        inferproxy.run_ocr(
+            np.zeros((32, 32, 3), dtype=np.uint8),
+            options=options,
+            source="预热",
+        )
+        state = {"running": False, "ok": True, "ms": round((time.perf_counter() - started) * 1000.0, 1),
+                 "error": "", "source": "warm"}
+    except Exception as exc:  # noqa: BLE001 - 预热失败不影响正常推理，只记状态
+        state = {"running": False, "ok": False, "ms": round((time.perf_counter() - started) * 1000.0, 1),
+                 "error": f"{type(exc).__name__}: {exc}", "source": "warm"}
+    with _OCR_WARM_LOCK:
+        _OCR_WARM_STATE.update(state)
+
+
+@app.post("/api/ocr/warm")
+def warm_ocr(body: OcrWarmRequest | None = None) -> dict:
+    """预热 OCR 句柄：立刻返回，真正加载放到后台线程。
+
+    幂等：已经在预热或已经热过时直接返回当前状态，不会重复建句柄。
+    """
+    body = body or OcrWarmRequest()
+    with _OCR_WARM_LOCK:
+        if _OCR_WARM_STATE["running"]:
+            return {"started": False, "reason": "正在预热", **_OCR_WARM_STATE}
+        if _OCR_WARM_STATE["ok"]:
+            return {"started": False, "reason": "已经预热过", **_OCR_WARM_STATE}
+
+    det = str(body.det_dir or "").strip()
+    rec = str(body.rec_dir or "").strip()
+    textline = str(body.textline_ori_dir or "").strip()
+    if not det or not rec:
+        picked_det, picked_rec, picked_textline = _pick_ocr_models()
+        det = det or picked_det
+        rec = rec or picked_rec
+        textline = textline or picked_textline
+    if not det or not rec:
+        return {"started": False, "reason": "没有找到可用的检测/识别模型，先下载模型再预热"}
+
+    options = {
+        "det_dir": det,
+        "rec_dir": rec,
+        "textline_dir": textline,
+        "device": body.device or "cpu",
+        "enable_mkldnn": 1 if body.enable_mkldnn else 0,
+        "cpu_threads": body.cpu_threads,
+        "rec_batch_size": 6,
+        "det_thresh": 0.3,
+        "det_box_thresh": 0.6,
+        "det_unclip_ratio": 1.5,
+        "rec_score_thresh": 0.0,
+    }
+    with _OCR_WARM_LOCK:
+        _OCR_WARM_STATE.update({"running": True, "ok": None, "ms": None, "error": "", "source": "warm"})
+    threading.Thread(target=_ocr_warm_worker, args=(options,), name="ocr-warm", daemon=True).start()
+    return {"started": True, "det_dir": det, "rec_dir": rec, "textline_dir": textline}
+
+
 @app.post("/api/infer/ocr")
 def infer_ocr(
     image: UploadFile = File(...),
@@ -2483,15 +2725,19 @@ def infer_ocr(
     rec_score_thresh: float = Form(0.0),
 ) -> JSONResponse:
     """OCR：检测、识别、方向分类都在 ocr_infer.dll 里完成。"""
+    started = time.perf_counter()
     det = _require_model_dir(det_dir, "检测模型目录")
     rec = _require_model_dir(rec_dir, "识别模型目录")
     textline = ""
     if str(textline_ori_dir or "").strip():
         textline = str(_require_model_dir(textline_ori_dir, "方向模型目录"))
 
-    data, temp_path = _save_upload(image)
+    data = _read_upload(image)
     try:
+        decoded_at = time.perf_counter()
         array = infer.decode_image(data)
+        decode_ms = (time.perf_counter() - decoded_at) * 1000.0
+        called_at = time.perf_counter()
         result = inferproxy.run_ocr(array, source=image.filename or "", options={
             "det_dir": str(det),
             "rec_dir": str(rec),
@@ -2505,14 +2751,13 @@ def infer_ocr(
             "det_unclip_ratio": det_unclip_ratio,
             "rec_score_thresh": rec_score_thresh,
         })
+        call_ms = (time.perf_counter() - called_at) * 1000.0
+        _note_server_stages(result, decode_ms, call_ms)
     except infer.InferError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except ocr_infer.OcrError as exc:
         raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
-    finally:
-        with contextlib.suppress(OSError):
-            temp_path.unlink()
-    return JSONResponse(result)
+    return _finish_infer(result, started)
 
 
 def _select_anomalib_backend(engine: str, metadata: str) -> tuple[bool, str, str | None]:
@@ -2555,17 +2800,24 @@ def infer_anomalib(
     pixel_threshold: float = Form(-1.0),
     heatmap_colormap: str = Form("TURBO"),
 ) -> JSONResponse:
-    """Anomalib 推理：返回分数、判定、叠加图、轮廓图、热能图与原图（base64）。
+    """Anomalib 推理：返回分数、判定、叠加图、轮廓图与热能图（base64）。
+
+    不回传原图：前端切图时已经显示本地原图，后端再编一张全尺寸 PNG 是纯重复
+    （3034x1586 上要 155 ms + 7.1 MB）。宽高仍在 `image_width/height` 里返回。
 
     阈值语义与 DLL 一致：`>= 0` 覆盖 metadata，`< 0` 沿用 metadata。
     响应里 `thresholds` 同时给出"本次生效值"与"metadata 文件原值"，
     因为 `ai_get_metadata` 拿到的已经是覆盖后的值，原值只能自己读文件。
     """
     use_dll, onnx_path, warning = _select_anomalib_backend(engine, metadata)
+    started = time.perf_counter()
 
-    data, temp_path = _save_upload(image)
+    data = _read_upload(image)
     try:
+        decoded_at = time.perf_counter()
         array = infer.decode_image(data)
+        decode_ms = (time.perf_counter() - decoded_at) * 1000.0
+        called_at = time.perf_counter()
         if use_dll:
             result = inferproxy.run_anomalib(
                 engine, metadata, array,
@@ -2584,26 +2836,26 @@ def infer_anomalib(
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
             # 降级路径没有 C++ 侧的热能图渲染，这里补齐字段，保证前端只有一条渲染逻辑
             result.setdefault("heatmap_png", None)
-            result.setdefault("source_png", None)
             result.setdefault("heatmap_colormap", None)
             result.setdefault("thresholds", {
                 "image": {"effective": None, "metadata": None, "overridden": False},
                 "pixel": {"effective": None, "metadata": None, "overridden": False},
             })
+        call_ms = (time.perf_counter() - called_at) * 1000.0
+        _note_server_stages(result, decode_ms, call_ms)
     except infer.InferError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    finally:
-        with contextlib.suppress(OSError):
-            temp_path.unlink()
 
     import base64
 
-    for key in ("overlay_png", "mask_png", "heatmap_png", "source_png"):
+    for key in ("overlay_jpg", "mask_png", "heatmap_png"):
         value = result.get(key)
         result[key] = base64.b64encode(value).decode("ascii") if value else None
+    # MIME 决定前端用哪种方式挂图；overlay 已经改成 JPEG，其他两张仍是 PNG
+    result.setdefault("overlay_mime", "image/jpeg" if result.get("overlay_jpg") else None)
     if warning:
         result["warning"] = warning
-    return JSONResponse(result)
+    return _finish_infer(result, started)
 
 
 class BatchInferRequest(BaseModel):
@@ -2763,7 +3015,9 @@ def build_batch_command(
     ]
 
     if request.kind == "yolo":
-        if request.task not in ("detect", "segment", "pose", "obb"):
+        if request.task == "classify" and engine.suffix.lower() in {".engine", ".trt", ".plan"}:
+            raise HTTPException(status_code=400, detail="分类引擎还没做，请改用 ONNX。")
+        if request.task not in ("detect", "segment", "pose", "obb", "classify"):
             raise HTTPException(status_code=400, detail=f"不支持的任务类型：{request.task}")
         command += [
             "--task", request.task,
@@ -2804,7 +3058,9 @@ def build_video_command(
     engine = _require_file(request.engine, "引擎文件")
     if engine.suffix.lower() not in ENGINE_SUFFIXES:
         raise HTTPException(status_code=400, detail=f"引擎格式不支持：{engine.suffix}")
-    if request.task not in ("detect", "segment", "pose", "obb"):
+    if request.task == "classify" and engine.suffix.lower() in {".engine", ".trt", ".plan"}:
+        raise HTTPException(status_code=400, detail="分类引擎还没做，请改用 ONNX。")
+    if request.task not in ("detect", "segment", "pose", "obb", "classify"):
         raise HTTPException(status_code=400, detail=f"不支持的任务类型：{request.task}")
 
     source = _require_file(request.source, "视频文件")
@@ -2945,6 +3201,7 @@ def infer_frame(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     result.pop("annotated_png", None)
+    result.pop("annotated_jpg", None)
     if warning:
         result["warning"] = warning
     return JSONResponse(result)
