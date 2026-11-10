@@ -43,6 +43,7 @@ import autolabeljobs
 import checkpoints
 import config
 import dataset
+import gpulock
 import infer
 import inferjobs
 import inferproxy
@@ -145,6 +146,23 @@ def _reject_if_busy() -> None:
                     "请先在「全流程串联」卡片里停止它，再启动新的任务。"
                 ),
             )
+
+    # 跨进程 GPU 锁：上面查的都是「本进程内存里的任务」，看不见两种真实情况——
+    #   1) 命令行在跑 autoexp.py run（自动实验循环）；
+    #   2) 本机还起着另一个 Web 实例（比如 8060 与 8094 各一套）。
+    # 两者都会和本进程的任务抢同一块显卡，通常双双 OOM。锁由 gpulock 维护，
+    # 自己持有的锁要跳过（pid == 本进程），否则会把自己拦住。
+    holder = gpulock.read()
+    if holder is not None and int(holder.get("pid") or 0) != os.getpid():
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"显卡正在被其他进程占用：{gpulock.describe(holder)}。"
+                "命令行任务请等它结束或在对应终端里停止；"
+                "另一个 Web 实例的任务请到那个页面停止。"
+                "现在就开新的训练会和它抢显存，通常两个都会 OOM。"
+            ),
+        )
 
 # ---------------------------------------------------------------------------
 # 常驻预热进程

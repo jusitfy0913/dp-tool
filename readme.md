@@ -206,6 +206,32 @@ python autoexp.py holdout --weights runs/autoexp/exp_0007/weights/best.pt
 
 **范围说明**：本轮只搭地基，**不含**"谁来决定下一次改什么参数"那一层，全程不需要任何大模型 API。Anomalib 侧不做——现有 `anomaly_val_report.json` 是 `auroc 1.0 / f1 1.0 / tp44 fp0 tn20 fn0`，奖励信号已饱和，任何配置都得满分，循环没有梯度可爬。EfficientAd 也不适合：20 epoch 要 3525 秒，压进 5 分钟预算会把 LR 日程一起改掉，实验之间比的就不再是"同一套方法跑多久"。
 
+### v1.32.1 — 2026-11-10（网页端与自动实验互斥：不再抢显存）
+
+**一句话**：网页端训练与命令行 `autoexp.py` 现在通过 `runtime/gpu_lock.json` 互相可见，一方在跑另一方会被明确拒绝，而不是两个训练一起 OOM。
+
+**为什么需要**：两者的产物目录本来是隔离的（网页写 `1-python-yolo/launcher/runs`，autoexp 写 `7-autoresearch-yolo/runs/autoexp`），但**共用同一块显卡**。原来的 `_reject_if_busy()` 只查本进程内存里的任务表，看不见两种真实情况：
+
+1. 命令行在跑 `autoexp.py run`；
+2. 本机同时起着两个 Web 实例（8060 与 8094 各一套），各自的任务表互不可见。
+
+后果不只是 OOM。autoexp 侧更麻烦：Ultralytics 遇 OOM 会把 batch 静默减半重试，于是这次实验的等效学习率、正则强度都和台账里其它实验不一样，横向比较全部失真，而台账上看不出来。
+
+**行为**
+
+| 场景 | 结果 |
+| --- | --- |
+| 网页点「开始训练」，锁被 autoexp / 另一套 Web 实例持有 | **409**，文案带占用方、PID、该去哪停 |
+| `autoexp.py run` / `holdout`，锁被网页端持有 | **退出码 5**，不建实验目录、不写台账、零显存消耗 |
+| 持有者被强杀 | 锁残留但 PID 已死 → 视为空闲，不会锁死机器 |
+| 锁文件损坏 | 视为空闲 |
+
+**实现**：`6-web/backend/gpulock.py`，零第三方依赖。放在 backend 里是因为打包脚本会整目录冻结，放外面会漏文件；autoexp 通过 `load_gpulock()` 复用同一份，不重复实现（锁文件格式是两边共用的契约，两份实现迟早漂移）。
+
+**修掉一个危险写法**：存活探测原本用 `os.kill(pid, 0)`。这在 POSIX 上是只读检查，但 CPython 的 Windows 实现把非控制台信号的 sig 直接传给 `TerminateProcess(handle, sig)`——**等于把对方进程以退出码 0 杀掉**。实测确认：本进程调 `os.kill(os.getpid(), 0)` 后无声退出。现改为 Windows 走 `OpenProcess` + `GetExitCodeProcess`，POSIX 仍用 `os.kill(pid, 0)`。
+
+**测试**：`6-web/backend/tools/test_gpulock.py` 7 项（含「Web 与 autoexp 读同一套字段」的契约测试）；`tools/test_concurrency.py` 7 项全过（含「两条重任务可并存」这条既有语义未被改变）；autoexp 侧 `run_all_tests.py` 17 项全过。
+
 ### v1.31.0 — 2026-11-10（网页端推理改成进程池：多人同时用不再排队）
 
 **一句话**：DLL 层的并发契约是「一句柄一线程」，所以网页端要并行只有多句柄或多进程两条路。这一版把 `inferproxy` 从「单个工作进程 + 一把锁」改成**进程池**：多个 `infer_worker` 各自有一套 DLL 与句柄，请求分发到空闲进程；OCR 固定留在 0 号进程（Paddle 常驻 1.7 GB，不随池扩散）；熔断分两层——单进程崩 3 次只停它自己，全池 60 秒累计崩 6 次才全池熔断。

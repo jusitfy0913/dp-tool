@@ -1,0 +1,5 @@
+{
+    "hypothesis":  "锁机制的冒烟测试",
+    "budget_seconds":  120,
+    "changed":  "无（仅验证加锁后能正常跑完并释放）"
+}

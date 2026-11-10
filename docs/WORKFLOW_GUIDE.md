@@ -2471,7 +2471,6 @@ Anomalib 的模型 + 后处理占 150~200 ms，池化就能兑现。
 **要解决什么**：手动调 YOLO 有三个实际痛点——单次 100 epoch @640 约 35~40 分钟，一次试错半小时没了；
 改了 epoch 数和改了增强的实验混在一起看，分不清是哪个起的作用；跑完十几个 `exp` / `exp-2` / `exp-3`
 目录后记不清哪个对应哪套参数。
-
 **在哪儿**：`7-autoresearch-yolo/`，与 `7-autoresearch-master/` 并列。后者是 Karpathy 的
 LLM 预训练方法论来源，**不参与本工程构建**；本模块只借用它的问题形式，不复用任何代码。
 
@@ -2576,6 +2575,54 @@ python autoexp.py holdout --weights runs/autoexp/exp_0007/weights/best.pt
 ```
 
 完整参数说明、台账字段与应用场景见 `7-autoresearch-yolo/README.md`。
+
+**与网页端共用显卡：跨进程互斥（v1.32.1）**
+
+两者产物目录完全隔离（网页写 `1-python-yolo/launcher/runs`，autoexp 写
+`7-autoresearch-yolo/runs/autoexp`），互不覆盖。但**共用同一块显卡**，所以同一时刻只允许一方占 GPU。
+
+```mermaid
+flowchart LR
+    subgraph Lock["runtime/gpu_lock.json"]
+        L["owner · pid · kind · label · since"]
+    end
+    W["网页端点击开始训练<br/>_reject_if_busy()"] -->|查锁| L
+    A["命令行 autoexp.py run"] -->|查锁| L
+    W -->|lock 被外人持有| R1["409<br/>说明谁在占、PID、去哪停"]
+    A -->|lock 被外人持有| R2["退出码 5<br/>零显存消耗、不写台账"]
+    W -->|空闲| Hold1["写锁 → 训练 → _finalize 释放"]
+    A -->|空闲| Hold2["写锁 → 训练 → finally 释放"]
+```
+
+| 场景 | 行为 |
+| --- | --- |
+| 网页点「开始训练」，锁被 autoexp 或另一套 Web 实例持有 | **409**，文案带占用方、PID、去处 |
+| `autoexp.py run` / `holdout`，锁被网页端持有 | **退出码 5**，不建实验目录、不写台账 |
+| 持有者被强杀 | 锁文件残留但 PID 已死 → 视为空闲，不会锁死机器 |
+| 锁文件损坏 | 视为空闲（宁可漏判一次，也不让所有人用不了） |
+
+**为什么必须拦**：8 GB 卡上两个训练同时跑通常双双 OOM；而 autoexp 侧更糟——
+Ultralytics 遇 OOM 会把 batch 静默减半重试，于是这次实验的等效学习率、正则强度
+和台账里其它实验都不一样，横比全失真，且台账上看不出来。
+
+**实现位置**：`6-web/backend/gpulock.py`（零第三方依赖）。autoexp 通过
+`load_gpulock()` **复用同一份**，不自己再写一遍——锁文件格式是两边共用的契约，
+两份实现迟早漂移，而漂移的表现正好是「两个训练都以为自己是唯一持有者」。
+
+排查用：
+
+```powershell
+python 6-web\backend\gpulock.py status
+# 锁文件：D:\test\deeplearning\dp-tool\runtime\gpu_lock.json
+# 状态：空闲
+```
+
+真被卡住时直接删 `runtime/gpu_lock.json` 即可，下次 acquire 会重建。
+
+**一个必须记住的坑**：存活探测**不能**用 `os.kill(pid, 0)`。POSIX 上它是只读检查，
+但 CPython 的 Windows 实现会把非控制台信号的 sig 直接交给
+`TerminateProcess(handle, sig)`——也就是**真的把那个进程杀掉**。现已改为
+Windows 走 `OpenProcess` + `GetExitCodeProcess`，POSIX 仍用 `os.kill(pid, 0)`。
 
 ---
 

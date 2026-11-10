@@ -30,6 +30,7 @@ from typing import Any
 
 import progress
 import warmpool
+import gpulock
 from config import EVENT_BUFFER_SIZE, LOG_DIR, TRAIN_EVENT_PREFIX
 
 #: 会独占 GPU（或会写同一批产物目录）的任务类型。
@@ -96,6 +97,9 @@ class Run:
     warm: bool = False
     # 事件序号，从 1 开始自增。断线重连补发历史时前端靠它去重。
     seq: int = 0
+    # 本次任务是否持有跨进程 GPU 锁（gpulock）。结束时要按它决定是否释放，
+    # 不能无条件 release：抢不到锁的任务若也去 release，会删掉别人的锁。
+    gpu_lock_held: bool = False
 
     def snapshot(self) -> dict:
         """给接口返回的任务摘要。"""
@@ -185,11 +189,26 @@ class RunManager:
         if env:
             child_env.update(env)
 
+        # 跨进程 GPU 占用锁：让命令行的 autoexp.py、以及本机其它 Web 实例
+        # 都能看见「显卡正被谁占着」。抢不到**不在这里抛错**——理由有两个：
+        #   1) 拒绝的职责在 app._reject_if_busy()，那里能返回带文案的 409；
+        #   2) 同进程可以同时挂多个独占任务（既有并发测试依赖这一行为），
+        #      抛错会改掉已生效的接口语义。
+        lock_held = False
+        if is_exclusive_kind(kind):
+            lock_held, lock_reason = gpulock.acquire("web", kind, run_id)
+            if not lock_held:
+                message = f"GPU 已被占用，本任务未取得跨进程锁：{lock_reason}"
+                # 直接打 stderr 而不是引 logging：runners 全模块没有 logger，
+                # 为一行日志新建一个配置不划算，而这条信息要能在服务日志里看到。
+                print(f"[runners] {message}", flush=True)
+
         worker = warmpool.pool.take(warm_kind) if warm_kind else None
         if worker is not None:
             try:
                 return self._create_warm(
-                    run_id, kind, worker, command, cwd, log_file, expect_file, meta
+                    run_id, kind, worker, command, cwd, log_file, expect_file, meta,
+                    gpu_lock_held=lock_held,
                 )
             except Exception:  # noqa: BLE001 - 热启动任何异常都退回冷启动
                 worker.terminate()
@@ -214,6 +233,7 @@ class RunManager:
             log_file=log_file,
             expect_file=expect_file,
             meta=dict(meta or {}),
+            gpu_lock_held=lock_held,
         )
         with self._lock:
             self._runs[run_id] = run
@@ -245,6 +265,7 @@ class RunManager:
         log_file: Path,
         expect_file: Path | None,
         meta: dict | None,
+        gpu_lock_held: bool = False,
     ) -> Run:
         """把任务交给预热进程。复用失败由 create() 捕获后回退冷启动。"""
         run = Run(
@@ -257,6 +278,7 @@ class RunManager:
             expect_file=expect_file,
             meta=dict(meta or {}),
             warm=True,
+            gpu_lock_held=gpu_lock_held,
         )
         with self._lock:
             self._runs[run_id] = run
@@ -434,6 +456,11 @@ class RunManager:
         # 先停心跳：进程都结束了还继续推进度，会和下面的 finished 抢语义
         if run.progress_stop is not None:
             run.progress_stop.set()
+        # 释放跨进程 GPU 锁。必须在最前面做：下面的补发事件、写日志都可能抛异常，
+        # 一旦抛在被释放之前，这把锁就会一直挂到进程死亡，把整台机器锁死。
+        if run.gpu_lock_held:
+            gpulock.release()
+            run.gpu_lock_held = False
         exit_code = None
         try:
             exit_code = run.process.wait(timeout=10)

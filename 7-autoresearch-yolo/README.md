@@ -1,4 +1,4 @@
-# 7-autoresearch-yolo — YOLO 自主实验循环
+﻿# 7-autoresearch-yolo — YOLO 自主实验循环
 
 在 **PCB 缺陷检测任务**上，用「固定时间预算 + 单一适应度 + 台账留痕」的方式做 YOLO
 超参/增强的自动化实验。方法论移植自 [Karpathy 的 autoresearch](../7-autoresearch-master/)，
@@ -231,7 +231,66 @@ python autoexp.py holdout --weights runs/autoexp/exp_0007/weights/best.pt
 
 改表头时会按**列名**迁移旧数据并留 `.bak` 备份，不会让历史行错位。
 
-## 九、安全性：为什么不会写坏生产环境
+## 九、与网页端的关系：跨进程 GPU 互斥
+
+网页端训练和 autoexp **各写各的产物目录**，从不互相覆盖：
+
+```
+网页端训练  →  1-python-yolo/launcher/runs/{pcb, detect, classify}
+autoexp     →  7-autoresearch-yolo/runs/autoexp/exp_NNNN
+```
+
+但它们**共用同一块显卡**。所以有一条硬规则：**同一时刻只允许一方占 GPU**。
+
+### 为什么必须互斥
+
+一台 8 GB 卡上跑两个训练，结果通常是双双 OOM。更麻烦的是 autoexp 侧的表现：
+Ultralytics 遇到 OOM 会把 batch 静默减半重试，于是「这次实验」用的 batch 和台账里
+其它实验不一样——等效学习率、正则强度全变了，横向比较全部失真，而台账上看不出来。
+
+### 怎么实现的
+
+一个 JSON 锁文件 `runtime/gpu_lock.json`，同一时刻最多一个持有者：
+
+```json
+{"owner": "autoexp", "pid": 12345, "kind": "autoexp-run",
+ "label": "exp_0011 提高分辨率", "since": "2026-11-10T13:20:00+08:00"}
+```
+
+| 场景 | 行为 |
+|---|---|
+| 网页端点「开始训练」，锁被 autoexp 持有 | 返回 **409**，文案带上占用方与 PID，提示去哪停止 |
+| 网页端点「开始训练」，锁被另一套 Web 实例持有 | 同上（8060 与 8094 两套服务也能互相看见） |
+| `autoexp.py run` / `holdout`，锁被网页端持有 | **拒绝启动，退出码 5**，零显存消耗、不写台账、不建实验目录 |
+| 持有者进程被强杀 | 锁文件残留，但 PID 已死 → 视为空闲，不会永久锁死机器 |
+| 锁文件损坏（写了一半） | 视为空闲（宁可漏判一次，也不让所有人用不了） |
+
+实现放在 `6-web/backend/gpulock.py`（零第三方依赖，只用标准库）。
+autoexp 通过 `load_gpulock()` 复用**同一份**，而不是自己再写一遍——
+锁文件格式是两边共用的契约，两份实现迟早漂移，而漂移的表现正好是
+「两个训练都以为自己是唯一持有者」。
+
+### 手动查看/排查
+
+```powershell
+python 6-web\backend\gpulock.py status
+# 锁文件：D:\test\deeplearning\dp-tool\runtime\gpu_lock.json
+# 状态：空闲
+```
+
+真被卡住时（比如锁指向一个你以为已经退出的进程），直接删 `runtime/gpu_lock.json`
+即可；下次 acquire 会重建。
+
+### 已知取舍
+
+- **不排队**。拿不到锁就立刻拒绝并说明原因，不让用户干等——排队会让界面卡住，
+  而用户真正需要的是马上知道「谁在占着 GPU、去哪停」。
+- **同进程可重入**。Web 内部同时挂多个独占任务时（既有并发测试依赖这一行为）
+  锁不拦自己，拦的是**其它进程**。
+- **锁保护不到非本工具的进程**。别人手工跑一个 `yolo train` 是看不见的，
+  那种情况只能靠显存预检兜底。
+
+## 十、安全性：为什么不会写坏生产环境
 
 1. **零改动生产代码**。`autoexp.py` 只 `import` `tf_yolo_launcher.py` 的
    `build_parser()` / `build_train_kwargs()` / `load_yolo()` 三个纯函数，不修改它。
@@ -244,7 +303,7 @@ python autoexp.py holdout --weights runs/autoexp/exp_0007/weights/best.pt
 4. **物理备份**。`_backup/launcher_<日期>/` 存了 launcher 的 `.py` 与 `configs/`
    （不含 `runs/`，约 6 MB），不依赖 git 状态。
 
-## 十、附录 A：这台机器的实测数据
+## 十一、附录 A：这台机器的实测数据
 
 **硬件**：NVIDIA T1000 8GB（8192 MiB），在 Ultralytics 的 AMP 黑名单里，训练强制走 fp32。
 
@@ -259,7 +318,7 @@ OOM 的根因：`6-web` 的两套常驻服务（端口 8060 / 8094）各挂一�
 
 **单轮耗时**：`batch=8 @640` 约 24 秒/epoch，600 秒预算约 24~25 个 epoch。
 
-## 十一、噪声测试结果
+## 十二、噪声测试结果
 
 **结论：预算够用，可用于自动搜索。**
 
@@ -292,7 +351,7 @@ keep 阈值（2 sigma）= 0.006368
    已经接近 keep 阈值了。这正是"适应度取最后一行、不取历史最佳"的原因：如果取 max，
    这一行会虚高 0.0054，恰好是噪声量级，足以骗过一个本该被丢弃的配置。
 
-## 十二、首轮实验结果（2026-11-10）
+## 十三、首轮实验结果（2026-11-10）
 
 基线 `configs/base.json`（`imgsz=640 batch=8`，600 秒）连跑 5 个假设。
 噪声底 sigma = 0.003184，**keep 阈值 2σ = 0.006368**，即只有比当前最佳高 0.0064 以上才算赢。
@@ -332,7 +391,7 @@ keep 阈值（2 sigma）= 0.006368
 960 训出来的模型。已改成**自动从该次训练的 `args.yaml` 读回 `imgsz` 与 `batch`**，
 命令行显式传 `--imgsz` 时才覆盖。教训：验收时必须用训练时的同一把尺子。
 
-## 十三、版本记录
+## 十四、版本记录
 
 ### v0.1.0 (2026-11-10)
 
@@ -364,4 +423,23 @@ python run_all_tests.py     # 17 项，不跑训练，约 3 秒
 - `noise`：sigma 0.003184，keep 阈值 0.006368
 - `holdout`：`exp_0005` 权重在 42 张 holdout 上得 mAP50-95 = 0.438056（185 个实例，耗时 8.5 秒）
 - `report`：按 `fitness_map50_95` 降序输出
+- 跨进程互斥：网页端持锁时 `autoexp.py run` 返回退出码 5 且不建实验目录；
+  autoexp 持锁时 Web 的 `_reject_if_busy()` 返回 409（见 §9）
 - 生产 launcher 零改动：`git diff yolo-stable-before-autoexp -- 1-python-yolo/launcher` 为空
+
+### v0.1.1 (2026-11-10)
+
+跨进程 GPU 互斥（配合 `6-web/backend/gpulock.py`）。
+
+| 变化 | 说明 |
+|---|---|
+| 新增 | `load_gpulock()`：复用 Web 那份锁模块，取不到则降级为不做互斥 |
+| 新增 | `run` / `holdout` 开跑前查锁；被占用时退出码 5，不写台账、不建实验目录 |
+| 变化 | `run` 的锁检查前移到「分配 exp_id」之前，避免被拒还留下空目录 |
+| 修复 | 存活探测不再用 `os.kill(pid, 0)`：该调用在 Windows 上会**真的终止对方进程** |
+
+**踩到的坑（重要）**：`os.kill(pid, 0)` 在 POSIX 上是只读探测，但 CPython 的
+Windows 实现把非控制台信号的 sig 直接交给 `TerminateProcess(handle, sig)`。
+写成 `os.kill(pid, 0)` 等于「以退出码 0 杀掉那个进程」。实测确认：本进程调
+`os.kill(os.getpid(), 0)` 后无声退出。现改为 Windows 走
+`OpenProcess` + `GetExitCodeProcess`，POSIX 仍用 `os.kill(pid, 0)`。

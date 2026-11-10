@@ -1903,6 +1903,42 @@ version_diff:
     tests: "后端 44 个脚本全绿（test_onnx_fallback 76 项、test_infer_timing 15 项）；前端 6 套全绿"
 ```
 
+#### v1.32.1 变更点（相对 v1.31.0）——跨进程 GPU 互斥：网页端与命令行不再抢显存
+
+**问题**：`_reject_if_busy()` 只查本进程内存里的任务表。两种真实情况它看不见：
+
+1. 命令行在跑 `7-autoresearch-yolo/autoexp.py run`（自动实验循环）；
+2. 本机同时起着两个 Web 实例（8060 与 8094），各自的任务表互不可见。
+
+后果不只是 OOM，autoexp 侧更糟：Ultralytics 遇 OOM 会把 batch 静默减半重试，
+于是这次实验的等效学习率、正则强度都和它自己的台账里其它实验不一样，横比全失真。
+
+**做法**：`runtime/gpu_lock.json` 一个锁文件，同一时刻最多一个持有者。
+
+| 场景 | 行为 |
+| --- | --- |
+| 网页点「开始训练」，锁被 autoexp / 另一套 Web 实例持有 | **409**，文案带占用方、PID、该去哪停 |
+| `autoexp.py run` / `holdout`，锁被网页端持有 | 退出码 5，不建实验目录、不写台账 |
+| 持有者被强杀 | 锁残留但 PID 已死 → 视为空闲 |
+| 锁文件损坏 | 视为空闲（宁可漏判一次，也不让所有人用不了） |
+
+**改动文件**
+
+| 文件 | 改动 |
+| --- | --- |
+| `backend/gpulock.py` | 新增。零第三方依赖（autoexp 会 import 它），放在 backend 内是因为打包脚本整目录冻结 |
+| `backend/runners.py` | 独占任务在 `create()` 取锁（拿不到**不抛错**，拒绝职责在 app 层）、`_finalize()` 最先释放 |
+| `backend/app.py` | `_reject_if_busy()` 增加外来持有者检查，返回 409 |
+| `backend/tools/test_gpulock.py` | 新增 7 项用例，全部把锁指向临时文件，不碰真实的 `runtime/gpu_lock.json` |
+
+**一个危险写法的修复**：存活探测原本打算用 `os.kill(pid, 0)`。POSIX 上没问题，
+但 CPython 的 Windows 实现把非控制台信号的 sig 直接传给 `TerminateProcess(handle, sig)`
+——**等于把那个进程以退出码 0 杀掉**。实测确认：本进程调 `os.kill(os.getpid(), 0)` 后无声退出。
+现改为 Windows 走 `OpenProcess` + `GetExitCodeProcess`。
+
+**兼容性**：既有语义不变。`create()` 拿不到锁不抛错，所以
+`tools/test_concurrency.py` 里「两条重任务可并存」这条用例仍然通过（7 项全绿）。
+
 #### v1.31.0 变更点（相对 v1.30.6）——上层并行：推理进程池
 
 **用户提问**：接着做上层并行，你要怎么修改打算？

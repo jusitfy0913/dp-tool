@@ -708,6 +708,30 @@ def cmd_split(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 
 
+def load_gpulock() -> Any:
+    """加载 6-web 的 ``gpulock``（零第三方依赖，只用标准库）。
+
+    为什么复用 Web 那一份而不是自己再写一遍：锁文件的格式是两边共用的契约，
+    两份实现迟早会漂移（一边加字段、一边改判定），而漂移的表现是
+    「两个训练都以为自己是唯一持有者」——正好是最危险的失效方式。
+
+    为什么放在 6-web/backend：Web 打包脚本会把整个 backend 目录一起冻结，
+    放在那里才不会漏文件。取不到就返回 None，由调用方降级为「不做互斥」，
+    不要让一把锁成为训练跑不起来的原因。
+    """
+    backend = ROOT.parent / "6-web" / "backend"
+    if not (backend / "gpulock.py").is_file():
+        return None
+    if str(backend) not in sys.path:
+        sys.path.insert(0, str(backend))
+    try:
+        import gpulock  # noqa: PLC0415 - 刻意延迟导入，缺文件时才能降级
+
+        return gpulock
+    except Exception:  # noqa: BLE001 - 互斥失败不该阻断训练
+        return None
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     config_path = Path(args.config).resolve()
     override = load_json(config_path)
@@ -722,9 +746,51 @@ def cmd_run(args: argparse.Namespace) -> int:
             log("如确认要越界，加 --no-validate 重跑。")
             return 2
 
+    # 跨进程 GPU 锁：网页端可能正在训练，或者还起着另一套 Web 实例。
+    # 那种情况下开跑必然抢显存，而 Ultralytics 会静默减半 batch 重试，
+    # 于是这次实验与台账里其它实验不再是同一件事。宁可拒绝，也不要产出不可比的数。
+    #
+    # 位置刻意放在分配 exp_id 之前：被拒时不该留下 experiments/exp_NNNN.json
+    # 和空的 runs 目录，否则台账会多出一堆「从没跑过」的编号，看的人会以为丢数据了。
+    lock = load_gpulock()
+    lock_held = False
+    if lock is not None:
+        holder = lock.read()
+        if holder is not None and int(holder.get("pid") or 0) != os.getpid():
+            log(f"显卡正被占用：{lock.describe(holder)}")
+            log("本次不启动。等它结束，或到那个页面/终端里停止后重试。")
+            return 5
+        lock_held, lock_reason = lock.acquire("autoexp", "autoexp-run", args.exp_id or "")
+        if lock_held and lock_reason:
+            log(f"注意：跨进程互斥未生效——{lock_reason}")
+    else:
+        log("注意：未找到 6-web/backend/gpulock.py，本次不做跨进程互斥")
+
+    try:
+        return _run_locked(args, cfg, config_path, lock, lock_held)
+    finally:
+        # 训练子进程已退出（或被打断），立刻让出 GPU 位置。
+        # 放在 finally 里：按 Ctrl+C 中途退出也要释放，否则锁会挂到进程死亡才清。
+        if lock is not None and lock_held:
+            lock.release()
+
+
+def _run_locked(
+    args: argparse.Namespace,
+    cfg: dict[str, Any],
+    config_path: Path,
+    lock: Any,
+    lock_held: bool,
+) -> int:
+    """``cmd_run`` 的主体。拆出来是为了让锁的获取/释放在一个地方看全。"""
     exp_id = args.exp_id or next_exp_id()
     project = assert_sandbox(RUNS_DIR, "project")
     exp_dir = assert_sandbox(project / exp_id, "exp_dir")
+
+    # 拿到锁之后再补一次 label：上面的 acquire 在 exp_id 还没分配时只能用参数值，
+    # 而锁里写明「哪一次实验」对排障很关键（看到 GPU 被占时能直接找到对应 run）。
+    if lock is not None and lock_held:
+        lock.acquire("autoexp", "autoexp-run", exp_id)
 
     # 开跑前体检。宁可早退，也不要跑一半因内存/显存不足产出假数据。
     try:
@@ -764,6 +830,8 @@ def cmd_run(args: argparse.Namespace) -> int:
         log_handle.write(f"# {exp_id} {snapshot['created_at']}\n")
         log_handle.write(f"# cmd: {' '.join(cmd)}\n\n")
         log_handle.flush()
+        # 锁的释放在 cmd_run 的 finally 里，这里不再重复：
+        # 两处都放会让人以为「必须两层救援」，实际只需最外层那一处。
         proc = subprocess.run(cmd, cwd=str(ROOT), stdout=log_handle, stderr=subprocess.STDOUT)
     elapsed = round(time.time() - started, 1)
 
@@ -1042,6 +1110,19 @@ def cmd_holdout(args: argparse.Namespace) -> int:
     else:
         log(f"未找到训练记录，按配置取 imgsz={train_imgsz} batch={train_batch}")
 
+    # holdout 也要占显卡。虽然只要 10 秒左右，但和正在跑的网页训练撞上
+    # 一样会 OOM，把本来 10 秒的验收变成一次失败。
+    lock = load_gpulock()
+    lock_held = False
+    if lock is not None:
+        holder = lock.read()
+        if holder is not None and int(holder.get("pid") or 0) != os.getpid():
+            log(f"显卡正被占用：{lock.describe(holder)}；holdout 未启动")
+            return 5
+        lock_held, lock_reason = lock.acquire("autoexp", "holdout", exp_id or weights.stem)
+        if lock_held and lock_reason:
+            log(f"注意：跨进程互斥未生效——{lock_reason}")
+
     # holdout 验收走独立子进程，防止污染主进程状态
     out_dir = assert_sandbox(ROOT / "runs" / "holdout" / f"{exp_id or 'adhoc'}_{datetime.now():%Y%m%d_%H%M%S}", "holdout_out")
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -1063,8 +1144,12 @@ def cmd_holdout(args: argparse.Namespace) -> int:
         str(args.device or (cfg.get("train") or {}).get("device", "0")),
     ]
     log_path = out_dir / "holdout.log"
-    with log_path.open("w", encoding="utf-8") as handle:
-        proc = subprocess.run(cmd, cwd=str(ROOT), stdout=handle, stderr=subprocess.STDOUT)
+    try:
+        with log_path.open("w", encoding="utf-8") as handle:
+            proc = subprocess.run(cmd, cwd=str(ROOT), stdout=handle, stderr=subprocess.STDOUT)
+    finally:
+        if lock is not None and lock_held:
+            lock.release()
 
     result_path = out_dir / "result.json"
     if not result_path.is_file():
