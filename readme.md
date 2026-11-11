@@ -153,6 +153,86 @@ python tf_anomalib_launcher.py --mode check-env
 
 ## 版本更新记录
 
+### v1.35.0 — 2026-11-11（标注页五步引导、左右栏重排、「移出图片」不删磁盘文件）
+
+**一句话**：标注页从「功能都摆在那，你自己找」变成「照着 1→5 往下走」——
+顶部五步引导条高亮当前该做的事并给出直达按钮；加错的图片在列表行尾点「×」即可移出工程，
+**磁盘上的原图不动**，按 `Ctrl+Z` 还能撤回。
+
+**解决什么**：功能齐全不代表新人会用。原来的标注页有三个具体问题：
+① 左栏加图控件在图片列表**下方**，空工程时用户看到的是一个空框，不知道该点哪；
+② 右栏把「草稿 / 审核」这两块进阶功能塞在「类别 / 标注框 / 导出」中间，主流程被打断；
+③ 选错目录批量加进 300 张图后，只能退出工程、去磁盘删文件、再重开——最容易让人放弃的一步。
+
+| 事项 | 变化 |
+| --- | --- |
+| 五步引导条 | `#annoGuide` 固定在标注页顶部：`1 工程 → 2 加入图片 → 3 设置类别 → 4 画框标注 → 5 保存 / 导出`；当前步高亮并显示「现在该做什么」，主按钮直接执行该步动作 |
+| 判定口径 | 五步是否完成由纯函数 `buildAnnoSteps(context)` 决定（见下表），**不读 DOM**，可 node 直跑 |
+| 引导条可收起 | 右上角「收起」，状态存 `localStorage`；收起后画布高度从 708px 让到 754px（1920×1080 实测） |
+| 左栏重排 | 加图控件（目录 + 「批量加入」+「选图片…」）移到图片列表**上方**；标题带步骤号 `2`；列表为空时显示「先做第 1 步」的占位提示 |
+| 工程区去歧义 | 「新建工程 / 打开」并排，路径说明写在下方；路径只给目录时自动补成 `<目录名>.tfanno` 并在状态栏写明 |
+| 右栏重排 | `3 类别` → `4 标注框` → 属性 → `5 导出` 依次排列；草稿与审核收进 `<details id="annoAdvDraft">`「进阶：预标注草稿与审核」 |
+| 进阶块展开策略 | 有草稿或有审核记录时自动展开；**用户亲手点过 summary 后，自动规则永久让位**（`shouldExpandDrafts` 的 `touched`） |
+| 移出图片 | 每行尾「×」→ `removeImage(index)`：整工程快照进撤销栈 → 从 `images` 移除 → 清该图草稿与审核 → 修正 `currentIndex` → 状态栏提示 |
+| 工具栏分组 | 中栏工具按「绘制 / 编辑 / 显示 / 视图」四组打小标题（`.anno-group-label`），不再是一条平铺的按钮带 |
+| 分栏拖动 | `#panel-annotate.active` 改为 flex 列：引导条 `flex: 0 0 auto`，`.anno-layout` `flex: 1 1 auto; min-height: 0`，`splitpanes.js` 的横向拖拽与折叠不受影响 |
+
+**五步判定口径（`6-web/frontend/js/annotateflow.js`）**
+
+| 步骤 | 完成的判定 | 主按钮动作（`action`） |
+| --- | --- | --- |
+| `project` 1 工程 | `state.project && state.path` | 路径空 → `create`（聚焦输入框）；有路径 → `create` 新建工程 |
+| `images` 2 加入图片 | `images.length > 0` | `addFiles`（打开原生「选图片」对话框） |
+| `classes` 3 设置类别 | 检测类任务：`hasCustomClass()` 为真（至少一个类别名不是占位名）；分类任务：有类别即可 | `focusClass`（聚焦类别输入框） |
+| `draw` 4 画框标注 | 检测类任务：**当前图片** `annotations.length > 0`；分类任务：至少一张图已标 `class_id` | `toolRect`（切到矩形工具） |
+| `save` 5 保存 / 导出 | 前四步全完成且 `state.dirty === false` | `save`（保存工程） |
+
+新建工程自带占位类别：检测是 `object`，分类是 `良品 / 不良`。
+**占位名不算第 3 步完成**——放行会让用户在还没定义缺陷种类时就开始画框，回头改类别要一个个点。
+`classify` 任务例外：它的默认类别本身就是业务含义，有类别即算完成。
+
+**「移出图片」的准确语义**
+
+| 行为 | 是否发生 | 备注 |
+| --- | --- | --- |
+| 从 `.tfanno` 的 `images` 数组移除 | ✅ | 重开工程不再出现 |
+| 清掉该图的草稿与审核状态 | ✅ | 调 `saveAnnotationDrafts({ images: { [id]: [] }, review: { [id]: { state: "unchecked" } } })`，只清这一张 |
+| 进撤销栈（整工程快照） | ✅ | `Ctrl+Z` 连标注一起恢复；**草稿与审核不随撤销恢复** |
+| 删除磁盘上的图片文件 | ❌ | 文件仍在原目录，可再次「批量加入」 |
+| 影响其它图片 / 类别表 | ❌ | — |
+
+下标修正（`removeImageAt` 纯函数，不改入参）：删中间那张 → 停在原下标（下一张顶上来）；
+删最后一张 → 退回前一张；删到空 → `currentIndex = -1`，画布回到空状态，
+避免「列表已经空了但画布还停在下标 5」这种越界后一片空白的怪状态。
+
+**纯函数接口（读取方/测试按这个格式解析）**
+
+| 函数 | 入参 | 返回 |
+| --- | --- | --- |
+| `buildAnnoSteps(context)` | `{ task, hasProject, imageCount, classCount, customClass, annotationCount, classifiedCount, dirty }` | `Array<{ id, no, title, hint, action, actionLabel, state }>`，`state ∈ done / current / todo` |
+| `currentStep(steps)` | 上一步的返回值 | 当前步对象；全部完成时返回最后一步（保存），不返回 `null` |
+| `resolveGuideAction(step)` | 单个步骤对象 | 动作名（`create / addFiles / focusClass / toolRect / save`），非法输入返回 `""` |
+| `hasCustomClass(classes, task)` | 类别数组、任务类型 | `boolean` |
+| `removeImageAt(images, index)` | 图片数组、要删的下标 | `{ images, removed, focusIndex }` |
+| `shouldExpandDrafts({ draftCount, reviewCount, touched, open })` | 草稿数、审核数、用户是否点过、当前展开态 | `boolean` |
+| `countAllDrafts(drafts)` | `Map` 或普通对象 | 草稿总条数 |
+
+**新增文件**：`6-web/frontend/js/annotateflow.js`、`6-web/frontend/tests/test_annotate_flow.mjs`、
+`6-web/backend/tools/test_annotate_wiring.py`。
+**改动文件**：`6-web/frontend/{index.html,css/style.css,js/annotate.js}`、`6-web/backend/config.py`（版本号）、
+`6-web/README.md`、`docs/WORKFLOW_GUIDE.md`、`docs/TRTForge_Web操作手册.md`。
+
+**兼容性（刻意保持不变）**：分栏与折叠、快捷键 `A` / `D` / `Space` / `K` / `Shift+K`、乐观锁与 409 冲突提示、
+YOLO 数据集导入、SAM 点框、文本提示、批量预标注、导出格式与目录结构——**全部原样**。
+五步引导只负责「告诉你去哪」，所有按钮仍走原来的处理函数；引导条收起时布局与 v1.34.4 等价。
+
+**测试**：`node 6-web\frontend\tests\test_annotate_flow.mjs` **57 项**（步骤判定 / 占位类别 /
+移除下标夹取 / 草稿展开策略 / 草稿计数）；`python 6-web\backend\tools\test_annotate_wiring.py` **58 项**
+（标注页内 id 引用全部存在、标签配对、DOM 顺序、样式类）；后端全量 `run_all_tests.py` **54 个脚本全绿**。
+浏览器实测：收起引导条画布 708px → 754px；建工程 `ui.tfanno`、加 3 张图、点行尾「×」移出，
+磁盘上 `a.png / b.png / c.png` **仍在**，`Ctrl+Z` 恢复第 3 张且下标停在 2。
+详细说明见 [6-web/README.md](6-web/README.md) 的「五步引导与「移出图片」（v1.35.0）」节。
+
 ### v1.34.4 — 2026-11-11（良品图 + 操作点：漏检-过杀曲线、引擎工作点、自动实验过杀约束）
 
 **一句话**：把「漏一个」和「多报一个」从只能事后感叹变成可以调的旋钮——良品图进验收集，

@@ -980,16 +980,80 @@ ONNX/引擎 sha256、来源训练 run 放在同一个旁挂文件里。**不修�
 
 #### 上手步骤
 
-1. 切到「标注」页签。顶部填工程路径（`.tfanno`），点「打开」。
-   文件不存在时后端返回空白骨架，前端进入「新建」流程，点「新建」即按当前路径落盘。
-   **路径要写到文件名**（浏览器没有系统文件对话框，「浏览」只能选目录）：
-   如果只选了目录，点「新建」会按目录名补成 `<目录名>.tfanno`，
-   状态栏会写明补成了什么名字，想换名字直接改输入框即可。
-2. 左侧是图片列表（显示每张图的标注数与未保存标记）；右上角「添加图片」可扫描目录批量加入。
-3. 中栏画布选工具（快捷键见下），左键画，`Esc` 取消，`Enter` 结束多边形 / 关键点。
-4. 右栏选类别；选中对象后属性面板可改标签、描述、分组、集合、置信度、难例、标记、属性。
-5. `Ctrl+S` 手动保存；不按也会在停止编辑 3 秒后自动保存（保存不进撤销栈）。
-6. 「自动标注」展开后可生成草稿；「导出」选格式与目录。
+1. 切到「标注」页签。顶部**五步引导条**会告诉你现在该做什么（`1 工程 → 2 加入图片 → 3 设置类别 → 4 画框标注 → 5 保存 / 导出`），右侧按钮就是这一步的动作，点它即可；嫌占地方点「隐藏流程」，选择记在 `localStorage`（键 `trtforge.anno.guide`）。
+2. 左栏「1 工程」填工程路径（`.tfanno`），点「打开」。
+   文件不存在时后端返回空白骨架，前端进入「新建」流程，点「新建工程」即按当前路径落盘。
+   **路径要写到文件名**（浏览器没有系统文件对话框，「…」只能选目录）：
+   如果只选了目录，「新建工程」会按目录名补成 `<目录名>.tfanno`，
+   状态栏会写明补成了什么名字，想换名字直接改输入框或点「选路径…」。
+3. 左栏「2 图片」在列表**上方**：填目录点「批量加入」，或点「选图片…」逐张挑。列表显示每张图的标注数与未保存标记。
+4. 右栏「3 类别」先加缺陷名（如 `划痕`），再回中栏画布选工具（快捷键见下），左键画，`Esc` 取消，`Enter` 结束多边形 / 关键点。
+5. 右栏「4 标注框」列出当前图的框；选中对象后「属性」面板可改标签、描述、分组、集合、置信度、难例、标记、属性。
+6. `Ctrl+S` 手动保存；不按也会在停止编辑 3 秒后自动保存（保存不进撤销栈）。
+7. 右栏「5 导出」选格式与目录。草稿与审核在右栏最下面的「进阶」折叠块里。
+
+#### 五步引导与「移出图片」（v1.35.0）
+
+**要解决的问题**：功能都在，但新人不看文档不知道从哪下手；加错的图片只能到磁盘上删文件再重开工程。
+
+| 改动 | v1.34.4 及之前 | v1.35.0 |
+| --- | --- | --- |
+| 流程提示 | 只能读文档 / 猜按钮 | 顶部五步引导条，高亮当前步，主按钮直接执行该步动作 |
+| 左栏顺序 | 图片列表在上、加图控件在下 | 加图控件移到列表上方；空列表给出"先做第 1 步"的提示 |
+| 右栏顺序 | 类别 → 标注框 → 草稿 → 审核 → 属性 → 导出 | 类别 → 标注框 → 属性 → 导出；草稿与审核折叠为「进阶」 |
+| 删图 | 不支持 | 行尾「×」移出工程，**不删磁盘文件**，`Ctrl+Z` 可撤销 |
+| 工具栏 | 平铺 | 「绘制 / 编辑 / 显示 / 视图」四组带小标题 |
+
+**五步判定口径**（`js/annotateflow.js` 的 `buildAnnoSteps`，纯函数、有单测）
+
+| 步骤 | 完成的判定 | 主按钮动作 |
+| --- | --- | --- |
+| 1 工程 | `state.project && state.path` | 路径空 → 聚焦输入框；有路径 → 新建工程 |
+| 2 加入图片 | `images.length > 0` | 打开「选图片」原生对话框 |
+| 3 设置类别 | 检测类任务：存在改名后的类别（`hasCustomClass`）；分类任务：有类别即可 | 聚焦类别输入框 |
+| 4 画框标注 | 检测类任务：**当前图片**的 `annotations.length > 0`；分类任务：至少一张已标 `class_id` | 切到矩形工具 |
+| 5 保存 / 导出 | 前四步完成且 `state.dirty === false` | 保存工程 |
+
+新建工程自带占位类别 `object`（分类是 `良品` / `不良`），**占位名不算第 3 步完成**：
+放行会让用户在没定义缺陷种类的情况下开始画框，回头改类别要一个个点。
+
+**「移出图片」的准确语义**
+
+| 行为 | 是否发生 | 备注 |
+| --- | --- | --- |
+| 从 `.tfanno` 的 `images` 数组移除 | ✅ | 重开工程不再出现 |
+| 清掉该图的草稿与审核状态 | ✅ | 调 `saveAnnotationDrafts({images:{id:[]}, review:{id:{state:'unchecked'}}})`；只清这一张 |
+| 进撤销栈（整工程快照） | ✅ | `Ctrl+Z` 连标注一起恢复；**草稿与审核不随撤销恢复** |
+| 删除磁盘上的图片文件 | ❌ | 移除后文件仍在原目录，可再次「批量加入」 |
+| 影响其它图片 / 类别表 | ❌ | — |
+
+下标修正规则（`removeImageAt` 纯函数）：删中间那张 → 停在原下标（下一张顶上来）；
+删最后一张 → 退回前一张；删到空 → `currentIndex = -1`，画布回到空状态。
+
+**实现文件**
+
+| 文件 | 职责 |
+| --- | --- |
+| `frontend/js/annotateflow.js` | 新增。五步判定、移除下标夹取、草稿面板展开策略，全部纯函数，不碰 DOM |
+| `frontend/js/annotate.js` | 渲染引导条（`renderGuide`）、动作分发（`runGuideAction`）、移除实现（`removeImage`） |
+| `frontend/index.html` | 引导条结构、左栏加图控件上移、右栏顺序调整、草稿/审核折叠块 |
+| `frontend/css/style.css` | `#panel-annotate.active` 改成 flex 列（引导条高度从画布让出来）、引导条/步骤号/移除按钮样式 |
+
+**验收**
+
+```powershell
+python 6-web\backend\tools\test_annotate_wiring.py     # 58/58：id 接线、标签配对、结构顺序
+node 6-web\frontend\tests\test_annotate_flow.mjs       # 57 项：步骤判定 / 下标夹取 / 展开策略
+node 6-web\frontend\tests\test_splitpanes.mjs          # 18 项：分栏拖动未被 flex 高度改坏
+python 6-web\backend\tools\run_all_tests.py            # 54 个脚本全绿
+```
+
+**已知边界（刻意不做）**
+
+- 移除图片不退化为「删除文件」：页面上的删除动作一律不动用户磁盘，这是本项目的一贯取舍。
+- 草稿与审核不随撤销恢复：撤销栈只存 `.tfanno` 快照，草稿在旁挂文件里，恢复会写回一份与正文不一致的候选框。
+- 引导条不做「强制步骤门禁」：可以跳着做（例如先加类别再补工程），引导条只是提示，不拦截。
+
 
 #### 导入已有 YOLO 标签（v1.19 新增）
 
@@ -3853,7 +3917,7 @@ offset1 = cursor - p_image * scale1
 **一条命令跑完全部后端测试**（v1.15 起，CI 与本地共用同一个入口）：
 
 ```powershell
-D:\Anaconda3\envs\dpenv\python.exe 6-web\backend\tools\run_all_tests.py      # 52 个脚本（v1.34.3）
+D:\Anaconda3\envs\dpenv\python.exe 6-web\backend\tools\run_all_tests.py      # 54 个脚本（v1.35.0）
 D:\Anaconda3\envs\dpenv\python.exe 6-web\backend\tools\run_all_tests.py transd  # 只跑名字含 transd 的
 ```
 
@@ -3905,6 +3969,10 @@ node 6-web\frontend\tests\test_viewer_math.mjs
 node 6-web\frontend\tests\test_engine_out.mjs
 node 6-web\frontend\tests\test_splitpanes.mjs
 node 6-web\frontend\tests\test_contrast.mjs
+node 6-web\frontend\tests\test_annotate_flow.mjs    # v1.35.0：五步判定 / 移除下标 / 草稿展开
+
+# 标注页静态接线（不需要服务：id 引用、标签配对、结构顺序、样式类）
+D:\Anaconda3\envs\dpenv\python.exe 6-web\backend\tools\test_annotate_wiring.py
 
 # 引擎构建进度与耗时估算（不需要服务、不需要 trtexec；有真实日志时自动回放全量）
 D:\Anaconda3\envs\dpenv\python.exe 6-web\backend\tools\test_engine_progress.py

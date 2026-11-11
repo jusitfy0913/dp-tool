@@ -41,6 +41,17 @@ import {
   screenToImage,
   wheelDeltaToFactor,
 } from "./viewer.js";
+// 五步流程的判定全是纯函数（有单测 tests/test_annotate_flow.mjs 覆盖），
+// 这里只负责把结果画到界面上、把按钮动作分发出去。
+import {
+  buildAnnoSteps,
+  countAllDrafts,
+  currentStep,
+  hasCustomClass,
+  removeImageAt,
+  resolveGuideAction,
+  shouldExpandDrafts,
+} from "./annotateflow.js";
 
 // ---------------------------------------------------------------------------
 // 常量
@@ -207,6 +218,14 @@ const state = {
   modelzoo: null,
   /** 正在轮询的下载任务 id 集合（避免同一任务起两个定时器）。 */
   modelPolls: new Set(),
+  /**
+   * 右栏「进阶：预标注草稿与审核」是否被用户手动动过。
+   *
+   * false：按内容自动展开/收起（有草稿就展开，让批量预标注的结果直接可见）；
+   * true ：用户点过折叠条，之后一律听用户的，不再自动弹开或收起。
+   * 切工程时重置，因为那是另一份草稿池，用户的临时偏好不该跨工程传染。
+   */
+  advDraftTouched: false,
 };
 
 const el = {};
@@ -1021,6 +1040,8 @@ async function adoptProject(data, path) {
   state.drafts.clear();
   state.draftDirty.clear();
   state.review.clear();
+  // 换了工程就重置进阶块的"用户偏好"：新工程可能有草稿需要自动展开
+  state.advDraftTouched = false;
   reviewPending = new Map();
   state.hidden.clear();
   state.selectedId = "";
@@ -1124,6 +1145,7 @@ async function createProject() {
     state.drafts.clear();
     state.draftDirty.clear();
     state.review.clear();
+    state.advDraftTouched = false;
     reviewPending = new Map();
     if (el.path) el.path.value = state.path;
     // 同名旁挂草稿属于"旧工程"：新工程里既没有那些图片，留着只会污染草稿池
@@ -1362,8 +1384,147 @@ function applyTaskChrome() {
   document.getElementById("annoAutoLabelBox")?.toggleAttribute("hidden", classify);
 }
 
+// ---------------------------------------------------------------------------
+// 五步引导条（v1.35.0）
+//
+// 目标只有一个：打开标注页的人不用读文档就知道"现在该做什么"。
+// 判定逻辑全在 annotateflow.js（纯函数、有单测），这里只做三件事：
+// 收集现场数据 → 渲染步骤条 → 把主按钮分发给已有函数。
+// ---------------------------------------------------------------------------
+
+/** 引导条隐藏状态存在 localStorage：老用户收起过一次，不该每次刷新又冒出来。 */
+const GUIDE_STORAGE = "trtforge.anno.guide";
+
+/** 当前该高亮的提示文案；没有未完成步骤时给一句收尾。 */
+function guideSuggestion(steps) {
+  const step = currentStep(steps);
+  if (!step) return { text: "", action: "", label: "" };
+  if (steps.every((item) => item.state === "done")) {
+    return { text: "五步都完成了：继续标下一张，或到「数据集」页切分后开始训练", action: "", label: "" };
+  }
+  return { text: step.hint, action: resolveGuideAction(step), label: step.actionLabel };
+}
+
+/** 收集这一步判定需要的数据。所有输入都来自内存状态，不额外发请求。 */
+function guideContext() {
+  const project = state.project;
+  const image = currentImage();
+  let annotationCount = 0;
+  let classifiedCount = 0;
+  for (const item of project?.images || []) {
+    annotationCount += (item.annotations || []).length;
+    if (item.class_id !== undefined && item.class_id !== null) classifiedCount += 1;
+  }
+  return {
+    task: project?.task || "detect",
+    hasProject: Boolean(project && state.path),
+    imageCount: project?.images?.length || 0,
+    classCount: project?.classes?.length || 0,
+    customClass: hasCustomClass(project?.classes || [], project?.task || "detect"),
+    // 画框进度按"当前图片"判定：用户关心的是这张标完了没有
+    annotationCount: image ? (image.annotations || []).length : annotationCount,
+    classifiedCount,
+    // 只看 `.tfanno` 本身的未保存改动；草稿有 800ms 防抖，算进来会让第 5 步
+    // 在"刚保存完"的瞬间还闪一下"未保存"
+    dirty: Boolean(state.dirty),
+  };
+}
+
+function renderGuide() {
+  if (!el.steps) return;
+  const steps = buildAnnoSteps(guideContext());
+  el.steps.innerHTML = "";
+  for (const step of steps) {
+    const li = document.createElement("li");
+    li.className = `anno-step ${step.state}`;
+    li.dataset.step = step.id;
+    li.title = step.hint;
+    const no = document.createElement("span");
+    no.className = "no";
+    // 完成的步骤显示 ✓，比"数字变绿"更直观
+    no.textContent = step.state === "done" ? "✓" : String(step.no);
+    const title = document.createElement("span");
+    title.textContent = step.title;
+    li.append(no, title);
+    li.addEventListener("click", () => runGuideAction(step.action));
+    el.steps.appendChild(li);
+  }
+  const suggestion = guideSuggestion(steps);
+  if (el.guideTip) el.guideTip.textContent = suggestion.text;
+  if (el.guideAction) {
+    el.guideAction.textContent = suggestion.label || "已就绪";
+    el.guideAction.disabled = !suggestion.action;
+  }
+}
+
+/** 引导条主按钮 / 步骤圆片共用的动作分发。每个动作都落到已有的按钮或状态上。 */
+function runGuideAction(action) {
+  switch (action) {
+    case "create":
+      // 没有工程时先聚焦路径输入框：用户多半还没填路径，直接弹"新建"会先报错
+      if (!(el.path?.value || "").trim()) {
+        el.path?.focus();
+        setStatus("先填 .tfanno 路径（可点「选路径…」），再点「新建工程」", "warn");
+        return;
+      }
+      createProject();
+      return;
+    case "addFiles":
+      addImagesByDialog();
+      return;
+    case "focusClass":
+      el.classNameInput?.focus();
+      setStatus("输入缺陷名后回车或点「加」", "");
+      return;
+    case "toolRect":
+      setTool("rectangle");
+      setStatus("已切到矩形工具：在图上按住拖出一个框", "");
+      return;
+    case "save":
+      saveProject({ silent: false });
+      return;
+    default:
+      return;
+  }
+}
+
+/**
+ * 引导条的显示/隐藏。
+ *
+ * 收起后只留一个「显示流程」按钮：不用 `hidden` 整条藏掉，是因为藏掉之后
+ * 用户找不到恢复入口（这个页面本来就没有设置面板）。
+ */
+function applyGuideVisibility() {
+  if (!el.guide) return;
+  const collapsed = localStorage.getItem(GUIDE_STORAGE) === "0";
+  el.guide.classList.toggle("is-collapsed", collapsed);
+  if (el.guideToggle) {
+    el.guideToggle.textContent = collapsed ? "显示流程" : "隐藏流程";
+    el.guideToggle.title = collapsed ? "展开五步流程说明" : "收起后画布会变高，可从同一位置恢复";
+  }
+}
+
+/**
+ * 「进阶：预标注草稿与审核」的展开状态。
+ *
+ * 判定在 annotateflow.shouldExpandDrafts：用户手动动过就完全听用户的，
+ * 没动过才按"有没有草稿/审核记录"自动展开。
+ */
+function syncDraftPanel() {
+  if (!el.advDraft) return;
+  const open = shouldExpandDrafts({
+    draftCount: countAllDrafts(state.drafts),
+    reviewCount: state.review.size,
+    touched: state.advDraftTouched,
+    open: el.advDraft.open,
+  });
+  if (el.advDraft.open !== open) el.advDraft.open = open;
+}
+
 function renderAll() {
   applyTaskChrome();
+  renderGuide();
+  syncDraftPanel();
   renderClassList();
   renderBoxTable();
   renderDraftList();
@@ -3136,10 +3297,94 @@ function renderImageList() {
     const split = document.createElement("span");
     split.className = `split ${image.split}`;
     split.textContent = image.split;
-    li.append(flag, name, meta, split);
+    // 行尾移除：只从工程里拿掉，不碰磁盘文件。默认低调，悬停才变红，
+    // 避免用户把"点整行切图"和"删图"弄混。
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "mini danger anno-remove";
+    remove.textContent = "×";
+    remove.title = "从工程移除（不删磁盘上的图片，Ctrl+Z 可撤销）";
+    remove.addEventListener("click", (event) => {
+      event.stopPropagation();
+      removeImage(index);
+    });
+    li.append(flag, name, meta, split, remove);
     li.addEventListener("click", () => switchImage(index));
     el.imageList.appendChild(li);
   });
+
+  // 空列表要给出"下一步该点哪里"，否则新工程打开后只是一片空白
+  if (!images.length) {
+    const empty = document.createElement("li");
+    empty.className = "empty";
+    empty.textContent = state.project
+      ? "还没有图片：填上面的图片目录后点「批量加入」，或点「选图片…」逐张挑。"
+      : "先按第 1 步新建或打开一个 .tfanno 工程，再回来加图片。";
+    el.imageList.appendChild(empty);
+  }
+}
+
+/**
+ * 从工程里移除一张图片（v1.35.0）。
+ *
+ * 只改 `.tfanno` 里的图片数组，**不删磁盘文件**——用户点「×」的意思几乎都是
+ * "这张不该在这个工程里"，而不是"把这张照片毁掉"。
+ *
+ * 三件事必须一起做，否则会留下脏数据：
+ * 1) 整工程进撤销栈：撤销要能把这行连标注一起恢复；
+ * 2) 同步旁挂草稿与审核状态：图片 id 没了，草稿还留着就是"孤儿"，
+ *    下次同 id 的新图会被旧草稿污染；
+ * 3) 修正当前下标：删掉的正好是当前图时要切到相邻图，删空则回空状态。
+ */
+async function removeImage(index) {
+  const project = state.project;
+  const image = project?.images?.[index];
+  if (!image) return;
+  const name = image.id || image.path;
+  const draftCount = (state.drafts.get(image.id) || []).length;
+  const extra = draftCount ? `\n\n这张图还有 ${draftCount} 条预标注草稿，也会一起清掉。` : "";
+  const confirmed = window.confirm(
+    `从工程中移除「${name}」？\n\n` +
+      `只移出工程，磁盘上的图片文件不会被删除。\n` +
+      `该图片的标注会一起移除，可以用 Ctrl+Z 撤销。${extra}`,
+  );
+  if (!confirmed) {
+    setStatus("已取消移除", "");
+    return;
+  }
+  // 先把手上的改动落盘：移除操作会整份重写 images 数组，不能让未保存内容陪葬
+  await flushSave();
+  pushHistory(true);
+  const wasCurrent = index === state.currentIndex;
+  const { images, removed, focusIndex } = removeImageAt(project.images, index);
+  if (!removed) return;
+  project.images = images;
+  // 下标修正：删的位置在当前之前，当前图整体前移一位；删的就是当前图，按 focusIndex 落位
+  if (state.currentIndex > index) state.currentIndex -= 1;
+  else if (wasCurrent) state.currentIndex = focusIndex;
+  state.drafts.delete(removed.id);
+  state.draftDirty.delete(removed.id);
+  state.review.delete(removed.id);
+  if (wasCurrent) {
+    state.image = null;
+    state.selectedId = "";
+    state.pending = [];
+    state.hidden.clear();
+    state.viewValid = false;
+  }
+  afterEdit();
+  if (wasCurrent) loadCurrentImage();
+  else renderCanvas();
+  // 旁挂文件增量清理：空数组 = 删掉这张图的草稿，unchecked = 删掉审核记录。
+  // 失败只提示不算失败的操作——磁盘上的 `.tfanno` 已经改对了。
+  if (state.path) {
+    saveAnnotationDrafts({
+      path: state.path,
+      images: { [removed.id]: [] },
+      review: { [removed.id]: { state: "unchecked" } },
+    }).catch((error) => setStatus(`草稿清理失败：${error.message}`, "warn"));
+  }
+  setStatus(`已从工程移除 ${name}（磁盘文件未删除，Ctrl+Z 可撤销）`);
 }
 
 async function switchImage(index) {
@@ -3651,7 +3896,17 @@ function defaultColor(seed) {
 // ---------------------------------------------------------------------------
 async function addImages() {
   const root = (el.addRoot?.value || "").trim();
-  if (!root || !state.project) return;
+  if (!state.project) {
+    // 静默返回会让人以为按钮坏了：明确指向第 1 步，并把焦点送回路径输入框
+    setStatus("先按第 1 步新建或打开一个 .tfanno 工程", "warn");
+    el.path?.focus();
+    return;
+  }
+  if (!root) {
+    setStatus("先填图片目录（或点左侧「…」选文件夹）", "warn");
+    el.addRoot?.focus();
+    return;
+  }
   setStatus("扫描图片…", "warn");
   try {
     const data = await scanAnnotationImages(root, true);
@@ -3673,7 +3928,8 @@ async function addImages() {
  */
 async function addImagesByDialog() {
   if (!state.project) {
-    setStatus("先打开或新建一个工程", "warn");
+    setStatus("先按第 1 步新建或打开一个 .tfanno 工程，再加图片", "warn");
+    el.path?.focus();
     return;
   }
   setStatus("请到系统窗口里选图片…", "warn");
@@ -4249,6 +4505,14 @@ export function initAnnotate() {
   Object.assign(el, {
     path: document.getElementById("annoPath"),
     saveState: document.getElementById("annoSaveState"),
+    // 五步引导条（v1.35.0）
+    guide: document.getElementById("annoGuide"),
+    steps: document.getElementById("annoSteps"),
+    guideTip: document.getElementById("annoGuideTip"),
+    guideAction: document.getElementById("annoGuideAction"),
+    guideToggle: document.getElementById("annoGuideToggle"),
+    // 进阶：预标注草稿与审核（折叠块）
+    advDraft: document.getElementById("annoAdvDraft"),
     imageList: document.getElementById("annoImageList"),
     imageCount: document.getElementById("annoImageCount"),
     addRoot: document.getElementById("annoAddRoot"),
@@ -4318,6 +4582,28 @@ export function initAnnotate() {
 
   document.getElementById("annoOpen")?.addEventListener("click", () => openProject((el.path.value || "").trim()));
   document.getElementById("annoCreate")?.addEventListener("click", createProject);
+  // 引导条：主按钮按当前步骤分发；点步骤圆片走同一套动作
+  el.guideAction?.addEventListener("click", () => {
+    const step = currentStep(buildAnnoSteps(guideContext()));
+    runGuideAction(step ? resolveGuideAction(step) : "");
+  });
+  el.guideToggle?.addEventListener("click", () => {
+    const collapsed = el.guide?.classList.contains("is-collapsed");
+    localStorage.setItem(GUIDE_STORAGE, collapsed ? "1" : "0");
+    applyGuideVisibility();
+    // 引导条高度变了，画布要重算一次尺寸，否则会被压扁或留白
+    requestAnimationFrame(() => {
+      resizeCanvas();
+      renderCanvas();
+    });
+  });
+  // 用户亲手折叠/展开进阶块后，就不再让"有草稿就自动展开"的规则改它。
+  // 监听 <summary> 的 click 而不是 <details> 的 toggle：toggle 事件在**脚本**
+  // 改 `open` 时也会触发，若挂在那里，自动展开一次就会被误判成"用户动过"，
+  // 之后永远不会自动收起。
+  el.advDraft?.querySelector("summary")?.addEventListener("click", () => {
+    state.advDraftTouched = true;
+  });
   document.getElementById("annoSaveNow")?.addEventListener("click", () => saveProject({ silent: false }));
   document.getElementById("annoSaveAs")?.addEventListener("click", saveAs);
   document.getElementById("annoAddImages")?.addEventListener("click", addImages);
@@ -4519,6 +4805,9 @@ export function initAnnotate() {
     review: [...state.review.keys()],
     reviewed: state.review.size,
     reviewPending: [...reviewPending.keys()],
+    // 五步流程：e2e 断言"第几步该亮"不用去数 class
+    guide: buildAnnoSteps(guideContext()).map((step) => ({ id: step.id, state: step.state })),
+    advDraftOpen: Boolean(el.advDraft?.open),
     batch: state.batchJob
       ? {
           id: state.batchJob.id,
@@ -4533,6 +4822,8 @@ export function initAnnotate() {
   resizeCanvas();
   // 通道初始化：按默认值把三块参数区显示对
   setAlChannel(state.alChannel);
+  // 引导条：读回上次的收起状态，再渲染第一帧
+  applyGuideVisibility();
   renderAll();
   renderCanvas();
 }

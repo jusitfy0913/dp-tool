@@ -1222,20 +1222,28 @@
 
   <!-- ==================== 标注工作台 ==================== -->
   <section class="panel" id="panel-annotate">
+    <!-- 五步引导条（v1.35.0）：先说「现在该做什么」，主按钮直接做那件事。
+         整条可以隐藏，状态存 localStorage；隐藏后只剩一个「显示流程」按钮，不占画布高度。 -->
+    <div class="anno-guide" id="annoGuide">
+      <ol class="anno-steps" id="annoSteps"></ol>
+      <div class="anno-guide-tip">
+        <span class="anno-guide-text" id="annoGuideTip">先填 .tfanno 路径并点「新建工程」</span>
+        <button type="button" class="mini primary" id="annoGuideAction">新建工程</button>
+        <button type="button" class="mini" id="annoGuideToggle" title="隐藏后可从这里恢复">隐藏流程</button>
+      </div>
+    </div>
+
     <div class="anno-layout">
       <!-- 左：工程与图片列表 -->
       <aside class="card anno-side anno-left">
-        <h2>工程</h2>
+        <h2><span class="anno-step-no">1</span>工程</h2>
         <div class="anno-row">
           <input type="text" id="annoPath" placeholder=".tfanno 工程文件路径" />
           <button type="button" class="mini" data-browse="annoPath" data-dialog="file"
                   data-patterns=".tfanno" data-label="标注工程" data-title="选择 .tfanno 工程">…</button>
-          <button type="button" class="mini" data-browse="annoPath" data-dialog="save"
-                  data-patterns=".tfanno" data-defaultextension=".tfanno" data-label="标注工程"
-                  title="新建工程（另存为）">新建…</button>
         </div>
         <div class="anno-row">
-          <label class="anno-field">任务
+          <label class="anno-field anno-field-grow">任务
             <select id="annoTask" title="新建工程时生效。分类是整张图点一个类别，不画框">
               <option value="detect">检测（画框）</option>
               <option value="segment">分割</option>
@@ -1244,29 +1252,38 @@
               <option value="classify">分类（整张图）</option>
             </select>
           </label>
+        </div>
+        <div class="anno-row anno-actions">
+          <!-- 「选路径…」只改输入框里的路径，不创建文件；真正创建由「新建工程」完成 -->
+          <button type="button" class="mini" data-browse="annoPath" data-dialog="save"
+                  data-patterns=".tfanno" data-defaultextension=".tfanno" data-label="标注工程"
+                  title="选一个新的 .tfanno 路径（只填进输入框，不创建文件）">选路径…</button>
           <button type="button" class="primary" id="annoOpen">打开</button>
-          <button type="button" id="annoCreate">新建</button>
+          <button type="button" id="annoCreate">新建工程</button>
+        </div>
+        <div class="anno-row anno-actions">
           <button type="button" id="annoSaveNow" title="Ctrl+S">保存</button>
           <button type="button" id="annoSaveAs" title="保存到输入框里的新路径，不动原工程">另存为</button>
         </div>
         <p class="anno-hint" id="annoSaveState">未打开工程</p>
 
-        <h2>图片 <span class="anno-count" id="annoImageCount">0</span></h2>
-        <ul class="anno-imagelist" id="annoImageList"></ul>
-
+        <h2><span class="anno-step-no">2</span>图片 <span class="anno-count" id="annoImageCount">0</span></h2>
+        <!-- 加图控件放在列表上方：新建工程后列表是空的，入口放在下面时用户要先滚动才找得到 -->
         <div class="anno-row anno-stack">
           <input type="text" id="annoAddRoot" placeholder="图片目录" />
-          <div class="anno-row">
+          <div class="anno-row anno-actions">
             <button type="button" class="mini" data-browse="annoAddRoot" data-dialog="dir"
                     title="选择图片所在文件夹">…</button>
             <button type="button" class="mini" id="annoAddImages">批量加入</button>
             <button type="button" class="mini" id="annoAddFiles" title="一次选多张图片直接加入工程">选图片…</button>
           </div>
         </div>
+        <p class="anno-hint">加图只记录路径，不复制文件；行尾「×」只把图移出工程，不删磁盘上的图片。</p>
+        <ul class="anno-imagelist" id="annoImageList"></ul>
 
         <!-- 导入已有 YOLO 标签：data.yaml 的 names 决定类别表，labels/*.txt 变成可编辑的框 -->
         <details class="anno-import" id="annoImportBox">
-          <summary title="把 data.yaml + images/ + labels/ 里的已有标注读进工程">导入 YOLO 数据集</summary>
+          <summary title="把 data.yaml + images/ + labels/ 里的已有标注读进工程">已有 YOLO 数据集？导入 data.yaml（自动读类别和框）</summary>
           <div class="anno-row anno-stack">
             <input type="text" id="annoImportSource" placeholder="data.yaml 或数据集根目录" />
             <div class="anno-row">
@@ -1304,12 +1321,27 @@
           </div>
           <p class="anno-hint" id="annoImportReport">选好 data.yaml 先「预览」，核对图数与框数再导入。</p>
         </details>
+
+        <!-- 画框技巧：新手第一次进页面最缺的是"怎么画、怎么收尾"，比一堆参数更有用 -->
+        <details class="anno-help" id="annoHelpBox">
+          <summary>画框技巧与快捷键</summary>
+          <ul class="anno-help-list">
+            <li><b>矩形</b>：选「矩形」后在图上按住拖动，松手即成框；框选中后可拖角点改大小。</li>
+            <li><b>多边形</b>：选「多边形」逐点单击，按 <code>Enter</code> 或双击收尾（至少 3 点）。</li>
+            <li><b>改类别</b>：先在右栏「3 类别」里加好名字；选中框后点类别行即可改。</li>
+            <li><b>微调</b>：<code>Shift+拖动</code> 正交约束；按住 <code>Alt</code> 临时关闭吸附。</li>
+            <li><b>改错了</b>：<code>Ctrl+Z</code> 撤销，<code>Ctrl+Shift+Z</code> 重做，<code>Delete</code> 删选中框。</li>
+            <li><b>切图</b>：点左栏图片名切换；<code>空格</code> 看下一张；<code>F</code> 适配窗口。</li>
+            <li><b>审核</b>：<code>A</code> 接受草稿 / <code>D</code> 丢弃 / <code>K</code> 标为已审核并跳下一张。</li>
+          </ul>
+        </details>
       </aside>
 
       <!-- 中：画布 -->
       <section class="anno-center">
         <div class="anno-toolbar">
           <div class="anno-group anno-detect-only" role="group" aria-label="绘制工具">
+            <span class="anno-group-label">绘制</span>
             <button type="button" class="mini tool active" data-tool="select" title="选择 (V)">选择</button>
             <button type="button" class="mini tool" data-tool="rectangle" title="矩形 (R)">矩形</button>
             <button type="button" class="mini tool" data-tool="rotated_rect" title="旋转矩形 (O)。画完后拖上方圆点旋转">旋转框</button>
@@ -1319,11 +1351,13 @@
             <button type="button" class="mini tool" data-tool="keypoints" title="关键点组 (G)">关键点</button>
           </div>
           <div class="anno-group">
+            <span class="anno-group-label">编辑</span>
             <button type="button" class="mini" id="annoUndo" title="撤销 (Ctrl+Z)">撤销</button>
             <button type="button" class="mini" id="annoRedo" title="重做 (Ctrl+Shift+Z)">重做</button>
             <button type="button" class="mini" id="annoDelete" title="删除选中 (Delete)">删除</button>
           </div>
           <div class="anno-group">
+            <span class="anno-group-label">显示</span>
             <label class="anno-toggle"><input type="checkbox" id="annoShowShapes" checked />框</label>
             <label class="anno-toggle"><input type="checkbox" id="annoShowLabels" checked />标签</label>
             <label class="anno-toggle"><input type="checkbox" id="annoShowScore" />置信度</label>
@@ -1336,6 +1370,7 @@
             </label>
           </div>
           <div class="anno-group">
+            <span class="anno-group-label">视图</span>
             <button type="button" class="mini" id="annoFit" title="适应窗口 (F)">FIT</button>
             <button type="button" class="mini" id="annoZoomReset" title="原始像素">1:1</button>
             <span class="anno-zoom" id="annoZoom">—</span>
@@ -1353,16 +1388,17 @@
         </div>
       </section>
 
-      <!-- 右：类别 / 属性 / 草稿 -->
+      <!-- 右：类别 / 标注框 / 属性 / 导出（进阶的草稿与审核折叠在最后） -->
       <aside class="card anno-side anno-right">
-        <h2>类别 <span class="anno-count" id="annoClassCount">0</span></h2>
+        <h2><span class="anno-step-no">3</span>类别 <span class="anno-count" id="annoClassCount">0</span></h2>
+        <p class="anno-hint">先在这里加好缺陷名（如「划痕」「脏污」）再画框；画完选中框，点类别行即可改类。</p>
         <ul class="anno-classlist" id="annoClassList"></ul>
         <div class="anno-row">
           <input type="text" id="annoClassName" placeholder="新类别名" />
           <button type="button" class="mini" id="annoClassAdd">加</button>
         </div>
 
-        <h2 class="anno-detect-only">标注框 <span class="anno-count" id="annoBoxCount">0</span></h2>
+        <h2 class="anno-detect-only"><span class="anno-step-no">4</span>标注框 <span class="anno-count" id="annoBoxCount">0</span></h2>
         <p class="anno-hint anno-detect-only">当前图片的框。点一行，图上对应的框会高亮。</p>
         <p class="anno-hint anno-classify-only" hidden>分类不画框。点右边的类别，就是给整张图打上这个标签，并跳到下一张还没标的图。</p>
         <div class="anno-boxtable-wrap anno-detect-only">
@@ -1379,31 +1415,13 @@
           </table>
         </div>
 
-        <h2 class="anno-detect-only">预标注草稿 <span class="anno-count" id="annoDraftCount">0</span></h2>
-        <div class="anno-row anno-detect-only">
-          <button type="button" class="mini" id="annoAcceptAll">全部接受</button>
-          <button type="button" class="mini" id="annoRejectAll">全部丢弃</button>
-        </div>
-        <div class="anno-row anno-detect-only">
-          <button type="button" class="mini accent" id="annoAcceptOne" title="接受当前草稿 (A)">接受当前 A</button>
-          <button type="button" class="mini" id="annoRejectOne" title="丢弃当前草稿 (D)">丢弃当前 D</button>
-        </div>
-        <p class="anno-hint anno-detect-only">A 接受 / D 丢弃 / 空格 下一张（未选中时按置信度从高到低处理）</p>
-        <ul class="anno-draftlist anno-detect-only" id="annoDraftList"></ul>
-
-        <h2>审核 <span class="anno-count" id="annoReviewCount">0/0</span></h2>
-        <div class="anno-row">
-          <button type="button" class="mini accent" id="annoMarkReviewed" title="标为已审核并跳到下一张未审核 (K)">已审核 K</button>
-          <button type="button" class="mini" id="annoUnmarkReviewed" title="取消当前图片的审核状态 (Shift+K)">取消审核</button>
-        </div>
-        <p class="anno-hint">K 标为已审核并跳下一张未审核；Shift+K 取消。状态存在 <code>*.drafts.json</code> 里，刷新不丢。</p>
-
         <h2>属性</h2>
         <div class="anno-props" id="annoProps">
           <p class="anno-hint">未选中标注</p>
         </div>
 
-        <h2>导出</h2>
+        <h2><span class="anno-step-no">5</span>导出</h2>
+        <p class="anno-hint">先保存（Ctrl+S）再导出；导出会带上还没手动保存、但已在内存里的修改。</p>
         <div class="anno-row">
           <select id="annoExportFormat">
             <option value="yolo">YOLO</option>
@@ -1417,6 +1435,33 @@
                   title="选择导出目录">…</button>
           <button type="button" class="mini primary" id="annoExport">导出</button>
         </div>
+
+        <!-- 进阶：预标注草稿与审核。有草稿/审核记录时自动展开，用户手动折叠后不再自动弹开；
+             折叠只影响可见性，A/D/空格/K 这些快捷键在收起状态下照样生效。 -->
+        <details class="anno-adv anno-detect-only" id="annoAdvDraft">
+          <summary>进阶：预标注草稿与审核
+            <span class="anno-count" id="annoDraftCount">0</span>
+            <span class="anno-count" id="annoReviewCount">0/0</span>
+          </summary>
+          <h3 class="anno-sub">预标注草稿</h3>
+          <div class="anno-row">
+            <button type="button" class="mini" id="annoAcceptAll">全部接受</button>
+            <button type="button" class="mini" id="annoRejectAll">全部丢弃</button>
+          </div>
+          <div class="anno-row">
+            <button type="button" class="mini accent" id="annoAcceptOne" title="接受当前草稿 (A)">接受当前 A</button>
+            <button type="button" class="mini" id="annoRejectOne" title="丢弃当前草稿 (D)">丢弃当前 D</button>
+          </div>
+          <p class="anno-hint">A 接受 / D 丢弃 / 空格 下一张（未选中时按置信度从高到低处理）</p>
+          <ul class="anno-draftlist" id="annoDraftList"></ul>
+
+          <h3 class="anno-sub">审核</h3>
+          <div class="anno-row">
+            <button type="button" class="mini accent" id="annoMarkReviewed" title="标为已审核并跳到下一张未审核 (K)">已审核 K</button>
+            <button type="button" class="mini" id="annoUnmarkReviewed" title="取消当前图片的审核状态 (Shift+K)">取消审核</button>
+          </div>
+          <p class="anno-hint">K 标为已审核并跳下一张未审核；Shift+K 取消。状态存在 <code>*.drafts.json</code> 里，刷新不丢。</p>
+        </details>
 
         <!-- 预标注参数（折叠）：放在右栏内部，展开时右栏自己滚动，画布高度不受影响 -->
         <details class="anno-autolabel" id="annoAutoLabelBox">
