@@ -29,6 +29,20 @@ DEFAULT_IOU_THRESHOLDS: tuple[float, ...] = tuple(
 )
 RECALL_POINTS = 101
 
+#: 漏检-过杀曲线的默认 conf 网格：0.05 → 0.95，步长 0.05。
+#: 为什么不是 0.001 起步：低于 0.05 的框在产线上没人会放行，画出来只会把曲线压扁；
+#: 为什么步长 0.05：19 个点足够看出拐点，又不至于让报告 JSON 变大。
+DEFAULT_OPERATING_CONFS: tuple[float, ...] = tuple(
+    round(0.05 + 0.05 * i, 2) for i in range(19)
+)
+
+#: 曲线点数上限。前端要画折线，点太多只是把 JSON 撑大。
+MAX_OPERATING_POINTS = 50
+
+#: 单张图的 GT 状态。``ok`` 是「标签文件存在且为空」（良品），
+#: ``missing`` 是「没有标签文件」（可能漏标），二者绝不能混为一谈。
+GT_STATES = ("labeled", "ok", "missing", "unparsed")
+
 
 def iou_xyxy(a: Sequence[float], b: Sequence[float]) -> float:
     """两个 [x1, y1, x2, y2] 框的 IoU。
@@ -424,3 +438,230 @@ def box_iou_matrix(a: Sequence[Sequence[float]], b: Sequence[Sequence[float]]) -
         for j, col in enumerate(b_array):
             matrix[i, j] = iou_xyxy(row, col)
     return matrix
+
+
+# ---------------------------------------------------------------------------
+# 漏检-过杀工作点
+#
+# ## 为什么不重复扫阈值
+#
+# COCO 的贪心匹配按分数从高到低处理，一张图里「先用高分框占 GT」。
+# 因此把低分框整体删掉，不会改变任何高分框的匹配结果——这正是
+# 「在 min(confs) 下匹配一次，再按 conf 取前缀累加」成立的原因。
+# 复杂度 O(P×G) 与点数无关；朴素做法是每个阈值重跑一次匹配。
+#
+# ## 为什么过杀率给两个数
+#
+# `fp_per_image` 是「每张图报几次」，包含 NG 图上的多检——产线关心的是这个。
+# `ok_fp_rate` 是「好品被误杀的比例」，只统计良品图——质检主管关心的是这个。
+# 把 NG 图上多出来的框也压进「良品误报率」会把两个不同的问题混成一个数字。
+# ---------------------------------------------------------------------------
+def _image_state(item: dict) -> str:
+    """图片的 GT 状态。没有显式状态的调用方按「GT 为空就是良品」推断。
+
+    这个兜底只服务于老调用方与单测；``tools/val_engine.py`` 一定会显式给出状态，
+    因为它能区分「文件不存在」与「文件为空」——那才是漏标与良品的分界线。
+    """
+    state = str(item.get("gt_state") or "")
+    if state in GT_STATES:
+        return state
+    return "labeled" if item.get("gts") else "ok"
+
+
+def gt_stats(images: Sequence[dict]) -> dict[str, int]:
+    """图片数、GT 框数、良品图数、漏标图数、无法解析图数。"""
+    stats = {"images": len(images), "instances": 0, "ok": 0, "missing": 0, "unparsed": 0}
+    for item in images:
+        state = _image_state(item)
+        if state in ("ok", "missing", "unparsed"):
+            stats[state] += 1
+        for boxes in (item.get("gts") or {}).values():
+            stats["instances"] += len(boxes or [])
+    return stats
+
+
+def _normalize_confs(confs: Iterable[float] | None) -> list[float]:
+    """去重、升序、夹到 (0, 1]，并限制点数上限。"""
+    raw = list(DEFAULT_OPERATING_CONFS if confs is None else confs)
+    cleaned = sorted({round(min(1.0, max(0.0, float(value))), 4) for value in raw})
+    if len(cleaned) > MAX_OPERATING_POINTS:
+        step = len(cleaned) / MAX_OPERATING_POINTS
+        cleaned = [cleaned[int(i * step)] for i in range(MAX_OPERATING_POINTS)]
+    return cleaned
+
+
+def operating_points(
+    images: Sequence[dict],
+    num_classes: int,
+    *,
+    confs: Iterable[float] | None = None,
+    iou: float = 0.5,
+) -> dict[str, Any]:
+    """按 conf 扫描「漏检 ↔ 过杀」，输出可直接画折线的点集。
+
+    入参 ``images`` 与 :func:`evaluate` 相同，另外可带 ``gt_state``：
+    ``labeled`` / ``ok`` / ``missing`` / ``unparsed``（见 :data:`GT_STATES`）。
+
+    返回的每个点含整体计数、派生指标与逐类明细；``ok_fp_rate`` 在没有良品图时为
+    ``None``——「没有良品图」和「良品全部判对」必须能区分。
+    """
+    num_classes = max(int(num_classes), 0)
+    conf_list = _normalize_confs(confs)
+    stats = gt_stats(images)
+    total_gts = stats["instances"]
+    ok_indexes = {
+        index for index, item in enumerate(images) if _image_state(item) == "ok"
+    }
+    total_images = len(images)
+
+    # 每类只匹配一次（见上方注释：前缀稳定），后续按 conf 取前缀
+    prepared: list[tuple[list[tuple[float, int, list[float]]], list[int], int]] = []
+    for cls in range(num_classes):
+        preds = _collect_class_preds(images, cls)
+        flags = _match_flags(preds, images, cls, iou)
+        prepared.append((preds, flags, _count_class_gts(images, cls)))
+
+    points: list[dict[str, Any]] = []
+    for conf in conf_list:
+        tp = fp = fn = 0
+        per_class: list[dict[str, Any]] = []
+        fp_by_image: dict[int, int] = {}
+        for cls, (preds, flags, class_gts) in enumerate(prepared):
+            scores = np.asarray([row[0] for row in preds], dtype=np.float64)
+            # scores 降序，-scores 升序；side="right" 让「恰好等于 conf」算进来，
+            # 与 DLL 的 `>=` 判定一致。
+            keep = (
+                int(np.searchsorted(-scores, -float(conf), side="right"))
+                if scores.size
+                else 0
+            )
+            class_tp = int(np.count_nonzero(flags[:keep]))
+            class_fp = keep - class_tp
+            class_fn = max(0, class_gts - class_tp)
+            for position in range(keep):
+                if not flags[position]:
+                    image_index = preds[position][1]
+                    fp_by_image[image_index] = fp_by_image.get(image_index, 0) + 1
+            tp += class_tp
+            fp += class_fp
+            fn += class_fn
+            if class_gts > 0:
+                per_class.append(
+                    {
+                        "id": cls,
+                        "instances": class_gts,
+                        "tp": class_tp,
+                        "fp": class_fp,
+                        "fn": class_fn,
+                        "recall": round(class_tp / class_gts, 6),
+                        "miss_rate": round(1.0 - class_tp / class_gts, 6),
+                        "fp_per_image": (
+                            round(class_fp / total_images, 6) if total_images else None
+                        ),
+                    }
+                )
+
+        recall = tp / total_gts if total_gts else None
+        precision = tp / (tp + fp) if (tp + fp) else None
+        f1 = (
+            2 * precision * recall / (precision + recall)
+            if (precision is not None and recall is not None and (precision + recall))
+            else None
+        )
+        ok_fp_images = sum(1 for index in ok_indexes if fp_by_image.get(index))
+        points.append(
+            {
+                "conf": round(float(conf), 4),
+                "tp": tp,
+                "fp": fp,
+                "fn": fn,
+                "recall": None if recall is None else round(recall, 6),
+                "miss_rate": None if recall is None else round(1.0 - recall, 6),
+                "precision": None if precision is None else round(precision, 6),
+                "f1": None if f1 is None else round(f1, 6),
+                "fp_per_image": round(fp / total_images, 6) if total_images else None,
+                "ok_images": len(ok_indexes),
+                "ok_fp_images": ok_fp_images,
+                "ok_fp_rate": (
+                    round(ok_fp_images / len(ok_indexes), 6) if ok_indexes else None
+                ),
+                "per_class": per_class,
+            }
+        )
+
+    return {
+        "iou": round(float(iou), 4),
+        "confs": conf_list,
+        "points": points,
+        "num_images": total_images,
+        "num_gts": total_gts,
+        "ok_images": stats["ok"],
+        "missing_label_images": stats["missing"],
+        "unparsed_label_images": stats["unparsed"],
+        "note": (
+            "miss_rate = 1 - recall（按 GT 框计）；fp_per_image = FP / 评估图片数；"
+            "ok_fp_rate 只在标签文件存在且为空的良品图上统计，无良品图时为 null。"
+        ),
+    }
+
+
+def recommend_operating_point(
+    report: dict[str, Any] | None,
+    *,
+    target_miss_rate: float | None = 0.01,
+    target_fp_per_image: float | None = None,
+) -> dict[str, Any]:
+    """在曲线里找「满足目标的最大 conf」。
+
+    产线的顺序是先定漏检上限（漏一个的成本远高于多报几个），再在这个前提下把过杀压到最低。
+    由于 FP 与 recall 都随 conf 单调不增，**满足漏检目标的最高 conf 就是过杀最低的那个点**，
+    所以取最大而不是最小。取最小 conf 会把「本可以少报的框全报出来」，那不是优化过杀。
+
+    无可行点时 MUST 返回 ``feasible: False`` 并给出最接近的点，绝不假装满足。
+    """
+    points = list((report or {}).get("points") or [])
+    result: dict[str, Any] = {
+        "target_miss_rate": target_miss_rate,
+        "target_fp_per_image": target_fp_per_image,
+        "feasible": False,
+        "point": None,
+        "reason": "",
+    }
+    if not points:
+        result["reason"] = "没有可用的阈值点（评估集为空或无法解析）"
+        return result
+
+    def meets(point: dict[str, Any]) -> bool:
+        if target_miss_rate is not None:
+            miss = point.get("miss_rate")
+            if miss is None or miss > float(target_miss_rate) + 1e-9:
+                return False
+        if target_fp_per_image is not None:
+            fpi = point.get("fp_per_image")
+            if fpi is None or fpi > float(target_fp_per_image) + 1e-9:
+                return False
+        return True
+
+    feasible = [point for point in points if meets(point)]
+    if feasible:
+        best = max(feasible, key=lambda point: (point["conf"], -(point.get("fp_per_image") or 0)))
+        result.update({"feasible": True, "point": best, "reason": "满足目标的最高 conf（过杀最低）"})
+        return result
+
+    # 无可行点：给出「最接近」的那个，让人知道差多远
+    def distance(point: dict[str, Any]) -> tuple[float, float]:
+        miss = point.get("miss_rate")
+        fpi = point.get("fp_per_image")
+        return (
+            float("inf") if miss is None else float(miss),
+            float("inf") if fpi is None else float(fpi),
+        )
+
+    closest = min(points, key=distance)
+    result["point"] = closest
+    result["reason"] = (
+        "所有阈值点都无法同时满足目标：最接近的点漏检率 "
+        f"{closest.get('miss_rate')}、过杀 {closest.get('fp_per_image')} 框/图。"
+        "要么放宽目标，要么补数据/换模型。"
+    )
+    return result

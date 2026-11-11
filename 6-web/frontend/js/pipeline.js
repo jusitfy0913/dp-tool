@@ -504,6 +504,14 @@ function renderMetrics(record) {
     console.table(metrics.per_class);
   }
   renderValDetail(metrics);
+  // 漏检-过杀曲线只有检测侧有：异常检测是单阈值判定，没有 conf 可扫
+  const opSection = metrics.kind === "anomaly" ? null : operatingSection(metrics);
+  if (opSection && dom.valDetail) {
+    // 重复渲染同一份报告时不叠第二份曲线
+    dom.valDetail.querySelector(".op-section")?.remove();
+    dom.valDetail.appendChild(opSection);
+    dom.valDetail.hidden = false;
+  }
 }
 
 const KIND_TEXT = { miss: "漏检", extra: "过检", wrong: "判错" };
@@ -613,7 +621,198 @@ function yoloMetricItems(metrics) {
       ["判错", found.wrong ?? 0],
     );
   }
+  // 工作点摘要：漏检率/过杀率才是产线口径，mAP 只是训练时的相对尺子
+  const ops = metrics.operating_points;
+  const recommended = metrics.recommended_operating_point || {};
+  const point = recommended.point || (ops && ops.points ? ops.points[0] : null);
+  if (point) {
+    items.push(
+      ["漏检率", fmtPct(point.miss_rate)],
+      ["过杀", point.fp_per_image == null ? "—" : `${fmtNum(point.fp_per_image, 3)} 框/图`],
+    );
+    if (ops && ops.ok_images) {
+      items.push([
+        "良品误报",
+        point.ok_fp_rate == null ? "—" : fmtPct(point.ok_fp_rate),
+      ]);
+      items.push(["良品图", ops.ok_images]);
+    } else {
+      items.push(["良品误报", "无良品图", "warn"]);
+    }
+  }
   return items;
+}
+
+// ---------------------------------------------------------------------------
+// 漏检-过杀曲线（零依赖内联 SVG）
+//
+// x 轴是漏检率（0 → 1），y 轴是每图过杀框数。conf 从低到高走一遍时，
+// 漏检单调上升、过杀单调下降——所以这条线本身就说明了「压漏检要多报多少」。
+// 选中点之后可以写进引擎旁挂文件，推理页会默认用它。
+// ---------------------------------------------------------------------------
+const OP_NS = "http://www.w3.org/2000/svg";
+
+function svgEl(name, attrs = {}) {
+  const node = document.createElementNS(OP_NS, name);
+  for (const [key, value] of Object.entries(attrs)) node.setAttribute(key, String(value));
+  return node;
+}
+
+function operatingChart(points) {
+  const width = 420;
+  const height = 180;
+  const pad = 34;
+  const usable = points.filter((p) => p.miss_rate != null && p.fp_per_image != null);
+  const svg = svgEl("svg", {
+    viewBox: `0 0 ${width} ${height}`,
+    class: "op-chart",
+    role: "img",
+    "aria-label": "漏检-过杀曲线",
+  });
+  if (!usable.length) return svg;
+
+  const maxFp = Math.max(0.01, ...usable.map((p) => p.fp_per_image));
+  const x = (miss) => pad + miss * (width - pad - 10);
+  const y = (fp) => height - pad - (fp / maxFp) * (height - pad - 12);
+
+  // 坐标轴
+  svg.appendChild(svgEl("line", { x1: pad, y1: height - pad, x2: width - 10, y2: height - pad, class: "op-axis" }));
+  svg.appendChild(svgEl("line", { x1: pad, y1: 12, x2: pad, y2: height - pad, class: "op-axis" }));
+  const xLabel = svgEl("text", { x: width - 10, y: height - pad + 16, class: "op-tick", "text-anchor": "end" });
+  xLabel.textContent = "漏检率 →";
+  svg.appendChild(xLabel);
+  const yLabel = svgEl("text", { x: pad - 6, y: 16, class: "op-tick", "text-anchor": "end" });
+  yLabel.textContent = "过杀/图";
+  svg.appendChild(yLabel);
+
+  // 曲线：按 conf 升序画，漏检从小到大
+  const sorted = usable.slice().sort((a, b) => a.miss_rate - b.miss_rate);
+  const path = sorted
+    .map((p, index) => `${index === 0 ? "M" : "L"}${x(p.miss_rate).toFixed(1)},${y(p.fp_per_image).toFixed(1)}`)
+    .join(" ");
+  svg.appendChild(svgEl("path", { d: path, class: "op-line" }));
+  sorted.forEach((p) => {
+    const dot = svgEl("circle", { cx: x(p.miss_rate).toFixed(1), cy: y(p.fp_per_image).toFixed(1), r: 2.2, class: "op-dot" });
+    const title = svgEl("title");
+    title.textContent = `conf ${p.conf} · 漏检 ${fmtPct(p.miss_rate)} · 过杀 ${p.fp_per_image}/图`;
+    dot.appendChild(title);
+    svg.appendChild(dot);
+  });
+  return svg;
+}
+
+function operatingSection(metrics) {
+  const ops = metrics.operating_points;
+  if (!ops || !Array.isArray(ops.points) || !ops.points.length) return null;
+  const host = document.createElement("div");
+  host.className = "op-section";
+
+  const title = document.createElement("p");
+  title.className = "pipe-val-note";
+  title.textContent =
+    "漏检-过杀曲线：每个点是一个 conf 阈值。产线先定漏检上限，再取满足它的最高 conf（过杀最低）。";
+  host.appendChild(title);
+
+  const chartBox = document.createElement("div");
+  chartBox.className = "op-chart-box";
+  chartBox.appendChild(operatingChart(ops.points));
+  host.appendChild(chartBox);
+
+  // 关键工作点表：只列几个常用的漏检目标，避免 19 行数字糊在页面上
+  const targets = [0.005, 0.01, 0.02, 0.05];
+  const table = document.createElement("table");
+  table.className = "data-table";
+  const head = document.createElement("tr");
+  ["目标漏检", "推荐 conf", "实际漏检", "过杀/图", "良品误报"].forEach((text) => {
+    const th = document.createElement("th");
+    th.textContent = text;
+    head.appendChild(th);
+  });
+  table.appendChild(head);
+  const bestByTarget = new Map();
+  for (const target of targets) {
+    const feasible = ops.points.filter((p) => p.miss_rate != null && p.miss_rate <= target + 1e-9);
+    const pick = feasible.length ? feasible[feasible.length - 1] : null;
+    bestByTarget.set(target, pick);
+    const tr = document.createElement("tr");
+    const cells = pick
+      ? [fmtPct(target), String(pick.conf), fmtPct(pick.miss_rate), fmtNum(pick.fp_per_image, 3),
+          pick.ok_fp_rate == null ? "无良品图" : fmtPct(pick.ok_fp_rate)]
+      : [fmtPct(target), "无可行点", "—", "—", "—"];
+    cells.forEach((text) => {
+      const td = document.createElement("td");
+      td.textContent = text;
+      tr.appendChild(td);
+    });
+    table.appendChild(tr);
+  }
+  host.appendChild(table);
+
+  if (ops.missing_label_images) {
+    const warn = document.createElement("p");
+    warn.className = "pipe-val-note is-warn";
+    warn.textContent =
+      `${ops.missing_label_images} 张图没有标签文件，可能是漏标，未计入良品误报率。`;
+    host.appendChild(warn);
+  }
+
+  const tools = document.createElement("div");
+  tools.className = "row op-tools";
+  const select = document.createElement("select");
+  select.title = "选择目标漏检率";
+  targets.forEach((target) => {
+    const option = document.createElement("option");
+    option.value = String(target);
+    option.textContent = `目标漏检 ${fmtPct(target)}`;
+    if (Math.abs(target - 0.01) < 1e-9) option.selected = true;
+    select.appendChild(option);
+  });
+  const save = document.createElement("button");
+  save.type = "button";
+  save.textContent = "保存为引擎工作点";
+  save.disabled = !metrics.engine;
+  save.title = metrics.engine
+    ? "写进 <engine>.meta.json，推理页选中该引擎时会预填这个 conf"
+    : "报告里没有引擎路径，无法保存";
+  const status = document.createElement("span");
+  status.className = "hint";
+
+  save.addEventListener("click", async () => {
+    const target = Number(select.value);
+    const point = bestByTarget.get(target);
+    if (!point) {
+      status.textContent = "该目标没有可行点，先放宽目标或补数据。";
+      status.className = "hint bad";
+      return;
+    }
+    save.disabled = true;
+    try {
+      await postJSON("/api/engine/operating-point", {
+        engine: metrics.engine,
+        conf: point.conf,
+        iou: point.iou ?? ops.iou ?? 0.5,
+        source: String(metrics.engine),
+        target_miss_rate: target,
+        metrics: {
+          miss_rate: point.miss_rate,
+          fp_per_image: point.fp_per_image,
+          ok_fp_rate: point.ok_fp_rate,
+          ok_images: ops.ok_images,
+        },
+      });
+      status.textContent = `已保存：conf ${point.conf}（目标漏检 ${fmtPct(target)}）`;
+      status.className = "hint";
+    } catch (error) {
+      status.textContent = `保存失败：${error.message}`;
+      status.className = "hint bad";
+    } finally {
+      save.disabled = false;
+    }
+  });
+
+  tools.append(select, save, status);
+  host.appendChild(tools);
+  return host;
 }
 
 function anomalyMetricItems(metrics) {

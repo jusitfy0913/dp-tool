@@ -37,6 +37,7 @@ from pydantic import BaseModel, Field
 import annotation
 import annotation_drafts
 import annotationimport
+import ampcheck
 import augpreview
 import autolabel
 import autolabeljobs
@@ -44,11 +45,15 @@ import autoexp_api
 import checkpoints
 import config
 import dataset
+import datasetqc
+import enginemeta
+import fingerprint
 import gpulock
 import infer
 import inferjobs
 import inferproxy
 import labels as labels_mod
+import logstore
 import models as models_mod
 import modelzoo
 import nativedialog
@@ -58,15 +63,18 @@ import onnx_fallback
 import pipeline as pipeline_mod
 import progress
 import promptlabel
+import runledger
 import runners
 import textlabel
 import traininfo
+import vram
 import warmpool
 from runners import manager
 
 #: 应用版本号。前端顶栏与 /api/health 都读它，方便一眼看出「页面连的是哪个后端」。
 #: 起因：改了代码但 8060 上跑的是几小时前的旧进程，排查很久才发现。
-APP_VERSION = "1.33.2"
+#: 常量本体在 config：dataset.py 写 manifest 时也要用，反向 import app 会循环。
+APP_VERSION = config.APP_VERSION
 
 #: 单图推理返回的标注图 JPEG 质量。
 #: 这张图只用于导出（查看时前端用本地原图 + SVG 叠加层），所以让体积优先：
@@ -209,6 +217,26 @@ async def lifespan(app: FastAPI):
     """服务启动时准备目录与事件循环，退出时清理子进程与句柄。"""
     config.ensure_dirs()
     manager.bind_loop(asyncio.get_running_loop())
+    # 上次进程被强杀时，台账里会留下状态为 running 的「僵尸任务」。
+    # 这里改判为 interrupted：前端能看见「它没跑完」，而不是一条永远转圈的记录。
+    try:
+        recovered = manager.recover_interrupted()
+        if recovered:
+            print(f"[app] 台账恢复：{len(recovered)} 个上次未结束的任务已标记为中断", flush=True)
+    except Exception as exc:  # noqa: BLE001 - 台账坏了不能挡住服务启动
+        print(f"[app] 台账恢复失败：{type(exc).__name__}: {exc}", flush=True)
+    # 清理过期任务日志：单次任务有上限，任务数多了总量仍会无限涨。
+    # 失败只记一笔，不影响启动。
+    try:
+        pruned = logstore.prune_logs()
+        if pruned["families"]:
+            print(
+                f"[app] 清理过期日志：{pruned['families']} 个任务、{pruned['files']} 个文件、"
+                f"{pruned['freed_bytes'] / 1048576:.1f} MB",
+                flush=True,
+            )
+    except Exception as exc:  # noqa: BLE001
+        print(f"[app] 日志清理失败：{type(exc).__name__}: {exc}", flush=True)
     # 拉起推理工作进程并探测推理库，让 /api/capabilities 立刻反映真实状态
     inferproxy.startup()
     # 预热训练进程：失败只记一笔，不影响服务启动（用户仍可走冷启动）
@@ -344,6 +372,14 @@ class YoloTrainRequest(BaseModel):
     copy_paste: float | None = Field(default=None, description="Copy-Paste 概率，默认 0")
     close_mosaic: int | None = Field(default=None, description="最后 N 个 epoch 关 mosaic，默认 10")
 
+    # 混合精度三态：None = 跟随检测（不传参数，行为与升级前完全一致）；
+    # False = 显式关闭（拼 --no-amp，跳过开训前那次前向自检）；True = 显式尝试。
+    # 注意：True 不等于「一定用上 fp16」——黑名单显卡上框架仍会关掉（见 ampcheck.py）。
+    amp: bool | None = Field(default=None, description="None=跟随检测 / False=强制关闭 / True=显式尝试")
+    # 显存预检不放行时是否仍然开跑。默认 False：宁可让用户看到一次明确的拦截，
+    # 也不要让 Ultralytics 静默把 batch 减半（那会让本次实验与台账其它行不可比）。
+    allow_low_vram: bool = Field(default=False, description="显存预检不通过时仍然启动")
+
 
 class AnomalibTrainRequest(BaseModel):
     """Anomalib 训练参数。"""
@@ -442,6 +478,15 @@ def build_train_command(request: "YoloTrainRequest", python: str) -> list[str]:
         if request.exist_ok:
             command.append("--exist-ok")
 
+    # 混合精度：三态。None 时**一个参数都不传**，走 launcher 默认（True），
+    # 由 Ultralytics 自己在前向对比后决定——这样升级前后的命令行完全一致。
+    # 之所以要显式开关：黑名单显卡（如 T1000）永远拿不到 fp16，传 --amp 只是多花
+    # 几秒做自检；已知本机不支持的场景可以 --no-amp 把这个过程也省掉。
+    if request.amp is True:
+        command.append("--amp")
+    elif request.amp is False:
+        command.append("--no-amp")
+
     # 学习率：留空 = 不传，用 Ultralytics 默认（0.01）；微调时前端会填 0.001 这种小步长。
     if request.lr0 is not None:
         command += ["--lr0", str(request.lr0)]
@@ -474,6 +519,150 @@ def build_train_command(request: "YoloTrainRequest", python: str) -> list[str]:
         if value is not None:
             command += [flag, str(value)]
     return command
+
+
+# ---------------------------------------------------------------------------
+# 开训前算力体检：显存预检（实测峰值表）+ 混合精度状态
+# ---------------------------------------------------------------------------
+# 这两项放在一起的原因：它们是同一件事的两面——「这一次训练到底需要多少显存」
+# 取决于「这台机器到底用不用混合精度」。fp32 的激活显存约为 fp16 的 1.5~2 倍，
+# 分开算必然出现「显存说够、AMP 说 fp32」的自相矛盾。
+
+
+def _batch_int(request: "YoloTrainRequest") -> int | None:
+    """把表单里的 batch 变成单个整数。
+
+    ``auto`` / ``8,16`` / ``-1`` 这类写法无法用单点估算（Ultralytics 会自己搜），
+    返回 ``None`` 由调用方跳过预检，而不是猜一个数把用户拦在门外。
+    """
+    raw = str(request.batch or "").strip()
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
+def _amp_from_mode(mode: str | None) -> bool | None:
+    """``auto`` / ``off`` / ``on`` → 三态 ``None`` / ``False`` / ``True``。"""
+    text = (mode or "auto").strip().lower()
+    if text in {"off", "no-amp", "false", "0", "fp32"}:
+        return False
+    if text in {"on", "amp", "true", "1", "fp16"}:
+        return True
+    return None
+
+
+def dataset_block(data: str) -> dict[str, Any]:
+    """算数据集指纹，并压成适合放进 ``meta`` 与环境变量的精简块。
+
+    为什么在开训**之前**算：训练要跑几百秒，源数据随时可能被重标或增删。
+    先算一次，记录的才是「按下开始那一刻用的那批图」；训练后再算会把两件事混在一起。
+
+    为什么精简：这个块会进 ``run.meta``（随接口返回给前端）和子进程环境变量
+    （Windows 环境变量总量有限）。完整报告（含类别表）由 launcher 写进
+    ``train_meta.json`` 时从同一份块生成，不会缺关键字段。
+    """
+    report = fingerprint.compute(data)
+    return {
+        "algo": report.get("algo"),
+        "dataset_fingerprint": report.get("dataset_fingerprint"),
+        "short": report.get("short") or fingerprint.short(report.get("dataset_fingerprint")),
+        "label_fingerprint": report.get("label_fingerprint"),
+        "split_fingerprints": report.get("split_fingerprints"),
+        "counts": report.get("counts"),
+        "task": report.get("task"),
+        "nc": report.get("nc"),
+        "yaml": report.get("yaml"),
+        "computed_at": report.get("computed_at"),
+        "error": report.get("error", ""),
+    }
+
+
+def vram_guard(request: "YoloTrainRequest") -> dict[str, Any]:
+    """开训前的显存闸门。
+
+    放行时返回预检详情（调用方写进台账）；不通过时抛 409，``detail`` 以
+    ``VRAM_PREFLIGHT:`` 开头——前端靠这个前缀把「仍然开始」按钮显示出来，
+    不必解析文案。
+    """
+    batch = _batch_int(request)
+    if batch is None:
+        return {"skipped": f"batch={request.batch!r} 不是单个正整数（auto/多卡列表），跳过显存预检"}
+    # 只有「显式关闭混合精度」才是确定事实；其余一律按本机情况预测（vram 内部解析）。
+    precision = "fp32" if request.amp is False else None
+    report = vram.preflight(request.imgsz, batch, precision=precision)
+    report["amp_requested"] = request.amp
+    if report.get("ok") or request.allow_low_vram:
+        return report
+    raise HTTPException(
+        status_code=409,
+        detail=(
+            f"VRAM_PREFLIGHT: {report.get('reason', '显存不足')}。{report.get('hint', '')}"
+        ),
+    )
+
+
+@app.get("/api/train/preflight")
+def train_preflight(
+    imgsz: int = 640,
+    batch: str = "16",
+    amp: str = "auto",
+) -> dict:
+    """算力体检（只读，不启动训练）。
+
+    前端在训练页按需调用：GPU、可用/需求显存、估算依据（实测还是公式）、
+    混合精度是否可用。**不缓存**：可用显存随时在变，读旧值只会误导。
+    """
+    requested = _amp_from_mode(amp)
+    # 只探测一次 GPU：free 与 name 都从这里取，避免 nvidia-smi 被调用两遍。
+    info = vram.gpu_info()
+    gpu = (info or {}).get("name")
+    status = ampcheck.amp_status(gpu, requested=requested)
+    precision = "fp32" if requested is False else status["expected_precision"]
+
+    raw_batch = str(batch or "").strip()
+    try:
+        batch_int = int(raw_batch)
+    except (TypeError, ValueError):
+        batch_int = 0
+    if batch_int > 0:
+        report = vram.preflight(
+            imgsz,
+            batch_int,
+            precision=precision,
+            free_mb=(info or {}).get("free_mb"),
+        )
+    else:
+        report = {
+            "ok": True,
+            "skipped": f"batch={raw_batch!r} 不是单个正整数（auto/多卡列表），无法估算",
+            "precision": precision,
+            "imgsz": imgsz,
+            "batch": None,
+            "free_mb": (info or {}).get("free_mb"),
+            "total_mb": (info or {}).get("total_mb"),
+            "gpu": gpu,
+            "reason": "batch 交给 Ultralytics 自动决定，已跳过显存预检",
+            "hint": "",
+        }
+    # 预检里 free_mb 是显式传入的，所以它自己不会再探测一次 GPU；
+    # 把端点已经探测到的名称/总量补进去，避免响应里一半有一半没有。
+    if gpu and not report.get("gpu"):
+        report["gpu"] = gpu
+    if not report.get("total_mb"):
+        report["total_mb"] = (info or {}).get("total_mb")
+    return {
+        "ok": bool(report.get("ok")),
+        "vram": report,
+        "amp": status,
+        "amp_requested": requested,
+        "precision": precision,
+        "amp_text": ampcheck.describe(status),
+        "sample_count": len(vram.load_samples()),
+        "store": str(vram.store_path()),
+        "version": APP_VERSION,
+    }
 
 
 @app.post("/api/train/yolo")
@@ -532,17 +721,59 @@ def train_yolo(request: YoloTrainRequest) -> dict:
     # 检查与创建同锁：双击按钮的两个请求不能都通过检查
     with _START_LOCK:
         _reject_if_busy()
+        # 显存闸门放在「忙」检查之后：已有任务在跑时，那是更根本的原因，
+        # 先报「显存不够」会把人引到错误的方向去释放显存。
+        preflight = vram_guard(request)
+        # 自动续训需要知道两件事：训练产物目录在哪（找 weights/last.pt）、
+        # 失败后用什么命令接着跑。两条都在这里交给 RunManager，崩溃后由它补跑。
+        run_dir = Path(request.project) / request.name
+        # 数据集指纹：与显存预检同处一次请求内算好。训练跑几百秒，期间源数据
+        # 随时可能被重标，事后再算记录的就不是「这次训练用的那批图」了。
+        data_meta = dataset_block(str(data_yaml))
+        meta: dict[str, Any] = {
+            "vram_preflight": preflight,
+            "dataset": data_meta,
+            "data_fp": data_meta["short"],
+        }
+        if backup_dir:
+            meta["backup_dir"] = str(backup_dir)
         try:
             run = manager.create(
                 "yolo-train",
                 command,
                 str(config.YOLO_LAUNCHER_DIR),
-                meta={"backup_dir": str(backup_dir)} if backup_dir else None,
+                # 走环境变量而不是命令行：argv 会出现在进程列表、日志与前端 tooltip 里。
+                # launcher 在 on_train_end 用它生成 train_meta.json（只有它知道最终 save_dir）。
+                env={"TRTFORGE_DATASET_FP": json.dumps(data_meta, ensure_ascii=False)},
+                meta=meta,
                 warm_kind="yolo",
+                resume_dir=run_dir,
+                resume_command=lambda: build_train_command(
+                    _resume_request(request, run_dir / "weights" / "last.pt"), python
+                ),
             )
         except OSError as exc:
             raise HTTPException(status_code=500, detail=f"启动训练进程失败：{exc}") from exc
     return run.snapshot()
+
+
+def _resume_request(request: "YoloTrainRequest", last_weights: Path) -> "YoloTrainRequest":
+    """把原始请求改成「从 last.pt 续训」的那一份。
+
+    为什么不在原请求上改：``request`` 还要用来拼那一次的 resume_command，
+    就地修改会让「成功后再点一次」这种操作拿到一份被污染的参数。
+    ``exist_ok=True`` 是必须的——续训要写回同一个 ``project/name`` 目录，
+    Ultralytics 默认会在目录已存在时新建 ``exp2``，用户会以为续训没生效。
+    """
+    patch = {
+        "resume": False,
+        "resume_from": str(last_weights),
+        "init_mode": "preset",
+        "exist_ok": True,
+    }
+    if hasattr(request, "model_copy"):
+        return request.model_copy(update=patch)
+    return request.copy(update=patch)  # pydantic v1 兜底
 
 
 def _backup_run_dir(run_dir: Path) -> Path | None:
@@ -1003,6 +1234,55 @@ def probe_onnx(onnx: str) -> dict:
     }
 
 
+class OperatingPointRequest(BaseModel):
+    """把「漏检-过杀」曲线上选定的点保存为引擎默认工作点。"""
+
+    engine: str = Field(..., description="引擎文件绝对路径")
+    conf: float = Field(..., ge=0.0, le=1.0)
+    iou: float = Field(default=0.5, ge=0.01, le=1.0)
+    source: str = Field(default="", description="哪个验证报告选的（便于追溯）")
+    target_miss_rate: float | None = Field(default=None, ge=0.0, le=1.0)
+    metrics: dict[str, Any] = Field(
+        default_factory=dict, description="当点的漏检率/过杀/良品误报，原样存进旁挂文件"
+    )
+
+
+@app.post("/api/engine/operating-point")
+def save_operating_point(request: OperatingPointRequest) -> dict:
+    """写 ``<engine>.meta.json`` 的 ``operating_point``。
+
+    只改旁挂文件：不碰引擎、不碰 metadata.json，所以不会改变已有部署的判定行为。
+    """
+    engine = Path(request.engine).expanduser()
+    if not engine.is_file():
+        raise HTTPException(status_code=400, detail=f"引擎文件不存在：{request.engine}")
+    payload = enginemeta.write_operating_point(
+        engine,
+        {
+            "conf": float(request.conf),
+            "iou": float(request.iou),
+            "source": request.source,
+            "target_miss_rate": request.target_miss_rate,
+            **request.metrics,
+        },
+    )
+    if payload.get("error"):
+        raise HTTPException(status_code=500, detail=payload["error"])
+    return {
+        "engine": str(engine),
+        "path": payload.get("path"),
+        "operating_point": payload.get("operating_point"),
+    }
+
+
+@app.get("/api/engine/operating-point")
+def get_operating_point(engine: str) -> dict:
+    """读回引擎工作点；没有就返回空对象，让前端沿用默认值。"""
+    path = Path(engine).expanduser()
+    point = enginemeta.read_operating_point(path)
+    return {"engine": str(path), "path": str(enginemeta.metadata_path(path)), "operating_point": point or None}
+
+
 @app.post("/api/engine/build")
 def build_engine(request: EngineBuildRequest) -> dict:
     """用 trtexec 把 ONNX 转成 TensorRT 引擎，日志复用通用事件流。"""
@@ -1133,6 +1413,30 @@ def build_engine(request: EngineBuildRequest) -> dict:
     meta["engine"] = str(engine_path)
     meta["estimate_seconds"] = round(estimate, 1)
 
+    # 引擎构建是异步任务，结束后再写来源说明。用 list 做 holder：on_finished 是
+    # 无参回调，而 run_id 要等 create() 返回才知道。回调里绝不抛异常——
+    # 引擎已经编译好了，为了一份说明把它判成失败是本末倒置。
+    created: list[Any] = []
+
+    def _write_engine_meta() -> None:
+        if not engine_path.is_file():
+            return
+        try:
+            report = enginemeta.write_meta(
+                engine_path,
+                onnx_path=onnx_path,
+                precision=request.precision,
+                command=list(command),
+                run_id=created[0].run_id if created else "",
+                dynamic=request.dynamic,
+                app_version=APP_VERSION,
+            )
+        except Exception as exc:  # noqa: BLE001 - 元数据失败不影响构建结果
+            print(f"[enginemeta] 元数据写入异常（不影响构建）：{type(exc).__name__}: {exc}", flush=True)
+            return
+        if report.get("error"):
+            print(f"[enginemeta] 元数据写入失败（不影响构建）：{report['error']}", flush=True)
+
     with _START_LOCK:
         _reject_if_busy()
         try:
@@ -1143,12 +1447,13 @@ def build_engine(request: EngineBuildRequest) -> dict:
                 expect_file=engine_path,
                 meta=meta,
                 estimate=estimate,
+                on_finished=_write_engine_meta,
             )
+            created.append(run)
         except OSError as exc:
             raise HTTPException(status_code=500, detail=f"启动 trtexec 失败：{exc}") from exc
 
-    return {
-        **run.snapshot(),
+    return {        **run.snapshot(),
         "engine": str(engine_path),
         "onnx_probe": probe,
         "estimate_seconds": round(estimate, 1),
@@ -1950,33 +2255,12 @@ def pipeline_stage_log(pipeline_id: str, stage: str, lines: int = 400) -> Respon
     if not run_id:
         raise HTTPException(status_code=404, detail=f"阶段 {stage} 没有日志（未启动或被跳过）")
 
-    log_file = (config.LOG_DIR / f"{run_id}.log").resolve()
-    # 路径只认 runtime/logs 下的 {run_id}.log，run_id 里带 .. 也不能跳出去
-    if log_file.parent != config.LOG_DIR.resolve() or not log_file.is_file():
+    if not logstore.any_shard(run_id):
         raise HTTPException(status_code=404, detail=f"阶段 {stage} 的日志文件不存在")
 
     limit = max(1, min(int(lines), 5000))
-    text = _read_log_tail(log_file, limit)
+    text = logstore.read_tail(run_id, limit)
     return Response(content=text, media_type="text/plain; charset=utf-8")
-
-
-def _read_log_tail(path: Path, limit: int) -> str:
-    """取最后 N 行。整个文件读进来在几百 MB 的构建日志上会很难受。"""
-    try:
-        with path.open("rb") as handle:
-            handle.seek(0, os.SEEK_END)
-            size = handle.tell()
-            block = 64 * 1024
-            data = b""
-            while size > 0 and data.count(b"\n") <= limit:
-                step = min(block, size)
-                size -= step
-                handle.seek(size)
-                data = handle.read(step) + data
-    except OSError as exc:
-        raise HTTPException(status_code=500, detail=f"读取日志失败：{exc}") from exc
-    lines = data.decode("utf-8", errors="replace").splitlines()
-    return "\n".join(lines[-limit:])
 
 
 @app.get("/api/pipeline/{pipeline_id}")
@@ -2013,7 +2297,16 @@ class DatasetScanRequest(BaseModel):
     task: str = Field(default="auto", description="auto / detect / segment / pose / obb")
     train: int = Field(default=80, ge=0, le=100)
     val: int = Field(default=20, ge=0, le=100)
+    group_by: str = Field(
+        default="none",
+        description="划分口径：none 按图片 / prefix 按文件名前缀 / dir 按目录（同组不跨划分）",
+    )
     limit: int = Field(default=200, ge=1, le=2000, description="预览列表最多返回多少张")
+    ok_dirs: list[str] = Field(
+        default_factory=list,
+        description="良品目录（相对数据源根）：目录里的图按空标签处理，默认只进验收划分",
+    )
+    ok_split: str = Field(default="val", description="良品图进哪个划分：val / test")
 
 
 class DatasetExportRequest(DatasetScanRequest):
@@ -2022,6 +2315,19 @@ class DatasetExportRequest(DatasetScanRequest):
     format: str = Field(default="yolo", description="yolo / coco / voc")
     output: str = Field(..., description="导出目标目录")
     overwrite: bool = Field(default=False, description="目标目录非空时是否允许覆盖")
+    with_qc: bool = Field(default=False, description="顺带体检，把结论写进 manifest（不影响导出结果）")
+
+
+class DatasetQcRequest(BaseModel):
+    """体检请求。只读，不落盘。"""
+
+    source: str = Field(..., description="YOLO 数据集目录、data.yaml 或 .tfanno 文件")
+    task: str = Field(default="auto", description="auto / detect / segment / pose / obb / classify")
+    threshold: int = Field(default=8, ge=0, le=256, description="256 位 dHash 的汉明距离上限")
+    limit: int = Field(default=500, ge=1, le=5000, description="问题列表最多返回多少条")
+    ok_dirs: list[str] = Field(
+        default_factory=list, description="良品目录：这些目录里的图不报 LBL_MISSING"
+    )
 
 
 def _ensure_dataset_path(path: str) -> None:
@@ -2034,12 +2340,43 @@ def dataset_scan(request: DatasetScanRequest) -> dict:
     """扫描数据集并返回按比例划分后的预览，不写任何文件。"""
     _ensure_dataset_path(request.source)
     try:
-        project = dataset.load_project(request.source, request.task)
-        return dataset.preview(project, request.train, request.val, request.limit)
+        project = dataset.load_project(
+            request.source, request.task, ok_dirs=request.ok_dirs, ok_split=request.ok_split
+        )
+        return dataset.preview(
+            project,
+            request.train,
+            request.val,
+            request.limit,
+            group_by=request.group_by,
+            ok_split=request.ok_split,
+        )
     except dataset.DatasetError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except OSError as exc:
         raise HTTPException(status_code=400, detail=f"读取数据集失败：{exc}") from exc
+
+
+@app.post("/api/dataset/qc")
+def dataset_qc(request: DatasetQcRequest) -> dict:
+    """数据集体检：同底板分组、跨划分泄漏、标注问题。只读，不写任何数据文件。
+
+    为什么和「指纹」分开：指纹回答「是不是同一份数据」，体检回答「这份数据本身
+    干不干净」。两者都只读，但体检要解码图片（秒级），不适合塞进导出/训练的必经路径。
+    """
+    _ensure_dataset_path(request.source)
+    try:
+        return datasetqc.inspect(
+            request.source,
+            request.task,
+            threshold=request.threshold,
+            limit=request.limit,
+            ok_dirs=request.ok_dirs,
+        )
+    except dataset.DatasetError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except OSError as exc:
+        raise HTTPException(status_code=400, detail=f"体检失败：{exc}") from exc
 
 
 @app.post("/api/dataset/export")
@@ -2056,11 +2393,30 @@ def dataset_export(request: DatasetExportRequest) -> dict:
             fmt=request.format,
             output=request.output,
             overwrite=request.overwrite,
+            group_by=request.group_by,
+            with_qc=request.with_qc,
+            ok_dirs=request.ok_dirs,
+            ok_split=request.ok_split,
         )
     except dataset.DatasetError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except OSError as exc:
         raise HTTPException(status_code=400, detail=f"导出失败：{exc}") from exc
+
+
+@app.get("/api/dataset/fingerprint")
+def dataset_fingerprint(source: str) -> dict:
+    """只读算出某个 ``dataset.yaml`` 的数据集指纹，不写任何文件。
+
+    用途：页面在用户选完数据集、还没开训时就能显示「本次将使用哪批数据」；
+    以及排查「两次实验为什么不可比」时手动比对。**不缓存**：源数据随时会变，
+    读到旧指纹比读不到更糟。
+    """
+    _ensure_dataset_path(source)
+    report = fingerprint.compute(source)
+    report["description"] = fingerprint.describe(report)
+    report["version"] = APP_VERSION
+    return report
 
 
 # ---------------------------------------------------------------------------
@@ -2077,6 +2433,23 @@ def list_runs(limit: int = 0) -> dict:
     if limit > 0:
         runs = runs[:limit]
     return {"runs": runs}
+
+
+@app.get("/api/runs/history")
+def list_run_history(limit: int = 50) -> dict:
+    """历史任务（跨服务重启）。
+
+    与 ``/api/runs`` 的区别：那条只返回**本进程**创建的任务，服务一重启就空；
+    这条读 ``runtime/runs.jsonl`` 台账，能回溯「上周那次训练到底怎么结束的」。
+
+    ``limit`` 上限 500：台账单条约 600 字节，一次吐几千条对前端也没意义。
+    """
+    capped = max(1, min(int(limit), 500))
+    try:
+        items = runledger.history(capped)
+    except Exception as exc:  # noqa: BLE001 - 台账坏了不该 500
+        raise HTTPException(status_code=500, detail=f"读取任务台账失败：{exc}") from exc
+    return {"runs": items, "limit": capped}
 
 
 @app.get("/api/runs/{run_id}")
@@ -2104,15 +2477,16 @@ def get_run_log(run_id: str, lines: int = 0) -> Response:
     if not re.fullmatch(r"[0-9a-f]{12}", run_id or ""):
         raise HTTPException(status_code=400, detail=f"非法的任务号：{run_id}")
 
-    log_file = (config.LOG_DIR / f"{run_id}.log").resolve()
-    if log_file.parent != config.LOG_DIR.resolve() or not log_file.is_file():
+    if not logstore.any_shard(run_id):
         raise HTTPException(status_code=404, detail=f"任务 {run_id} 的日志文件不存在")
 
     if lines > 0:
-        text = _read_log_tail(log_file, max(1, min(int(lines), 5000)))
+        # 跨滚动分片取尾部：日志一旦超过 LOG_MAX_BYTES 就会被切成 .log / .log.1…
+        # 只读当前文件会丢掉前面的报错，而用户要的恰恰是最早那几行。
+        text = logstore.read_tail(run_id, max(1, min(int(lines), 5000)))
     else:
         try:
-            text = log_file.read_text(encoding="utf-8", errors="replace")
+            text = logstore.read_all(run_id)
         except OSError as exc:
             raise HTTPException(status_code=500, detail=f"读取日志失败：{exc}") from exc
     return Response(
@@ -2445,6 +2819,21 @@ def _fallback_reason(primary: str, detail: str) -> str:
     return f"{primary} 不可用（{detail}），已自动降级为 onnxruntime"
 
 
+def _infer_worker_down_but_allowed() -> bool:
+    """进程没在跑，但不是让出、也不是熔断。
+
+    训练结束后进程是故意停着的，等下一次真正推理再拉起。
+    这时状态里的 yolo_ok 是 False，只表示「还没问过 DLL」，
+    不能当成 DLL 坏了去走降级，否则按需重载永远不会发生。
+    """
+    if not inferproxy.isolation_enabled():
+        return False
+    state = inferproxy.worker_state()
+    if state.get("gpu_hold") or state.get("pool_tripped") or state.get("state") == "tripped":
+        return False
+    return state.get("state") != "running"
+
+
 def _select_yolo_backend(engine: str) -> tuple[bool, str, str | None]:
     """决定 YOLO 这次走哪个后端，返回 (是否走 DLL, 兜底 ONNX 路径, 降级说明)。
 
@@ -2452,7 +2841,13 @@ def _select_yolo_backend(engine: str) -> tuple[bool, str, str | None]:
     1. 传的是 `.onnx` 且 `onnx_infer.dll` 可用 → 走 ONNX DLL；
     2. 传的是引擎且 `yolo_infer.dll` 可用 → 走 TRT DLL；
     3. 以上都不可用 → onnxruntime 降级（只在找不到模型时抛 503）。
+
+    让出期间直接 503，不走降级：降级会在网页进程里加载模型，把刚让出的显存又占回去。
+    进程停着但没有让出时，仍选推理进程，由真正的推理调用把它拉起来。
     """
+    inferproxy._refuse_if_yielded()
+    if _infer_worker_down_but_allowed():
+        return True, "", None
     backend = inferproxy.status()
 
     if infer.is_onnx_model(engine):
@@ -3277,8 +3672,20 @@ def infer_cache() -> dict:
 
 @app.post("/api/infer/worker/restart")
 def infer_worker_restart() -> dict:
-    """熔断后由用户手动重启推理进程。"""
+    """熔断后由用户手动重启推理进程。训练占着显存时会拒绝，避免把显存抢回去。"""
     return {"ok": True, **inferproxy.restart_worker()}
+
+
+@app.post("/api/infer/gpu-yield")
+def infer_gpu_yield(reason: str = "训练") -> dict:
+    """停掉推理进程，把显存让给训练。自动实验开始时调用。"""
+    return inferproxy.yield_gpu(reason)
+
+
+@app.post("/api/infer/gpu-release")
+def infer_gpu_release() -> dict:
+    """训练结束：允许下次推理按需重新加载，此刻不拉起进程。"""
+    return inferproxy.release_gpu_hold()
 
 
 # ---------------------------------------------------------------------------
@@ -3645,12 +4052,21 @@ def annotation_export(request: AnnotationExportRequest) -> dict:
     splits = [image.current_split for image in project.images]
 
     try:
+        # 划分来自工程里逐个设过的 current_split，所以 manifest 里如实写 manual，
+        # 而不是伪造一个比例——后人看到「80/20」会以为可以按比例复现。
+        split_mode = {"mode": "manual", "source": "annotation"}
         if request.format == "yolo":
-            result = dataset.export_yolo(project, target, splits, request.overwrite)
+            result = dataset.export_yolo(
+                project, target, splits, request.overwrite, split_mode=split_mode
+            )
         elif request.format == "coco":
-            result = dataset.export_coco(project, target, splits, request.overwrite)
+            result = dataset.export_coco(
+                project, target, splits, request.overwrite, split_mode=split_mode
+            )
         else:
-            result = dataset.export_voc(project, target, splits, request.overwrite)
+            result = dataset.export_voc(
+                project, target, splits, request.overwrite, split_mode=split_mode
+            )
     except dataset.DatasetError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except OSError as exc:

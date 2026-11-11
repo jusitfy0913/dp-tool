@@ -1,20 +1,22 @@
 {
   "_comment": "当前最佳配置。由首轮 5 次真实实验 + holdout 验收得出。改这里之前先看 7-autoresearch-yolo/README.md 的 keep 阈值说明。",
-  "updated_at": "2026-11-10T13:10:00",
-  "exp_id": "exp_0006",
+  "updated_at": "2026-11-11T14:01:30",
+  "exp_id": "exp_0034",
+  "source": "autoexp agent",
+  "top_level": {},
   "train": {
     "imgsz": 960,
-    "batch": "4"
+    "batch": "4",
+    "cos_lr": true,
+    "nbs": 16
   },
   "evidence": {
-    "tune_map50_95": 0.45862,
-    "holdout_map50_95": 0.473726,
-    "baseline_tune_mean": 0.406633,
-    "baseline_holdout": 0.438055,
-    "noise_sigma": 0.003184,
-    "keep_threshold_2sigma": 0.006368,
-    "delta_tune": 0.051987,
-    "delta_holdout": 0.035671
+    "tune_map50_95": 0.4951,
+    "baseline_tune_mean": 0.4531866666666667,
+    "noise_sigma": 0.00807,
+    "keep_threshold_2sigma": 0.01614,
+    "delta_tune": 0.041913,
+    "holdout_map50_95": null
   },
-  "note": "imgsz 960 / batch 4 是本轮唯一通过 keep 阈值的改动（tune +0.052，约 16 sigma；holdout 同向 +0.036）。注意 960 下 600 秒只跑得完 12 个 epoch，而 640 能跑 24 个——分辨率带来的收益远大于 epoch 数减少的损失。batch 从 8 降到 4 是显存所迫，属于已知混淆因素，但提升幅度（16 sigma）远大于该因素可能造成的偏差。"
+  "note": "holdout 尚未验收，需人工执行：python autoexp.py holdout --exp-id exp_0034"
 }

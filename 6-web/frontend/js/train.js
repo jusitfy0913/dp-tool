@@ -35,6 +35,10 @@ const precheck = {
   finetuneFrom: "",
   finetuneLabel: "",
   finetuneSource: null,
+  // 算力体检结果（GET /api/train/preflight）与「显存不够但用户坚持要跑」的标记。
+  // 后者只生效一次：下次点「开始训练」会重新走一遍预检。
+  hardware: null,
+  forceLowVram: false,
 };
 
 /// 进度与曲线状态。
@@ -139,6 +143,16 @@ export function initTrain() {
     // 日志出口
     btnCopyLog: document.getElementById("btnCopyLog"),
     btnOpenLog: document.getElementById("btnOpenLog"),
+    // 算力体检（显存 + 混合精度）
+    btnCheckHw: document.getElementById("btnCheckHw"),
+    btnForceVram: document.getElementById("btnForceVram"),
+    ampMode: document.getElementById("ampMode"),
+    hwHint: document.getElementById("hwHint"),
+    hwBody: document.getElementById("hwBody"),
+    hwGpu: document.getElementById("hwGpu"),
+    hwVram: document.getElementById("hwVram"),
+    hwAmp: document.getElementById("hwAmp"),
+    hwData: document.getElementById("hwData"),
   };
 
   logActions = createLogActions({
@@ -193,6 +207,19 @@ export function initTrain() {
   });
   dom.btnScanRuns.addEventListener("click", () => scanRuns());
   dom.btnClearResume.addEventListener("click", () => clearResume());
+
+  // 算力体检：按钮手动触发；改 amp 档位时若已经展开过，顺手重算一次
+  // （显存需求会随「预测精度」变，用户改了档位却看到旧结论才是真误导）。
+  dom.btnCheckHw.addEventListener("click", () => scanHardware());
+  dom.ampMode.addEventListener("change", () => {
+    if (precheck.hardware) scanHardware();
+  });
+  dom.btnForceVram.addEventListener("click", () => {
+    // 只越权这一次：标记用完即清，避免之后每次启动都绕过预检。
+    precheck.forceLowVram = true;
+    dom.btnForceVram.hidden = true;
+    onSubmit(new Event("submit", { cancelable: true }));
+  });
 
   syncKind();
   setDefaultRunName();
@@ -368,6 +395,19 @@ function buildYoloPayload() {
     }
     payload[key] = value;
   }
+
+  // 混合精度三态：auto 不传字段——后端会拼出与升级前完全一致的命令行，
+  // 由 Ultralytics 自己在训练开始时判定（黑名单显卡上一定会回退 fp32）。
+  const ampMode = formValue("ampMode");
+  if (ampMode === "off") payload.amp = false;
+  else if (ampMode === "on") payload.amp = true;
+
+  // 显存预检没通过时，用户点了「仍然开始」才带这个标记，且只带这一次。
+  if (precheck.forceLowVram) {
+    payload.allow_low_vram = true;
+    precheck.forceLowVram = false;
+    appendLog("显存预检未通过，按用户要求强行开始（若 OOM，batch 可能被框架自动减半）", "warn");
+  }
   return payload;
 }
 
@@ -456,9 +496,16 @@ async function onSubmit(event) {
     dom.btnTrain.disabled = false;
     refreshTrainButton();
     setBadge("启动失败", "fail");
-    // 409 = 机器上已经有任务在跑。此时最有用的是直接接管它，
-    // 而不是让用户盯着「请先停止它」自己去找那个停止按钮在哪。
-    if (error.status === 409) attachIfRunning();
+    // 409 有两种含义，必须分开处理：
+    //   1. 已经有任务在跑 → 最有用的动作是直接接管它，而不是让用户自己去找停止按钮；
+    //   2. 显存预检不通过 → 接管一个不存在的任务毫无意义，应该给「仍然开始」。
+    if (error.status === 409 && !String(error.message).startsWith("VRAM_PREFLIGHT")) {
+      attachIfRunning();
+    } else if (error.status === 409) {
+      // 后缀式提示：把前缀去掉再展示，前缀只是前后端约定的识别标记
+      setHint(String(error.message).replace(/^VRAM_PREFLIGHT:\s*/, ""));
+      dom.btnForceVram.hidden = false;
+    }
   }
 }
 
@@ -719,6 +766,34 @@ function handleEvent(event) {
       if (name === "warm_ready") {
         // 预热进程就绪只对「下一次点击」有意义，不改变当前任务状态
         renderWarmStatus({ enabled: true, kinds: [{ kind: dom.kind.value, state: "ready" }] });
+      }
+      break;
+    }
+    case "amp_state": {
+      // 实际生效的精度。必须显示「实际」而不是「请求」：黑名单显卡上请求 amp=True
+      // 也会被框架关掉，用户看到的慢一倍只有这一个解释来源。
+      const actual = event.precision === "fp16"
+        ? "fp16（混合精度已启用）"
+        : event.precision === "fp32"
+          ? "fp32（未启用混合精度）"
+          : "未知";
+      const requested = event.amp_requested === undefined || event.amp_requested === null
+        ? "未指定"
+        : String(event.amp_requested);
+      appendLog(
+        `混合精度：实际 ${actual}，请求 amp=${requested}，GPU=${event.gpu || "-"}`,
+        event.precision === "fp32" ? "warn" : "ok",
+      );
+      setMetric("精度", event.precision || "unknown");
+      break;
+    }
+    case "vram_peak": {
+      if (event.peak_mb) {
+        appendLog(
+          `峰值显存：${event.peak_mb} MB（已写入实测峰值表，下次预检用实测值判断）`,
+          "ok",
+        );
+        setMetric("峰值显存 MB", String(event.peak_mb));
       }
       break;
     }
@@ -1503,6 +1578,119 @@ function renderPreviewApplied(result) {
     li.textContent = text;
     dom.previewApplied.appendChild(li);
   }
+}
+
+// ---- 算力体检（显存 + 混合精度）--------------------------------------------
+// 只读探测：走 GET /api/train/preflight，不启动训练、不占显存。
+// 不自动轮询：可用显存随时在变，频繁探测没有意义；用户点按钮或改档位时算一次就够。
+
+async function scanHardware() {
+  const imgsz = formValue("yoloImgsz") || "640";
+  const batch = formValue("yoloBatch") || "16";
+  const amp = formValue("ampMode") || "auto";
+  const dataPath = formValue("yoloData");
+  dom.btnCheckHw.disabled = true;
+  setHwHint("探测中…");
+  try {
+    const query = new URLSearchParams({ imgsz, batch, amp }).toString();
+    // 数据集指纹与显存体检一起取：用户点「检查算力」时最关心的就是
+    // 「这台机器跑不跑得动」和「跑的是哪批数据」，两个问题一起回答。
+    const [data, fp] = await Promise.all([
+      getJSON(`/api/train/preflight?${query}`),
+      dataPath
+        ? getJSON(`/api/dataset/fingerprint?${new URLSearchParams({ source: dataPath })}`).catch(
+            (error) => ({ error: error.message }),
+          )
+        : Promise.resolve(null),
+    ]);
+    precheck.hardware = data;
+    renderHardware(data, fp);
+  } catch (error) {
+    setHwHint(error.message, "bad");
+  } finally {
+    dom.btnCheckHw.disabled = false;
+  }
+}
+
+function setHwHint(text, cls = "") {
+  dom.hwHint.textContent = text;
+  dom.hwHint.className = `hint ${cls}`.trim();
+}
+
+/** 渲染体检结论：GPU / 显存需求与依据 / 混合精度 / 数据集指纹。 */
+function renderHardware(data, fp = null) {
+  dom.hwBody.hidden = false;
+  const vram = data.vram || {};
+  const amp = data.amp || {};
+  const gpu = vram.gpu || amp.gpu;
+
+  // 第一行：显卡与「表里有多少样本」。样本数就是这套估算的可信度来源，
+  // 用户看到「0 条」就知道这次是按公式估的，可以不信那么多。
+  const total = vram.total_mb ? `，总 ${fmtMB(vram.total_mb)} MB` : "";
+  dom.hwGpu.textContent = gpu
+    ? `GPU：${gpu}${total}｜实测峰值表：${data.sample_count ?? 0} 条组合`
+    : `GPU：未检测到（没有 CUDA 或 nvidia-smi）`;
+
+  // 第二行：显存结论。必须写清「依据是实测还是公式」，否则用户没法判断该不该信。
+  const free = vram.free_mb == null ? null : fmtMB(vram.free_mb);
+  const need = vram.needed_mb == null ? null : fmtMB(vram.needed_mb);
+  const source = vram.source === "measured"
+    ? `按实测峰值 ${fmtMB(vram.measured_mb)} MB × 1.15 + 400 MB`
+    : vram.source === "scaled"
+      ? `按 batch=${vram.sample_batch} 的实测峰值 ${fmtMB(vram.measured_mb)} MB 线性外推 × 1.15 + 400 MB`
+      : vram.source === "capped"
+        ? `取更大 batch 的实测峰值 ${fmtMB(vram.measured_mb)} MB 作上界 × 1.15 + 400 MB`
+        : "按公式 2600 + 300 × batch × (imgsz/640)²（无实测样本）";
+  if (vram.skipped) {
+    dom.hwVram.textContent = `显存：${vram.skipped}`;
+  } else if (free === null || need === null) {
+    dom.hwVram.textContent = "显存：无法读取（没有 CUDA 或 nvidia-smi），启动时不做预检";
+  } else {
+    const verdict = vram.ok ? "够用" : "不够用";
+    const hint = vram.hint ? `｜建议：${vram.hint}` : "";
+    dom.hwVram.textContent = `显存：可用 ${free} MB / 需求 ${need} MB → ${verdict}（${source}${hint}）`;
+  }
+
+  // 第三行：混合精度。黑名单卡上「请求 fp16 也一定会 fp32」，必须在开训前就说明白，
+  // 否则用户只会觉得「同一组参数怎么慢了一倍」。
+  const parts = [`混合精度：${data.amp_text || "未知"}`];
+  if (amp.available === false) {
+    parts.push(amp.reason || "");
+    parts.push("即使选「显式尝试」也无法开启，关闭发生在框架内部");
+  } else if (amp.available === true) {
+    parts.push("训练开始时框架还会做一次前向对比，极小概率仍回退 fp32");
+  }
+  dom.hwAmp.textContent = parts.filter(Boolean).join("｜");
+
+  // 第四行：本次将用哪批数据。写清算法覆盖范围，避免被当成「图片内容校验」。
+  // 指纹不同就意味着这次训练的结果和旧台账不能直接横比。
+  if (fp && fp.dataset_fingerprint) {
+    const counts = fp.counts || {};
+    dom.hwData.textContent =
+      `数据集：${fp.short}（${counts.train ?? 0} train / ${counts.val ?? 0} val）` +
+      `｜算法 ${fp.algo}：路径+大小+标注，不含图片内容`;
+    dom.hwData.title = `完整指纹 ${fp.dataset_fingerprint}｜标注指纹 ${fp.label_fingerprint || "—"}`;
+  } else if (fp && fp.error) {
+    dom.hwData.textContent = `数据集：指纹计算失败（${fp.error}）`;
+    dom.hwData.title = "";
+  } else {
+    dom.hwData.textContent = "数据集：未选择 dataset.yaml，无法记录指纹";
+    dom.hwData.title = "";
+  }
+
+  if (vram.ok) {
+    setHwHint("体检通过", "ok");
+    dom.btnForceVram.hidden = true;
+  } else {
+    setHwHint("显存不足：可以调小 batch/imgsz，或停掉常驻推理进程", "bad");
+  }
+}
+
+/** MB 数字的显示格式：小于 10000 保留一位小数，避免「5460.4 MB」这种噪声。 */
+function fmtMB(value) {
+  const num = Number(value);
+  if (!Number.isFinite(num)) return String(value);
+  return num >= 1000 ? String(Math.round(num)) : num.toFixed(1);
 }
 
 // ---- 断点续训 -------------------------------------------------------------

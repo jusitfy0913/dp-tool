@@ -833,6 +833,141 @@ def build_train_kwargs(args: argparse.Namespace) -> Dict[str, Any]:
     return {k: v for k, v in kwargs.items() if v is not None}
 
 
+def _effective_amp(trainer: Any) -> Optional[bool]:
+    """从 trainer 上读出**真正生效**的混合精度标志。
+
+    为什么不能看 ``args.amp``：黑名单显卡（如 T1000）上 ``args.amp`` 仍是 True，
+    但 ``Trainer.__init__`` 里的 ``check_amp()`` 已经把它关掉了。真正的事实是
+    ``trainer.amp``——一个 0 维张量（DDP 下会被 broadcast）。
+    """
+    value = getattr(trainer, "amp", None)
+    if value is None:
+        return None
+    try:
+        if hasattr(value, "item"):
+            return bool(value.item())
+        return bool(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _current_gpu_name() -> Optional[str]:
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            return torch.cuda.get_device_name(torch.cuda.current_device())
+    except Exception:  # noqa: BLE001 - 观测失败不影响训练
+        return None
+    return None
+
+
+def _collect_amp_state(trainer: Any, args: argparse.Namespace) -> Dict[str, Any]:
+    """``amp_state`` 事件：请求值 vs 实际值。
+
+    页面上「为什么慢一倍」只有这一个答案来源，所以即使拿不到也要发事件（值为 None），
+    让前端能明确显示「未知」，而不是干脆不显示、让人以为在用 fp16。
+    """
+    effective = _effective_amp(trainer)
+    requested = getattr(args, "amp", None)
+    if effective is None:
+        precision = "unknown"
+    else:
+        precision = "fp16" if effective else "fp32"
+    return {
+        "amp_requested": requested,
+        "amp_effective": effective,
+        "precision": precision,
+        "gpu": _current_gpu_name(),
+    }
+
+
+def _collect_vram_peak(trainer: Any, args: argparse.Namespace) -> Dict[str, Any]:
+    """``vram_peak`` 事件：本次训练的峰值显存 + 可写入实测表的样本键。
+
+    取 ``max_memory_reserved`` 而不是 ``allocated``：OOM 发生在向驱动申请的那一刻，
+    预留（reserved）才是 PyTorch 真正占住的显存，allocated 会低估 30% 以上
+    （本机 batch=8@640 实测 1769 MB，但同一组合在 2600 MB 可用时并不稳）。
+
+    样本里的 batch 用 ``trainer.batch_size``（实际生效值），不是命令行请求值：
+    Ultralytics 在首轮 OOM 时会悄悄把 batch 减半，用请求值记账会让下次预检误判。
+    """
+    peak_mb: Optional[float] = None
+    allocated_mb: Optional[float] = None
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            peak_mb = round(torch.cuda.max_memory_reserved() / (1024 ** 2), 1)
+            allocated_mb = round(torch.cuda.max_memory_allocated() / (1024 ** 2), 1)
+    except Exception:  # noqa: BLE001 - 读数失败只影响自校准
+        peak_mb = None
+
+    payload: Dict[str, Any] = {
+        "peak_mb": peak_mb,
+        "peak_allocated_mb": allocated_mb,
+        "sample": None,
+    }
+    if not peak_mb or peak_mb <= 0:
+        return payload
+
+    trainer_args = getattr(trainer, "args", None)
+    imgsz = getattr(trainer_args, "imgsz", None) or getattr(args, "imgsz", None)
+    batch = getattr(trainer, "batch_size", None) or getattr(trainer_args, "batch", None)
+    try:
+        imgsz_int = int(imgsz)
+        batch_int = int(batch)
+    except (TypeError, ValueError):
+        return payload
+    if imgsz_int <= 0 or batch_int <= 0:
+        return payload
+
+    effective = _effective_amp(trainer)
+    payload["sample"] = {
+        "imgsz": imgsz_int,
+        "batch": batch_int,
+        "peak_mb": peak_mb,
+        "peak_allocated_mb": allocated_mb,
+        "precision": "fp32" if effective is False else ("fp16" if effective else "unknown"),
+    }
+    return payload
+
+
+def write_dataset_meta(save_dir: Any, data_arg: Any) -> None:
+    """把数据集指纹写进训练目录（``train_meta.json``）。
+
+    为什么由 launcher 写而不是 Web 后端写：只有 trainer 知道**最终**的 ``save_dir``。
+    用户填的 name 已存在时 Ultralytics 会自动改成 ``name2``，后端按请求路径写会写错位置。
+
+    指纹内容由环境变量 ``TRTFORGE_DATASET_FP`` 传入，不走 argv：命令行会出现在
+    进程列表、``runtime/logs/*.log`` 与前端「运行中」条的 tooltip 里，指纹没必要四处留。
+
+    失败只打日志：这份文件是溯源凭据，写不出来不该让已经成功的训练变成失败。
+    """
+    raw = os.environ.get("TRTFORGE_DATASET_FP", "").strip()
+    if not raw or not save_dir:
+        return
+    try:
+        dataset = json.loads(raw)
+    except ValueError:
+        return
+    if not isinstance(dataset, dict):
+        return
+    payload = {
+        "dataset": dataset,
+        "data_arg": str(data_arg or ""),
+        "run_dir": str(save_dir),
+        "run_id": os.environ.get("TRTFORGE_RUN_ID", "").strip(),
+        "written_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+    }
+    try:
+        (Path(save_dir) / "train_meta.json").write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+        )
+    except OSError as exc:
+        print(f"写入 train_meta.json 失败（不影响训练）：{type(exc).__name__}: {exc}", flush=True)
+
+
 def add_train_callbacks(model: Any, args: argparse.Namespace) -> None:
     last_gpu_emit = [0.0]
 
@@ -845,6 +980,7 @@ def add_train_callbacks(model: Any, args: argparse.Namespace) -> None:
         total = int(getattr(getattr(trainer, "args", object()), "epochs", 0) or 0)
         emit_phase("train_start", "开始训练", total=total)
         emit({"type": "event", "name": "train_start", "ts": time.time(), "total": total})
+        emit({"type": "event", "name": "amp_state", "ts": time.time(), **_collect_amp_state(trainer, args)})
         emit_gpu_status()
 
     def on_fit_epoch_end(trainer: Any) -> None:
@@ -886,6 +1022,8 @@ def add_train_callbacks(model: Any, args: argparse.Namespace) -> None:
                 names = data.get("names")
             generate_labels_json(save_dir, args.name, names, args.data)
             emit_plot_artifacts(save_dir)
+            write_dataset_meta(save_dir, args.data)
+        emit({"type": "event", "name": "vram_peak", "ts": time.time(), **_collect_vram_peak(trainer, args)})
         emit({"type": "event", "name": "train_finished", "ts": time.time()})
 
     model.add_callback("on_pretrain_routine_end", on_pretrain_routine_end)

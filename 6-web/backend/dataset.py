@@ -20,10 +20,15 @@ FNV-1a 64 位，盐值仍保留 ``_2026``，好处是：
 
 from __future__ import annotations
 
+import hashlib
 import json
 import shutil
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
+
+import config
+import fingerprint
 
 # ---------------------------------------------------------------------------
 # 常量
@@ -118,6 +123,98 @@ def assign_splits_stratified(
     return splits, notes
 
 
+#: 这些目录名是「划分」语义，不是「组」。按目录分组时要跳过它们往上一层找。
+SPLIT_WORDS = {"train", "val", "test", "tune", "holdout", "valid", "validation"}
+
+
+def group_key(rel: str, mode: str = "none") -> str:
+    """从相对路径里取「同一底板/同一工件」的组键。
+
+    ``prefix`` 取文件名第一个下划线之前的片段（``01_missing_hole_01.jpg`` → ``01``），
+    ``dir`` 取所在目录名，目录名本身是划分语义时往上一层。
+
+    为什么默认 ``none``：按组划分会改变划分结果，进而改变导出内容与指纹。
+    这个开关必须是显式的，不能因为升级就悄悄换掉用户已有的数据集。
+    """
+    if mode in ("", "none", None):
+        return ""
+    parts = rel.replace("\\", "/").split("/")
+    if mode == "prefix":
+        stem = parts[-1].rsplit(".", 1)[0]
+        head = stem.split("_")[0].strip()
+        return head or stem
+    if mode == "dir":
+        parent = parts[-2] if len(parts) >= 2 else ""
+        if parent.lower() in SPLIT_WORDS and len(parts) >= 3:
+            parent = parts[-3]
+        # 标准 YOLO 布局没有目录级分组信息（全是 images/train），此时每张自成一组，
+        # 而不是把所有图并进一个叫 "images" 的巨组。
+        if parent.lower() in {"images", "labels"} or not parent:
+            return parts[-1].rsplit(".", 1)[0]
+        return parent
+    raise DatasetError(f"未知的分组方式：{mode}，可选 none / prefix / dir")
+
+
+def assign_splits_grouped(
+    keys: list[str], train: int, val: int
+) -> tuple[list[str], list[str]]:
+    """按组划分：同一组的全部图片进同一个 split。
+
+    比例用「按缺口贪心」逼近，而不是精确命中：10 个组、每组 32~120 张时，
+    70/15/15 不可能精确。**宁可比例不准，也不拆组**——拆组等于把泄漏又放回来。
+
+    返回 (每张图的 split, 说明)，说明里写实际张数与偏差。
+    """
+    count = len(keys)
+    if count <= 0:
+        return [], []
+    for name, value in (("train", train), ("val", val)):
+        if not 0 <= value <= 100:
+            raise DatasetError(f"{name} 比例必须在 0~100 之间，当前为 {value}")
+    if train + val > 100:
+        raise DatasetError(f"train({train}%) + val({val}%) 不能超过 100%")
+
+    members: dict[str, list[int]] = {}
+    for index, key in enumerate(keys):
+        members.setdefault(key, []).append(index)
+
+    targets = {
+        "train": count * train // 100,
+        "val": count * val // 100,
+    }
+    targets["test"] = count - targets["train"] - targets["val"]
+    got = {"train": 0, "val": 0, "test": 0}
+    result = ["test"] * count
+
+    # 组内先后不影响结果；组间顺序由固定哈希决定，保证换机器、换进程可复现
+    order = sorted(members, key=lambda key: (fnv1a64(f"{key}{SALT}"), key))
+    for key in order:
+        indexes = members[key]
+        # 选「离目标缺口最大」的划分。并列时按 train / val / test 顺序取第一个，
+        # 因为 max 返回首次出现的最大值，结果确定。
+        chosen = max(("train", "val", "test"), key=lambda name: targets[name] - got[name])
+        for index in indexes:
+            result[index] = chosen
+        got[chosen] += len(indexes)
+
+    notes: list[str] = []
+    for name, ratio in (("train", train), ("val", val), ("test", 100 - train - val)):
+        if ratio > 0 and got[name] == 0:
+            notes.append(f"按组划分后 {name} 为 0 张：组太大，凑不出这个划分")
+        elif ratio > 0:
+            actual = got[name] * 100 / count
+            if abs(actual - ratio) > 5:
+                notes.append(
+                    f"按组划分后 {name} 实际 {got[name]} 张（{actual:.1f}%），"
+                    f"与目标 {ratio}% 偏差 {actual - ratio:+.1f} 个百分点："
+                    "整组不可拆，只能接受这个偏差"
+                )
+    notes.append(
+        f"按组划分：{len(members)} 个组，train={got['train']} val={got['val']} test={got['test']}"
+    )
+    return result, notes
+
+
 # ---------------------------------------------------------------------------
 # 数据模型
 # ---------------------------------------------------------------------------
@@ -141,6 +238,9 @@ class DatasetImage:
     current_split: str = "train"
     #: 分类任务的整图类别。None 表示还没标，导出时跳过。
     label_id: int | None = None
+    #: 良品图（用户显式声明的良品目录里的图）。导出时写空标签、只进验收划分，
+    #: 用来统计过杀率。绝不能靠「没有标注」自动推断——那是漏标的特征。
+    is_ok: bool = False
 
 
 @dataclass
@@ -151,6 +251,8 @@ class DatasetProject:
     classes: list[dict] = field(default_factory=list)
     images: list[DatasetImage] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    #: 本次扫描声明的良品目录（原样保留，供 manifest 与界面回显）
+    ok_dirs: list[str] = field(default_factory=list)
 
     def class_name(self, class_id: int) -> str:
         for item in self.classes:
@@ -357,7 +459,142 @@ def _collect_yolo_images(root: Path, warnings: list[str]) -> list[tuple[Path, st
     return found
 
 
-def load_yolo(source: Path, task: str = "auto") -> DatasetProject:
+def _label_path_candidates(root: Path, path: Path) -> list[Path]:
+    """良品图的标签候选路径：先按 images/xx → labels/xx 镜像，再看同名 .txt。"""
+    candidates: list[Path] = []
+    try:
+        parts = path.relative_to(root).parts
+    except ValueError:
+        parts = ()
+    if len(parts) >= 3 and parts[0] == "images":
+        mirrored = root / "labels" / parts[1] / Path(*parts[2:]).with_suffix(".txt")
+        candidates.append(mirrored)
+    candidates.append(path.with_suffix(".txt"))
+    return candidates
+
+
+def attach_ok_images(
+    root: Path,
+    ok_dirs: list[str],
+    ok_split: str,
+    images: list[DatasetImage],
+    warnings: list[str],
+) -> int:
+    """把用户显式声明的良品目录接进扫描结果，返回新增张数。
+
+    三条硬规则：
+
+    1. 良品目录里的图 **必须没有标注**。发现非空标签就报错——否则「良品」会被
+       悄悄掺进缺陷图，后续的过杀率会变成一个既不是良品、也不是 NG 的数字。
+    2. 已经在正常扫描里的图（例如勾选了 ``images/val`` 下的子目录）只打标记，
+       不重复计数。
+    3. 良品图统一进入 ``ok_split``，导出时写空标签，**不参与训练**。
+    """
+    if ok_split not in SPLITS:
+        raise DatasetError(f"良品图目标划分必须是 {', '.join(SPLITS)}，收到 {ok_split!r}")
+
+    resolved: list[Path] = []
+    for raw in ok_dirs:
+        text = str(raw).strip()
+        if not text:
+            continue
+        directory = Path(text)
+        if not directory.is_absolute():
+            directory = root / directory
+        if not directory.is_dir():
+            raise DatasetError(f"良品目录不存在或不是目录：{text}")
+        resolved.append(directory)
+
+    by_path = {image.path.resolve(): image for image in images}
+    added = 0
+    for directory in resolved:
+        files = sorted(
+            (p for p in directory.rglob("*") if p.is_file() and p.suffix.lower() in IMAGE_EXTS),
+            key=lambda p: str(p).lower(),
+        )
+        if not files:
+            warnings.append(f"良品目录里没有图片：{directory}")
+            continue
+        for path in files:
+            for candidate in _label_path_candidates(root, path):
+                if not candidate.is_file():
+                    continue
+                text = candidate.read_text(encoding="utf-8", errors="replace")
+                if text.strip():
+                    raise DatasetError(
+                        f"良品目录里有非空标注：{path}（{candidate}）。"
+                        "良品图必须没有标注；若这是缺陷图，请不要放进良品目录。"
+                    )
+                break
+
+            existing = by_path.get(path.resolve())
+            if existing is not None:
+                existing.is_ok = True
+                existing.current_split = ok_split
+                continue
+
+            width, height = _image_size(path)
+            try:
+                rel = str(path.relative_to(root)).replace("\\", "/")
+            except ValueError:
+                rel = str(path).replace("\\", "/")
+            item = DatasetImage(
+                index=len(images),
+                path=path,
+                rel=rel,
+                width=width,
+                height=height,
+                objects=[],
+                current_split=ok_split,
+                is_ok=True,
+            )
+            images.append(item)
+            by_path[path.resolve()] = item
+            added += 1
+
+    if added:
+        warnings.append(
+            f"已把 {added} 张良品图加入 {ok_split} 划分（导出写空标签，不参与训练）。"
+        )
+    return added
+
+
+def apply_ok_split(project: DatasetProject, splits: list[str], ok_split: str) -> int:
+    """把良品图强制归到验收划分，返回被移动的张数。
+
+    只动良品图，其余图片的划分结果与升级前完全一致——不能用「重新划分」的方式
+    实现，那会改掉用户已有数据集的指纹。
+    """
+    if ok_split not in SPLITS:
+        raise DatasetError(f"良品图目标划分必须是 {', '.join(SPLITS)}，收到 {ok_split!r}")
+    moved = 0
+    for position, image in enumerate(project.images):
+        if not image.is_ok or position >= len(splits):
+            continue
+        if splits[position] != ok_split:
+            splits[position] = ok_split
+            moved += 1
+        image.current_split = ok_split
+    return moved
+
+
+def ok_summary(project: DatasetProject, ok_split: str) -> dict:
+    """良品图统计，写进 manifest 与界面。"""
+    ok_images = [image for image in project.images if image.is_ok]
+    return {
+        "dirs": list(project.ok_dirs),
+        "images": len(ok_images),
+        "split": ok_split,
+        "note": (
+            "良品图导出为空标签，只进验收划分；过杀率按「标签文件存在且为空」统计，"
+            "没有标签文件的图不算良品。"
+        ),
+    }
+
+
+def load_yolo(
+    source: Path, task: str = "auto", ok_dirs: list[str] | None = None, ok_split: str = "val"
+) -> DatasetProject:
     """扫描一个 YOLO 数据集目录（或它里面的 data.yaml）。"""
     warnings: list[str] = []
     yaml_text = ""
@@ -426,12 +663,25 @@ def load_yolo(source: Path, task: str = "auto") -> DatasetProject:
         )
 
     if empty:
-        warnings.append(f"{empty} 张图片没有标注或标签文件缺失，导出时会写成空标签")
+        warnings.append(
+            f"{empty} 张图片没有标注或标签文件缺失，导出时会写成空标签。"
+            "若其中一部分是良品图，请在「良品目录」里显式声明——工具不会自动把漏标当良品。"
+        )
     if any(img.width <= 0 for img in images):
         warnings.append("部分图片读不到尺寸，导出 COCO / VOC 时这些图会被跳过")
 
+    declared = [str(item) for item in (ok_dirs or []) if str(item).strip()]
+    if declared:
+        attach_ok_images(root, declared, ok_split, images, warnings)
+
     return DatasetProject(
-        source=root, kind="yolo", task=resolved_task, classes=classes, images=images, warnings=warnings
+        source=root,
+        kind="yolo",
+        task=resolved_task,
+        classes=classes,
+        images=images,
+        warnings=warnings,
+        ok_dirs=declared,
     )
 
 
@@ -513,13 +763,15 @@ def load_tfanno(source: Path) -> DatasetProject:
     )
 
 
-def load_project(source: str, task: str = "auto") -> DatasetProject:
+def load_project(
+    source: str, task: str = "auto", ok_dirs: list[str] | None = None, ok_split: str = "val"
+) -> DatasetProject:
     path = Path(source).expanduser()
     if not path.exists():
         raise DatasetError(f"路径不存在：{source}")
     if path.is_file() and path.suffix.lower() == ".tfanno":
         return load_tfanno(path)
-    return load_yolo(path, task)
+    return load_yolo(path, task, ok_dirs=ok_dirs, ok_split=ok_split)
 
 
 # ---------------------------------------------------------------------------
@@ -529,19 +781,38 @@ def split_counts(splits: list[str]) -> dict:
     return {name: sum(1 for s in splits if s == name) for name in SPLITS}
 
 
-def preview(project: DatasetProject, train: int, val: int, limit: int = 200) -> dict:
+def preview(
+    project: DatasetProject,
+    train: int,
+    val: int,
+    limit: int = 200,
+    group_by: str = "none",
+    ok_split: str = "val",
+) -> dict:
     """给前端预览用：不落盘，只算分配结果。"""
     notes: list[str] = []
-    if project.task == "classify":
+    grouped = bool(group_by) and group_by != "none"
+    group_count = 0
+    if grouped:
+        keys = [group_key(img.rel, group_by) for img in project.images]
+        group_count = len(set(keys))
+        splits, group_notes = assign_splits_grouped(keys, train, val)
+        notes.extend(group_notes)
+        if project.task == "classify":
+            notes.append("按组划分时不再按类别分层：类别均衡由组的实际构成决定")
+    elif project.task == "classify":
         splits, notes = assign_splits_stratified([img.label_id for img in project.images], train, val)
     else:
         splits = assign_splits(len(project.images), train, val)
+    ok_moved = apply_ok_split(project, splits, ok_split) if project.ok_dirs else 0
     counts = split_counts(splits)
     counts["total"] = len(project.images)
     if project.task == "classify":
         counts["empty"] = sum(1 for img in project.images if img.label_id is None)
     else:
         counts["empty"] = sum(1 for img in project.images if not img.objects)
+    if ok_moved:
+        notes.append(f"{ok_moved} 张良品图已改到 {ok_split} 划分（用于统计过杀率）。")
 
     class_counter = {item["id"]: 0 for item in project.classes}
     if project.task == "classify":
@@ -564,6 +835,7 @@ def preview(project: DatasetProject, train: int, val: int, limit: int = 200) -> 
             "objects": len(img.objects),
             "current_split": img.current_split,
             "split": split,
+            "ok": img.is_ok,
         }
         if project.task == "classify":
             row["label"] = "未标注" if img.label_id is None else project.class_name(img.label_id)
@@ -579,6 +851,13 @@ def preview(project: DatasetProject, train: int, val: int, limit: int = 200) -> 
         "counts": counts,
         "images": images,
         "truncated": len(project.images) > limit,
+        "split_mode": {
+            "mode": f"group:{group_by}" if grouped else "ratio",
+            "train": train,
+            "val": val,
+            "groups": group_count,
+        },
+        "ok": ok_summary(project, ok_split),
         "warnings": list(project.warnings) + notes,
     }
 
@@ -608,6 +887,139 @@ def _prepare_output(output: Path, overwrite: bool, source: Path) -> None:
             raise DatasetError(f"输出目录非空：{output}。确认要覆盖请勾选「允许覆盖」")
     else:
         output.mkdir(parents=True, exist_ok=True)
+
+
+# ---------------------------------------------------------------------------
+# 导出清单（manifest）：给「这批图」一个可核对的身份证
+# ---------------------------------------------------------------------------
+#: 写进 manifest 的说明。算法边界必须写在数据旁边，否则读的人会把它当成图片级校验。
+FINGERPRINT_NOTE = (
+    "指纹覆盖「相对路径 + 文件大小 + 标注文本」，不含图片内容；"
+    "因此重命名图片也会让指纹变化，而「同名同大小但内容被换」发现不了。"
+)
+
+
+def _previous_fingerprint(output: Path) -> str | None:
+    """读上一次导出的指纹。读不出来就当作没有——这只是用来提示「内容未变」。"""
+    try:
+        payload = json.loads((output / "manifest.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    value = payload.get("dataset_fingerprint") if isinstance(payload, dict) else None
+    return value if isinstance(value, str) and value else None
+
+
+def _finalize_export(
+    output: Path,
+    fmt: str,
+    project: DatasetProject,
+    *,
+    split_mode: dict,
+    counts: dict,
+    group_signature: dict | None = None,
+    qc: dict | None = None,
+    ok: dict | None = None,
+) -> dict:
+    """算指纹、写 ``manifest.json``，返回要合并进接口响应的字段。
+
+    指纹在**导出完成之后**对输出目录算，而不是对源工程算：这样它证明的是
+    「真正写出去的那批文件」，源工程被改动过也不影响已导出产物的身份。
+    """
+    previous = _previous_fingerprint(output)
+    if fmt == "yolo":
+        # 训练吃的就是这份 dataset.yaml，与训练侧、实验台账的指纹必须能对上
+        report = fingerprint.compute(output / "dataset.yaml")
+    else:
+        report = fingerprint.compute_tree(
+            output,
+            task=project.task,
+            nc=len(project.classes),
+            classes=project.classes,
+        )
+
+    stored = report.get("dataset_fingerprint")
+    unchanged = bool(stored) and stored == previous
+    payload = {
+        "algo": report.get("algo", fingerprint.ALGO),
+        "scope": report.get("scope", "dataset"),
+        "dataset_fingerprint": stored,
+        "short": fingerprint.short(stored),
+        "label_fingerprint": report.get("label_fingerprint"),
+        "split_fingerprints": report.get("split_fingerprints"),
+        "counts": counts,
+        "task": project.task,
+        "nc": len(project.classes),
+        "classes": project.classes,
+        "format": fmt,
+        "source": str(project.source),
+        "source_kind": project.kind,
+        "split_mode": split_mode,
+        "created_at": report.get("computed_at"),
+        "app_version": config.APP_VERSION,
+        "note": FINGERPRINT_NOTE,
+        "error": report.get("error", ""),
+    }
+    # 体检结果是「事前建议」，不参与指纹与 unchanged 判定：
+    # 否则同一批数据每次体检结论微变，都会让「内容未变」失效。
+    if group_signature:
+        payload["group_signature"] = group_signature
+    if qc:
+        payload["qc"] = qc
+    if ok and ok.get("images"):
+        payload["ok"] = ok
+    target = output / "manifest.json"
+    write_error = ""
+    try:
+        target.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+        )
+    except OSError as exc:  # 清单写不进去不能让「已经导出成功的图」变成失败
+        write_error = f"{type(exc).__name__}: {exc}"
+
+    result = {
+        "dataset_fingerprint": stored,
+        "data_fp": fingerprint.short(stored),
+        "label_fingerprint": report.get("label_fingerprint"),
+        "split_fingerprints": report.get("split_fingerprints"),
+        "fingerprint_algo": report.get("algo"),
+        "fingerprint_error": report.get("error", ""),
+        "unchanged": unchanged,
+        "manifest": str(target),
+    }
+    if write_error:
+        result["manifest_error"] = write_error
+    return result
+
+
+def _clear_previous_export(output: Path, fmt: str, task: str) -> None:
+    """覆盖导出前清掉上一次的产物目录。
+
+    为什么不依赖 ``_copy_image`` 的「重名加序号」：那是为了防止**同一次**导出里
+    两个不同子目录的同名图互相覆盖。跨次数重复导出时它会让旧文件越积越多，
+    于是「同一批数据再导一次」得到的 manifest 指纹与上次不同——这恰好毁掉了
+    指纹最重要的性质（同内容 → 同指纹）。
+
+    只删本工具自己生成的目录，不碰输出目录里的其它文件。调用方已经过了
+    ``_prepare_output`` 的检查（``overwrite=False`` 时非空目录根本走不到这里）。
+    """
+    if fmt == "yolo":
+        if task == "classify":
+            targets = [output / name for name in SPLITS]
+        else:
+            targets = [output / "images", output / "labels"]
+    elif fmt == "voc":
+        targets = [output / "JPEGImages", output / "Annotations"]
+    else:
+        targets = [output / "annotations.json"]
+    for target in targets:
+        try:
+            if target.is_dir():
+                shutil.rmtree(target, ignore_errors=True)
+            elif target.is_file():
+                target.unlink(missing_ok=True)
+        except OSError:
+            # 删不掉就让后面的导出自己报错（同名文件会加序号，至少不会静默丢数据）
+            continue
 
 
 def _yolo_line(obj: DatasetObject, task: str, width: int, height: int) -> str:
@@ -679,9 +1091,17 @@ def _class_dir_name(name: str) -> str:
     return text
 
 
-def export_yolo_classify(project: DatasetProject, output: Path, splits: list[str], overwrite: bool) -> dict:
+def export_yolo_classify(
+    project: DatasetProject,
+    output: Path,
+    splits: list[str],
+    overwrite: bool,
+    split_mode: dict | None = None,
+    meta: dict | None = None,
+) -> dict:
     """导出 Ultralytics 分类目录：train/<类别名>/图片.jpg，不写 labels/*.txt。"""
     _prepare_output(output, overwrite, project.source)
+    _clear_previous_export(output, "yolo", "classify")
     names = {int(item["id"]): _class_dir_name(str(item["name"])) for item in project.classes}
     written: dict[str, int] = {name: 0 for name in SPLITS}
     skipped: list[str] = []
@@ -711,7 +1131,7 @@ def export_yolo_classify(project: DatasetProject, output: Path, splits: list[str
     for item in project.classes:
         yaml_lines.append(f"  {item['id']}: {names[int(item['id'])]}")
     (output / "dataset.yaml").write_text("\n".join(yaml_lines) + "\n", encoding="utf-8")
-    return {
+    result = {
         "format": "yolo",
         "output": str(output),
         "counts": written,
@@ -719,12 +1139,33 @@ def export_yolo_classify(project: DatasetProject, output: Path, splits: list[str
         "skipped_unlabeled": sum(1 for line in skipped if line.startswith("未标注")),
         "extra_files": ["dataset.yaml"],
     }
+    result.update(
+        _finalize_export(
+            output,
+            "yolo",
+            project,
+            split_mode=split_mode or {"mode": "unspecified"},
+            counts=dict(written),
+            group_signature=(meta or {}).get("group_signature"),
+            qc=(meta or {}).get("qc"),
+            ok=(meta or {}).get("ok"),
+        )
+    )
+    return result
 
 
-def export_yolo(project: DatasetProject, output: Path, splits: list[str], overwrite: bool) -> dict:
+def export_yolo(
+    project: DatasetProject,
+    output: Path,
+    splits: list[str],
+    overwrite: bool,
+    split_mode: dict | None = None,
+    meta: dict | None = None,
+) -> dict:
     if project.task == "classify":
-        return export_yolo_classify(project, output, splits, overwrite)
+        return export_yolo_classify(project, output, splits, overwrite, split_mode=split_mode)
     _prepare_output(output, overwrite, project.source)
+    _clear_previous_export(output, "yolo", project.task)
     for name in SPLITS:
         (output / "images" / name).mkdir(parents=True, exist_ok=True)
         (output / "labels" / name).mkdir(parents=True, exist_ok=True)
@@ -760,24 +1201,45 @@ def export_yolo(project: DatasetProject, output: Path, splits: list[str], overwr
         yaml_lines.append(f"  {item['id']}: {item['name']}")
     (output / "dataset.yaml").write_text("\n".join(yaml_lines) + "\n", encoding="utf-8")
 
-    return {
+    result = {
         "format": "yolo",
         "output": str(output),
         "counts": written,
         "skipped": skipped,
         "extra_files": ["dataset.yaml"],
     }
+    result.update(
+        _finalize_export(
+            output,
+            "yolo",
+            project,
+            split_mode=split_mode or {"mode": "unspecified"},
+            counts=dict(written),
+            group_signature=(meta or {}).get("group_signature"),
+            qc=(meta or {}).get("qc"),
+            ok=(meta or {}).get("ok"),
+        )
+    )
+    return result
 
 
 # ---------------------------------------------------------------------------
 # 导出：COCO
 # ---------------------------------------------------------------------------
-def export_coco(project: DatasetProject, output: Path, splits: list[str], overwrite: bool) -> dict:
+def export_coco(
+    project: DatasetProject,
+    output: Path,
+    splits: list[str],
+    overwrite: bool,
+    split_mode: dict | None = None,
+    meta: dict | None = None,
+) -> dict:
     if project.task == "classify":
         raise DatasetError("分类只导出类别文件夹，不支持 COCO")
     if project.task == "obb":
         raise DatasetError("标准 COCO 不支持旋转框，请改用 YOLO OBB 导出")
     _prepare_output(output, overwrite, project.source)
+    _clear_previous_export(output, "coco", project.task)
 
     images_json = []
     annotations_json = []
@@ -851,14 +1313,32 @@ def export_coco(project: DatasetProject, output: Path, splits: list[str], overwr
     target = output / "annotations.json"
     target.write_text(json.dumps(doc, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    return {
+    coco_counts = {
+        "images": len(images_json),
+        "annotations": len(annotations_json),
+        "empty": empty,
+    }
+    result = {
         "format": "coco",
         "output": str(output),
-        "counts": {"images": len(images_json), "annotations": len(annotations_json), "empty": empty},
+        "counts": coco_counts,
         "skipped": skipped,
         "extra_files": [target.name],
         "note": "COCO 只写标注文件，不复制图片；图片路径以 file_name 记录",
     }
+    result.update(
+        _finalize_export(
+            output,
+            "coco",
+            project,
+            split_mode=split_mode or {"mode": "unspecified"},
+            counts=dict(coco_counts),
+            group_signature=(meta or {}).get("group_signature"),
+            qc=(meta or {}).get("qc"),
+            ok=(meta or {}).get("ok"),
+        )
+    )
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -897,7 +1377,14 @@ def _voc_xml(image: DatasetImage, objects: list[DatasetObject], project: Dataset
     return "\n".join(lines) + "\n"
 
 
-def export_voc(project: DatasetProject, output: Path, splits: list[str], overwrite: bool) -> dict:
+def export_voc(
+    project: DatasetProject,
+    output: Path,
+    splits: list[str],
+    overwrite: bool,
+    split_mode: dict | None = None,
+    meta: dict | None = None,
+) -> dict:
     if project.task == "classify":
         raise DatasetError("分类只导出类别文件夹，不支持 VOC")
     if project.task != "detect":
@@ -906,6 +1393,7 @@ def export_voc(project: DatasetProject, output: Path, splits: list[str], overwri
             "segment / pose / obb 请改用 YOLO 或 COCO 导出。"
         )
     _prepare_output(output, overwrite, project.source)
+    _clear_previous_export(output, "voc", project.task)
     (output / "Annotations").mkdir(exist_ok=True)
     (output / "JPEGImages").mkdir(exist_ok=True)
 
@@ -920,14 +1408,28 @@ def export_voc(project: DatasetProject, output: Path, splits: list[str], overwri
         (output / "Annotations" / f"{target.stem}.xml").write_text(xml, encoding="utf-8")
         written += 1
 
-    return {
+    voc_counts = {"images": written}
+    result = {
         "format": "voc",
         "output": str(output),
-        "counts": {"images": written},
+        "counts": voc_counts,
         "skipped": skipped,
         "extra_files": ["Annotations/", "JPEGImages/"],
         "note": "VOC 本身没有 train/val 划分，划分比例仅用于统计",
     }
+    result.update(
+        _finalize_export(
+            output,
+            "voc",
+            project,
+            split_mode=split_mode or {"mode": "unspecified"},
+            counts=dict(voc_counts),
+            group_signature=(meta or {}).get("group_signature"),
+            qc=(meta or {}).get("qc"),
+            ok=(meta or {}).get("ok"),
+        )
+    )
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -936,8 +1438,57 @@ def export_voc(project: DatasetProject, output: Path, splits: list[str], overwri
 FORMATS = ("yolo", "coco", "voc")
 
 
+def group_signature(keys: list[str]) -> dict:
+    """组键与各组张数的紧凑签名，写进 manifest。
+
+    存摘要而不是全量映射：1 万个组全存进去会把 manifest 撑到几百 KB，而事后需要
+    回答的问题只有两个——「这次是不是按组划分的」「两次的组结构是否相同」。
+    """
+    counts = Counter(keys)
+    text = "\n".join(f"{key}\t{value}" for key, value in sorted(counts.items()))
+    return {
+        "algo": "sha256-16",
+        "count": len(counts),
+        "digest": hashlib.sha256(text.encode("utf-8")).hexdigest()[:16],
+        "sizes": sorted(counts.values(), reverse=True)[:20],
+    }
+
+
+def qc_summary(source: str, task: str, ok_dirs: list[str] | None = None) -> dict:
+    """体检结果的可落盘摘要。失败不抛异常——体检是建议，不该让导出失败。"""
+    try:
+        import datasetqc  # 延迟导入：datasetqc 依赖本模块，顶层导入会成环
+    except ImportError as exc:
+        return {"algo": "", "error": f"找不到 datasetqc：{exc}"}
+    try:
+        report = datasetqc.inspect(source, task, ok_dirs=ok_dirs)
+    except Exception as exc:  # noqa: BLE001 - 体检失败不影响导出
+        return {"algo": "", "error": f"{type(exc).__name__}: {exc}"}
+    return {
+        "algo": report.get("algo"),
+        "threshold": report.get("threshold"),
+        "summary": report.get("summary"),
+        "ok_images": report.get("ok_images"),
+        "by_rule": {code: item["count"] for code, item in report.get("by_rule", {}).items()},
+        "groups": {
+            key: report.get("groups", {}).get(key)
+            for key in ("total", "cross_split", "leak_images", "same_label_total")
+        },
+    }
+
+
 def run_export(
-    source: str, task: str, train: int, val: int, fmt: str, output: str, overwrite: bool
+    source: str,
+    task: str,
+    train: int,
+    val: int,
+    fmt: str,
+    output: str,
+    overwrite: bool,
+    group_by: str = "none",
+    with_qc: bool = False,
+    ok_dirs: list[str] | None = None,
+    ok_split: str = "val",
 ) -> dict:
     """扫描 → 划分 → 导出，一次请求走完，避免前端保存中间状态。"""
     if fmt not in FORMATS:
@@ -945,34 +1496,68 @@ def run_export(
     if not output.strip():
         raise DatasetError("请填写输出目录")
 
-    project = load_project(source, task)
+    project = load_project(source, task, ok_dirs=ok_dirs, ok_split=ok_split)
     split_notes: list[str] = []
-    if project.task == "classify":
+    grouped = bool(group_by) and group_by != "none"
+    keys: list[str] = []
+    if grouped:
+        keys = [group_key(img.rel, group_by) for img in project.images]
+        splits, split_notes = assign_splits_grouped(keys, train, val)
+        if project.task == "classify":
+            split_notes.append("按组划分时不再按类别分层：类别均衡由组的实际构成决定")
+    elif project.task == "classify":
         splits, split_notes = assign_splits_stratified([img.label_id for img in project.images], train, val)
     else:
         splits = assign_splits(len(project.images), train, val)
+    ok_moved = apply_ok_split(project, splits, ok_split) if project.ok_dirs else 0
+    if ok_moved:
+        split_notes.append(
+            f"{ok_moved} 张良品图已改到 {ok_split} 划分（空标签，不参与训练，用于统计过杀率）。"
+        )
     target = Path(output).expanduser()
+    # 划分方式写进 manifest：同样 1200 张图，80/20 与 70/20/10 得到的是不同数据集，
+    # 光看指纹只能知道「不同」，看不出「为什么不同」。
+    split_mode = {
+        "mode": f"group:{group_by}" if grouped else "ratio",
+        "train": train,
+        "val": val,
+    }
+    meta: dict = {}
+    if grouped:
+        split_mode["groups"] = len(set(keys))
+        meta["group_signature"] = group_signature(keys)
+    if project.ok_dirs:
+        split_mode["ok_split"] = ok_split
+        meta["ok"] = ok_summary(project, ok_split)
+    if with_qc:
+        meta["qc"] = qc_summary(str(project.source), project.task, ok_dirs=project.ok_dirs)
 
     if fmt == "yolo":
-        result = export_yolo(project, target, splits, overwrite)
+        result = export_yolo(project, target, splits, overwrite, split_mode=split_mode, meta=meta)
     elif fmt == "coco":
-        result = export_coco(project, target, splits, overwrite)
+        result = export_coco(project, target, splits, overwrite, split_mode=split_mode, meta=meta)
     else:
-        result = export_voc(project, target, splits, overwrite)
+        result = export_voc(project, target, splits, overwrite, split_mode=split_mode, meta=meta)
 
     result.update(
         {
             "task": project.task,
             "source_kind": project.kind,
             "split_counts": split_counts(splits),
+            "split_mode": split_mode,
             "warnings": list(project.warnings) + split_notes,
         }
     )
+    if meta.get("group_signature"):
+        result["group_signature"] = meta["group_signature"]
+    if meta.get("qc"):
+        result["qc"] = meta["qc"]
     # 比例向下取整后可能出现空集（例如 3 张图配 33% 的 train 会算成 0 张），
     # 这里显式提示，避免用户拿到「训练集空」的数据集还以为是 bug。
-    for name, ratio in (("train", train), ("val", val)):
-        if ratio > 0 and result["split_counts"].get(name, 0) == 0:
-            result["warnings"].append(
-                f"{name} 比例填了 {ratio}%，但样本量向下取整后为 0 张。请提高比例或增加图片。"
-            )
+    if not grouped:
+        for name, ratio in (("train", train), ("val", val)):
+            if ratio > 0 and result["split_counts"].get(name, 0) == 0:
+                result["warnings"].append(
+                    f"{name} 比例填了 {ratio}%，但样本量向下取整后为 0 张。请提高比例或增加图片。"
+                )
     return result

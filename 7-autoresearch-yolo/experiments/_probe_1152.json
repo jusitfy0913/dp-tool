@@ -1,0 +1,9 @@
+{
+  "_comment": "只用于确认本机 8GB 仍跑不了 1152。搜索空间已拒绝这个值，真机补测要加 --no-validate。预期几十秒内因显存不足或降 batch 被终止，不要把它当成科研结论。",
+  "hypothesis": "本机 T1000 8GB 上 1152 仍然放不下",
+  "changed": "imgsz 960 -> 1152, batch 4",
+  "train": {
+    "imgsz": 1152,
+    "batch": "4"
+  }
+}

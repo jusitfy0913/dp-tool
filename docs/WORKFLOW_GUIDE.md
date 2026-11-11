@@ -2,7 +2,7 @@
 
 > 本文回答一个核心问题：**从原始图片到产线推理，每一步该做什么、用什么命令、产出什么文件、怎么验证。**
 > 面向对象：需要独立跑通全流程的工程师（不需要深入算法细节）。
-> 最后更新：2026-11-10（v1.31.0：网页端推理改成进程池，见 §7.15；v1.30.6：分类走 `onnx_infer.dll`，见 §7.13；v1.30.5：OCR 往返拆解 + 识别 batch 按设备取值，见 §7.12；v1.30.4：OCR 文字醒目化 + 异常检测改回「区域」，见 §7.11；v1.30.3：推理往返耗时优化，见 §7.10；v1.30.2：OCR `mklml.dll` 加载修复，见 §7.7.1；v1.30.1：分类真机闭环，见 §7.9；v1.30.0：YOLO 整图分类；v1.28.0：推理进程隔离 infer_worker，见 §7.8；v1.27.0 OCR 见 §7.7）
+> 最后更新：2026-11-11（v1.34.1：显存预检改实测峰值表 + AMP 状态可见可覆盖，见 §7.18；v1.34.0：任务台账落盘 / 日志轮转 / 训练崩溃自动续训，见 §7.1、§7.16；v1.33.0：LLM 决策层，见 §7.17；v1.32.0：YOLO 自主实验循环，见 §7.16；v1.31.0：网页端推理改成进程池，见 §7.15；v1.30.6：分类走 `onnx_infer.dll`，见 §7.13；v1.30.5：OCR 往返拆解 + 识别 batch 按设备取值，见 §7.12；v1.30.4：OCR 文字醒目化 + 异常检测改回「区域」，见 §7.11；v1.30.3：推理往返耗时优化，见 §7.10；v1.30.2：OCR `mklml.dll` 加载修复，见 §7.7.1；v1.30.1：分类真机闭环，见 §7.9；v1.30.0：YOLO 整图分类；v1.28.0：推理进程隔离 infer_worker，见 §7.8；v1.27.0 OCR 见 §7.7）
 
 
 ---
@@ -894,6 +894,8 @@ WebSocket 也随之中断，但日志文件一直在磁盘上。
 - **服务重启过**：内存里的 run 全部消失，页面也就不知道该指向哪个任务号（按钮变灰）。
   这时直接打开 `runtime/logs/<run_id>.log`，或用 `GET /api/runs/<run_id>/log` 访问，
   文件仍然在——接口按路径取文件，不依赖任务是否还在内存里。
+  **v1.34 起**顶栏「历史」按钮能列出重启前的任务（含 run_id），从那里直接点「日志」即可，
+  不用自己去翻目录。
 - **远程访问（`http://<同事机器>:8060`）**：`navigator.clipboard` 在非安全上下文不可用，
   「复制」会自动退回 `textarea` 方案，所以照样能复制，不会点了没反应。
 - **贴给别人时**：优先给「日志文件」的 URL（`/api/runs/<run_id>/log`），
@@ -920,6 +922,91 @@ curl -s -o NUL -w "%{http_code}`n" "http://127.0.0.1:8060/api/runs/..%2F..%2Fetc
 ```
 
 页面上则直接点「复制」（随便找段文本粘贴验证）和「日志文件」（新标签页标题应是 `<run_id>.log`）。
+
+### 3.8 任务台账、历史任务与崩溃自动续训（v1.34）
+
+这一节解决三件「只有出事那天才会发现」的事：重启后查不到历史、日志把磁盘写满、
+训练半夜崩了没人续。
+
+#### 3.8.1 台账在哪、记什么
+
+任务记录写在 `6-web/runtime/runs.jsonl`（追加式，一个任务两行：开始一行、结束一行）。
+每行是一条**完整快照**：`run_id / kind / status / exit_code / started_at / finished_at /
+command / log_file / meta / resumed_from / error`。
+
+| 时机 | 写入的状态 |
+| --- | --- |
+| 任务创建 | `running` |
+| 正常结束 | `finished`（退出码 0 且产物存在） |
+| 失败 | `failed`（非零退出码 / 产物没落盘） |
+| 用户点停止 | `cancelled` |
+| 服务被强杀后重启 | `interrupted` + `orphan=true` |
+
+读的时候按 `run_id` 取最后一条为准。最后一行如果只写了半截（进程被强杀），
+该行被跳过，前面的记录不受影响。
+
+#### 3.8.2 怎么查历史
+
+```powershell
+# 最近 10 条历史（新的在前）
+curl -s "http://127.0.0.1:8060/api/runs/history?limit=10"
+
+# 某次的完整日志（历史任务同样能打开）
+curl -s "http://127.0.0.1:8060/api/runs/<run_id>/log?lines=100"
+```
+
+| 接口 | 区别 |
+| --- | --- |
+| `GET /api/runs` | 只返回**本进程**在跑/跑完的任务，重启即空（顶栏每 3 秒轮询的就是它） |
+| `GET /api/runs/history` | 读台账，跨重启；`limit` 默认 50、上限 500；返回项带 `history=true` |
+| `POST /api/runs/{id}/stop` | 对历史任务返回 **404**（只读，避免误以为能停掉已结束的任务） |
+
+页面上点顶栏的「历史」按钮即可，状态分四种颜色：完成（绿）、失败（红）、
+已停止（黄）、已中断（黄，文案不同——一个是用户停的，一个是服务没交代就没了）。
+
+#### 3.8.3 日志轮转与清理
+
+| 变量 | 默认 | 作用 |
+| --- | --- | --- |
+| `TRTFORGE_LOG_MAX_MB` | 20 | 单任务日志上限，超过滚动成 `.log.1` / `.log.2`… |
+| `TRTFORGE_LOG_BACKUPS` | 3 | 每个任务保留几个滚动分片 |
+| `TRTFORGE_LOG_RETENTION_DAYS` | 30 | 启动时整族删除更老的任务日志；`0` = 不清理 |
+| `TRTFORGE_RUNS_LEDGER` | `runtime/runs.jsonl` | 台账路径（测试用它指到临时文件） |
+
+`GET /api/runs/{id}/log` 会跨分片拼接，所以「日志文件」按钮拿到的仍是完整内容。
+清理只认 `{12位十六进制}.log[N]` 这种文件名，`infer_worker.log` 之类不会被误删。
+
+#### 3.8.4 训练崩溃自动续训
+
+`yolo-train` 以非零退出码结束、且训练目录下存在 `weights/last.pt` 时，后端自动用
+`--resume-from <last.pt>`（`exist_ok=True`，写回同一个 `project/name`）再跑一次：
+
+| 条件 | 结果 |
+| --- | --- |
+| 有 `last.pt`，`TRTFORGE_AUTO_RESUME=1`（默认） | 自动续跑一次，台账里新任务带 `resumed_from` |
+| 续训那次又失败 | **不再续**，停在 `failed`（防止无人值守地重跑一夜） |
+| 没有 `last.pt`（参数错、数据集路径错） | 不续，直接 `failed` |
+| `TRTFORGE_AUTO_RESUME=0` | 完全不续 |
+| Anomalib 训练 | 不续：没有等价的命令行续训入口，重跑不等于续训 |
+
+#### 3.8.5 怎么验（不需要训练）
+
+```powershell
+# 1) 台账与日志轮转、修复闸门（48 项）
+python 6-web\backend\tools\test_run_history.py
+
+# 2) 真机造一次「中断」：起一个自检任务，运行中把服务进程杀掉，再启动
+curl -s -X POST "http://127.0.0.1:8060/api/train/anomalib/check-env"
+#    ...杀掉 uvicorn 后重新启动...
+curl -s "http://127.0.0.1:8060/api/runs/history?limit=3"
+#    期望看到 status=interrupted、orphan=true，且该 run_id 的日志仍能取到（HTTP 200）
+# 3) 历史任务不能停：期望 404
+curl -s -o NUL -w "%{http_code}`n" -X POST "http://127.0.0.1:8060/api/runs/<run_id>/stop"
+```
+
+本机实测（v1.34.0，T1000 / 8060）：启动日志打印
+`[app] 台账恢复：1 个上次未结束的任务已标记为中断`，历史接口返回
+`anomalib-check-env / interrupted / orphan=true / 8.0s`，日志 `HTTP 200`，停止 `404`。
 
 ---
 
@@ -2575,9 +2662,11 @@ git diff yolo-stable-before-autoexp -- 1-python-yolo/launcher    # 应为空
 两者叠加会把 8 GB 撑爆，表现为「预检通过 → 第一个 batch OOM → 降 batch →
 崩在主机内存」。2026-11-10 的 `exp_0020~0022` 连续三次就是这样。
 
+跑长实验前，自动实验会自己让推理进程退出（v1.33.3）。若是没经过网页、也连不上 8060 的命令行，仍建议先看一眼：
+
 ```powershell
 nvidia-smi --query-gpu=memory.used,memory.free --format=csv
-# 空闲应约 800 MB used / 7.2 GB free
+# 推理进程已退出时，空闲应约 800 MB used / 7.2 GB free
 ```
 
 **首轮 5 个假设（600 秒基准）**
@@ -2837,6 +2926,291 @@ o 系列会先思考再作答，思考 token 不出现在正文里，但照样�
 `close_mosaic` 方向，而那条路已经证明没有收益。**噪声区间内的一切解释都是自我欺骗**，
 这与模型多聪明无关。
 
+### 7.18 显存预检与混合精度体检（v1.34.1）
+
+**这一节解决什么**：开训前「显存够不够」和「是不是真用了混合精度」这两个问题，
+以前一个靠手拟合公式猜、一个靠参数推断，都会给出与事实相反的结论。
+
+**一、显存预检改成实测峰值表**
+
+判定只有一份实现：`6-web/backend/vram.py`。网页端训练页和 `7-autoresearch-yolo`
+的自动实验都调它——历史上两处各写一份，在 960/batch=4 上给出过「一边放行、
+一边拒绝」的矛盾结论。
+
+| 依据 | 触发条件 | 需求计算 |
+| --- | --- | --- |
+| `measured` | 同 `(imgsz, batch, 精度)` 有实测样本 | `峰值 × 1.15 + 400 MB` |
+| `scaled` | 同 `imgsz`/精度，只有**更小** batch 的样本 | `峰值 × b/b₀ × 1.15 + 400 MB`（固定开销会被重复计一遍，偏差方向安全） |
+| `capped` | 同 `imgsz`/精度，只有**更大** batch 的样本 | 用它的实测值作上界（显存随 batch 不减） |
+| `formula` | 什么都没跑过 | `2600 + 300 × batch × (imgsz/640)²`（刻意保守，它是闸门不是预测器） |
+
+实测表在 `7-autoresearch-yolo/experiments/vram_samples.json`，键格式
+`imgsz x batch x 精度`（如 `640x8xfp32`），值为历次最大
+`torch.cuda.max_memory_reserved()`。**每次训练结束自动写回**，越用越准，
+不需要人工维护；用 `reserved` 不用 `allocated`，因为 OOM 发生在向驱动申请的那一刻，
+`allocated` 低估 30% 以上。
+
+```mermaid
+flowchart TD
+    A["开训请求<br/>imgsz / batch / amp"] --> B{"batch 是单个正整数?"}
+    B -->|"否（auto / 8,16）"| Z1["放行，reason 说明已跳过预检"]
+    B -->|"是"| C["确定精度<br/>amp=false → fp32<br/>其余按本机显卡预测"]
+    C --> D["读实测峰值表<br/>vram_samples.json"]
+    D --> E{"同 imgsz/batch/精度<br/>有样本?"}
+    E -->|"有"| M["measured<br/>峰值 × 1.15 + 400"]
+    E -->|"没有"| F{"有更小 batch<br/>的同 imgsz/精度样本?"}
+    F -->|"有"| S["scaled<br/>峰值 × b/b₀ × 1.15 + 400"]
+    F -->|"没有"| G{"有更大 batch<br/>的同 imgsz/精度样本?"}
+    G -->|"有"| P["capped<br/>取其实测值作上界"]
+    G -->|"没有"| H["formula<br/>2600 + 300 × b × (imgsz/640)²"]
+    M --> K{"可用显存 ≥ 需求?"}
+    S --> K
+    P --> K
+    H --> K
+    K -->|"是"| OK["放行，依据写进 run.meta"]
+    K -->|"否"| NG{"allow_low_vram?"}
+    NG -->|"否"| R409["HTTP 409<br/>VRAM_PREFLIGHT: …<br/>+ 可执行建议"]
+    NG -->|"是"| FORCE["照常开训<br/>台账记录低显存放行"]
+    K -.->|"训练结束"| W["写回 reserved 峰值<br/>自校准"]
+```
+
+本机（T1000 8GB，fp32）实算：
+
+| 配置 | 依据 | 需求 | 旧公式 |
+| --- | --- | --- | --- |
+| `640/batch=8` | `measured`（2132 MB） | 2852 MB | 4520 MB |
+| `640/batch=16` | `scaled` | 5304 MB | 7400 MB |
+| `640/batch=4` | `capped` | 2852 MB | 3800 MB |
+
+**被拦住时怎么办**：`POST /api/train/yolo` 返回 **HTTP 409**，`detail` 以
+`VRAM_PREFLIGHT:` 开头，并给出「停掉哪个进程 / batch 降到多少」。页面出现
+「仍然开始（显存可能不够）」，确认后带 `allow_low_vram=true` 重发。
+只想知道当前能不能跑，用 `GET /api/train/preflight?imgsz=640&batch=16`，不用真开训。
+
+**二、混合精度：检测、可见、可覆盖**
+
+Ultralytics 8.4.192 有一份 `AmpBlacklist`，命中就**静默**关闭 AMP。T1000/T1200/GTX16xx
+都在名单上，本机因此一直跑 fp32——用户看到的是「训练慢、显存高」，却没有任何解释。
+`6-web/backend/ampcheck.py` 复刻那份正则，命中时页面直接写明：
+
+> 本机命中 AMP 黑名单（t1000），训练实际走 fp32：显存约为 fp16 的 1.5~2 倍，速度约慢一倍。
+> 即使传 `--amp` 也无法强制开启——关闭发生在框架内部。
+
+三个 `amp` 取值：不传 / `null` = 按本机自动（黑名单机器走 fp32）；`false` = `--no-amp`；
+`true` = `--amp`（黑名单机器上仍会被关掉）。**页面上显示的实际值来自事件而不是参数**：
+launcher 在 `on_train_start` 发 `amp_state`（`amp_requested` / `amp_effective` / `precision`），
+训练结束再发 `vram_peak`，两者都记进 `run.meta` 并用于自校准。
+
+**排错顺序**：先看「算力体检」里的 `source`——若是 `formula`，说明这组参数还没跑过，
+拦住时按建议降 batch 跑一次，之后就有实测依据了；若是 `measured` 却仍然 OOM，
+说明算余量时漏了别的进程（通常是 `infer_worker` 常驻），先停它再跑。
+
+### 7.19 数据集指纹与来源追溯（v1.34.2）
+
+**问题**：「这次模型比上次好 0.004，是参数改对了还是数据换了？」旧版本无从回答。
+导出目录可以被覆盖、数据集可以被补图、标注可以被修，而这些全都不会在台账里留痕。
+更糟的是 `autoexp` 的 `splits/_manifest.json` 只记文件名列表 + seed，**改掉一张
+holdout 图的标注它完全无感**——holdout 纪律上最后一个没堵住的口子。
+
+**指纹算法（`6-web/backend/fingerprint.py`，`algo: v1`）**
+
+对每个 split，把图片按相对路径排序，逐行拼
+`<split>/<相对路径>\t<字节数>\t<标注sha256前16位>\t<类别数>`，全部行再整体算 sha256
+取前 16 位十六进制。三个层级：
+
+| 字段 | 变什么才会变 | 用途 |
+| --- | --- | --- |
+| `dataset_fingerprint` | 增删改名换图、改标注、改 split 归属 | 总指纹，跨批次对比的唯一依据 |
+| `split_fingerprints` | 只影响对应 split | 判断「是不是只动了 val」 |
+| `label_fingerprint` | **只**看标注内容哈希（不含路径） | 区分「改了标注」与「只是重命名图片」 |
+
+相对路径锚定在各 split 的 `images/` 目录，所以导出到别的目录、或镜像到 `splits/`
+都得到同一个值。**不读图片内容**：650 张约 0.14 秒，可随时重算。
+
+**落在哪里（五处，全自动）**
+
+| 位置 | 文件 / 字段 |
+| --- | --- |
+| 导出 | `<导出目录>/manifest.json`：指纹、各 split 张数、类别数、`unchanged`（是否与上次完全相同） |
+| 训练 | `run.meta["dataset"]` 预检即算；经环境变量 `TRTFORGE_DATASET_FP` 传给子进程 |
+| 训练产物 | `<save_dir>/train_meta.json`：指纹 + `data`/`model`/`imgsz`/`batch`/`epochs` |
+| 台账 | `runtime/runs.jsonl` 的 `data_fp`（Web）与 `results.tsv` 的 `data_fp` 列（autoexp） |
+| 引擎 | `<engine>.meta.json`：ONNX/engine 的 sha256、精度、trtexec 命令、`dataset_fingerprint`、上游 `train_meta.json` |
+
+**`unchanged: true` 的含义**：这次导出与上次导出的指纹完全相同，页面会直接提示
+「数据未变化，无需重训」。注意实现上每次导出会先清空目标目录的旧文件——否则重复
+导出会在 `train_` 下堆出 `xxx_2.jpg`，指纹自己就变了，`unchanged` 永远为假。
+
+**读台账的方法**：`data_fp` 不同的行**不可横比**。`results.tsv` 里出现多个 `data_fp`
+时，Web 的实验历史表会整行标色并在顶部提示「存在多个数据集指纹」。想知道是「只改了
+标注」还是「重命名了图」，比对 `label_fingerprint` 与 `dataset_fingerprint` 是否
+同时变化即可。
+
+**holdout 漂移**：`autoexp.py holdout` 开跑前调 `check_split_drift()`，与
+`splits/_manifest.json` 里记录的 `holdout_fingerprint` 比对，不一致就警告
+「之前的验收结论不可沿用」。`splits/` 用的是硬链接，原始数据集被改动会直接透传。
+
+**与本版的关系**：v1.34.3 补上了这里原本「已知不做」的两件事——重复图/同底板泄漏检测
+（2.2/2.3）与按组切分（2.4），见 §7.20。指纹回答「是不是同一份数据」，体检回答
+「这份数据本身干不干净」，两者互补、互不替代。
+
+---
+
+### 7.20 数据集体检与按组切分（v1.34.3）
+
+**问题**：`PCB data/PCB缺陷检测` 共 692 张，实际只有 **10 块底板**，每块底板拍了
+几十张「同位置、不同缺陷」的图。v1.6 起的划分是「逐图哈希」——同一块底板必然同时
+出现在 train 和 val 里。模型学会的是底板外观，val mAP 好看，换一块新底板就崩。
+以前没有任何入口能看见这件事。
+
+**flow（三步，全部只读或可选）**
+
+```mermaid
+flowchart TD
+    A["选择数据集<br/>YOLO 目录 / .tfanno"] --> B["点「体检」<br/>POST /api/dataset/qc"]
+    B --> C{"分组结果"}
+    C -->|"A 级 完全重复<br/>sha256 相同"| D["报告，供人工清理<br/>不删"]
+    C -->|"B 级 同底板<br/>dHash≤8 且 MAE≤2.0"| E{"是否跨划分？"}
+    E -->|"是"| F["红色标记 + 警告<br/>验证指标不可信"]
+    E -->|"否"| G["绿色，仅展示组"]
+    B --> H["逐行标注质检<br/>error / warn / info"]
+    H -->|"存在 error"| I["autoexp run --qc-gate<br/>拒绝启动，退出码 6"]
+    H -->|"只有 warn/info"| J["打印不拦"]
+    F --> K["导出时把 group_by 改成 prefix/dir<br/>同组强制进同一划分"]
+    G --> K
+    K --> L["manifest.json 记录<br/>split_mode + group_signature"]
+```
+
+**两级判定（`6-web/backend/datasetqc.py`，`algo: dsqc-v1`）**
+
+| 级别 | 判定 | 允许的动作 |
+| --- | --- | --- |
+| A 完全重复 | 文件 `sha256` 相同 | 只报告 / 人工清理。**工具从不删** |
+| B 同底板 | 256 位 dHash（17×16 灰度比较相邻像素）汉明距离 ≤ 8，**且** 32×32 灰度平均绝对差 ≤ 2.0 | 泄漏告警、按组切分。**永不删除** |
+
+为什么要 MAE 第二道关：dHash 只看梯度符号，PCB 大面积纯色板面在纯哈希下**可能**
+让不同底板撞位，漏判会给出错误的「无泄漏」结论。用真实像素再确认一次。
+（反过来也不成立：64 位 dHash 在阈值 ≤6 时确实能分出这 10 组，但常规「重复图去重」
+会顺手删掉组内 691 张，等于毁掉全部缺陷样本——所以 B 级只告警。）
+
+**分组实现**：候选对用 banding 生成（把 256 位切成 8 段做桶），超过 3000 张才退回
+全量两两比较；分组用并查集。粒度上限：单组 ≤400 张才做「同底板异类标注」检查，
+避免体检变成 O(n²) 的长时间任务。
+
+**标注质检规则（逐行，永不抛异常）**
+
+| 级别 | 规则码 |
+| --- | --- |
+| error | `LBL_MISSING` 标注缺失、`LBL_FIELD` 字段数与任务不符、`LBL_PARSE` 数值无法解析、`LBL_CLASS_RANGE` 类别越界、`LBL_COORD_RANGE` 坐标越界、`LBL_ZERO_AREA` 零面积 |
+| warn | `LBL_TINY` <0.01%、`LBL_HUGE` >60%、`LBL_BORDER` 贴边、`LBL_DUP_BOX` 同图两框 IoU>0.9、`LBL_CLASS_ABSENT` 某类缺失 |
+| info | `LBL_EMPTY` 空标注、`LBL_IMBALANCE` 某类占比 <2%、`GRP_LABEL_DIFF` 同底板同位置异类 |
+
+**按组切分（`group_by`）**
+
+| 取值 | 组键 | 适用 |
+| --- | --- | --- |
+| `none`（默认） | 每张图自成一键 | 与 v1.6 行为完全一致 |
+| `prefix` | 文件名第一个 `_` 之前的部分（`01_missing_hole_01.jpg` → `01`） | 底板编号命名 |
+| `dir` | 父目录名 | 一块板一个文件夹 |
+
+组键相同 ⇒ 必须同一个划分。分配用「补最大缺口」贪心：每次取下一个组，放进
+（目标张数 − 当前张数）缺口最大的一侧。**组数 <2 或单组过大时比例会明显偏离**，
+日志与 `manifest.json` 会写明——宁可比例不准，也不要泄漏。
+
+**验收命令**
+
+```powershell
+# 只读体检（人类可读）；有 error 时退出码 1
+D:\anaconda3\envs\dpenv\python.exe 7-autoresearch-yolo\labelqc.py "PCB data/PCB缺陷检测" --fail-on error
+# 机器可读
+D:\anaconda3\envs\dpenv\python.exe 7-autoresearch-yolo\labelqc.py 7-autoresearch-yolo\splits\pcb.yaml --json
+# 按底板前缀重新切分
+D:\anaconda3\envs\dpenv\python.exe 7-autoresearch-yolo\autoexp.py split --group-by prefix
+# 开跑前门禁（error 级问题拒绝启动，退出码 6）
+D:\anaconda3\envs\dpenv\python.exe 7-autoresearch-yolo\autoexp.py run --config 7-autoresearch-yolo\experiments\cur.json --qc-gate
+```
+
+**实测（2026-11-11，T1000 8GB）**：`PCB data/PCB缺陷检测` → 10 组、**10 组全部跨划分**、
+涉及 **689 张**（组大小 120/118/60×6/59/32，另 3 张自成一类）；`labelqc.py` 无 error 级问题，首次约 1.3 秒、二次走缓存。
+`splits/pcb`（553 train / 97 tune / 42 holdout）按 `prefix` 重切后 10 组各自只在一个划分内。
+**泄漏对指标的实际影响本轮尚未做训练对比**，不要把它当成已验证的收益。
+
+**缓存**：`runtime/dsqc_cache.json`（`TRTFORGE_DSQC_CACHE` 可改），键
+`绝对路径｜字节数｜纳秒mtime`，`algo` 变化整体作废，上限 2 万条。
+**只读保证**：体检不写任何图片或标注，唯一写入是这份签名缓存。
+
+### 7.21 良品图与操作点：漏检-过杀曲线（v1.34.4）
+
+**问题**：验证只给 mAP，答不了产线真正问的两件事——「这个阈值下会漏几个」和
+「为了不漏，要多报几个」。第二个问题还缺数据前提：**没有良品图就没法统计误报**。
+
+**flow（声明良品 → 看曲线 → 存工作点 → 推理复现）**
+
+```mermaid
+flowchart TD
+    A["准备良品图<br/>一台设备拍的空板/OK 件"] --> B["数据集页填「良品目录」<br/>ok_dirs，分号分隔"]
+    B --> C{"良品目录里有非空标注？"}
+    C -->|"有"| D["直接报错<br/>缺陷图不许混进良品目录"]
+    C -->|"没有"| E["ok_split 选 val/test<br/>只进验收划分"]
+    E --> F["导出：良品图写空标签<br/>不进训练集"]
+    F --> G["验证：对导出目录跑 val_engine<br/>扫 19 个 conf 点（良品图自动计入）"]
+    G --> H["报告 operating_points<br/>+ recommended_operating_point"]
+    H --> I{"选目标漏检率"}
+    I --> J["取满足目标的最高 conf<br/>过杀最低"]
+    J --> K["POST /api/engine/operating-point<br/>写 engine.meta.json"]
+    K --> L["推理页选中该引擎<br/>conf 自动回填 + 提示"]
+    H --> M["autoexp 每轮记 fp_per_image<br/>恶化超容差则 DISCARD"]
+```
+
+**GT 四态（分不清这四种，过杀率一定是假的）**
+
+| 状态 | 磁盘上的样子 | 是否进过杀统计 | 说明 |
+| --- | --- | --- | --- |
+| `labeled` | `.txt` 存在且有内容 | 否（进漏检率） | 正常缺陷图 |
+| `ok` | `.txt` 存在且**为空** | **是** | 良品图。导出时工具写的就是空文件 |
+| `missing` | `.txt` **不存在** | 否 | 漏标嫌疑。当成良品会把过杀率稀释成好看的数字 |
+| `unparsed` | `.txt` 有内容但解析失败 | 否 | 数据坏了，单独计数提醒 |
+
+**曲线怎么读**
+
+| 字段 | 含义 | 读法 |
+| --- | --- | --- |
+| `conf` | 置信度阈值 | 从左到右 conf 升高 |
+| `miss_rate` | `1 - recall`，按 GT 框算 | 横轴。产线先给它定上限 |
+| `fp_per_image` | 误报框 / 评估图片数 | 纵轴。压漏检的代价 |
+| `ok_fp_rate` | 至少一个误报的良品图 / 良品图总数 | **`null` = 没有良品图**，`0.0` = 测过且零误报 |
+| `ok_images` | 良品图数 | 判断 `ok_fp_rate` 可信度的分母 |
+
+**推荐点为什么取「最高 conf」**：FP 与 recall 都随 conf 单调不增，满足漏检目标的
+**最高** conf 就是过杀最低的点。取最低 conf 等于「把本可以少报的框全报出来」，
+方向正好反了。目标无解时 `feasible: false` + 最接近的点 + 原因，不假装达标。
+
+**验收命令**
+
+```powershell
+# 对「导出后」的目录验证：良品图已经在 val 里，会自动计入过杀率
+D:\anaconda3\envs\dpenv\python.exe 6-web\backend\tools\val_engine.py `
+  --engine runs\exp_0007\weights\best_fp16.engine --data out\dataset.yaml `
+  --target-miss-rate 0.01
+
+# 自定义扫描点（默认 0.05 → 0.95 共 19 点，上限 50）
+D:\anaconda3\envs\dpenv\python.exe 6-web\backend\tools\val_engine.py `
+  --engine ... --data ... --operating-confs "0.05,0.1,0.2,0.35,0.5"
+
+# 单测（不需要 GPU / 引擎）
+D:\anaconda3\envs\dpenv\python.exe 6-web\backend\tools\test_operating_points.py
+```
+
+**工作点存放位置**：`<引擎文件名>.meta.json` 的 `operating_point`，与 v1.34.2 的
+sha256/来源 run 同文件。**引擎文件和 `metadata.json` 都不动**，删掉该字段即回到默认 conf。
+
+**验收（2026-11-11）**：`test_operating_points.py` 48 项、`test_dataset_workbench.py`
+良品部分 23 项、后端 53/53 套件、`run_all_tests.py` 71/71、前端 `node --check` 通过。
+**本机本轮未跑 GPU 推理**，曲线在真实引擎上的数值需在产线机器跑一次 `val_engine` 后确认。
+
+**边界**：良品图只做验收、不参与训练；自动实验的 `fp_per_image` 是 P/R 反推的近似值，
+只用于拦明显恶化；异常检测是单阈值判定，不提供该曲线。
+
 ---
 
 ## 8. 常见故障排查
@@ -2898,6 +3272,10 @@ o 系列会先思考再作答，思考 token 不出现在正文里，但照样�
 | 自动实验报「提议被拒：`train.imgsz = 1024` 不在允许取值…」 | 模型在猜取值（v0.2.1 前上下文只给键名，不给取值） | 升级到 v0.2.1（上下文已带 `search_space`）；若仍发生，在 `configs/space.json` 里把该值加进 `enum`，别指望模型自己猜对 |
 | 自动实验连跑 5 轮后提示「连续 5 轮没有进展」但其实每轮都报错 | v0.2.1 前「没提议」也计入 `stale`，文案误导 | 升级到 v0.2.1：模型侧故障走独立的 `--max-errors`（默认 3），文案会明说「不是搜索瓶颈」 |
 | 自动实验点「测试连通性」说失败，但实际能跑 | 自检只有 16 token，推理型模型必然被截断 | v0.2.1 起 `ping()` 会把截断判为「连通正常（只有思考、没有正文）」；旧版请直接看日志里的真实请求结果 |
+| 点「开始训练」返回 **409 / `VRAM_PREFLIGHT:`** | 显存预检不通过（v1.34.1）。`detail` 里已写明依据与建议 | 按 `hint` 停掉 `infer_worker` 或降 batch；确实要跑就点「仍然开始（显存可能不够）」（带 `allow_low_vram=true`）。想知道当前能不能跑：`GET /api/train/preflight?imgsz=640&batch=16` |
+| 被拦时「降 batch」建议越降越红 | v1.34.1 之前没有单调性约束 | 升级到 v1.34.1：`capped` 档会用更大 batch 的实测峰值作上界。仍异常就删掉 `vram_samples.json` 里那个离谱样本 |
+| 「算力体检」写了「训练实际为 fp32 / 混合精度不可用」 | 显卡命中 Ultralytics 的 `AmpBlacklist`（T1000/T1200/GTX16xx 等） | 属硬件事实，`--amp` 也压不住。要提速只能换卡或降 imgsz/batch；显存按 1.5~2 倍于 fp16 估算 |
+| 请求了 `amp=true` 但界面显示 fp32 | 同上，黑名单在框架内部生效 | 看 `amp_state` 事件的 `amp_effective` —— 它来自 `trainer.amp`，是唯一可信的实际值 |
 
 ---
 
@@ -2912,6 +3290,7 @@ o 系列会先思考再作答，思考 token 不出现在正文里，但照样�
 | 项目整体结构与层级 | `readme.md` |
 | DLL C API 调用与打包 | `docs/TRTForge_yolo_infer与anomalib_infer_DLL调用与源码打包说明.md` |
 | 三个推理 DLL 能怎么并发（同步/异步、单/多线程、多模型） | 本节 7.14；细节看 `3-cpp-tensorrt/{yolo,anomalib,onnx}_infer/README.md` |
+| 显存预检的依据与例外、为什么本机训练是 fp32 | 本节 7.18 |
 | YOLO TRT 推理细节 | `docs/trtexec_gui_YOLO_TRT推理流程说明.md` |
 | 小白版算法与场景说明 | `docs/TRTForge_算法与应用场景说明_小白版.md` |
 | 接 VLM 自动标注 / LLM 训练诊断要花多少 token | `docs/VLM_LLM接入方案与Token成本评估.md` |

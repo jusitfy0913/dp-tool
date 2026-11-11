@@ -317,8 +317,14 @@ class FakeManager:
     def active_exclusive(self):
         return []
 
-    def create(self, kind, command, cwd, env=None):
-        self.calls.append({"kind": kind, "command": list(command), "cwd": cwd, "env": dict(env or {})})
+    def create(self, kind, command, cwd, env=None, on_finished=None, **_kwargs):
+        self.calls.append({
+            "kind": kind,
+            "command": list(command),
+            "cwd": cwd,
+            "env": dict(env or {}),
+            "on_finished": on_finished,
+        })
         return FakeRun()
 
     def get(self, run_id):
@@ -370,6 +376,13 @@ def test_start_hides_key_from_argv() -> None:
         call["env"].get("AUTOEXP_GPU_LOCK_PID"), str(os.getpid()),
         "必须把后端 pid 传下去，子进程据此只跳过「自己家那把锁」",
     )
+    check_eq(
+        call["env"].get("AUTOEXP_INFER_YIELDED"), "1",
+        "子进程必须知道推理进程已让出，不能在每一轮结束时提前归还显存",
+    )
+    check(callable(call["on_finished"]), "任务结束回调要负责解除让出")
+    yielded = response.json().get("infer_yielded") or {}
+    check(yielded.get("held") is True, f"启动前应先让出推理显存：{yielded}")
 
     # 轮数/时间上限等参数要真的传下去，否则界面上改了半天没用
     check("--rounds" in call["command"], "缺少 --rounds")
@@ -379,27 +392,65 @@ def test_start_hides_key_from_argv() -> None:
     check_eq(call["kind"], "autoexp-agent", "kind")
 
 
-@case("已有任务在跑时 /start 返回 409")
+@case("已有任务在跑时 /start 返回 409，并且不得让出推理显存")
 def test_start_rejects_busy() -> None:
     from fastapi import HTTPException
 
-    with TempStore() as store:
-        store.write_text(json.dumps({"api_key": "sk-busy-test"}), encoding="utf-8")
+    import inferproxy
 
-        def busy():
-            raise HTTPException(status_code=409, detail="已有任务正在运行：yolo-train")
+    yield_calls: list[str] = []
+    original = inferproxy.yield_gpu
 
-        import autoexp_api
+    def counting_yield(reason: str = "训练"):
+        yield_calls.append(reason)
+        return original(reason)
 
-        autoexp_api.set_busy_check(busy)
-        try:
-            with TempGpuLock():
-                response = client().post("/api/autoexp/start", json={"rounds": 3})
-        finally:
-            import app as web_app
+    inferproxy.yield_gpu = counting_yield
+    try:
+        with TempStore() as store:
+            store.write_text(json.dumps({"api_key": "sk-busy-test"}), encoding="utf-8")
 
-            autoexp_api.set_busy_check(web_app._reject_if_busy)
+            def busy():
+                raise HTTPException(status_code=409, detail="已有任务正在运行：yolo-train")
+
+            import autoexp_api
+
+            autoexp_api.set_busy_check(busy)
+            try:
+                with TempGpuLock():
+                    response = client().post("/api/autoexp/start", json={"rounds": 3})
+            finally:
+                import app as web_app
+
+                autoexp_api.set_busy_check(web_app._reject_if_busy)
+    finally:
+        inferproxy.yield_gpu = original
     check_eq(response.status_code, 409, "状态码")
+    check_eq(yield_calls, [], "别人占着显卡时不能把推理进程停掉")
+
+
+class BoomManager(FakeManager):
+    """create() 直接失败，用来确认启动半路失败会把让出还回去。"""
+
+    def create(self, kind, command, cwd, env=None, on_finished=None, **_kwargs):
+        super().create(kind, command, cwd, env, on_finished, **_kwargs)
+        raise OSError("模拟进程拉起失败")
+
+
+@case("启动进程失败时必须立刻解除显存让出")
+def test_start_failure_releases_yield() -> None:
+    import inferproxy
+
+    inferproxy.release_gpu_hold()
+    fake = BoomManager()
+    with TempStore() as store:
+        store.write_text(json.dumps({"api_key": "sk-boom"}), encoding="utf-8")
+        with TempGpuLock(), FakeManagerSwap(fake), IdleBusyCheck():
+            response = client().post("/api/autoexp/start", json={"rounds": 1})
+    check_eq(response.status_code, 500, "状态码")
+    check("启动自动实验进程失败" in response.json().get("detail", ""), f"应说明启动失败：{response.json()}")
+    check(inferproxy._pool.gpu_hold() == "", f"失败后让出标记必须清掉，实际 {inferproxy._pool.gpu_hold()!r}")
+    check_eq(len(fake.calls), 1, "应确实尝试过启动")
 
 
 @case("/stop 在没有任务时返回 404")

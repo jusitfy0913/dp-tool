@@ -17,10 +17,13 @@ from __future__ import annotations
 import csv
 import importlib
 import json
+import os
 import shutil
 import sys
 import tempfile
+import threading
 import traceback
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -214,10 +217,14 @@ def test_tsv_no_rewrite_when_same() -> None:
 
 @case("显存预检：需求随 batch 与分辨率单调增长")
 def test_preflight_monotonic() -> None:
-    # 直接比对估算公式的序关系；实际可用显存由机器决定，不在这里断言
-    low = 2600.0 + 240.0 * 8 * (640 / 640) ** 2
-    high = 2600.0 + 240.0 * 16 * (640 / 640) ** 2
-    big = 2600.0 + 240.0 * 8 * (1280 / 640) ** 2
+    # 直接比对估算公式的序关系；实际可用显存由机器决定，不在这里断言。
+    # 系数与实现都在 6-web/backend/vram.py（Web 与 autoexp 共用同一份），
+    # 这里只验证「序关系」这种与具体机器无关的性质。
+    module = A.load_vram()
+    check(module is not None, "应能找到 6-web/backend/vram.py（两边共用同一份预检实现）")
+    low = module.formula_mb(640, 8)
+    high = module.formula_mb(640, 16)
+    big = module.formula_mb(1280, 8)
     check(low < high, "batch 翻倍，需求应变大")
     check(low < big, "分辨率翻倍，需求应变大")
     # 无 CUDA 的机器上 free_vram_mb 返回 None，预检必须放行而不是卡死
@@ -235,6 +242,235 @@ def test_preflight_rejects_when_tight() -> None:
     else:
         check(ok is False, "需求远超可用显存时应拒绝")
         check("可用显存" in reason, f"原因应包含可用显存读数，实际：{reason}")
+
+
+@case("显存预检：委托共享实现，缺模块时降级为公式")
+def test_preflight_delegates() -> None:
+    """autoexp 不能自己再维护一条公式：那正是「页面说能跑、这里说不能跑」的来源。"""
+    module = A.load_vram()
+    check(module is not None, "应能找到 6-web/backend/vram.py")
+
+    original_free = A.free_vram_mb
+    original_load = A.load_vram
+    try:
+        class _Fake:
+            seen: list[tuple] = []
+
+            @staticmethod
+            def preflight(imgsz, batch, precision=None, free_mb=None):
+                _Fake.seen.append((imgsz, batch, precision, free_mb))
+                return {"ok": False, "reason": "共享实现的结论"}
+
+        A.free_vram_mb = lambda: 4000.0  # type: ignore[assignment]
+        A.load_vram = lambda: _Fake  # type: ignore[assignment]
+        ok, reason = A.preflight_vram(960, 4, precision="fp32")
+        check(ok is False, "共享实现判不通过时应透传")
+        check_eq(reason, "共享实现的结论", "原因文案")
+        check_eq(_Fake.seen[-1], (960, 4, "fp32", 4000.0), "参数透传")
+
+        # 缺 vram.py（只部署 autoexp 的裁剪场景）：降级为公式，不能放行会 OOM 的组合
+        A.load_vram = lambda: None  # type: ignore[assignment]
+        ok, reason = A.preflight_vram(960, 4)
+        # 2600 + 300*4*(960/640)^2 = 5300 > 4000
+        check(ok is False, f"降级公式应拦住 5300MB 的需求：{reason}")
+        check("5300" in reason, f"原因应写明公式估算值：{reason}")
+    finally:
+        A.free_vram_mb = original_free  # type: ignore[assignment]
+        A.load_vram = original_load  # type: ignore[assignment]
+
+
+@case("台账：新增 amp 与 reserved 峰值列，旧行按列名迁移")
+def test_results_header_has_amp() -> None:
+    check("amp" in A.RESULTS_HEADER, f"应记录实际生效的精度：{A.RESULTS_HEADER}")
+    check(
+        "peak_vram_reserved_mb" in A.RESULTS_HEADER,
+        f"实测表用 reserved 口径，台账要能对上：{A.RESULTS_HEADER}",
+    )
+    check_eq(
+        A.RESULTS_HEADER.index("amp"),
+        A.RESULTS_HEADER.index("batch_eff") + 1,
+        "amp 紧跟 batch_eff（读表时一眼能对上「这批用了什么精度」）",
+    )
+
+    tmp = Path(tempfile.mkdtemp(prefix="autoexp_tsv_amp_"))
+    try:
+        path = tmp / "results.tsv"
+        old_header = [name for name in A.RESULTS_HEADER if name not in {"amp", "peak_vram_reserved_mb"}]
+        A.append_tsv(path, old_header, {name: f"v_{name}" for name in old_header})
+        A.ensure_tsv(path, A.RESULTS_HEADER)
+        rows = A.read_tsv(path)
+        check_eq(len(rows), 1, "行数")
+        check_eq(rows[0]["exp_id"], "v_exp_id", "旧值按列名迁移")
+        check_eq(rows[0]["amp"], "", "新列补空串")
+        check_eq(rows[0]["peak_vram_reserved_mb"], "", "新列补空串")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+@case("数据集指纹：台账新增 data_fp 列，且与 Web 端共用实现")
+def test_results_header_has_data_fp() -> None:
+    check("data_fp" in A.RESULTS_HEADER, f"数据身份要进台账：{A.RESULTS_HEADER}")
+    check_eq(
+        A.RESULTS_HEADER.index("data_fp"),
+        A.RESULTS_HEADER.index("amp") + 1,
+        "data_fp 紧跟 amp（同一次实验的「用了什么精度、哪批数据」在一起）",
+    )
+
+    tmp = Path(tempfile.mkdtemp(prefix="autoexp_tsv_fp_"))
+    try:
+        path = tmp / "results.tsv"
+        old_header = [name for name in A.RESULTS_HEADER if name != "data_fp"]
+        A.append_tsv(path, old_header, {name: f"v_{name}" for name in old_header})
+        A.ensure_tsv(path, A.RESULTS_HEADER)
+        rows = A.read_tsv(path)
+        check_eq(len(rows), 1, "行数")
+        check_eq(rows[0]["exp_id"], "v_exp_id", "旧值按列名迁移")
+        check_eq(rows[0]["data_fp"], "", "新列补空串，历史行不错位")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+@case("数据集指纹：与 Web 端算出同一个值，缺模块时降级为 unavailable")
+def test_dataset_fingerprint_block() -> None:
+    block = A.dataset_fingerprint("splits/pcb_tune.yaml")
+    if block.get("unavailable"):
+        # 裁剪部署里没有 6-web/backend 是允许的，但必须显式标记而不是悄悄为空
+        check(True, "缺模块时标记 unavailable")
+        return
+    check_eq(block.get("algo"), "v1", "算法版本")
+    check(
+        isinstance(block.get("dataset_fingerprint"), str)
+        and len(block["dataset_fingerprint"]) == 16,
+        f"16 位指纹：{block.get('dataset_fingerprint')}",
+    )
+    check_eq(
+        block.get("short"),
+        block["dataset_fingerprint"][:8],
+        "短码是完整指纹的前 8 位",
+    )
+    check("error" in block, "失败信息字段始终存在，读取方不用分叉")
+
+    # 与 Web 端直接调用同一份实现的结果必须一致（这就是「共用」的意义）
+    module = A.load_fingerprint()
+    direct = module.compute(Path(A.__file__).resolve().parent / "splits" / "pcb_tune.yaml")
+    check_eq(
+        block.get("dataset_fingerprint"),
+        direct.get("dataset_fingerprint"),
+        "autoexp 与 Web 端指纹一致",
+    )
+
+    # 缺模块：降级，不抛异常
+    original = A.load_fingerprint
+    A.load_fingerprint = lambda: None  # type: ignore[assignment]
+    try:
+        missing = A.dataset_fingerprint("splits/pcb_tune.yaml")
+        check(bool(missing.get("unavailable")), f"缺模块要标记 unavailable：{missing}")
+    finally:
+        A.load_fingerprint = original  # type: ignore[assignment]
+
+
+@case("数据集指纹：holdout 漂移检查在无记录时放行")
+def test_split_drift_without_record() -> None:
+    # 当前仓库的 _manifest.json 是升级前的产物（没有 data_fingerprint），
+    # 此时无法判断，必须放行而不是拦住验收。
+    check(
+        A.check_split_drift(A.SPLITS_DIR / "pcb_holdout.yaml") is True,
+        "没有指纹记录时不应拦 holdout",
+    )
+
+
+# ---------------------------------------------------------------------------
+# 4.5 过杀（KEEP 约束）
+# ---------------------------------------------------------------------------
+
+
+@case("过杀：由 P/R 反推每图误报数，缺项时返回 None 而不是猜 0")
+def test_fp_per_image_from_pr() -> None:
+    # P=0.5、R=0.5、20 个 GT、10 张图 → TP=10、FP=10、每图 1 个
+    check_eq(A.fp_per_image_from_pr(0.5, 0.5, 20, 10), 1.0, "常规换算")
+    # P=1 时没有误报，必须是 0.0 而不是 None：None 表示「不知道」，0 表示「一个没有」
+    check_eq(A.fp_per_image_from_pr(1.0, 0.5, 20, 10), 0.0, "零误报")
+    check_eq(A.fp_per_image_from_pr(0.9, 1.0, 100, 50), 0.222222, "保留 6 位")
+    # 缺任何一项都算不知道，绝不能当 0 参与判断
+    for args in ((None, 0.5, 20, 10), (0.5, None, 20, 10), (0.5, 0.5, 0, 10), (0.5, 0.5, 20, 0)):
+        check_eq(A.fp_per_image_from_pr(*args), None, f"缺项应返回 None：{args}")
+    # P 或 R 为 0 时公式会除零/放大，属于无效值
+    check_eq(A.fp_per_image_from_pr(0.0, 0.5, 20, 10), None, "P=0 无效")
+    check_eq(A.fp_per_image_from_pr(0.5, 0.0, 20, 10), None, "R=0 无效")
+
+
+@case("过杀：mAP 提升但过杀明显恶化时必须 DISCARD")
+def test_judge_round_blocks_overkill() -> None:
+    verdict, reason = A.judge_round(
+        0.50, 0.40, 0.005, fp_per_image=1.50, incumbent_fp_per_image=0.20
+    )
+    check_eq(verdict, "DISCARD", reason)
+    check("过杀" in reason, f"理由要写明过杀：{reason}")
+
+    # 提升在容差内（max(0.01, 基线×5%)）不算恶化：近似算法下这点差异不可信
+    verdict, reason = A.judge_round(
+        0.50, 0.40, 0.005, fp_per_image=0.205, incumbent_fp_per_image=0.20
+    )
+    check_eq(verdict, "KEEP", reason)
+
+    # 过杀变好当然是 KEEP
+    verdict, reason = A.judge_round(
+        0.50, 0.40, 0.005, fp_per_image=0.05, incumbent_fp_per_image=0.20
+    )
+    check_eq(verdict, "KEEP", reason)
+
+    # 任一侧缺数时退回 2σ 规则：不能因为算不出过杀就永远不转正
+    verdict, _ = A.judge_round(0.50, 0.40, 0.005, fp_per_image=None, incumbent_fp_per_image=0.20)
+    check_eq(verdict, "KEEP", "基线过杀未知时不该拦")
+    verdict, _ = A.judge_round(0.50, 0.40, 0.005, fp_per_image=2.0, incumbent_fp_per_image=None)
+    check_eq(verdict, "KEEP", "候选过杀未知时不该拦")
+
+    # 没有提升时本来就 DISCARD，理由不该变成过杀（避免误导用户）
+    verdict, reason = A.judge_round(
+        0.402, 0.400, 0.005, fp_per_image=2.0, incumbent_fp_per_image=0.20
+    )
+    check_eq(verdict, "DISCARD", reason)
+    check("过杀" not in reason, f"未超过噪声阈值的提升不该拿过杀当理由：{reason}")
+
+
+@case("过杀：台账与 holdout 表头都记录过杀列")
+def test_overkill_columns_in_ledgers() -> None:
+    check("fp_per_image" in A.RESULTS_HEADER, f"results 表头：{A.RESULTS_HEADER}")
+    check("fp_per_image" in A.HOLDOUT_HEADER, f"holdout 表头：{A.HOLDOUT_HEADER}")
+
+
+@case("trainer.amp 读取：实际生效值，不是请求值")
+def test_read_trainer_amp() -> None:
+    class _Trainer:
+        def __init__(self, value):
+            self.amp = value
+
+    class _Scalar:
+        """0 维张量：bool(张量) 会抛异常，真实现必须走 .item()。"""
+
+        def __init__(self, value):
+            self._value = value
+
+        def item(self):
+            return self._value
+
+    check(A.read_trainer_amp(_Trainer(_Scalar(0))) is False, "0 -> False（fp32）")
+    check(A.read_trainer_amp(_Trainer(_Scalar(1))) is True, "1 -> True（fp16）")
+    check(A.read_trainer_amp(_Trainer(False)) is False, "布尔 False 也认")
+    check(A.read_trainer_amp(object()) is None, "没有 amp 属性时返回 None（未知）")
+
+
+@case("混合精度黑名单：T1000 必须判成 fp32")
+def test_amp_blacklist() -> None:
+    module = A.load_web_module("ampcheck")
+    check(module is not None, "应能找到 6-web/backend/ampcheck.py")
+    t1000 = module.amp_status("NVIDIA T1000 8GB")
+    check(t1000["available"] is False, f"T1000 在 Ultralytics 黑名单里：{t1000}")
+    check_eq(t1000["matched"], "t1000", "命中型号")
+    check_eq(module.expected_precision(None, "NVIDIA T1000 8GB"), "fp32", "预计精度")
+    rtx = module.amp_status("NVIDIA GeForce RTX 4090")
+    check(rtx["available"] is True, f"4090 不该被误伤：{rtx}")
+    check_eq(module.expected_precision(None, "NVIDIA GeForce RTX 4090"), "fp16", "预计精度")
 
 
 # ---------------------------------------------------------------------------
@@ -547,6 +783,32 @@ def test_noise_threshold_for_groups() -> None:
     check_eq(got["sigma"], 0.012, "应取该组的 sigma，而不是全局的 0.003184")
     check_eq(got["threshold"], 0.024, "阈值 = 2 sigma")
     check("groups" in got["source"], f"来源应指向 groups：{got['source']}")
+
+
+@case("真实噪声文件里 640 和 960 各用各的尺子")
+def test_real_noise_file_keeps_both_rulers() -> None:
+    """顶层 sigma 现在是 960 的测量。640 必须仍能从 groups 里拿到自己的 0.006368。"""
+    got640 = A.noise_threshold_for(
+        [], {"imgsz": 640, "batch": "8"},
+        global_threshold=0.016139, global_sigma=0.00807, global_source="顶层是 960",
+    )
+    check_eq(got640["group"], "imgsz=640|batch=8", "640 分组键")
+    check_eq(got640["calibrated"], True, "640 有实测，不能标成未校准")
+    check_eq(got640["threshold"], 0.006368, "640 的阈值不能变成 960 的 0.016139")
+    got960 = A.noise_threshold_for(
+        [], {"imgsz": 960, "batch": "4"},
+        global_threshold=0.006368, global_sigma=0.003184, global_source="旧的 640 全局",
+    )
+    check_eq(got960["calibrated"], True, "960 有实测")
+    check_eq(got960["threshold"], 0.01614, "960 的阈值是 2×四舍五入后的 sigma")
+
+
+@case("1152 不在本机搜索空间里")
+def test_imgsz_1152_is_rejected() -> None:
+    space = A.load_json(A.SPACE_JSON)
+    cfg = A.deep_merge(A.load_json(A.BASE_JSON), {"train": {"imgsz": 1152, "batch": "4"}})
+    errors = A.validate_against_space(cfg, space)
+    check(any("1152" in item for item in errors), f"应拒绝 1152：{errors}")
 
 
 @case("噪声底分组：台账里配置完全相同的重复实验可作为校准依据")
@@ -1119,9 +1381,230 @@ def test_exec_tee_passthrough() -> None:
         check_eq(fail_rc, 7, "子进程退出码应原样返回")
 
 
-# ---------------------------------------------------------------------------
-# main
-# ---------------------------------------------------------------------------
+class _YieldHandler(BaseHTTPRequestHandler):
+    """记下自动实验打过来的让出 / 归还请求。"""
+
+    hits: list[str] = []
+
+    def do_POST(self) -> None:  # noqa: N802
+        _YieldHandler.hits.append(self.path.split("?", 1)[0])
+        body = b'{"ok":true,"held":true,"stopped":1}'
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, _format: str, *_args) -> None:
+        return
+
+
+@case("让出推理显存：只有拿到所有权的那一层才能归还")
+def test_infer_yield_owner_is_not_nested() -> None:
+    """agent 包着每一轮 run。若每一轮结束都归还，两轮之间网页一点推理，显存就回去了。"""
+    _YieldHandler.hits = []
+    server = HTTPServer(("127.0.0.1", 0), _YieldHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    previous_url = os.environ.get("AUTOEXP_WEB_URL")
+    previous_flag = os.environ.get(A.INFER_YIELDED_ENV)
+    os.environ["AUTOEXP_WEB_URL"] = f"http://127.0.0.1:{server.server_address[1]}"
+    os.environ.pop(A.INFER_YIELDED_ENV, None)
+    try:
+        owned = A.acquire_infer_yield("自动实验")
+        check(owned, "第一层应拿到所有权")
+        check_eq(_YieldHandler.hits, ["/api/infer/gpu-yield"], "应通知网页退出推理进程")
+        nested = A.acquire_infer_yield("自动实验训练")
+        check(not nested, "嵌套的训练轮次不能再拿所有权")
+        A.release_infer_yield(nested)
+        check_eq(_YieldHandler.hits, ["/api/infer/gpu-yield"], "嵌套层归还不能打到网页")
+        check_eq(os.environ.get(A.INFER_YIELDED_ENV), "1", "父进程的让出标记要留着")
+        A.release_infer_yield(owned)
+        check(_YieldHandler.hits[-1] == "/api/infer/gpu-release", f"父层结束才归还：{_YieldHandler.hits}")
+        check(A.INFER_YIELDED_ENV not in os.environ, "归还后要清掉标记，下次独立训练才能再让出")
+    finally:
+        server.shutdown()
+        if previous_url is None:
+            os.environ.pop("AUTOEXP_WEB_URL", None)
+        else:
+            os.environ["AUTOEXP_WEB_URL"] = previous_url
+        if previous_flag is None:
+            os.environ.pop(A.INFER_YIELDED_ENV, None)
+        else:
+            os.environ[A.INFER_YIELDED_ENV] = previous_flag
+
+
+@case("网页没开时让出失败不算训练失败，也不假装已经让出")
+def test_infer_yield_missing_web_does_not_claim_ownership() -> None:
+    previous_url = os.environ.get("AUTOEXP_WEB_URL")
+    previous_flag = os.environ.get(A.INFER_YIELDED_ENV)
+    # 本机立刻拒绝的端口，不要用会超时的地址，否则这一条要干等几秒。
+    os.environ["AUTOEXP_WEB_URL"] = "http://127.0.0.1:9"
+    os.environ.pop(A.INFER_YIELDED_ENV, None)
+    try:
+        owned = A.acquire_infer_yield("自动实验训练")
+        check(not owned, "连不上网页就不能声称已经让出")
+        check(A.INFER_YIELDED_ENV not in os.environ, "失败时不能留下让出标记")
+    finally:
+        if previous_url is None:
+            os.environ.pop("AUTOEXP_WEB_URL", None)
+        else:
+            os.environ["AUTOEXP_WEB_URL"] = previous_url
+        if previous_flag is None:
+            os.environ.pop(A.INFER_YIELDED_ENV, None)
+        else:
+            os.environ[A.INFER_YIELDED_ENV] = previous_flag
+
+
+@case("agent 开场事件能读到时间上限和 max_tokens")
+def test_agent_loop_start_event_sees_hours() -> None:
+    """拆出循环函数时，hours / llm_cfg 必须作为参数传进去。
+
+    漏传的话，网页一点「开始」就 NameError，实验还没跑就退出。
+    轮数传 0，循环体不会执行，也不会调模型、也不会训练。
+    """
+    events: list[dict] = []
+    original = A.emit_event
+    A.emit_event = lambda payload: events.append(payload)
+
+    class _Args:
+        max_stale = 1
+        max_errors = 1
+
+    class _Llm:
+        def describe_config(self) -> str:
+            return "fake-model"
+
+    try:
+        code = A._cmd_agent_loop(
+            _Args(), _Llm(), {}, {}, 0, None, 0.01, 0.001, "测试",
+            0.02, {"max_tokens": 4096},
+        )
+    finally:
+        A.emit_event = original
+    check_eq(code, 0, "空轮应正常结束")
+    check(events, "应发出开场事件")
+    check_eq(events[0].get("name"), "agent_start", "第一条应是开场")
+    check_eq(events[0].get("hours"), 0.02, "时间上限")
+    check_eq(events[0].get("max_tokens"), 4096, "max_tokens")
+
+
+def _build_tiny_dataset(root: Path, broken: bool) -> None:
+    """造一个最小 YOLO 数据集：broken=True 时写一行 4 字段的坏标签。"""
+    from PIL import Image
+    import numpy as np
+
+    (root / "images" / "train").mkdir(parents=True, exist_ok=True)
+    (root / "labels" / "train").mkdir(parents=True, exist_ok=True)
+    (root / "data.yaml").write_text(
+        "path: {}\ntrain: images/train\nnc: 2\nnames: [defect, other]\n".format(root.as_posix()),
+        encoding="utf-8",
+    )
+    array = np.full((240, 320), 120, dtype=np.uint8)
+    array[40:80, 40:80] = 20
+    for index in range(3):
+        name = f"01_defect_{index + 1:02d}"
+        Image.fromarray(array, "L").convert("RGB").save(
+            root / "images" / "train" / f"{name}.jpg", quality=95
+        )
+        text = "0 0.5 0.5 0.1\n" if broken else "0 0.5 0.5 0.1 0.1\n"
+        (root / "labels" / "train" / f"{name}.txt").write_text(text, encoding="utf-8")
+
+
+@case("按组切分 val：同一底板不跨 tune / holdout，组数不足时明确拒绝")
+def test_grouped_val_split_keeps_groups() -> None:
+    pool: list[Path] = []
+    for name in ("tune", "holdout"):
+        directory = HERE / "splits" / "pcb" / "images" / name
+        if directory.is_dir():
+            pool.extend(sorted(directory.glob("*.jpg")))
+    if len(pool) < 20:
+        raise Skip("splits/pcb 还没生成")
+
+    result = A.grouped_val_split(pool, 0.3, "prefix")
+    check(result is not None, "应能切出两侧")
+    holdout, tune = result
+    names = lambda items: {item.name for item in items}
+    check_eq(len(names(holdout)) + len(names(tune)), len(pool), "不丢图、不重复")
+    prefix = lambda items: {item.name.split("_")[0] for item in items}
+    check(not (prefix(holdout) & prefix(tune)), f"同前缀跨两侧：{prefix(holdout) & prefix(tune)}")
+    check(len(holdout) > 0 and len(tune) > 0, "两侧都不能为空")
+
+    single = [pool[0], pool[0].parent / pool[0].name]
+    check(A.grouped_val_split(single, 0.3, "prefix") is None, "只有一个组时必须拒绝而不是硬切")
+
+
+@case("体检 CLI：退出码与 --fail-on 一致")
+def test_labelqc_cli_exit_codes() -> None:
+    import subprocess
+
+    tmp = Path(tempfile.mkdtemp(prefix="dsqc_cli_"))
+    env = os.environ.copy()
+    env["TRTFORGE_DSQC_CACHE"] = str(tmp / "cache.json")
+    script = HERE / "labelqc.py"
+    try:
+        broken = tmp / "broken"
+        _build_tiny_dataset(broken, broken=True)
+        clean = tmp / "clean"
+        _build_tiny_dataset(clean, broken=False)
+
+        loose = subprocess.run(
+            [sys.executable, str(script), str(broken)], capture_output=True, env=env, timeout=120
+        )
+        check_eq(loose.returncode, 0, "默认只报告，不返回失败")
+        strict = subprocess.run(
+            [sys.executable, str(script), str(broken), "--fail-on", "error"],
+            capture_output=True,
+            env=env,
+            timeout=120,
+        )
+        check_eq(strict.returncode, 1, "--fail-on error 时错误级问题应返回 1")
+        good = subprocess.run(
+            [sys.executable, str(script), str(clean), "--fail-on", "error", "--json"],
+            capture_output=True,
+            env=env,
+            timeout=120,
+        )
+        check_eq(good.returncode, 0, "干净数据应返回 0")
+        payload = json.loads((good.stdout or b"{}").decode("utf-8", errors="replace"))
+        check_eq(payload.get("summary", {}).get("error"), 0, "干净数据无错误级问题")
+        check("groups" in payload and "issues" in payload, "JSON 同时含分组与问题")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+@case("数据门禁：错误级问题拦下，缺模块时放行")
+def test_qc_gate_blocks_broken_data() -> None:
+    tmp = Path(tempfile.mkdtemp(prefix="dsqc_gate_"))
+    previous_cache = os.environ.get("TRTFORGE_DSQC_CACHE")
+    os.environ["TRTFORGE_DSQC_CACHE"] = str(tmp / "cache.json")
+    try:
+        broken = tmp / "broken"
+        _build_tiny_dataset(broken, broken=True)
+        clean = tmp / "clean"
+        _build_tiny_dataset(clean, broken=False)
+
+        passed, lines = A.qc_gate({"data": str(broken)})
+        check(passed is False, f"坏数据应被拦下：{lines}")
+        check(any("LBL_FIELD" in line for line in lines), f"应指出具体规则：{lines}")
+
+        passed_clean, lines_clean = A.qc_gate({"data": str(clean)})
+        check(passed_clean is True, f"干净数据应放行：{lines_clean}")
+
+        # 裁剪部署没有 datasetqc.py 时不能把训练拦下来
+        original = A.load_web_module
+        A.load_web_module = lambda name: None  # type: ignore[assignment]
+        try:
+            passed_missing, _ = A.qc_gate({"data": str(broken)})
+            check(passed_missing is True, "缺模块时放行")
+        finally:
+            A.load_web_module = original  # type: ignore[assignment]
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+        if previous_cache is None:
+            os.environ.pop("TRTFORGE_DSQC_CACHE", None)
+        else:
+            os.environ["TRTFORGE_DSQC_CACHE"] = previous_cache
 
 
 def main() -> int:

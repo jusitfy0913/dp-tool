@@ -1,3 +1,4 @@
 exp_id	created_at	weights	split_yaml	map50_95	map50	precision	recall	seconds	num_images	num_instances
 exp_0005	2026-11-10T12:14:33	D:\test\deeplearning\dp-tool\7-autoresearch-yolo\runs\autoexp\exp_0005\weights\best.pt	D:\test\deeplearning\dp-tool\7-autoresearch-yolo\splits\pcb_holdout.yaml	0.4380553793247416	0.8822592812133806	0.952168289466484	0.8282777212050667	8.5	42	185
 exp_0006	2026-11-10T13:09:52	D:\test\deeplearning\dp-tool\7-autoresearch-yolo\runs\autoexp\exp_0006\weights\best.pt	D:\test\deeplearning\dp-tool\7-autoresearch-yolo\splits\pcb_holdout.yaml	0.473726	0.920854	0.937989	0.867051	10.18	42	185
+exp_0006	2026-11-11T10:41:50	D:\test\deeplearning\dp-tool\7-autoresearch-yolo\runs\autoexp\exp_0006\weights\best.pt	D:\test\deeplearning\dp-tool\7-autoresearch-yolo\splits\pcb_holdout.yaml	0.473726	0.920854	0.937989	0.867051	5.31	42	185

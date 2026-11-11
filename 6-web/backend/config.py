@@ -35,6 +35,50 @@ RUNTIME_DIR = WEB_ROOT / "runtime"
 UPLOAD_DIR = RUNTIME_DIR / "uploads"
 LOG_DIR = RUNTIME_DIR / "logs"
 
+# 任务运行台账：追加式 JSONL，一个任务两行（开始一行、结束一行）。
+# 为什么需要它：RunManager 的内存字典一重启就空，而日志文件还躺在 LOG_DIR 里，
+# 前端拿不到 run_id 就等于把那份日志弄丢了。台账是「日志文件的索引 + 结束原因」。
+# 可用 TRTFORGE_RUNS_LEDGER 指到别处：测试与 CI 不该往开发机的历史列表里塞假任务。
+RUNS_LEDGER = Path(
+    os.environ.get("TRTFORGE_RUNS_LEDGER", "").strip() or (RUNTIME_DIR / "runs.jsonl")
+)
+
+# 单次任务日志上限与保留份数。默认 20MB × 4 份 = 80MB / 任务。
+# 训练日志一次十几个 MB 很常见，不设上限长期跑会把磁盘写满。
+LOG_MAX_BYTES = max(1, int(os.environ.get("TRTFORGE_LOG_MAX_MB", "20"))) * 1024 * 1024
+LOG_BACKUPS = max(0, int(os.environ.get("TRTFORGE_LOG_BACKUPS", "3")))
+
+#: 应用版本号。放在 config 而不是 app：数据集导出（dataset.py）也要把它写进 manifest，
+#: 而 dataset 反过来 import app 会形成循环。app.py 只做 `APP_VERSION = config.APP_VERSION`。
+APP_VERSION = "1.34.4"
+
+# 任务日志的保留天数（按整个任务的所有分片一起判断，最旧一份多久没更新就删）。
+# 之所以还要这一层：单任务有上限，但「任务数 × 上限」仍然会无限增长。
+# 设 0 表示关闭自动清理（想永久留档时用）。
+LOG_RETENTION_DAYS = max(0, int(os.environ.get("TRTFORGE_LOG_RETENTION_DAYS", "30")))
+
+# 显存实测峰值表：按 (imgsz, batch, 精度) 记录历史最大峰值，供开训前预检使用。
+#
+# 为什么落在 7-autoresearch-yolo/experiments/ 而不是 6-web/runtime/：
+# 这张表由 autoexp（无人值守跑实验）和 Web 训练页共同积累，谁写进去都该被对方看见。
+# autoexp 的 experiments/ 本来就是「实验事实」的落盘位置（best.json、exp_*.json 都在那），
+# 放在这里语义一致；6-web/runtime 是纯运行期缓存，打包/清理时会被当成垃圾。
+# 该目录不存在（只部署 Web 的场景）时退回 RUNTIME_DIR，功能不受影响。
+_VRAM_SAMPLES_ENV = os.environ.get("TRTFORGE_VRAM_SAMPLES", "").strip()
+VRAM_SAMPLES = Path(_VRAM_SAMPLES_ENV) if _VRAM_SAMPLES_ENV else (
+    (REPO_ROOT / "7-autoresearch-yolo" / "experiments" / "vram_samples.json")
+    if (REPO_ROOT / "7-autoresearch-yolo").is_dir()
+    else (RUNTIME_DIR / "vram_samples.json")
+)
+
+# 训练类任务异常退出后是否自动续训一次（见 runners.RunManager._maybe_resume）。
+AUTO_RESUME = os.environ.get("TRTFORGE_AUTO_RESUME", "1").strip().lower() not in {
+    "0",
+    "false",
+    "no",
+    "off",
+}
+
 # ---------------------------------------------------------------------------
 # 训练工程与 launcher
 # ---------------------------------------------------------------------------

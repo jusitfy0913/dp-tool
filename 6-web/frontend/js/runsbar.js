@@ -10,7 +10,8 @@
 // /api/runs 就说明服务没了，立刻在顶栏写出来，而不是等用户点按钮收一句
 // 英文的 "Failed to fetch"。
 
-import { listRuns, stopRun } from "./api.js";
+import { listRuns, listRunHistory, stopRun } from "./api.js";
+import { runLogUrl } from "./logs.js";
 
 //: 轮询间隔。3 秒足够让「开训 / 结束」在一眼之内出现在顶栏，
 //: 又不会让 127.0.0.1 上的服务多出可观察的负担。
@@ -60,9 +61,35 @@ export function fmtElapsed(seconds) {
   return h > 0 ? `${h}:${pad(m)}:${pad(s)}` : `${m}:${pad(s)}`;
 }
 
+/** 结束状态 → 中文 + 颜色类。导出给单测，界面文案不该散落在两处。 */
+const STATUS_META = {
+  running: { text: "进行中", cls: "" },
+  finished: { text: "完成", cls: "h-status-ok" },
+  failed: { text: "失败", cls: "h-status-bad" },
+  cancelled: { text: "已停止", cls: "h-status-warn" },
+  // 服务被强杀/重启后，台账里还是 running 的那条会被改判成 interrupted。
+  // 它和「已停止」要分开写：一种是用户主动停的，一种是服务没交代就没了。
+  interrupted: { text: "已中断", cls: "h-status-warn" },
+};
+
+export function statusMeta(status) {
+  return STATUS_META[String(status || "")] || { text: String(status || "未知"), cls: "" };
+}
+
+/** epoch 秒 → 「11-11 14:12」。历史列表用，跨天靠日期区分。 */
+export function fmtClock(seconds) {
+  const value = Number(seconds);
+  if (!Number.isFinite(value) || value <= 0) return "";
+  const date = new Date(value * 1000);
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
 export function initRunsBar() {
   const bar = document.getElementById("runsBar");
   if (!bar) return;
+
+  initHistoryPanel();
 
   let timer = 0;
   //: 上一次渲染的「签名」。内容没变就不重画，避免 3 秒一次的无谓 DOM 抖动
@@ -179,4 +206,110 @@ export function initRunsBar() {
 
   poll();
   loop();
+}
+
+/**
+ * 历史任务面板。
+ *
+ * 为什么放在顶栏而不是各页面：任务不止一种（训练/构建/批量/自动实验），
+ * 而「上次那个引擎构建到底成功了没」是跨页面的问题。放在顶栏，任何页面都能查。
+ *
+ * 只在点开时请求：历史不会自己变，没必要参与 3 秒轮询。
+ */
+function initHistoryPanel() {
+  const button = document.getElementById("runsHistoryBtn");
+  const panel = document.getElementById("runsHistory");
+  if (!button || !panel) return;
+
+  function close() {
+    panel.hidden = true;
+  }
+
+  function renderHistory(runs) {
+    panel.innerHTML = "";
+
+    const head = document.createElement("div");
+    head.className = "history-head";
+    const title = document.createElement("span");
+    title.textContent = `历史任务 ${runs.length}`;
+    const hint = document.createElement("span");
+    hint.textContent = "点「日志」看完整输出";
+    head.append(title, hint);
+    panel.appendChild(head);
+
+    if (!runs.length) {
+      const empty = document.createElement("div");
+      empty.className = "history-empty";
+      empty.textContent = "还没有历史任务。跑一次训练或构建就会记在这里。";
+      panel.appendChild(empty);
+      return;
+    }
+
+    for (const run of runs) {
+      const row = document.createElement("div");
+      row.className = "history-row";
+
+      const kind = document.createElement("span");
+      kind.className = "h-kind";
+      kind.textContent = kindLabel(run.kind);
+      // 悬停看完整 kind 与 run_id：排障时要能一眼对上后端日志
+      row.title = `${run.kind} · ${run.run_id}`;
+
+      const status = statusMeta(run.status);
+      const statusEl = document.createElement("span");
+      statusEl.className = `h-time ${status.cls}`.trim();
+      // 中断/停止的任务补上时长，用户能看出「跑了 3 小时才断」
+      statusEl.textContent = run.status === "running"
+        ? status.text
+        : `${status.text} · ${fmtElapsed(run.elapsed)}`;
+
+      const time = document.createElement("span");
+      time.className = "h-time";
+      time.textContent = fmtClock(run.started_at);
+
+      const open = document.createElement("a");
+      open.className = "h-open";
+      open.textContent = "日志";
+      open.href = runLogUrl(run.run_id);
+      open.target = "_blank";
+      open.rel = "noopener";
+
+      // 顺序与 CSS 的 grid 列一致：内容 / 状态 / 时间 / 日志
+      row.append(kind, statusEl, time, open);
+      panel.appendChild(row);
+    }
+  }
+
+  async function load() {
+    panel.hidden = false;
+    panel.innerHTML = '<div class="history-empty">正在读取任务台账…</div>';
+    try {
+      const data = await listRunHistory(50);
+      renderHistory(data?.runs || []);
+    } catch (error) {
+      panel.innerHTML = "";
+      const box = document.createElement("div");
+      box.className = "history-empty";
+      box.textContent = `读取历史失败：${error?.message || error}`;
+      panel.appendChild(box);
+    }
+  }
+
+  button.addEventListener("click", () => {
+    if (panel.hidden) {
+      load();
+    } else {
+      close();
+    }
+  });
+
+  // 点面板外任意处 / 按 Esc 收起：浮层挡住内容时用户的第一反应就是点旁边
+  document.addEventListener("click", (event) => {
+    if (panel.hidden) return;
+    if (panel.contains(event.target) || button.contains(event.target)) return;
+    close();
+  });
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") close();
+  });
 }

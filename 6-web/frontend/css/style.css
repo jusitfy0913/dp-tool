@@ -351,6 +351,78 @@ body::after {
 .runs.offline .run-chip { border-color: var(--danger); color: var(--danger); cursor: default; }
 .runs.offline .run-dot { background: var(--danger); box-shadow: 0 0 8px var(--danger); }
 
+/* 历史任务入口：低存在感（文字按钮），只在用户主动点开时才展开列表。
+   刻意不做成第二个下拉菜单样式——顶栏已经有环境状态，再加一个强调按钮会抢注意力。 */
+.runs-history-btn {
+  padding: 2px var(--sp-2);
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-dim);
+  font-family: inherit;
+  font-size: var(--fs-2xs);
+  cursor: pointer;
+}
+.runs-history-btn:hover { border-color: var(--line); color: var(--text); }
+
+/* 历史面板：从顶栏右下展开的浮层。position: fixed 而不是 absolute，
+   因为 .topbar 有自己的层叠上下文，absolute 会被日志区盖住。 */
+.runs-history {
+  position: fixed;
+  top: 52px;
+  right: var(--sp-3);
+  z-index: 60;
+  width: min(560px, calc(100vw - 32px));
+  max-height: 60vh;
+  overflow: auto;
+  padding: var(--sp-2);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  background: var(--surface-1);
+  box-shadow: 0 12px 32px rgba(0, 0, 0, .45);
+}
+.runs-history[hidden] { display: none; }
+
+.history-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-2);
+  padding: 0 var(--sp-1) var(--sp-2);
+  color: var(--text-dim);
+  font-size: var(--fs-2xs);
+  text-transform: uppercase;
+  letter-spacing: .4px;
+}
+
+.history-row {
+  display: grid;
+  grid-template-columns: 1fr auto auto auto;
+  gap: var(--sp-2);
+  align-items: center;
+  padding: var(--sp-1) var(--sp-2);
+  border-radius: var(--radius-sm);
+  font-size: var(--fs-2xs);
+  font-variant-numeric: tabular-nums;
+}
+.history-row:hover { background: var(--surface-3); }
+.history-row .h-kind { color: var(--text); white-space: nowrap; }
+.history-row .h-time { color: var(--text-dim); white-space: nowrap; }
+.history-row .h-open {
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  padding: 0 var(--sp-2);
+  color: var(--text-dim);
+  text-decoration: none;
+  white-space: nowrap;
+}
+.history-row .h-open:hover { border-color: var(--cyan); color: var(--text); }
+/* 结束状态用颜色说话：绿=正常，红=失败，黄=被停止/中断 */
+.h-status-ok { color: var(--ok); }
+.h-status-bad { color: var(--danger); }
+.h-status-warn { color: var(--amber); }
+.history-empty { padding: var(--sp-3); color: var(--text-dim); font-size: var(--fs-2xs); text-align: center; }
+
 /* 状态指示灯 */
 .dot {
   width: 9px;
@@ -1050,6 +1122,17 @@ table.data-table td.ae-cell-change {
   white-space: nowrap;
 }
 
+/* 数据集指纹短码：等宽、小号、低调。它是「这行属于哪批数据」的标记，
+ * 不是主要信息，不该抢走 mAP 的注意力。 */
+.fp-tag {
+  display: inline-block;
+  margin-top: 2px;
+  font-family: var(--mono, monospace);
+  font-size: 0.78em;
+  letter-spacing: 0.02em;
+  color: var(--text-dim);
+}
+
 /* ---- 4.7 表格 ---- */
 table.env { width: 100%; border-collapse: collapse; font-size: var(--fs-sm); }
 table.env td {
@@ -1099,6 +1182,18 @@ table.env td:first-child { width: 250px; color: var(--text); }
 .conf-matrix td, .conf-matrix th { text-align: center; min-width: 3.2em; }
 .conf-matrix td.is-hit { background: var(--cyan-a10); font-weight: 600; }
 .pipe-val-note { margin: 4px 0 10px; color: var(--text-dim); font-size: var(--fs-sm); }
+.pipe-val-note.is-warn { color: var(--danger); }
+
+/* 漏检-过杀曲线：零依赖内联 SVG，配色跟随主题变量，不引入图表库 */
+.op-section { margin-top: 10px; }
+.op-chart-box { max-width: 460px; }
+.op-chart { width: 100%; height: auto; display: block; }
+.op-axis { stroke: var(--line-strong, var(--line)); stroke-width: 1; }
+.op-line { fill: none; stroke: var(--cyan, #3fd0e0); stroke-width: 2; }
+.op-dot { fill: var(--cyan, #3fd0e0); }
+.op-dot:hover { fill: var(--danger); }
+.op-tick { fill: var(--text-dim); font-size: 9px; }
+.op-tools { align-items: center; gap: 8px; margin-top: 8px; }
 
 /* 数据集预览列表：图片多时只滚动容器，不把整页撑长。
    表格本体用 .data-table，这里只补容器约束与更紧凑的行高。 */
@@ -2707,3 +2802,71 @@ input[type="range"]:disabled { cursor: not-allowed; }
 
 .pipe-log-pre.bad { color: var(--danger); }
 
+
+/* ===== 数据集体检（datasetqc） =====
+   体检区默认折叠：绝大多数时候用户只想扫描/导出，分组与问题列表是次要信息。
+   跨划分泄漏用红色左边框而不是整块红底——整块红底会让整页看起来像报错，
+   但它其实只是「结论有风险」，不是「操作失败」。 */
+.qc-box {
+  margin-top: var(--sp-3);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  padding: var(--sp-3);
+  background: var(--surface-2);
+}
+.qc-box > summary {
+  cursor: pointer;
+  user-select: none;
+  font-weight: 600;
+  color: var(--text);
+}
+.qc-box[open] > summary { margin-bottom: var(--sp-2); }
+.qc-box .metrics { margin-top: var(--sp-2); }
+
+.qc-list { display: flex; flex-direction: column; gap: 4px; margin-top: var(--sp-2); }
+
+.qc-group {
+  padding: 6px 10px;
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--line-strong);
+  border-radius: var(--radius-sm);
+  font-size: var(--fs-xs);
+  color: var(--text-dim);
+}
+.qc-group.bad { border-left-color: var(--danger); }
+
+.qc-tag {
+  margin-left: var(--sp-2);
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: var(--surface-3, var(--surface-2));
+  border: 1px solid var(--line-strong);
+  font-size: var(--fs-2xs);
+  color: var(--text-dim);
+}
+
+.qc-issue {
+  padding: 6px 10px;
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--line-strong);
+  border-radius: var(--radius-sm);
+  font-size: var(--fs-xs);
+  color: var(--text-dim);
+}
+.qc-issue > summary { cursor: pointer; }
+.qc-issue.error { border-left-color: var(--danger); }
+.qc-issue.error > summary { color: var(--danger); }
+.qc-issue.warn { border-left-color: var(--amber); }
+.qc-issue.warn > summary { color: var(--amber); }
+.qc-issue.info { border-left-color: var(--cyan); }
+
+.qc-members {
+  margin-top: 4px;
+  max-height: 200px;
+  overflow: auto;
+  font-family: var(--font-mono);
+  font-size: var(--fs-2xs);
+  line-height: 1.7;
+  color: var(--text-dim);
+  overflow-wrap: anywhere;
+}

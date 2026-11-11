@@ -19,9 +19,11 @@
   于是不同配置的 mAP 可以直接横比。
 - **适应度取 `results.csv` 的最后一行**，不是历史上的最佳 epoch。固定预算下比的就是
   「到点那一刻的水平」，取 max 会让早慧型配置虚高。
-- **台账 `results.tsv` 一行一个实验**，含请求参数、实际生效 batch、峰值显存、假设描述。
-- **显存预检**。宁可提前拒绝，也不让 Ultralytics 静默把 batch 减半——batch 一变，
-  等效学习率和正则强度全跟着变，那次实验就与其它实验不等价了。
+- **台账 `results.tsv` 一行一个实验**，含请求参数、实际生效 batch、峰值显存（分配 + 预留两列）、
+  实际精度、假设描述。
+- **显存预检用实测峰值表，不用手拟合公式**。宁可提前拒绝，也不让 Ultralytics 静默把 batch
+  减半——batch 一变，等效学习率和正则强度全跟着变，那次实验就与其它实验不等价了。
+  表在 `experiments/vram_samples.json`，每次训练结束自动写回（自校准），详见 §8.1。
 
 ## 二、核心设计：与上游的三处有意偏离
 
@@ -92,6 +94,11 @@
 
 镜像用**硬链接**（`os.link`），不复制文件。所以 732 MB 训练集只占一份磁盘，改动原始
 数据集里的图片会同步体现（因为本来就是同一个 inode）。
+
+**数据变过的检测（v0.2.4）**：`_manifest.json` 除 `signature`（文件名 + seed）外，
+还记录 `data_fingerprint` 与 `holdout_fingerprint`。`holdout` 子命令开跑前会对比当前
+实际指纹，不一致就明确警告「之前的验收结论不可沿用」。原因：`signature` 对「把某张
+holdout 图的标注改掉」完全无感，而硬链接意味着这种改动会悄悄生效。
 
 ## 五、使用方式
 
@@ -264,9 +271,13 @@ python autoexp.py holdout --weights runs/autoexp/exp_0007/weights/best.pt
 | `map50` / `precision` / `recall` | 同一行其它指标 |
 | `epochs_done` | 预算内实际跑完的 epoch 数 |
 | `train_seconds` | Ultralytics 统计的训练秒数（不含启动与收尾验证） |
-| `peak_vram_mb` | PyTorch 统计的峰值显存 |
+| `peak_vram_mb` | PyTorch 统计的峰值显存（`max_memory_allocated`，**分配**量） |
+| `peak_vram_reserved_mb` | **v0.2.3 新增**。峰值显存（`max_memory_reserved`，**预留**量）。显存预检与自校准都用这一列：OOM 发生在向驱动申请的那一刻，`allocated` 会低估 30% 以上 |
 | `imgsz` | 输入分辨率 |
 | `batch_req` / `batch_eff` | 请求的 batch / 实际生效的 batch。**两者不等说明被自动降过，该行不可与其它行横比** |
+| `amp` | **v0.2.3 新增**。本次训练实际生效的精度（`fp16` / `fp32` / 空=未知）。本机 T1000 命中 Ultralytics 的 AmpBlacklist，即使请求 AMP 也是 `fp32` |
+| `data_fp` | **v0.2.4 新增**。本次训练所用数据集指纹的前 8 位（算法见 `6-web/backend/fingerprint.py`）。**跨这一列不同的行不可直接横比**：参数没变，数据变了 |
+| `fp_per_image` | **v0.2.5 新增**。每张验证图的平均误报框数，由 Ultralytics 的 P/R 反推（近似值）。**只用于拦「拿过杀换 mAP」**，不是产线验收数字；空=算不出 |
 | `model` | 权重文件名 |
 | `budget_seconds` | 本次预算 |
 | `status` | `done` / `crash` / `preflight_blocked` / `batch_downgraded` |
@@ -277,6 +288,43 @@ python autoexp.py holdout --weights runs/autoexp/exp_0007/weights/best.pt
 都变了，这次实验与台账其它行不是同一件事。程序会立刻中止子进程、把
 `fitness_map50_95` 留空、把状态记为 `batch_downgraded`，并在该 run 目录写
 `batch_downgraded.json` 留证。它**不计入 crash 统计**，也不会污染 `current_best`。
+
+### 8.1 显存预检：实测峰值表 + 安全余量 + 自校准（v0.2.3）
+
+**旧做法错在哪**。曾经这里有一条手拟合公式 `2600 + 240 × batch × (imgsz/640)²`：
+台账里 `640/batch=8` 的峰值是 1769 MB，公式估 4520 MB（多估一倍半）；
+`960/batch=4` 公式估 4760 MB 就放行，**实际仍然 OOM**。同一套判定在
+`6-web` 里还有另一份实现，两处已经在 960/batch=4 上给出互斥结论。
+显存占用与 `(batch, imgsz, 精度)` 的关系不是一条固定系数能覆盖的。
+
+**现在的判定**：委托 `6-web/backend/vram.py`，与网页端训练页共用同一份实现。
+
+| 依据 | 触发条件 | 需求 |
+| --- | --- | --- |
+| `measured` | 同 `(imgsz, batch, 精度)` 有实测样本 | `峰值 × 1.15 + 400 MB` |
+| `scaled` | 同 `imgsz`/精度，只有**更小** batch 的样本 | `峰值 × b/b₀ × 1.15 + 400 MB` |
+| `capped` | 同 `imgsz`/精度，只有**更大** batch 的样本 | 它的实测值作上界（显存随 batch 不减） |
+| `formula` | 什么都没跑过 | `2600 + 300 × batch × (imgsz/640)²` |
+
+**自校准**：`experiments/vram_samples.json`，键 `imgsz x batch x 精度`（如 `640x8xfp32`），
+每次训练正常结束由 `exec` 子进程把 `max_memory_reserved` 写回（取历次最大），
+并把 `amp_effective / precision / peak_vram_reserved_mb` 补进 `exp_NNNN.json`。
+用 `reserved` 而不是 `allocated`：OOM 发生在向驱动申请的那一刻，后者低估 30% 以上。
+
+**AMP 也是实测出来的**：本机 T1000 命中 Ultralytics 8.4.192 的 AmpBlacklist，
+请求 `amp=True` 实际仍是 `fp32`。台账的 `amp` 列与 `exp_NNNN.json` 的
+`amp_effective` 记的是**实际生效值**（来自 `trainer.amp`），不是请求值。
+
+**本机实测（T1000 8GB，fp32）**
+
+| 配置 | 依据 | 需求 | 旧公式 |
+| --- | --- | --- | --- |
+| `640/batch=8` | `measured`（2132 MB） | 2852 MB | 4520 MB |
+| `640/batch=16` | `scaled`（由 batch=8 外推） | 5304 MB | 7400 MB |
+| `640/batch=4` | `capped`（batch=8 作上界） | 2852 MB | 3800 MB |
+| `960/batch=8` | `formula`（没跑过 960） | 8000 MB | 8000 MB |
+
+### 8.2 表头迁移
 
 改表头时会按**列名**迁移旧数据并留 `.bak` 备份，不会让历史行错位。
 
@@ -359,8 +407,9 @@ python 6-web\backend\gpulock.py status
 | 配置 | 结果 |
 |---|---|
 | `batch=16 @640`，可用显存 5302 MB | **OOM**。Ultralytics 自动降 16→8→4→2，三次后抛错 |
-| `batch=8 @640`，可用显存 5302 MB | 正常，峰值 1769.5 MB |
+| `batch=8 @640`，可用显存 5302 MB | 正常，峰值 `allocated` 1769.5 MB |
 | `batch=8 @640`，600 秒预算 | 正常，峰值 1769.5 MB，23~24 个 epoch |
+| `batch=8 @640`，1 epoch（2026-11-11 自校准实测） | 正常，`reserved` **2132.0 MB** / `allocated` 1769.2 MB；`amp_requested=true` 但 `amp_effective=false`，精度 `fp32`；已写入 `vram_samples.json` 的 `640x8xfp32` |
 
 OOM 的根因：`6-web` 的两套常驻服务（端口 8060 / 8094）各挂一个 `infer_worker.py`，
 长期占用约 2.7 GB 显存。跑实验前若不需要 Web 端，建议停掉一套。
@@ -385,6 +434,8 @@ sigma  0.003184
 极差   0.007240
 keep 阈值（2 sigma）= 0.006368
 ```
+
+这组数字写在 `experiments/_noise_summary.json` 的 `groups["imgsz=640|batch=8"]`。顶层字段后来被 960 的测量覆盖，分组必须单独留着，否则回到 640 时会借到 960 的尺子。
 
 **怎么用这个数**：新实验的 `fitness_map50_95` 必须比当前最佳高 **0.0064 以上**才算赢。
 小于这个幅度的提升，无法与随机波动区分，一律 discard。
@@ -497,10 +548,14 @@ keep 阈值（2 sigma）= 0.016139
 5.5 + 1.7 > 8 GB，表现为「预检通过 → 第一个 batch OOM → 降 batch → 崩在主机内存」。
 本轮 `exp_0020~0022` 连续三次崩就是这个原因，停掉 worker 后同样配置一次跑通。
 
+从 v1.33.3 起不用手停：自动实验开始时会让推理进程退出，整场结束前不许它自己再起来，
+结束后也不立刻加载，下次在网页上推理才按需重载。命令行连的是
+`http://127.0.0.1:8060`，地址不同时设 `AUTOEXP_WEB_URL`。
+
 ```powershell
-# 跑长实验前先看一眼
+# 跑长实验前可以看一眼，确认推理进程已经退出
 nvidia-smi --query-gpu=memory.used,memory.free --format=csv
-# 空闲应约 800 MB used；> 1.5 GB 就先停掉网页端推理 worker
+# 空闲应约 800 MB used；> 1.5 GB 说明让出没生效（网页没开，或地址不对）
 ```
 
 ## 十四、第 4 阶段：LLM 决策层（`agent` 子命令）
@@ -974,3 +1029,167 @@ nvidia-smi --query-gpu=memory.used,memory.free --format=csv
 实测噪声数据见本节「实测结论」：960 的 σ = 0.008070（2σ = 0.016139），
 比 640 的 0.003184 大 2.5 倍，且 exp_0006 的 0.45862 落在其分布内 ——
 **KEEP 0 次是真实的科研结果，不是阈值冤枉了模型**。
+
+### v0.2.3 (2026-11-11) — 显存预检改实测峰值表并自校准，AMP 记录实际生效值
+
+**一句话**：预检不再用手拟合的公式猜，改成「跑过就记下来」；台账新增
+`peak_vram_reserved_mb` 与 `amp` 两列，记的是**实际**吃到的显存和**实际**生效的精度。
+
+**为什么改**
+
+- 旧公式 `2600 + 240 × batch × (imgsz/640)²` 与台账脱节：`640/batch=8` 实测峰值
+  1769 MB，公式估 4520 MB；`960/batch=4` 公式估 4760 MB 就放行，实际仍然 OOM。
+- 同一套判定在 `6-web` 里还有一份实现，两处已经给出互斥结论。
+
+**改了什么**
+
+| 事项 | 变化 |
+| --- | --- |
+| 判定实现 | `preflight_vram()` 委托 `6-web/backend/vram.py`（找不到时退回同一套公式并说明「按公式估算」）；`need_mb` 参数保留旧语义供测试用 |
+| 实测表 | `experiments/vram_samples.json`，键 `imgsz x batch x 精度`，值取历次最大 `max_memory_reserved` |
+| 自校准 | 训练结束自动写回；样本键带精度，避免「别处 fp16 的样本」放行「本机 fp32 的组合」 |
+| 台账 | `RESULTS_HEADER` 新增 `peak_vram_reserved_mb`、`amp`（按列名迁移旧行，留 `.bak`） |
+| 实验记录 | `exp_NNNN.json` 追加 `amp_effective / precision / peak_vram_reserved_mb`（开跑前不知道的事实） |
+
+**本机实测（T1000 8GB，fp32）**：`640/batch=8` → `measured` 2852 MB；
+`640/batch=16` → `scaled` 5304 MB；`640/batch=4` → `capped` 2852 MB；
+`960/batch=8` → `formula` 8000 MB。四档意义见 §8.1。
+
+**验证**：`run_all_tests.py` 62 / 62 通过；真机跑 1 epoch，`amp_requested=true`
+但 `amp_effective=false`（T1000 在 AmpBlacklist 里），`reserved` 2132.0 MB
+自动写入 `640x8xfp32`。
+
+### v0.2.5 (2026-11-11) — 数据体检门禁与按组切分：不让同一块底板同时进训练与验证
+
+**一句话**：`split` 新增 `--group-by`，让同一块底板（同一前缀 / 同一目录）只能落进一个划分；
+`run` 新增 `--qc-gate`，开跑前体检标注，存在 error 级问题时拒绝启动；另提供独立 CLI `labelqc.py`。
+
+**为什么改**
+
+- PCB 数据 692 张其实只有 10 块底板，每块拍了「同位置不同缺陷」的几十张。按图片随机切分
+  时同一块底板必然横跨 train 和 val，val 指标反映的是「记住了底板」，不是「认出了缺陷」。
+- 标注坏掉（字段数不对、类别越界、坐标越界）时 Ultralytics 往往只打一行摘要就继续训练，
+  或者直接崩在很后面，一轮几分钟到几十分钟白花。
+
+**改了什么**
+
+| 事项 | 变化 |
+| --- | --- |
+| 共享实现 | `load_web_module("datasetqc")` 加载 `6-web/backend/datasetqc.py`（与 Web 端同一份，理由同 `vram` / `fingerprint`） |
+| 按组切分 | `split --group-by {none,prefix,dir}`：`prefix` 取文件名首个 `_` 前的前缀，`dir` 取父目录名；同组整组进同一侧，用「补最大缺口」贪心近似目标比例 |
+| 不拆组的代价 | 组数 <2 直接退出码 2 并提示可退回 `--group-by none`；组过大时比例会偏离，日志写明实际组数 |
+| 切分清单 | `_manifest.json` 新增 `group_by`、`group_signature`、`groups`，事后可证「这批切分是按组做的」 |
+| 数据门禁 | `run --qc-gate`：只拦 `error` 级；`warn`/`info` 只打印；体检本身异常则放行（不让检查变成阻塞），退出码 **6** |
+| 体检耗时 | 默认不检查：解码整份数据 692 张约 1~10 秒（有缓存更快），而一轮实验只有几分钟 |
+| CLI | 新增 `labelqc.py`，人类可读 / `--json` 两种输出，`--fail-on {none,error,warn}` 控制退出码 |
+
+**退出码（接 CI 时按这个判断）**
+
+| 码 | 含义 |
+| --- | --- |
+| 0 | 体检完成且未触发 `--fail-on` 阈值 |
+| 1 | 触发 `--fail-on`（存在对应级别的问题） |
+| 2 | 输入无效（路径不存在、无法识别为数据集） |
+| 6 | `run --qc-gate` 拦下：存在 error 级标注问题，本次未启动 |
+
+**命令**
+
+```powershell
+# 体检（只读），有 error 就返回非 0
+D:\anaconda3\envs\dpenv\python.exe labelqc.py "D:/test/deeplearning/dp-tool/PCB data/PCB缺陷检测" --fail-on error
+# 机器可读
+D:\anaconda3\envs\dpenv\python.exe labelqc.py splits/pcb.yaml --json
+
+# 按底板前缀重新切分（同前缀只进一侧）
+D:\anaconda3\envs\dpenv\python.exe autoexp.py split --group-by prefix
+
+# 开跑前门禁
+D:\anaconda3\envs\dpenv\python.exe autoexp.py run --config experiments/cur.json --qc-gate
+```
+
+**验证**：`run_all_tests.py` **68 / 68** 通过（新增 3 条：按组切分不拆组、
+`labelqc.py` 退出码、`--qc-gate` 拦住坏数据）。真机：`PCB data/PCB缺陷检测` 体检得到
+10 组、全部跨划分、涉及 689 张（另 3 张自成一类）；按 `prefix` 切分后 10 组各自只在一个划分里。
+
+### v0.2.5 (2026-11-11) — 过杀进台账，KEEP 不再允许拿过杀换 mAP
+
+**一句话**：`results.tsv` / `holdout.tsv` 新增 `fp_per_image`（每图误报框数），
+`judge_round()` 在 mAP 提升超过噪声阈值、但过杀明显恶化时判 `DISCARD`。
+
+**为什么改**
+
+- 只看 mAP 的自动搜索会稳定地往「多报框」方向漂：多报一个高分框会抬高 recall，
+  mAP 可能涨，但产线上每多报一个就要停一次线。
+- `judge_round` 是全流程唯一有权说「这个改动算成功」的地方。如果它不知道过杀，
+  等于把成本项完全排除在决策之外。
+
+**改了什么**
+
+| 事项 | 变化 |
+| --- | --- |
+| 台账列 | `RESULTS_HEADER` / `HOLDOUT_HEADER` 新增 `fp_per_image`（按列名迁移，旧行补空，留 `.bak`） |
+| 近似换算 | `fp_per_image_from_pr(P, R, instances, images)`：`TP = R×GT`、`FP = TP×(1-P)/P`、`fp = FP/图片数` |
+| 缺项语义 | P/R/GT/图片数任一缺失、或 P≤0、R≤0 时返回 **`None`**（不知道），不是 0 |
+| KEEP 拦截 | `judge_round(..., fp_per_image, incumbent_fp_per_image)`：只在**两边都有值**时生效 |
+| 容差 | `max(0.01, 基线×5%)`：低于这个量级的差异在近似算法下不可信，不当成「变差」 |
+| 理由文案 | 被拦时写明「过杀从 x 升到 y 框/图（容差 z）——不拿过杀换 mAP」，进台账和界面 |
+| 不误伤 | 任一侧缺数时退回原 2σ 规则；没有超过噪声阈值的提升也不会被过杀理由误导 |
+
+**字段说明**
+
+| 字段 | 类型 | 含义 |
+| --- | --- | --- |
+| `fp_per_image` | float\|null | 每张验证图平均误报框数（**近似值**，见下方边界） |
+| `incumbent_fp_per_image` | float\|null | 上一条 KEEP 记录的过杀，用于比较 |
+| `val_instances` / `val_images` | int | 换算用的分母，台账里单独留一份便于复核 |
+
+**边界（写清楚以免被当成验收数字）**
+
+- Ultralytics 的 P/R 取自 **best-F1 conf**，不是固定 conf，也不区分良品图。
+- 因此这里的 `fp_per_image` 只用于自动搜索里拦「明显恶化」，**不能当产线验收数字**；
+  验收数字要用 Web 验证页的 `operating_points` 曲线（`tools/val_engine.py`）。
+- 没有良品图时不做良品误报统计；曲线里的 `ok_fp_rate` 为 `null` 表示「没测过」。
+
+**验证**：`run_all_tests.py` **71 / 71** 通过（新增 3 条：P/R 反推与缺项语义、
+过杀拦截与容差不误伤、两张台账都有该列）。
+
+### v0.2.4 (2026-11-11) — 台账记录数据集指纹，holdout 数据变了会被发现
+
+**一句话**：每轮实验开跑前算一次数据指纹，写进 `exp_NNNN.json` 与 `results.tsv`
+的 `data_fp` 列；`splits/_manifest.json` 也记下切分时的指纹，holdout 验收前自动核对。
+
+**为什么改**
+
+- 台账只记参数与指标。换了数据集之后，「`0.4109` → `0.4150`」到底是参数赢了
+  还是数据变了，无法判断，`best.json` 的「当前最佳」也不再可比。
+- `splits/_manifest.json` 的 `signature` 只记**文件名列表 + seed**。holdout 的图
+  被改过标注后它一点不变，于是「验收通过」的结论悄悄失效——这是 holdout 纪律
+  上最后一个没堵住的口子。
+
+**改了什么**
+
+| 事项 | 变化 |
+| --- | --- |
+| 共享实现 | 新增 `load_fingerprint()` / `dataset_fingerprint()`，加载 `6-web/backend/fingerprint.py`；找不到时标 `unavailable`，不阻断实验 |
+| 实验记录 | `exp_NNNN.json` 新增 `dataset` 块（`algo` / 三个指纹 / `counts` / `error`），开跑前写 |
+| 台账 | `RESULTS_HEADER` 新增 `data_fp`（紧跟 `amp`；按列名迁移，旧行补空，留 `.bak`） |
+| 最佳配置 | `best.json` 的 `evidence.dataset_fingerprint` 记录这次 KEEP 依据的数据短码 |
+| 切分清单 | `_manifest.json` 新增 `data_fingerprint` 与 `holdout_fingerprint`（holdout 的图不在 tune 的 train/val 里，必须单独记） |
+| 漂移检查 | `holdout` 子命令开跑前调 `check_split_drift()`；数据变过时明确警告「之前的验收结论不可沿用」 |
+| 内存占用 | 没有。指纹只读 `stat` 与标注文本，650 张约 0.14 秒 |
+
+**指纹字段（读台账时按这个解析）**
+
+| 字段 | 类型 | 含义 |
+| --- | --- | --- |
+| `algo` | string | `v1`；不同版本永不相等 |
+| `dataset_fingerprint` | string(16) | 整批指纹，跨这一列不同的行不可直接横比 |
+| `short` | string(8) | `results.tsv` 的 `data_fp` 就是它 |
+| `split_fingerprints` | object | `{train, val, test}`，用于判断「只改了 val 吗」 |
+| `label_fingerprint` | string(16) | 标注文本指纹（不含路径） |
+| `counts` | object | 各 split 图片数 |
+
+**验证**：`run_all_tests.py` **65 / 65** 通过（新增 3 条：`data_fp` 列迁移、
+与 Web 端指纹一致、无记录时漂移检查放行）。真机：`splits/pcb_tune.yaml`
+在 autoexp、Web 接口、训练目录三处一致得到 `5a9749c58c8a0ea9`。
+

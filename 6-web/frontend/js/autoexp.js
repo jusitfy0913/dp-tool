@@ -315,6 +315,16 @@ function attachRun(run) {
 // 台账
 // ---------------------------------------------------------------------------
 
+//: 指纹配色板。只用于「区分组」，不承载好坏语义——所以不用红/绿。
+const FP_COLORS = ["#4f8cff", "#22c55e", "#f59e0b", "#a855f7", "#14b8a6", "#ef4444"];
+
+/** 由指纹字符串稳定地映射到一个颜色：同一批数据永远同色。 */
+function fpColor(fp) {
+  let hash = 0;
+  for (const ch of String(fp || "")) hash = (hash * 31 + ch.charCodeAt(0)) >>> 0;
+  return FP_COLORS[hash % FP_COLORS.length];
+}
+
 function renderRows(rows) {
   if (!dom.rows) return;
   dom.rows.innerHTML = "";
@@ -328,12 +338,38 @@ function renderRows(rows) {
     dom.rows.appendChild(tr);
     return;
   }
+  // 数据指纹分组：同一列里不同指纹的行，参数可能完全相同但数据不同。
+  // 在这种行之间比 mAP 等于把「换数据」误读成「改参数有效」，所以必须显式区分。
+  const fpSet = new Set(rows.map((row) => row.data_fp).filter(Boolean));
+  if (dom.fpHint) {
+    if (fpSet.size > 1) {
+      dom.fpHint.hidden = false;
+      dom.fpHint.className = "hint bad";
+      dom.fpHint.textContent =
+        `本台账出现 ${fpSet.size} 组不同的数据集指纹（${[...fpSet].join(" / ")}）。` +
+        "跨组的行不可直接横向比较：数据变了，指标差异不一定是参数带来的。";
+    } else {
+      dom.fpHint.hidden = true;
+    }
+  }
   // 最新的在最上面：跑一整晚之后没人愿意滚到底部看最新一轮
   for (const row of [...rows].reverse()) {
     const tr = document.createElement("tr");
 
     const cellId = document.createElement("td");
     cellId.textContent = row.exp_id || "—";
+    if (row.data_fp) {
+      // 左边框上色：一眼看出哪些行属于同一批数据
+      tr.style.borderLeft = `3px solid ${fpColor(row.data_fp)}`;
+      cellId.title = `数据集指纹 ${row.data_fp}（数据不同的实验不可直接横比）`;
+      const tag = document.createElement("span");
+      tag.className = "fp-tag";
+      tag.textContent = row.data_fp;
+      cellId.appendChild(document.createElement("br"));
+      cellId.appendChild(tag);
+    } else {
+      cellId.title = "未记录数据集指纹（升级前的实验，无法核对数据是否相同）";
+    }
 
     const cellChange = document.createElement("td");
     cellChange.className = "ae-cell-change";
@@ -576,6 +612,7 @@ export function initAutoexp() {
   dom.budgetHint = q("aeBudgetHint");
   dom.copyLog = q("aeCopyLog");
   dom.rows = q("aeRows");
+  dom.fpHint = q("aeFpHint");
   dom.ledgerCount = q("aeLedgerCount");
   dom.previewCard = q("aePreviewCard");
   dom.previewText = q("aePreviewText");

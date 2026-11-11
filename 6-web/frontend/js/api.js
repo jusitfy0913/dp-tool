@@ -95,6 +95,16 @@ export function listRuns() {
   return getJSON("/api/runs?limit=20");
 }
 
+/**
+ * 历史任务（跨服务重启）。
+ *
+ * 与 listRuns 的分工：那条是「现在谁在跑」，这条是「以前跑过什么、怎么结束的」。
+ * 服务重启后 listRuns 会空，但历史仍可查——排障时最需要的恰恰是上一次的结束原因。
+ */
+export function listRunHistory(limit = 50) {
+  return getJSON(`/api/runs/history?limit=${encodeURIComponent(String(limit))}`);
+}
+
 export function stopRun(runId) {
   return postJSON(`/api/runs/${runId}/stop`, {});
 }

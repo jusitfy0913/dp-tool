@@ -65,6 +65,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--limit", type=int, default=0, help="最多评估多少张，0 = 全部")
     parser.add_argument("--min-score", type=float, default=0.001,
                         help="参与 AP 计算的最低置信度，默认与 COCO 一致取 0.001")
+    parser.add_argument("--target-miss-rate", type=float, default=0.01,
+                        help="反查工作点时允许的漏检率上限，默认 0.01（1%%）")
+    parser.add_argument("--operating-confs", default="",
+                        help="漏检-过杀曲线的 conf 列表（逗号分隔），留空用默认 0.05~0.95")
     parser.add_argument("--out", required=True, help="报告输出目录")
     return parser.parse_args(argv)
 
@@ -72,6 +76,25 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 def labels_dir_for(images_dir: Path, yaml_dir: Path, split: str) -> Path:
     """沿用 traininfo 的推导规则（images/xx → labels/xx），不在本文件另写一份。"""
     return traininfo.labels_dir_for(images_dir, yaml_dir, split)
+
+
+def classify_ground_truth(label_path: Path, gts: dict[int, list[list[float]]]) -> str:
+    """把一张图的标签情况分成四种状态（见 valmetrics.GT_STATES）。
+
+    为什么必须区分「文件不存在」与「文件为空」：
+    - 导出流程永远会写 ``.txt``（哪怕是空文件），所以空文件就是**显式声明的良品**；
+    - 没有文件则说明这张图根本没标注过，可能是漏标。
+    两者都让 GT 为空，但前者可以拿来算过杀率，后者算进去就是在用漏标冒充良品。
+    """
+    if not label_path.is_file():
+        return "missing"
+    if gts:
+        return "labeled"
+    try:
+        text = label_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return "missing"
+    return "ok" if not text.strip() else "unparsed"
 
 
 def read_yolo_labels(path: Path, width: int, height: int) -> dict[int, list[list[float]]]:
@@ -247,6 +270,7 @@ def main(argv: list[str]) -> int:
                 label_path = image_path.with_suffix(".txt")
 
             gts = read_yolo_labels(label_path, width, height)
+            gt_state = classify_ground_truth(label_path, gts)
             try:
                 result = infer.run_yolo(
                     str(engine_path), args.task, image, conf=args.min_score, nms=args.nms
@@ -263,7 +287,10 @@ def main(argv: list[str]) -> int:
                 failed.append({"file": str(image_path), "error": f"{type(exc).__name__}: {exc}"})
                 preds = []
                 gts = {}
-            evaluated.append({"file": str(image_path), "preds": preds, "gts": gts})
+                gt_state = "unparsed"
+            evaluated.append(
+                {"file": str(image_path), "preds": preds, "gts": gts, "gt_state": gt_state}
+            )
 
         now = time.time()
         if index == len(images) or index % 10 == 0 or now - last_emit >= 0.5:
@@ -292,6 +319,49 @@ def main(argv: list[str]) -> int:
         "note": "AP 按 COCO 口径计算（IoU 0.50:0.95、全点插值）；P/R 取自 conf 阈值下 IoU 0.5 的整体统计。",
     })
 
+    # ---- 漏检-过杀曲线 ----
+    # 预测框是在 min_score（默认 0.001）下跑出来的，所以曲线可以事后算，
+    # 不需要为了多几个阈值再推理一遍——这是本功能成本极低的原因。
+    confs: list[float] | None = None
+    if args.operating_confs.strip():
+        try:
+            confs = [
+                float(part)
+                for part in args.operating_confs.replace(";", ",").split(",")
+                if part.strip()
+            ]
+        except ValueError:
+            emit_error("CONF_INVALID", f"--operating-confs 无法解析：{args.operating_confs!r}")
+            return 4
+    ops = valmetrics.operating_points(evaluated, len(classes), confs=confs, iou=0.5)
+    recommendation = valmetrics.recommend_operating_point(
+        ops, target_miss_rate=args.target_miss_rate
+    )
+    report["operating_points"] = ops
+    report["recommended_operating_point"] = recommendation
+    report["ok"] = {
+        "images": ops["ok_images"],
+        "missing_label_images": ops["missing_label_images"],
+        "unparsed_label_images": ops["unparsed_label_images"],
+    }
+
+    if ops["missing_label_images"]:
+        emit({
+            "type": "warning",
+            "message": (
+                f"{ops['missing_label_images']} 张图没有标签文件，可能是漏标。"
+                "这些图不计入良品误报率——把它们当良品会把过杀率算成 0。"
+            ),
+        })
+    if ops["unparsed_label_images"]:
+        emit({
+            "type": "warning",
+            "message": (
+                f"{ops['unparsed_label_images']} 张图的标签文件非空但一行都解析不出来，"
+                "同样不计入良品统计，请检查标签格式。"
+            ),
+        })
+
     json_path = out_dir / "val_report.json"
     csv_path = out_dir / "val_report.csv"
     images_csv = out_dir / "val_images.csv"
@@ -314,10 +384,34 @@ def main(argv: list[str]) -> int:
         "failed": len(failed),
         "elapsed": report["elapsed"],
         "report": str(json_path),
+        "ok_images": ops["ok_images"],
+        "missing_label_images": ops["missing_label_images"],
+        "operating_point": {
+            "target_miss_rate": args.target_miss_rate,
+            "feasible": recommendation.get("feasible"),
+            "conf": (recommendation.get("point") or {}).get("conf"),
+            "miss_rate": (recommendation.get("point") or {}).get("miss_rate"),
+            "fp_per_image": (recommendation.get("point") or {}).get("fp_per_image"),
+            "ok_fp_rate": (recommendation.get("point") or {}).get("ok_fp_rate"),
+        },
     })
     print(f"[val] mAP50={report['map50']:.4f} mAP50-95={report['map5095']:.4f} "
           f"P={report['precision']:.4f} R={report['recall']:.4f} "
           f"报告={json_path}", flush=True)
+    point = recommendation.get("point") or {}
+    if point:
+        target = f"{args.target_miss_rate:.2%}"
+        prefix = "满足" if recommendation.get("feasible") else "未满足"
+        ok_text = (
+            "n/a" if point.get("ok_fp_rate") is None
+            else f"{point['ok_fp_rate']:.2%}（{point.get('ok_fp_images')}/{ops['ok_images']} 张）"
+        )
+        print(
+            f"[val] 漏检 {target} → conf={point.get('conf')} "
+            f"实际漏检={point.get('miss_rate')} 过杀={point.get('fp_per_image')} 框/图 "
+            f"良品误报={ok_text}（{prefix}目标）",
+            flush=True,
+        )
     return 0
 
 

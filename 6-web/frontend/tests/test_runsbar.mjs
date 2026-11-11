@@ -6,7 +6,7 @@
 // 一旦过滤条件写错（比如把「已结束」也算进来、或把真在跑的训练过滤掉），
 // 用户看到的就是一条假的任务条，或者一条都没有——两种情况都比报错更难排查。
 
-import { fmtElapsed, isNoteworthyRun, kindLabel } from "../js/runsbar.js";
+import { fmtClock, fmtElapsed, isNoteworthyRun, kindLabel, statusMeta } from "../js/runsbar.js";
 
 // ---------------------------------------------------------------------------
 // 极简断言框架（与 test_engine_out.mjs 保持一致）
@@ -74,6 +74,28 @@ assert(!isNoteworthyRun(run("yolo-check-env")), "自检任务不该闪现");
 assert(!isNoteworthyRun(run("anomalib-check-env")), "Anomalib 自检同样不该闪现");
 // 但不能因为「叫 check-env」就把真的训练过滤掉
 assert(isNoteworthyRun(run("yolo-train")), "过滤自检不能误伤训练");
+
+// ---------------------------------------------------------------------------
+group("历史任务的状态文案");
+// ---------------------------------------------------------------------------
+equal(statusMeta("finished").text, "完成", "正常结束");
+equal(statusMeta("failed").text, "失败", "失败");
+equal(statusMeta("cancelled").text, "已停止", "用户主动停止");
+// 「中断」和「已停止」必须分开：一个是用户点的，一个是服务没交代就没了
+equal(statusMeta("interrupted").text, "已中断", "服务重启导致的中断");
+assert(statusMeta("interrupted").cls !== statusMeta("failed").cls, "中断与失败的配色不能相同");
+equal(statusMeta("finished").cls, "h-status-ok", "完成用绿色");
+equal(statusMeta("failed").cls, "h-status-bad", "失败用红色");
+equal(statusMeta("weird").text, "weird", "未知状态原样显示，不能变 undefined");
+equal(statusMeta(null).text, "未知", "缺状态给「未知」");
+
+// ---------------------------------------------------------------------------
+group("历史时间格式");
+// ---------------------------------------------------------------------------
+equal(fmtClock(0), "", "0 表示没时间，显示空串而不是 1970");
+equal(fmtClock(undefined), "", "缺字段不抛异常");
+equal(fmtClock("nope"), "", "非数字不抛异常");
+assert(/^\d{2}-\d{2} \d{2}:\d{2}$/.test(fmtClock(1700000000)), "格式为 MM-DD HH:MM");
 
 // ---------------------------------------------------------------------------
 if (failures.length) {

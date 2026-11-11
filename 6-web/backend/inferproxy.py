@@ -223,6 +223,8 @@ class _Worker:
         self._log_name = "infer_worker.log" if index == 0 else f"infer_worker-{index + 1}.log"
         #: 池子挂上来的回调：某次请求把进程打崩时通知池子累计（跨进程熔断用）。
         self.on_crash = None
+        #: 返回 False 时禁止拉起进程。自动实验占显存期间用它挡住「空闲退出后自动重拉」。
+        self.may_start = None
         self._lock = threading.RLock()
         self._process: subprocess.Popen | None = None
         self._conn = None
@@ -287,6 +289,10 @@ class _Worker:
         self._last_error = ""
 
     def _start_locked(self) -> None:
+        if self.may_start is not None and not self.may_start():
+            self._last_error = "显存已让给训练，暂不拉起推理进程"
+            self._status = _unavailable_status(self._last_error)
+            return
         try:
             self._spawn_locked()
         except (WorkerError, _Died, _TimedOut, OSError) as exc:
@@ -311,6 +317,8 @@ class _Worker:
 
     def startup(self) -> None:
         with self._lock:
+            if self.may_start is not None and not self.may_start():
+                return
             if not self._alive():
                 self._start_locked()
 
@@ -538,6 +546,8 @@ class _Pool:
         self._tripped_at: float | None = None
         self._last_error = ""
         self._started = False
+        #: 非空表示「显存已让给训练」。此期间禁止拉起推理进程，哪怕有推理请求进来。
+        self._gpu_hold = ""
         self._primary = _Worker(0)
         # 必须走 _attach：它负责挂崩溃回调。漏挂 0 号会让跨进程熔断永远凑不满次数。
         self._attach(self._primary)
@@ -558,7 +568,15 @@ class _Pool:
 
     def _attach(self, worker: _Worker) -> None:
         worker.on_crash = self._record_crash
+        worker.may_start = self._allow_worker_start
         self._workers.append(worker)
+
+    def _allow_worker_start(self) -> bool:
+        """自动实验占着显存时，任何路径（请求、崩溃重启、手动 startup）都不许拉起进程。"""
+        return not self._gpu_hold
+
+    def gpu_hold(self) -> str:
+        return self._gpu_hold
 
     # ---------------- 跨进程熔断 ----------------
 
@@ -596,6 +614,8 @@ class _Pool:
     # ---------------- 生命周期 ----------------
 
     def startup(self) -> None:
+        if self._gpu_hold:
+            return
         with self._lock:
             if self._started:
                 return
@@ -642,7 +662,59 @@ class _Pool:
             self._tripped_at = None
             self._last_error = ""
 
+    def yield_gpu(self, reason: str) -> dict:
+        """停掉全部推理进程，并在解除之前拒绝重新拉起。
+
+        自动实验的训练和推理进程抢的是同一块 8GB。推理进程是懒加载的：
+        页面上点一次推理，它就把模型留在显存里不放。训练一开始再去抢，
+        就会差几十 MB 然后 OOM，接着 Ultralytics 把 batch 偷偷减半。
+
+        这里主动退出，而不是等它自己崩。解除时**不**马上拉起——
+        下次真正的推理请求才会加载（见 ``release_gpu_hold``）。
+        """
+        reason = (reason or "训练").strip() or "训练"
+        with self._lock:
+            self._gpu_hold = reason
+            self._started = False
+            workers = list(self._workers) + list(self._evicted)
+            self._evicted = []
+            self._free = queue.Queue()
+        stopped = 0
+        for worker in workers:
+            try:
+                alive = worker._alive()
+            except Exception:  # noqa: BLE001
+                alive = False
+            if alive:
+                stopped += 1
+            try:
+                worker.shutdown()
+            except Exception as exc:  # noqa: BLE001
+                print(f"[inferproxy] {worker._tag}让出显存时停止异常：{type(exc).__name__}: {exc}", flush=True)
+        print(f"[inferproxy] 已退出推理进程（{stopped} 个），显存让给：{reason}", flush=True)
+        return {
+            "ok": True,
+            "held": True,
+            "mode": "worker",
+            "reason": reason,
+            "stopped": stopped,
+        }
+
+    def release_gpu_hold(self) -> dict:
+        """允许下次推理重新加载。此刻不拉起进程，避免训练刚结束又把显存占回去。"""
+        with self._lock:
+            self._gpu_hold = ""
+        return {
+            "ok": True,
+            "held": False,
+            "mode": "worker",
+            "reloaded": False,
+        }
+
     def restart(self) -> None:
+        if self._gpu_hold:
+            print(f"[inferproxy] 训练占用显存（{self._gpu_hold}），忽略重启推理进程的请求", flush=True)
+            return
         with self._crash_lock:
             self._crashes.clear()
             self._tripped_at = None
@@ -665,8 +737,15 @@ class _Pool:
 
     def call(self, message: dict, image: np.ndarray | None = None, *, model: str = "",
              source: str = "", timeout: float | None = None):
+        if self._gpu_hold:
+            raise WorkerError(
+                f"推理进程已退出，把显存让给训练（{self._gpu_hold}）。"
+                "训练结束后，下次推理会自动重新加载。",
+                503,
+            )
         if not self._started:
-            # 与单进程时代一致：shutdown 之后再调用会自动拉起，而不是报错
+            # 与单进程时代一致：shutdown 之后再调用会自动拉起，而不是报错。
+            # 上面的 gpu_hold 是唯一的例外：训练还没结束时不许拉起。
             self.startup()
         self._check_trip()
         with self._lock:
@@ -708,12 +787,32 @@ class _Pool:
         reason = self.trip_reason()
         data["pool_tripped"] = bool(reason)
         data["pool_error"] = reason
+        hold = self.gpu_hold()
+        data["gpu_hold"] = hold
+        if hold:
+            data["state"] = "yielded"
+            data["last_error"] = f"已退出并把显存让给训练（{hold}），下次推理时重新加载"
         return data
 
 
 _pool = _Pool()
 #: 主进程（0 号）。状态、缓存、手动重启、OCR 固定走它——单进程时代的外部契约不变。
 _worker = _pool.primary
+#: 直通模式（不启子进程）时的让出标记。隔离模式的标记在池子里。
+_DIRECT_HOLD = ""
+
+
+def _yield_message(reason: str) -> str:
+    return (
+        f"推理进程已退出，把显存让给训练（{reason}）。"
+        "训练结束后，下次推理会自动重新加载。"
+    )
+
+
+def _refuse_if_yielded() -> None:
+    reason = _DIRECT_HOLD if not isolation_enabled() else _pool.gpu_hold()
+    if reason:
+        raise WorkerError(_yield_message(reason), 503)
 
 
 # ---------------------------------------------------------------------------
@@ -722,6 +821,8 @@ _worker = _pool.primary
 
 def startup() -> None:
     """服务启动时调用：隔离模式拉起工作进程（可能是多个），直通模式按原样加载 DLL。"""
+    if _DIRECT_HOLD or (isolation_enabled() and _pool.gpu_hold()):
+        return
     if isolation_enabled():
         _pool.startup()
     else:
@@ -755,6 +856,7 @@ def ocr_status() -> dict:
 
 def run_yolo(engine_path: str, task: str, image: np.ndarray, conf: float = 0.25, nms: float = 0.45,
              want_masks: bool = False, source: str = "") -> dict:
+    _refuse_if_yielded()
     if not isolation_enabled():
         infer.status()  # 未加载时先加载，与 1.27.0 启动时加载的效果一致
         return infer.run_yolo(engine_path, task, image, conf=conf, nms=nms, want_masks=want_masks)
@@ -775,6 +877,7 @@ def run_anomalib(engine_path: str, metadata_path: str, image: np.ndarray, model_
         "colormap": colormap,
         "want_heatmap": want_heatmap,
     }
+    _refuse_if_yielded()
     if not isolation_enabled():
         infer.status()
         return infer.run_anomalib(image=image, **kwargs)
@@ -788,6 +891,7 @@ def run_classify(onnx_path: str, image: np.ndarray, source: str = "") -> dict:
     整个 Web 进程会跟着退出——而分类恰恰是"随手试一下"的操作，
     用户不会预期它把服务带走。
     """
+    _refuse_if_yielded()
     if not isolation_enabled():
         infer.status()
         return infer.run_classify(onnx_path, image)
@@ -803,6 +907,7 @@ def run_ocr(image: np.ndarray, options: dict, source: str = "") -> dict:
     收益很小、代价极大。固定 0 号还有个好处：它加载期间其余进程照常做检测，
     用户不会再看到「点了 OCR 之后检测也卡住」。
     """
+    _refuse_if_yielded()
     if not isolation_enabled():
         return ocr_infer.run(image, options)
     # 首次加载 Paddle（1.7GB 的 paddle_inference.dll）比普通推理慢得多
@@ -840,9 +945,37 @@ def worker_state() -> dict:
     return _pool.state()
 
 
+def yield_gpu(reason: str = "训练") -> dict:
+    """停掉推理进程并把显存让给训练。解除前不会自动重载。"""
+    global _DIRECT_HOLD
+    reason = (reason or "训练").strip() or "训练"
+    if not isolation_enabled():
+        try:
+            infer.release_handles()
+            ocr_infer.release_handles()
+        except Exception as exc:  # noqa: BLE001
+            print(f"[inferproxy] 直通模式释放句柄失败：{type(exc).__name__}: {exc}", flush=True)
+        _DIRECT_HOLD = reason
+        return {"ok": True, "held": True, "mode": "direct", "reason": reason, "stopped": 0}
+    return _pool.yield_gpu(reason)
+
+
+def release_gpu_hold() -> dict:
+    """训练结束：允许下次推理按需重载，此刻不拉起进程。"""
+    global _DIRECT_HOLD
+    _DIRECT_HOLD = ""
+    if not isolation_enabled():
+        return {"ok": True, "held": False, "mode": "direct", "reloaded": False}
+    return _pool.release_gpu_hold()
+
+
 def restart_worker() -> dict:
     if not isolation_enabled():
         return worker_state()
+    if _pool.gpu_hold():
+        state = worker_state()
+        state["refused"] = True
+        return state
     _pool.restart()
     return worker_state()
 

@@ -153,6 +153,320 @@ python tf_anomalib_launcher.py --mode check-env
 
 ## 版本更新记录
 
+### v1.34.4 — 2026-11-11（良品图 + 操作点：漏检-过杀曲线、引擎工作点、自动实验过杀约束）
+
+**一句话**：把「漏一个」和「多报一个」从只能事后感叹变成可以调的旋钮——良品图进验收集，
+验证报告画出整条**漏检-过杀曲线**，选定的点存进引擎旁挂文件并在推理页自动回填；
+自动实验不再允许「拿过杀换 mAP」。
+
+**解决什么**：v1.34.3 之前的验证只回答「mAP 是多少」，而产线真正问的是两件事：
+**「这个阈值下会漏几个？」** 和 **「为了不漏，要误报多少个？」**。这两件事需要两样以前没有的东西：
+① 良品图（没有缺陷的 OK 图）参与评估，否则「误报」无从统计；
+② 沿 conf 扫一遍的曲线，否则用户只能凭感觉填一个 0.25。
+
+| 事项 | 变化 |
+| --- | --- |
+| 良品图声明 | 数据集扫描/预览/导出/体检新增 `ok_dirs`：相对数据源根的目录，多个用分号分隔（如 `ok;test/good`） |
+| 良品图去向 | `ok_split` = `val`（默认）/ `test`：**只进验收划分，绝不参与训练**；导出时写**空标签文件**（不是缺文件） |
+| 为什么必须显式声明 | 「没有缺陷」和「忘了标」在磁盘上都表现为没有框。只有用户声明过的目录才算良品，其余空标注/缺标注仍按漏标嫌疑处理 |
+| GT 四态 | `labeled`（有标注）/ `ok`（标签文件存在且为空）/ `missing`（标签文件不存在）/ `unparsed`（有内容但解析失败）；**只有 `ok` 进过杀统计** |
+| 过杀率定义 | `ok_fp_rate = 至少有一个误报框的良品图数 / 良品图总数`；**没有良品图时返回 `null`**，不是 0 |
+| 曲线 | `valmetrics.operating_points()`：按 conf 从 0.05 到 0.95 扫 19 个点（可用 `--operating-confs` 指定，最多 50 个） |
+| 单调性 | 每类只做一次贪心匹配，再按 conf 取前缀累积——保证 conf 升高时 TP/FP 单调不增，且与 `evaluate()` 的数字逐点对得上 |
+| 推荐点 | `recommend_operating_point()`：在**满足目标漏检率**的点里取 **conf 最高**的那个（过杀最低）。取最低 conf 是反方向 |
+| 无解不撒谎 | 所有点都不满足目标时返回 `feasible: false` + 最接近的点 + 原因，绝不假装达标 |
+| 曲线入口 | 验证结果卡片下方：内联 SVG 折线（零依赖）+「目标漏检 → 推荐 conf / 实际漏检 / 过杀 / 图 / 良品误报」四行对照表 |
+| 引擎工作点 | 新增 `POST/GET /api/engine/operating-point`，写进 `<engine>.meta.json` 的 `operating_point`（**不碰引擎文件、不改 `metadata.json`**） |
+| 推理页联动 | 选中引擎时自动读回工作点并预填 `conf` 输入框，提示行显示「已回填验证操作点 conf=…，漏检 …，过杀 …」 |
+| 自动实验过杀列 | `results.tsv` / `holdout.tsv` 新增 `fp_per_image`；由 Ultralytics 的 P/R 反推（`TP = R×GT`、`FP = TP×(1-P)/P`），拿不到就留空 |
+| KEEP 约束 | `judge_round()`：mAP 提升超过噪声阈值，但过杀恶化超过 `max(0.01, 基线×5%)` 时判 **DISCARD**，理由写明「不拿过杀换 mAP」 |
+
+**曲线点字段（读取方按这个格式解析）**
+
+| 字段 | 类型 | 含义 |
+| --- | --- | --- |
+| `conf` | number | 该点的置信度阈值 |
+| `tp` / `fp` / `fn` | int | 该阈值下的命中 / 误报 / 漏检框数 |
+| `recall` | number\|null | `tp / GT 框数`；没有 GT 时为 `null` |
+| `miss_rate` | number\|null | `1 - recall`，**产线关心的是这个** |
+| `precision` | number\|null | `tp / (tp + fp)` |
+| `f1` | number\|null | P/R 调和平均 |
+| `fp_per_image` | number\|null | `fp / 评估图片数` |
+| `ok_images` | int | 本次评估里的良品图数 |
+| `ok_fp_images` | int | 至少有一个误报的良品图数 |
+| `ok_fp_rate` | number\|null | `ok_fp_images / ok_images`；**无良品图时为 `null`** |
+| `per_class` | array | 逐类明细：`id, instances, tp, fp, fn, recall, miss_rate, fp_per_image` |
+
+报告级字段：`iou`、`confs`、`points`、`num_images`、`num_gts`、`ok_images`、
+`missing_label_images`、`unparsed_label_images`、`note`。
+
+**使用方式**
+
+```powershell
+# 1) Web 数据集页：填「良品目录」（多个用分号）→ 选「良品图进哪个划分」→ 扫描/预览/导出
+#    导出的良品图只出现在 val（或 test），标签是空 .txt
+#    —— 验证时用的就是这份导出目录，所以良品图会自动被算进过杀率，命令行不需要额外参数
+
+# 2) 命令行验证：对导出的 YOLO 目录跑曲线与推荐点
+python 6-web/backend/tools/val_engine.py --engine runs/exp/best_fp16.engine --data out/dataset.yaml `
+  --target-miss-rate 0.01 --operating-confs "0.05,0.1,0.2,0.3,0.5"
+
+# 3) Web 验证结果页：看曲线 → 选目标漏检 → 点「保存为引擎工作点」
+#    推理页再选这个引擎时 conf 会自动变成保存的值
+
+# 4) 自动实验：过杀恶化会被拦下
+python 7-autoresearch-yolo/autoexp.py run --config experiments/cur.json
+```
+
+**测试**：`test_operating_points.py` 48 项断言（曲线单调性、`ok_fp_rate` 的 null 语义、
+与 `evaluate()` 逐点一致、推荐取最高 conf、无解不撒谎、过杀目标约束）；
+`test_dataset_workbench.py` 新增 23 项良品图断言（导出空标签、不重复计数、良品目录有标注时报错）；
+后端 **53/53** 套件全绿；`7-autoresearch-yolo/run_all_tests.py` **71/71**；前端 `node --check` 通过。
+
+**已知边界（刻意不做）**：良品图不参与训练（只做验收，做训练要另设计半监督方案）；
+`fp_per_image` 在自动实验里是**近似值**（Ultralytics 的 P/R 取自 best-F1 conf，也不是固定 conf），
+只用于拦「明显恶化」，不能当产线验收数字——验收数字用验证页那条曲线；
+曲线只在检测/分割/姿态/OBB 上有意义，异常检测是单阈值判定，不提供该曲线。
+
+### v1.34.3 — 2026-11-11（数据集体检：同底板分组、跨划分泄漏、标注问题；按组划分）
+
+**一句话**：给数据做一次「体检」——找出完全重复的图、找出**同一块底板拍出来的不同缺陷图**
+（这类图会让验证指标虚高）、逐行检查标注字段；并在导出/切分时可选「同底板进同一划分」。
+
+**解决什么**：PCB 这类工业数据集里，692 张图其实只有 10 块底板，每块底板拍了几十张
+「同位置不同缺陷」的图。按图片随机划分时，同一块底板必然同时出现在 train 和 val 里，
+模型记住的是底板而不是缺陷 → val 指标好看、上线就掉。以前的工具完全看不见这件事。
+
+| 事项 | 变化 |
+| --- | --- |
+| 体检实现 | 新增 `6-web/backend/datasetqc.py`（算法标识 `dsqc-v1`），Web 后端与 `autoexp.py`、`labelqc.py` **共用同一份**实现 |
+| 签名 | 每张图算 `sha256` + **256 位 dHash**（17×16 灰度图比较相邻像素）+ 32×32 灰度缩略图 |
+| 两级判定 | **A 级 完全重复**：文件 sha256 相同（改名/复制得到的那张）；**B 级 同底板**：dHash 汉明距离 ≤ 8 **且** 32×32 灰度平均绝对差 ≤ 2.0 |
+| 为什么要 MAE 复核 | dHash 只看梯度符号，大面积纯色（PCB 的空白板面）在纯哈希下**可能**让不同底板的图撞位，漏判就会给出错误的泄漏结论；MAE 用真实像素再确认一次 |
+| 绝不自动删 | A 级也只是「报告 + 可选标记」，B 级只用于告警与分组。**任何情况下都不自动删除用户图片** |
+| 分组算法 | 候选对按 banding（把 256 位切成 8 段做桶）生成，避免 692×692 全比；超 3000 张退回全量两两比较；分组用并查集 |
+| 跨划分泄漏 | 每组的 `cross_split` 标记是否横跨 train/val/test；报告给出跨划分组数与涉及图片数 |
+| 同组同标签提示 | 同底板且类别数量相同、框 IoU > 0.95 的两张图，单独列进 `same_label_pairs` 供人工确认（工业缺陷天然可能在同一位置重复出现，所以只提示不判定为错） |
+| 标注质检 | 逐行检查，**永不抛异常**：字段数、数值解析、类别越界、坐标越界、零面积、极小框(<0.01%)、超大框(>60%)、贴边、同图重复框(IoU>0.9)、某类缺失、空标注、类别占比 <2%、同底板异类标注 |
+| 只读 | 体检不改任何图片或标注文件；唯一写入是 `runtime/dsqc_cache.json` 的签名缓存（键 `路径｜大小｜纳秒mtime`，算法版本变化整体作废，上限 2 万条） |
+| 按组划分 | 扫描/导出新增 `group_by`：`none`（默认，逐图哈希）/ `prefix`（文件名前缀，如 `01_`）/ `dir`（父目录名）。同组图片**必须进同一划分**，用「补最大缺口」的贪心近似目标比例 |
+| 不拆组的代价 | 组数少于 2 或组太大时比例会明显偏离设定值，报告里会说明；这是刻意取舍——宁可比例不准，也不要泄漏 |
+| 清单记录 | `manifest.json` 新增 `split_mode: {mode, groups, note}` 与 `group_signature`，事后能证明「这次是按组分的」 |
+| 导出时附体检 | 导出可选 `with_qc`，把体检摘要写进 `manifest.json` 的 `qc` 字段（不额外发请求） |
+| 新接口 | `POST /api/dataset/qc`（只读）：`{source, task, threshold, limit}` → 分组/泄漏/问题明细/耗时 |
+| CLI | 新增 `7-autoresearch-yolo/labelqc.py <source> [--task] [--threshold] [--limit] [--json] [--fail-on none\|error\|warn]` |
+| 实验门禁 | `autoexp.py run --qc-gate`：存在 **error** 级问题直接拒绝启动（退出码 6）；warn/info 只打印不拦；体检本身失败则放行（不让检查变成阻塞） |
+| 按组切分 | `autoexp.py split --group-by {none,prefix,dir}` |
+
+**体检报告字段（读取方按这个格式解析）**
+
+| 字段 | 类型 | 含义 |
+| --- | --- | --- |
+| `algo` | string | 当前 `dsqc-v1`；算法变了旧缓存与旧报告不可比 |
+| `threshold` / `mae_limit` | number | 本次使用的汉明距离上限（默认 8）与灰度差上限（2.0） |
+| `counts` | object | 图片总数、各 split 张数、空标注数 |
+| `summary` | object | `{error, warn, info}` 三级问题计数 |
+| `by_rule` | object | 按规则码聚合：`{code: {count, title, severity}}` |
+| `groups` | object | `{total, cross_split, leak_images, items[≤50], same_label_pairs[≤50], truncated}` |
+| `exact_groups` | array | A 级完全重复组（相对路径列表，≤50 组） |
+| `issues` | array | `{code, severity, rel, split, line, detail}`，最多 `limit` 条 |
+| `cache` | object | 命中/新增条数，回答「为什么这次快/慢」 |
+| `elapsed_ms` | number | 实际耗时 |
+| `version` | string | 产生报告的后端版本 |
+
+**使用方式**
+
+```powershell
+# 1) 命令行体检（只读，人类可读格式）
+D:\anaconda3\envs\dpenv\python.exe 7-autoresearch-yolo/labelqc.py "PCB data/PCB缺陷检测" --task auto
+
+# 2) 机器可读 + 有错误时返回非 0（可接进 CI / 上线前检查）
+python 7-autoresearch-yolo/labelqc.py "splits/pcb.yaml" --json --fail-on error
+
+# 3) Web 数据集页：点「体检」，看底板组 / 跨划分标记 / 标注问题
+#    导出时勾选「按组划分（prefix）」即可让同一底板只进一个划分
+
+# 4) 自动实验：开跑前门禁 + 切分时按组
+python 7-autoresearch-yolo/autoexp.py split --group-by prefix
+python 7-autoresearch-yolo/autoexp.py run --config experiments/cur.json --qc-gate
+```
+
+**真机验证（T1000 8GB）**：对 `PCB data/PCB缺陷检测`（692 张）体检得到
+**10 组、10 组全部跨划分、涉及 689 张**（另有 3 张自成一类未参与泄漏）——即「按图片随机划分」
+在这份数据上必然泄漏；
+`labelqc.py` 逐图检查未发现 error 级标注问题，耗时约 1 秒（第二次走缓存）。
+接口 `POST /api/dataset/qc` 实测返回 `version=1.34.3`、`algo=dsqc-v1`、`counts.train=553`、
+`summary {error:0, warn:0, info:10}`、`cache {hits:692}`、`elapsed_ms=1274`。
+对照实验：同一批数据用 64 位 dHash（阈值 ≤6）也能分出这 10 组——但常规「重复图去重」会
+把组内 691 张判成重复直接删掉，等于毁掉全部缺陷样本；这就是本版分两级、B 级永不删除的原因。
+对 `splits/pcb`（553 train / 97 tune / 42 holdout）按 `prefix` 重新切分后，
+10 组各自只落在一个划分里，比例因不拆组略有偏离（`manifest.json` 的 `split_mode` 记录了实际组数）。
+泄漏对指标的影响本轮**没有做训练对比**，属于后续实验项，不在本版结论内。
+
+**新增文件**：`6-web/backend/datasetqc.py`、`6-web/backend/tools/test_dataset_hygiene.py`、
+`7-autoresearch-yolo/labelqc.py`。
+**改动文件**：`6-web/backend/{dataset,app,config}.py`、
+`6-web/frontend/{index.html,js/dataset.js,css/style.css}`、
+`7-autoresearch-yolo/{autoexp.py,run_all_tests.py}`。
+
+**测试**：`test_dataset_hygiene.py` 43 项断言；后端 **52/52** 套件全绿；
+`7-autoresearch-yolo/run_all_tests.py` **68/68**；前端 `node --check` 通过。
+
+**边界（刻意不做）**：不做自动删除/自动改标注（不可逆操作留给人和版本库）；
+不哈希图片内容来决定去重（内容哈希只能发现字节相同的复制品，对「同一底板不同照片」无用）；
+不做感知哈希的定量「相似度排名」（距离 ≤8 是工程阈值，不是物理量）。
+
+### v1.34.2 — 2026-11-11（数据集指纹：模型/实验/引擎都能追回「用的哪批图」）
+
+**一句话**：给数据算一个内容指纹，写进导出清单、训练目录、实验台账和引擎元数据——
+以后「这个模型用的到底是哪批图」不再靠人回忆。
+
+**解决什么**：训练目录里只有一个 `data:` 路径。图片被重标注、增删、重划分后路径不变、
+内容已变，于是模型无法溯源、两次实验无法判断是否可比、线上引擎精度掉了查不到来源。
+附带修掉一个隐患：`splits/_manifest.json` 以前只记文件名与 seed，holdout 的图被改过标注
+后「验收通过」的结论会悄悄失效。
+
+| 事项 | 变化 |
+| --- | --- |
+| 指纹实现 | 新增 `6-web/backend/fingerprint.py`，Web 后端与 `autoexp.py` **共用同一份**实现（与 `vram.py` 同样的理由：两边各写一份必然打架） |
+| 指纹粒度 | `dataset_fingerprint`（整批）、`split_fingerprints`（train/val/test 各自）、`label_fingerprint`（只算标注文本） |
+| 指纹输入 | 每个 split 内「相对路径 + 文件字节数 + 标注文件原始字节哈希」，排序后 sha256，取前 16 位；带 `algo: "v1"` 版本前缀 |
+| 路径语义 | 相对 split 的 images 目录，所以导出到不同目录/镜像到 `splits/` 指纹相同 |
+| 重命名 | **算数据变化**（路径进哈希）；重命名图片时必须同时改标签文件名，否则那条标注会丢 |
+| 不做什么 | 不哈希图片内容（读全量图要几十秒，绝大多数变更靠路径+大小+标注就能发现）、不用 mtime（复制/解压会变） |
+| 导出清单 | 每个导出目录新增 `manifest.json`（与 `dataset.yaml` 同级），含指纹、数量、类别、来源、划分方式、程序版本 |
+| 重复导出 | 同目录内容未变时返回 `unchanged: true`；**覆盖导出前清理上次产物**，不再让同名图累积成 `xxx_2.jpg`（那会让「同一批数据再导一次」得到不同指纹） |
+| 训练记录 | 开训前算一次放进 `run.meta`；launcher 在 `on_train_end` 写 `train_meta.json`（位置由 trainer 的最终 `save_dir` 决定，避免 name 被改成 `name2` 时写错目录） |
+| 任务台账 | `runtime/runs.jsonl` 的 `meta` 带 `data_fp` 短码；子进程环境变量新增 `TRTFORGE_RUN_ID` |
+| 自动实验 | `exp_NNNN.json` 新增 `dataset` 块；`results.tsv` 新增 `data_fp` 列（按列名迁移，旧文件备份 `.bak`）；`best.json` 的 `evidence` 记录指纹 |
+| holdout 纪律 | `splits/_manifest.json` 记录 `data_fingerprint` 与 `holdout_fingerprint`；`autoexp.py holdout` 开跑前对比，数据变过会明确警告「之前的验收结论不可沿用」 |
+| 引擎溯源 | 构建成功后写 `<engine>.meta.json`：ONNX 与引擎的 sha256、精度、trtexec 参数、来源训练 run、数据集指纹。**不改 DLL**，纯旁挂文件 |
+| 界面 | 训练页「算力体检」多一行「数据集：`5a9749c5`（553 train / 97 val）」；数据集页导出结果显示指纹与 `unchanged`；自动实验列表按指纹着色并提示跨组不可横比 |
+| 新接口 | `GET /api/dataset/fingerprint?source=<dataset.yaml>`（只读，不落盘、不缓存） |
+| 兼容 | 旧模型/旧实验没有指纹时显示「未记录」，不报错、不回填（当时的原始数据已不可得，补出来的是假的） |
+
+**指纹记录字段（读取方按这个格式解析）**
+
+| 字段 | 类型 | 含义 |
+| --- | --- | --- |
+| `algo` | string | 算法版本，当前 `v1`。不同版本的指纹永远不相等 |
+| `dataset_fingerprint` | string(16) | 整批指纹，用于判断「能不能横比」 |
+| `short` | string(8) | 前 8 位，界面与台账展示用 |
+| `split_fingerprints` | object | `{train, val, test}` 各自的指纹，回答「只改了 val 吗」 |
+| `label_fingerprint` | string(16) | 只算标注文本、**不含路径**，回答「标注被改过吗」 |
+| `counts` | object | `{train, val, test}` 图片数 |
+| `error` | string | 计算失败的原因；为空表示正常 |
+
+**使用方式**
+
+```powershell
+# 1) 命令行直接查某个 dataset.yaml 的指纹
+curl "http://127.0.0.1:8060/api/dataset/fingerprint?source=D:/data/pcb/dataset.yaml"
+
+# 2) 导出时自动写 <输出目录>/manifest.json，响应里带 data_fp
+#    （Web 数据集页点「导出」即可，无需额外操作）
+
+# 3) 自动实验：每轮自动写进 exp_NNNN.json 的 dataset 块与 results.tsv 的 data_fp 列
+python 7-autoresearch-yolo/autoexp.py run --config 7-autoresearch-yolo/experiments/cur.json
+```
+
+**真机验证（T1000 8GB）**：对 `splits/pcb_tune.yaml`（553 train / 97 val / 6 类），
+Web 接口、`autoexp.py`、训练目录 `train_meta.json` 三处都得到 **`5a9749c58c8a0ea9`**；
+1 epoch 最小训练（320/ batch 2）后 `train_meta.json` 落在 Ultralytics 的真实 `save_dir` 下，
+`run_id` 与 `data_arg` 正确。指纹耗时 650 张 **0.14 秒**。
+
+**新增文件**：`6-web/backend/fingerprint.py`、`6-web/backend/enginemeta.py`、
+`6-web/backend/tools/test_dataset_fingerprint.py`。
+**改动文件**：`6-web/backend/{dataset,app,runners,config,autoexp_api}.py`、
+`1-python-yolo/launcher/tf_yolo_launcher.py`、`7-autoresearch-yolo/{autoexp.py,run_all_tests.py}`、
+`6-web/frontend/{index.html,js/dataset.js,js/train.js,js/autoexp.js,css/style.css}`。
+
+**测试**：`test_dataset_fingerprint.py` 45 项；后端 **51/51** 套件全绿；
+`7-autoresearch-yolo/run_all_tests.py` **65/65**；前端 `node --check` 通过。
+
+**边界（刻意不做）**：不做数据快照/版本库（那是 DVC 的职责，指纹只证明「是不是同一份」，
+不负责把旧的那份留住）；不哈希图片内容，所以「同名同大小但内容被换」发现不了；
+不回填历史产物。
+
+### v1.34.1 — 2026-11-11（显存预检改「实测峰值表 + 安全余量 + 自校准」；AMP 状态可见可覆盖）
+
+**一句话**：显存预检不再靠一条手拟合的公式猜——跑过一次就把真实峰值记下来，下次按实测值
++15% 余量 +400MB 保留判定；同时把「本机到底有没有用上混合精度」摆到界面上，
+并允许用户在明知风险时手动放行。
+
+| 事项 | 变化 |
+| --- | --- |
+| 预检判定 | 新增 `6-web/backend/vram.py`，`6-web` 训练接口与 `7-autoresearch-yolo/autoexp.py` **共用同一套**判定（此前两处各写一份，已在 960/batch=4 上给出互斥结论） |
+| 实测峰值表 | `7-autoresearch-yolo/experiments/vram_samples.json`，键 `imgsz x batch x 精度`（如 `640x8xfp32`），值取历次训练的最大 `max_memory_reserved` |
+| 自校准 | 训练结束（launcher 的 `on_train_end`）自动写回，越用越准，不需要人工维护 |
+| 估算优先级 | 精确命中实测 → 更小 batch 线性外推 → 更大 batch 作上界 → 无样本才用公式 `2600 + 300×batch×(imgsz/640)²` |
+| 余量 | 实测值 × 1.15 + 400MB（覆盖批次间波动、桌面合成与其它进程的瞬时申请） |
+| AMP 体检 | 新增 `6-web/backend/ampcheck.py`，复刻 Ultralytics 8.4.192 的 AmpBlacklist 正则；T1000/T1200/GTX16xx 等会明确告警「训练实为 fp32，显存更高、速度约慢一倍」 |
+| AMP 覆盖 | `POST /api/train/yolo` 新增三态 `amp`：不传＝按本机自动、`false`＝`--no-amp`、`true`＝`--amp` |
+| 实际状态回显 | launcher 在训练开始时发 `amp_state` 事件，训练结束发 `vram_peak` 事件；页面据此显示「请求 / 实际」两种精度，不再靠猜 |
+| 拦不住时放行 | 预检不过返回 HTTP 409，页面出现「仍然开始（显存可能不够）」，确认后带 `allow_low_vram=true` 重发 |
+| 体检接口 | `GET /api/train/preflight` 实时返回 GPU 名称/总量/可用量与当前 imgsz、batch 的估算依据 |
+
+**本机实测（T1000 8GB，fp32）**：`640/batch=8` 峰值 **2132 MB**（`allocated` 1769 MB，取
+`reserved` 是因为 OOM 发生在向驱动申请那一刻），写入 `640x8xfp32`；据此
+`batch=16` 外推需要 **5304 MB**、`batch=4` 取上界只需 2852 MB —— 而旧公式对
+batch=4/8/16 分别给出 3800/4520/7400 MB，前两者都是错误的保守估计。
+
+**新增文件**：`6-web/backend/vram.py`、`6-web/backend/ampcheck.py`、`6-web/backend/tools/test_vram_amp.py`。
+**改动文件**：`6-web/backend/{app,config,runners}.py`、`1-python-yolo/launcher/tf_yolo_launcher.py`、
+`7-autoresearch-yolo/autoexp.py`、`6-web/frontend/{index.html,js/train.js}`。
+
+**测试**：`test_vram_amp.py` 118 项；`7-autoresearch-yolo/run_all_tests.py` 62/62；后端 5 个测试套件全绿。
+真机：跑 1 epoch 得到 `amp_requested=true / amp_effective=false / precision=fp32` 与
+`peak 2132 MB`，样本自动落盘，页面「算力体检」显示 5304 MB 需求并通过；
+把 batch 调到 64 触发 409，页面出现覆盖按钮，服务端未创建任务。
+
+**边界（刻意不做）**：不做 batch 插值（插值等于回到「猜系数」）；不做显存表的跨机器合并
+（不同卡/驱动不可比，样本只服务本机）；AMP 无法真正强制打开（黑名单在框架内部生效，`--amp` 也压不住）。
+
+### v1.34.0 — 2026-11-11（Web 端任务台账落盘、日志轮转、训练崩溃自动续训）
+
+**一句话**：服务重启不再「一夜之间什么都查不到」——任务记录落到 `runtime/runs.jsonl`，
+日志按体积滚动并按天清理，YOLO 训练崩了会自己续一次。
+
+| 事项 | 变化 |
+| --- | --- |
+| 任务台账 | `6-web/runtime/runs.jsonl`，一个任务两行（开始 / 结束），含 `run_id / kind / status / exit_code / started_at / finished_at / command / log_file / resumed_from` |
+| 重启恢复 | 启动时把仍为 `running` 的记录改判 `interrupted`（`orphan=true`），日志照样能打开 |
+| 历史接口 | 新增 `GET /api/runs/history?limit=50`（上限 500）；`GET /api/runs` 语义不变，仍只返回本进程任务 |
+| 顶栏「历史」 | 点开列出最近 50 条，状态区分「完成 / 失败 / 已停止 / 已中断」，可打开该次完整日志 |
+| 日志轮转 | 单任务 20MB 滚动、留 3 份（`TRTFORGE_LOG_MAX_MB` / `TRTFORGE_LOG_BACKUPS`），读取接口跨分片拼接 |
+| 日志清理 | 启动时整族删除 30 天未更新的任务日志（`TRTFORGE_LOG_RETENTION_DAYS`，`0` 关闭） |
+| 自动续训 | `yolo-train` 失败且存在 `weights/last.pt` 时用 `--resume-from` 续跑一次；`TRTFORGE_AUTO_RESUME=0` 关闭 |
+
+**新增文件**：`6-web/backend/runledger.py`、`6-web/backend/logstore.py`、`6-web/backend/tools/test_run_history.py`。
+**改动文件**：`6-web/backend/{config,runners,app}.py`、`6-web/frontend/{index.html,css/style.css,js/api.js,js/runsbar.js}`、`6-web/frontend/tests/test_runsbar.mjs`、`6-web/backend/tools/run_all_tests.py`。
+
+**边界（刻意不做）**：Anomalib 没有等价的命令行续训入口，自动续训只覆盖 YOLO；历史任务只读，停止接口返回 404；台账写失败不影响任务本身。
+
+**测试**：`test_run_history.py` 48 项；回归 `test_run_log.py` 22 项、`test_exit_codes.py` 6 项、
+`test_pipeline_log.py` 9 项、`test_pipeline_stages.py` 50 项、`test_concurrency.py` 全绿；
+前端 `test_runsbar.mjs` 41 项。真机：运行中强杀服务后重启，历史列表出现
+`anomalib-check-env / interrupted / orphan=true / 8.0s`，该任务日志仍可打开，停止接口 404。
+详细说明见 [6-web/README.md](6-web/README.md) 的 v1.34.0 节。
+
+### v1.33.3 — 2026-11-10（自动实验开始时退出推理进程，结束后按需重载）
+
+**一句话**：自动实验一开始就让 `infer_worker` 退出并腾出显存；实验没结束前它不会自己再起来；实验结束后不马上加载，下次真正推理时才加载。
+
+960/batch4 训练大约要 5.5GB。网页上的推理进程是懒加载的，点一次推理就占住约 1.7GB 不放，两者叠在 8GB 卡上会在第一个 batch OOM，然后 Ultralytics 把 batch 偷偷减半。现在：
+
+| 时机 | 行为 |
+| --- | --- |
+| 网页点「开始」或命令行 `agent` / `run` / `noise` | 通知正在运行的 6-web：`POST /api/infer/gpu-yield`，推理进程退出 |
+| 实验进行中（含每一轮之间） | 推理请求返回 503，手动「重启推理进程」也会被拒绝 |
+| 整场实验结束 | 只解除限制，**不**拉起进程 |
+| 下一次检测 / 分类 / OCR | 按需重新加载 |
+
+网页启动的实验由后端直接停进程，并给子进程带上 `AUTOEXP_INFER_YIELDED=1`，避免每一轮训练结束时把显存提前还回去。命令行实验打给 `http://127.0.0.1:8060`（可用 `AUTOEXP_WEB_URL` 改地址）。网页没开时训练照常进行，日志会说明推理进程可能还占着显存。
+
+**测试**：`test_infer_yield.py` 6 项；autoexp `run_all_tests.py` 56 项；`test_autoexp_api.py` 16 项。真机短测记录在 `docs/TEST_PLAN_AUTOEXP_ROBUSTNESS.md`。
+
 ### v1.33.2 — 2026-11-10（修「5 轮全 DISCARD」暴露的三个问题）
 
 **一句话**：模型侧 0 失败说明 v1.33.1 的截断修复生效了，但那一场 5 轮里混着三个**与模型无关**的问题：模型以为在 960 上做实验、程序实际跑在 640；用 640 的噪声底去判 960；显存预检放行了必然 OOM 的 1152，还让训练框架把 batch 偷偷减半。

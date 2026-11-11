@@ -21,6 +21,10 @@
        条本身是刷新/切页都不会丢的停止入口，兼任后端心跳（见 js/runsbar.js）。 -->
   <div class="topbar-right">
     <div class="runs" id="runsBar" hidden></div>
+    <!-- 历史任务：服务重启后 listRuns 会空，但这次之前的训练/构建记录仍要能查。
+         点开才请求，不参与 3 秒轮询（历史不会变）。 -->
+    <button class="runs-history-btn" id="runsHistoryBtn" type="button" title="查看历史任务与各自的结束状态">历史</button>
+    <div class="runs-history" id="runsHistory" hidden></div>
     <div class="status" id="envStatus">
       <span class="dot" id="envDot"></span>
       <span id="envText">检测环境…</span>
@@ -125,6 +129,38 @@
             <div class="actions">
               <button type="button" class="mini" id="augSmallDefect">小缺陷预设</button>
               <button type="button" class="mini" id="augReset">清空（用默认）</button>
+            </div>
+          </details>
+
+          <!-- 算力体检：显存够不够、混合精度能不能用。
+               这两件事共同决定「这次训练要多久」，也解释了「同一组参数昨天能跑、今天 OOM」。
+               只读探测，不启动训练；点一次探一次（可用显存随时在变，不做轮询）。 -->
+          <details class="augbox" id="hwBox">
+            <summary>算力体检（显存够不够 / 混合精度能不能用）</summary>
+            <p class="hint">
+              按当前表单的 <b>imgsz</b> 与 <b>batch</b> 估算所需显存：本机跑过的组合按
+              <b>实测峰值</b>加 15% 余量判断，没跑过的才回落到公式。显存不够时点「开始训练」
+              会被拦下并给出建议（可以强行继续）。训练结束会把本次峰值记进实测表，下次判断更准。
+            </p>
+            <div class="grid2">
+              <label>混合精度 amp
+                <select id="ampMode">
+                  <option value="auto" selected>跟随检测（推荐）</option>
+                  <option value="off">强制关闭（fp32）</option>
+                  <option value="on">显式尝试（fp16）</option>
+                </select>
+              </label>
+            </div>
+            <div class="actions">
+              <button type="button" class="mini" id="btnCheckHw">检查算力</button>
+              <button type="button" class="mini" id="btnForceVram" hidden>仍然开始（显存可能不够）</button>
+              <span class="hint" id="hwHint"></span>
+            </div>
+            <div id="hwBody" hidden>
+              <p class="hint" id="hwGpu"></p>
+              <p class="hint" id="hwVram"></p>
+              <p class="hint" id="hwAmp"></p>
+              <p class="hint" id="hwData"></p>
             </div>
           </details>
 
@@ -1108,6 +1144,34 @@
         </div>
         <p class="hint" id="dsRatioHint">其余全部归 test（与 Qt 版一致：train / val 向下取整）</p>
 
+        <label>划分口径
+          <select id="dsGroupBy" title="同一底板/同一工件的多张图必须进同一个划分，否则指标会虚高">
+            <option value="none">按图片（默认，与旧版一致）</option>
+            <option value="prefix">按文件名前缀（01_xxx.jpg → 01）</option>
+            <option value="dir">按所在目录</option>
+          </select>
+        </label>
+        <p class="hint">按组划分时整组只进一个划分，比例只能尽量接近；勾选后请先「扫描预览」看实际张数。</p>
+
+        <label>良品目录（可多个）
+          <div class="row">
+            <input type="text" id="dsOkDirs"
+                   placeholder="相对数据源根，如 ok 或 test/good；多个用分号隔开">
+            <button type="button" class="mini" data-browse="dsOkDirs" data-dialog="dir"
+                    data-title="选择良品目录">目录</button>
+          </div>
+        </label>
+        <label>良品图进哪个划分
+          <select id="dsOkSplit" title="良品图只用来统计过杀，默认不参与训练">
+            <option value="val">val（推荐）</option>
+            <option value="test">test</option>
+          </select>
+        </label>
+        <p class="hint">
+          良品图 = 没有缺陷的 OK 图：导出写空标签、不参与训练，只用来统计「过杀」。
+          必须在这里显式声明——工具不会把漏标当良品（否则过杀率会被算成 0）。
+        </p>
+
         <label>输出目录
           <div class="row">
             <input type="text" id="dsOutput" placeholder="导出到哪里，不能放在数据源内部">
@@ -1124,6 +1188,7 @@
         <div class="actions">
           <button type="button" class="primary" id="btnScan">扫描预览</button>
           <button type="submit" id="btnExport">开始导出</button>
+          <button type="button" id="btnQc" title="只读检查：同底板分组、跨划分泄漏、标注问题">体检</button>
         </div>
         <p class="hint" id="dsHint"></p>
       </form>
@@ -1139,6 +1204,18 @@
           </table>
         </div>
         <pre class="log hidden" id="dsResult"></pre>
+
+        <details class="qc-box" id="dsQcBox">
+          <summary>数据集体检 <span class="badge" id="dsQcBadge">未体检</span></summary>
+          <p class="hint">
+            体检只读：不修改任何标注，也不改变导出结果。分组依据是图像相似度（dHash + 像素差），
+            「同一组」只说明它们来自同一张底片，不等于重复样本。
+          </p>
+          <div class="metrics" id="dsQcMetrics"></div>
+          <p class="hint bad hidden" id="dsQcLeak"></p>
+          <div class="qc-list" id="dsQcGroups"></div>
+          <div class="qc-list" id="dsQcIssues"></div>
+        </details>
       </div>
     </div>
   </section>
@@ -1560,6 +1637,7 @@
             「模型提议」来自 LLM，「判定」由程序按噪声阈值给出。两者分开看：
             提议看起来再合理，只要差值进了噪声区间就是 DISCARD。
           </p>
+          <p class="hint" id="aeFpHint" hidden></p>
           <div class="scrollbox">
             <table class="data-table" id="aeTable">
               <thead>

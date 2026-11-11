@@ -31,6 +31,9 @@ from typing import Any
 import progress
 import warmpool
 import gpulock
+import logstore
+import runledger
+import vram
 from config import EVENT_BUFFER_SIZE, LOG_DIR, TRAIN_EVENT_PREFIX
 
 #: 会独占 GPU（或会写同一批产物目录）的任务类型。
@@ -98,11 +101,23 @@ class Run:
     meta: dict = field(default_factory=dict)
     # 是否复用了常驻预热进程。前端据此显示「热启动」，日志与排障也用得上。
     warm: bool = False
+    # 进程结束（成功、失败、取消）后调用一次。自动实验用它把推理进程的「让出显存」解开。
+    # 回调解不开也别影响任务状态：调用方自己吞异常。
+    on_finished: Any = None
     # 事件序号，从 1 开始自增。断线重连补发历史时前端靠它去重。
     seq: int = 0
     # 本次任务是否持有跨进程 GPU 锁（gpulock）。结束时要按它决定是否释放，
     # 不能无条件 release：抢不到锁的任务若也去 release，会删掉别人的锁。
     gpu_lock_held: bool = False
+    # 这条任务是「自动续训」拉起来的：指向被续的那个 run_id。
+    # 台账与前端都要能看出「这不是用户点的那一次，是系统补跑的」。
+    resumed_from: str | None = None
+    # 自动续训已经用过一次（防止续训又失败再续，形成无限循环）。
+    resume_used: bool = False
+    # 失败时自动续训需要的信息：训练产物目录 + 重建命令的回调。
+    # 只有训练类任务会带上，其它任务保持 None。
+    resume_dir: Path | None = None
+    resume_command: Any = None
 
     def snapshot(self) -> dict:
         """给接口返回的任务摘要。"""
@@ -122,6 +137,8 @@ class Run:
             # 日志文件路径：任务跑完、服务重启后内存里什么都没有了，
             # 只有这个文件还在，排障时前端要拿它去 /api/runs/{id}/log 取回全文。
             "log_file": str(self.log_file) if self.log_file else None,
+            # 自动续训衍生出来的任务：前端可以写成「由 xxx 续训」
+            "resumed_from": self.resumed_from,
         }
 
 
@@ -167,6 +184,10 @@ class RunManager:
         meta: dict | None = None,
         estimate: float | None = None,
         warm_kind: str | None = None,
+        on_finished: Any = None,
+        resume_dir: Path | str | None = None,
+        resume_command: Any = None,
+        resumed_from: str | None = None,
     ) -> Run:
         """启动子进程并立即开始读取输出。
 
@@ -176,6 +197,8 @@ class RunManager:
         前者是估算依据（同时回传给前端），后者是本轮估算耗时（秒）。
         `warm_kind` 非空时优先复用常驻预热进程；取不到就照旧冷启动，
         因此这个参数只会更快，不会让原本能跑的任务跑不起来。
+        `resume_dir` / `resume_command` 只对训练类任务有意义：失败且该目录下
+        存在 ``weights/last.pt`` 时，用 ``resume_command`` 重建命令自动续训一次。
         """
         run_id = uuid.uuid4().hex[:12]
         log_file = LOG_DIR / f"{run_id}.log"
@@ -188,6 +211,9 @@ class RunManager:
         child_env = os.environ.copy()
         child_env.setdefault("PYTHONIOENCODING", "utf-8")
         child_env.setdefault("PYTHONUNBUFFERED", "1")
+        # 让子进程知道自己是哪一次 run：launcher 写 train_meta.json 时要带上它。
+        # 用 setdefault 而不是赋值，调用方显式给的值优先（测试会用固定 id）。
+        child_env.setdefault("TRTFORGE_RUN_ID", run_id)
         _apply_offline_defaults(kind, child_env)
         if env:
             child_env.update(env)
@@ -212,6 +238,10 @@ class RunManager:
                 return self._create_warm(
                     run_id, kind, worker, command, cwd, log_file, expect_file, meta,
                     gpu_lock_held=lock_held,
+                    on_finished=on_finished,
+                    resume_dir=resume_dir,
+                    resume_command=resume_command,
+                    resumed_from=resumed_from,
                 )
             except Exception:  # noqa: BLE001 - 热启动任何异常都退回冷启动
                 worker.terminate()
@@ -237,9 +267,25 @@ class RunManager:
             expect_file=expect_file,
             meta=dict(meta or {}),
             gpu_lock_held=lock_held,
+            on_finished=on_finished,
+            resumed_from=resumed_from,
+            resume_dir=Path(resume_dir) if resume_dir else None,
+            resume_command=resume_command,
         )
         with self._lock:
             self._runs[run_id] = run
+
+        # 台账：这一行是「服务重启后还能看见这次任务」的唯一依据。
+        # 写失败不影响任务，record_started 内部已吞掉异常。
+        runledger.record_started(
+            run_id=run_id,
+            kind=kind,
+            command=command,
+            log_file=log_file,
+            started_at=run.started_at,
+            meta=dict(meta or {}),
+            resumed_from=resumed_from,
+        )
 
         # 第一条事件：让前端立刻知道「进程已经起来了」，而不是干等第一行日志。
         self._publish(
@@ -269,6 +315,10 @@ class RunManager:
         expect_file: Path | None,
         meta: dict | None,
         gpu_lock_held: bool = False,
+        on_finished: Any = None,
+        resume_dir: Path | str | None = None,
+        resume_command: Any = None,
+        resumed_from: str | None = None,
     ) -> Run:
         """把任务交给预热进程。复用失败由 create() 捕获后回退冷启动。"""
         run = Run(
@@ -282,9 +332,23 @@ class RunManager:
             meta=dict(meta or {}),
             warm=True,
             gpu_lock_held=gpu_lock_held,
+            on_finished=on_finished,
+            resumed_from=resumed_from,
+            resume_dir=Path(resume_dir) if resume_dir else None,
+            resume_command=resume_command,
         )
         with self._lock:
             self._runs[run_id] = run
+
+        runledger.record_started(
+            run_id=run_id,
+            kind=kind,
+            command=command,
+            log_file=log_file,
+            started_at=run.started_at,
+            meta=dict(meta or {}),
+            resumed_from=resumed_from,
+        )
 
         pre_events = worker.bind(command[2:])
         # 第一条事件必须是 spawned：前端靠它立刻确认「任务已经起来了」。
@@ -342,6 +406,20 @@ class RunManager:
             runs = [r for r in self._runs.values() if r.status == "running" and is_exclusive_kind(r.kind)]
         runs.sort(key=lambda r: r.started_at, reverse=True)
         return [r.snapshot() for r in runs]
+
+    def recover_interrupted(self) -> list[dict]:
+        """启动时把台账里仍为 running 的任务改判为 interrupted。
+
+        返回被改判的记录（快照形式）。台账读不出来时返回空列表——历史列表为空
+        比服务起不来强。
+        """
+        try:
+            runledger.compact()
+            records = runledger.recover_interrupted()
+        except Exception as exc:  # noqa: BLE001
+            print(f"[runners] 台账恢复失败：{type(exc).__name__}: {exc}", flush=True)
+            return []
+        return [runledger.to_snapshot(record) for record in records]
 
     def stop(self, run_id: str) -> bool:
         """终止任务。先 terminate，3 秒不退再 kill。"""
@@ -403,39 +481,40 @@ class RunManager:
     def _reader(self, run: Run) -> None:
         """在独立线程中逐行读取输出，解析并广播。"""
         assert run.process is not None
-        log_handle = None
+        sink = None
         try:
-            log_handle = open(run.log_file, "a", encoding="utf-8", errors="replace")
+            sink = logstore.RunLogSink(run.log_file)
             for raw in iter(run.process.stdout.readline, b""):
-                self._consume(run, raw, log_handle)
+                self._consume(run, raw, sink)
         except Exception as exc:  # noqa: BLE001 - 读线程不能静默死掉
             self._publish_crash(run, exc)
         finally:
-            self._close_log(log_handle)
+            self._close_log(sink)
             self._finalize(run)
 
     def _warm_reader(self, run: Run, worker: warmpool.WarmWorker) -> None:
         """预热进程的读线程：行来源换成 worker 的任务队列，其余流程与冷启动完全一致。"""
-        log_handle = None
+        sink = None
         try:
-            log_handle = open(run.log_file, "a", encoding="utf-8", errors="replace")
+            sink = logstore.RunLogSink(run.log_file)
             for raw in worker.read_task_lines():
-                self._consume(run, raw, log_handle)
+                self._consume(run, raw, sink)
         except Exception as exc:  # noqa: BLE001
             self._publish_crash(run, exc)
         finally:
-            self._close_log(log_handle)
+            self._close_log(sink)
             self._finalize(run)
 
-    def _consume(self, run: Run, raw: bytes, log_handle: Any) -> None:
+    def _consume(self, run: Run, raw: bytes, sink: Any) -> None:
         """处理一行子进程输出：落盘 + 广播 + 喂给进度推断器。"""
         line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
         if not line:
             return
-        log_handle.write(line + "\n")
-        log_handle.flush()
+        if sink is not None:
+            sink.write(line)
         payload = self._parse_line(line)
         self._publish(run, payload)
+        self._absorb_hardware(run, payload)
         # 引擎构建：同一行再喂给进度推断器。tracker 只在阶段变化时返回事件，
         # 普通日志行返回 None，所以不会多出事件。
         if run.tracker is not None:
@@ -444,9 +523,44 @@ class RunManager:
                 self._publish(run, tracker_event)
 
     @staticmethod
-    def _close_log(log_handle: Any) -> None:
-        if log_handle is not None:
-            log_handle.close()
+    def _absorb_hardware(run: Run, payload: dict[str, Any]) -> None:
+        """吸收 launcher 上报的硬件事实：实际精度、峰值显存。
+
+        为什么在读线程里做、而不是等任务结束后统一处理：
+        这些事件在读线程里只出现一次，丢掉就再也拿不到了（日志文件里是文本，
+        再解析一遍既慢又脆）。实测峰值表的价值就在「每次真实训练都记一笔」。
+
+        两张表都只做「顺手记下」：任何异常只留一条日志，绝不影响任务状态——
+        记不住样本只是下次估得保守一点，不该让一次成功的训练被标成失败。
+        """
+        if payload.get("type") != "event":
+            return
+        name = payload.get("name")
+        if name == "amp_state":
+            meta = run.meta
+            meta["amp_requested"] = payload.get("amp_requested")
+            meta["amp_effective"] = payload.get("amp_effective")
+            meta["precision"] = payload.get("precision")
+            if payload.get("gpu"):
+                meta["gpu"] = payload.get("gpu")
+            return
+        if name != "vram_peak":
+            return
+        sample = payload.get("sample")
+        if not isinstance(sample, dict) or not sample:
+            return
+        run.meta["peak_vram_mb"] = payload.get("peak_mb")
+        try:
+            entry = vram.record_sample(**sample)
+        except Exception as exc:  # noqa: BLE001 - 自校准失败不能影响任务
+            entry = {"skipped": f"{type(exc).__name__}: {exc}"}
+        if entry.get("skipped"):
+            run.meta["vram_sample"] = f"未记录：{entry['skipped']}"
+
+    @staticmethod
+    def _close_log(sink: Any) -> None:
+        if sink is not None:
+            sink.close()
 
     def _publish_crash(self, run: Run, exc: Exception) -> None:
         self._publish(
@@ -506,6 +620,90 @@ class RunManager:
                 "log_file": str(run.log_file),
             },
             close=True,
+        )
+        # 台账先落地，再跑收尾回调：回调里可能抛异常，但历史记录不该因此丢。
+        self._record_finished(run)
+        callback = run.on_finished
+        if callback is not None:
+            try:
+                callback()
+            except Exception as exc:  # noqa: BLE001 - 收尾回调不能把任务状态改丢
+                print(f"[runners] 任务结束回调失败：{type(exc).__name__}: {exc}", flush=True)
+        # 自动续训放在最后：它要重新拿 GPU 锁、重新起进程，失败也只影响这一次补跑。
+        self._maybe_resume(run)
+
+    @staticmethod
+    def _record_finished(run: Run) -> None:
+        """把结束状态写进台账。写失败只影响历史列表，不影响任务本身。"""
+        try:
+            runledger.record_finished(
+                run_id=run.run_id,
+                kind=run.kind,
+                status=run.status,
+                exit_code=run.exit_code,
+                started_at=run.started_at,
+                finished_at=run.finished_at,
+                command=run.command,
+                log_file=run.log_file,
+                meta=run.meta,
+                resumed_from=run.resumed_from,
+            )
+        except Exception as exc:  # noqa: BLE001 - 台账不能拖垮收尾
+            print(f"[runners] 台账写入失败：{type(exc).__name__}: {exc}", flush=True)
+
+    def _maybe_resume(self, run: Run) -> None:
+        """训练类任务异常退出后自动续训一次。
+
+        三个前提缺一不可：
+          1. 配置允许（``TRTFORGE_AUTO_RESUME``）；
+          2. 产物目录里有 ``weights/last.pt``——没有权重说明训练根本没开始，
+             重跑只会把「参数写错」变成「一直重跑」；
+          3. 这条任务本身不是续训出来的（``resumed_from`` 为空），
+             杜绝「续训失败又续训」的无限循环。
+        """
+        import config  # 延迟导入：测试里会临时改 config.AUTO_RESUME
+
+        if not config.AUTO_RESUME or run.resume_used:
+            return
+        if run.status != "failed" or run.resume_command is None:
+            return
+        if run.resumed_from:
+            return
+        # 只做 YOLO：launcher 有 `--resume-from`，参数从检查点里读回来，
+        # 续训后的结果与「一次跑完」等价。Anomalib 侧没有对应命令行入口，
+        # 硬做只能重新开一次训练，那不是续训，是重跑。
+        if not run.kind.startswith("yolo-train"):
+            return
+        if run.resume_dir is None:
+            return
+        last_weights = Path(run.resume_dir) / "weights" / "last.pt"
+        if not last_weights.is_file():
+            return
+        try:
+            command = run.resume_command() if callable(run.resume_command) else run.resume_command
+        except Exception as exc:  # noqa: BLE001 - 重建命令失败就当不续训
+            print(f"[runners] 自动续训重建命令失败：{type(exc).__name__}: {exc}", flush=True)
+            return
+        if not command:
+            return
+        try:
+            resumed = self.create(
+                kind=run.kind,
+                command=list(command),
+                cwd=run.cwd,
+                expect_file=run.expect_file,
+                meta=run.meta,
+                resumed_from=run.run_id,
+                resume_dir=run.resume_dir,
+                resume_command=run.resume_command,
+            )
+            resumed.resume_used = True
+        except Exception as exc:  # noqa: BLE001 - 起不来就保持原任务失败状态
+            print(f"[runners] 自动续训启动失败：{type(exc).__name__}: {exc}", flush=True)
+            return
+        print(
+            f"[runners] {run.run_id} 异常结束，已自动续训为 {resumed.run_id}（last.pt 存在）",
+            flush=True,
         )
 
     @staticmethod

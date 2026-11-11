@@ -1,9 +1,12 @@
 {
-  "hypothesis": "在只有 553 张图、960 分辨率下仅约 12 个 epoch 的情况下，冻结前 10 层能显著加快每轮速度（换来更多轮），同时减少小样本过拟合，最后一行 mAP 会高于当前最优。",
-  "changed": "保持 imgsz 960 / batch 4，新增 freeze 0 -> 10",
+  "hypothesis": "在 incumbent 配方上加入垂直翻转（flipud 0 -> 0.5）能让 553 张图在 12 个 epoch 里见到更多视角，提升末行 mAP；PCB 图像上下翻转后，缺陷外观仍然合理。",
+  "changed": "flipud 0.0 -> 0.5（继承 imgsz 960 / batch 4 / cos_lr true / nbs 16 / close_mosaic 4）",
   "train": {
     "imgsz": 960,
     "batch": "4",
-    "freeze": 10
+    "close_mosaic": 4,
+    "cos_lr": true,
+    "nbs": 16,
+    "flipud": 0.5
   }
 }

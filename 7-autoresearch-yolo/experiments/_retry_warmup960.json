@@ -1,0 +1,10 @@
+{
+  "_comment": "补测 exp_0017。上次只写了 warmup_epochs，实际跑成了 640/batch8，结论作废。这次显式继承现任 960/batch4。",
+  "hypothesis": "现任 960 基座上把 warmup 降到 1，看是不是真的不如默认预热",
+  "changed": "warmup_epochs -> 1（继承 imgsz 960 / batch 4）",
+  "train": {
+    "imgsz": 960,
+    "batch": "4",
+    "warmup_epochs": 1
+  }
+}

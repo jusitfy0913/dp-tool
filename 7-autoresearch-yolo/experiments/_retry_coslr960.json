@@ -1,0 +1,10 @@
+{
+  "_comment": "补测 exp_0018。上次打开 cos_lr 后训到第 4 轮进程被杀掉，没有 result.json。这次仍继承现任 960/batch4。",
+  "hypothesis": "现任 960 基座上打开余弦学习率",
+  "changed": "cos_lr false -> true（继承 imgsz 960 / batch 4）",
+  "train": {
+    "imgsz": 960,
+    "batch": "4",
+    "cos_lr": true
+  }
+}

@@ -36,6 +36,13 @@ def discover(filters: list[str]) -> list[Path]:
 def run_one(path: Path) -> tuple[bool, str, float]:
     env = os.environ.copy()
     env.setdefault("PYTHONIOENCODING", "utf-8")
+    # 测试会真的起子进程（退出码、并发、日志轮转那些用例），它们现在会把任务写进
+    # 生产台账 runtime/runs.jsonl。指到临时文件后，跑完一轮测试不会把开发机上的
+    # 「历史任务」列表塞满 kind=test 的假记录。
+    env.setdefault("TRTFORGE_RUNS_LEDGER", str(TOOLS / ".." / ".." / ".." / "runtime" / "runs.test.jsonl"))
+    # 体检缓存同理：测试产生的临时路径签名不该写进开发机的正式缓存，否则真实数据集
+    # 第一次体检时那份缓存会被挤掉，白等十秒。
+    env.setdefault("TRTFORGE_DSQC_CACHE", str(TOOLS / ".." / ".." / ".." / "runtime" / "dsqc_cache.test.json"))
     started = time.time()
     try:
         proc = subprocess.run(

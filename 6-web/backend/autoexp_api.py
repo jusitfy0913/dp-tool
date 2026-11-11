@@ -37,6 +37,7 @@ from pydantic import BaseModel, Field
 
 import config
 import gpulock
+import inferproxy
 import runners
 from runners import manager
 
@@ -344,6 +345,9 @@ def get_history(limit: int = 60) -> dict[str, Any]:
             "verdict": audit.get("verdict", ""),
             "reason": audit.get("reason", ""),
             "delta": audit.get("delta"),
+            # 升级前的台账没有这一列，读出来是空串：前端据此显示「未记录」，
+            # 而不是把所有旧行都当成同一批数据。
+            "data_fp": row.get("data_fp", ""),
         })
     return {"rows": rows, "total": ledger["count"]}
 
@@ -521,15 +525,33 @@ def start_agent(request: AgentStartRequest) -> dict[str, Any]:
                     ),
                 )
         try:
+            info = inferproxy.yield_gpu("自动实验")
+        except Exception as exc:  # noqa: BLE001 - 让出失败不能把训练卡在半路
+            raise HTTPException(status_code=500, detail=f"退出推理进程失败：{exc}") from exc
+
+        def _release_infer() -> None:
+            try:
+                inferproxy.release_gpu_hold()
+            except Exception as exc:  # noqa: BLE001
+                print(f"[autoexp] 解除推理让出失败：{type(exc).__name__}: {exc}", flush=True)
+
+        # 子进程看到这个标记就不再自己去通知网页、更不会在每一轮结束时把让出提前还回去。
+        # 整场实验结束由上面的 _release_infer 解除，下次推理才重新加载。
+        child_env["AUTOEXP_INFER_YIELDED"] = "1"
+        try:
             run = manager.create(
                 RUN_KIND,
                 command,
                 str(AUTOEXP_DIR),
                 env=child_env,
+                on_finished=_release_infer,
             )
         except OSError as exc:
+            _release_infer()
             raise HTTPException(status_code=500, detail=f"启动自动实验进程失败：{exc}") from exc
-    return run.snapshot()
+    snapshot = run.snapshot()
+    snapshot["infer_yielded"] = info
+    return snapshot
 
 
 @router.post("/stop")

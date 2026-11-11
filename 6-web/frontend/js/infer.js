@@ -122,12 +122,14 @@ export function initInfer() {
   });
   // 切换权重格式只换路径，不重扫目录：引擎与 ONNX 都在同一条产物里
   dom.weight?.addEventListener("change", onWeightChange);
-  // 手动改路径后让权重格式跟随后缀，避免界面显示和实际后端不一致
+  // 手动改路径后让权重格式跟随后缀，避免界面显示和实际后端不一致；
+  // 顺带回填该引擎验证时存下的操作点 conf
   for (const id of ["yoloEngine", "anomEngine"]) {
     document.getElementById(id)?.addEventListener("change", (event) => {
       const isOnnx = String(event.target.value || "").toLowerCase().endsWith(".onnx");
       if (dom.weight) dom.weight.value = isOnnx ? "onnx" : "engine";
       updateWeightHint();
+      if (id === "yoloEngine") applyEngineOperatingPoint();
     });
   }
 
@@ -502,6 +504,41 @@ function updateWeightHint() {
   } else {
     dom.weightHint.textContent = "TensorRT 引擎走 yolo_infer / anomalib_infer 动态库。";
   }
+  if (engineOpHint) dom.weightHint.textContent += ` ${engineOpHint}`;
+}
+
+// 操作点提示单独存一份：其它地方会重置 hint 文案，存成变量才能在重写后再拼回去
+let engineOpHint = "";
+
+/**
+ * 回填引擎操作点：验证页「保存为引擎操作点」把 conf 写进 <engine>.meta.json。
+ * 拿不到操作点是正常情况（没验证过就没存），静默跳过，不打扰用户。
+ */
+async function applyEngineOperatingPoint() {
+  engineOpHint = "";
+  const engine = value("yoloEngine");
+  const confEl = document.getElementById("inferConf");
+  if (!engine || !confEl || !/\.engine$/i.test(engine)) {
+    updateWeightHint();
+    return;
+  }
+  try {
+    const data = await getJSON(`/api/engine/operating-point?engine=${encodeURIComponent(engine)}`);
+    const point = (data && data.operating_point) || null;
+    if (!point || typeof point.conf !== "number") {
+      updateWeightHint();
+      return;
+    }
+    confEl.value = String(point.conf);
+    const bits = [`已回填验证操作点 conf=${point.conf.toFixed(2)}`];
+    if (typeof point.miss_rate === "number") bits.push(`漏检 ${(point.miss_rate * 100).toFixed(1)}%`);
+    if (typeof point.fp_per_image === "number") bits.push(`过杀 ${point.fp_per_image.toFixed(2)} 图`);
+    engineOpHint = bits.join("，") + "。";
+    updateWeightHint();
+  } catch (_err) {
+    // 老引擎没有 meta.json，属正常情况
+    updateWeightHint();
+  }
 }
 
 function onWeightChange() {
@@ -563,6 +600,8 @@ function applyModelToForm(item) {
       : `已填入 ${item.name}${item.labels ? "（含标签文件）" : ""}`;
   }
   markParamsDirty();
+  // 选中模型后同步回填操作点：用户不必记上次验证定的 conf
+  if (item.kind === "yolo") applyEngineOperatingPoint();
 }
 
 /** `Patchcore` / `PATCHCORE` → 下拉里的 `PatchCore`。 */

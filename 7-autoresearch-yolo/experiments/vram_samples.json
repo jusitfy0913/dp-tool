@@ -1,0 +1,16 @@
+{
+  "_comment": "显存实测峰值表。键格式 imgsz x batch x 精度（如 960x4xfp32），值为该组合历次训练的最大峰值（torch.cuda.max_memory_reserved，MB）。由训练结束自动写入，不要手工改成「理论值」，否则预检会失去意义。",
+  "updated_at": "2026-11-11T16:06:26",
+  "samples": {
+    "640x8xfp32": {
+      "imgsz": 640,
+      "batch": 8,
+      "precision": "fp32",
+      "peak_mb": 2132.0,
+      "count": 1,
+      "last_at": "2026-11-11T16:06:26",
+      "first_at": "2026-11-11T16:06:26",
+      "peak_allocated_mb": 1769.2
+    }
+  }
+}

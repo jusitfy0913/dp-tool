@@ -818,6 +818,8 @@ job.json                     # 本次参数与耗时，便于复现
 3. 填 train / val 比例，右侧会实时显示 `test = 100 - train - val`。
 4. 点「扫描预览」：显示总图片、各集张数、空标注数、类别数，以及每张图的「现有划分 → 新划分」。
 5. 选导出格式与输出目录，点「开始导出」。
+6. 可选：点「体检」查重复图 / 同底板分组 / 标注问题（见下方 v1.34.3）；导出前把「划分口径」
+   从 `none` 改成 `prefix` 或 `dir`，即可让同一块底板的图只落在一个划分里。
 
 **划分规则（与 Qt 版对齐，务必注意）**
 
@@ -846,6 +848,121 @@ job.json                     # 本次参数与耗时，便于复现
 实测参考（PCB 6 类 / 692 张 / 3034×1586）：扫描 692 张、2950 个对象、0 空标注；
 70/20/10 → 484/138/70；YOLO 标签往返逐值无损；COCO 2950 条标注；VOC 692 个 XML。
 验收脚本：`python 6-web/backend/tools/test_dataset_workbench.py`（20 项）。
+
+#### 数据集指纹（v1.34.2）
+
+导出时会算一个**内容指纹**并写进 `<输出目录>/manifest.json`，回答「这批图到底是哪一批」。
+
+- **算法 `v1`**：每个 split 内取 `相对路径 + 文件字节数 + 标注文件原始字节哈希`，
+  排序后 sha256 取前 16 位；三个 split 的摘要再合成整批指纹。
+- **三个粒度**：`dataset_fingerprint`（整批，判断能不能横比）、
+  `split_fingerprints`（只改了 val 吗）、`label_fingerprint`（只算标注、不含路径，
+  判断「模型变了还是标注变了」）。
+- **相对路径以 split 的 images 目录为基准**，所以同一批数据导出到 `D:\out_a` 与
+  `E:\out_b`、或镜像到 `splits/`，指纹完全相同。
+- **重命名算变化**：路径进哈希。重命名图片时必须同步改标签文件名，否则那条标注会丢。
+- **不哈希图片内容**：只读 `stat` 与标注文本，650 张约 0.14 秒；因此
+  「同名同大小但内容被换」发现不了，界面上会写明这个边界。
+
+| 指纹字段 | 类型 | 含义 |
+| --- | --- | --- |
+| `algo` | string | 算法版本，当前 `v1` |
+| `dataset_fingerprint` | string(16) | 整批指纹 |
+| `short` | string(8) | 前 8 位，页面与台账展示 |
+| `split_fingerprints` | object | `{train, val, test}` 各自指纹 |
+| `label_fingerprint` | string(16) | 标注文本指纹（不含路径） |
+| `counts` | object | `{train, val, test}` 图片数 |
+| `error` | string | 计算失败原因；空表示正常 |
+
+重复导出到同一目录时，内容未变会返回 `unchanged: true`。覆盖导出前会清理上次的
+`images/`、`labels/`（或分类的 `train/val/test`、VOC 的 `JPEGImages/Annotations`），
+避免同名图被 `_copy_image` 累积成 `xxx_2.jpg` —— 那会让「同一批数据再导一次」得到
+不同指纹。
+
+指纹还会写进：训练 `run.meta.dataset`、训练目录 `train_meta.json`、
+`7-autoresearch-yolo` 的 `exp_NNNN.json` / `results.tsv` 的 `data_fp` 列 / `best.json`，
+以及引擎旁的 `<engine>.meta.json`。
+
+#### 数据集体检与按组划分（v1.34.3）
+
+**要解决的问题**：`PCB data/PCB缺陷检测` 这类工业数据集合计 692 张，实际只有 **10 块底板**，
+每块底板拍了几十张「同位置、不同缺陷」的图。按图片随机划分时，同一块底板必然同时出现在
+train 和 val 里；模型记住的是底板外观，val 指标虚高、上线就掉。指纹（上一节）回答
+「是不是同一批数据」，体检回答「这批数据本身干不干净」，两者都只读。
+
+点「体检」后页面显示三块内容：指标行（图片数 / 底板组数 / 跨划分组数 / 错误·警告计数）、
+可展开的底板组列表（跨划分的组带红色标记）、按规则折叠的标注问题列表。
+
+**分组判定分两级，绝不自动删图**
+
+| 级别 | 判定 | 用途 |
+| --- | --- | --- |
+| A 完全重复 | 文件 `sha256` 相同（改名/复制出来的那张） | 只报告，供人工清理 |
+| B 同底板 | **256 位 dHash**（17×16 灰度图比较相邻像素）汉明距离 ≤ 8，**且** 32×32 灰度平均绝对差 ≤ 2.0 | 泄漏告警 + 按组划分，**永不自动删除** |
+
+为什么要第二种校验：dHash 只看梯度符号，PCB 的大面积纯色板面在纯哈希下**可能**让不同底板撞位，
+一旦漏判就会给出错误的泄漏结论；MAE 用真实像素再确认一次。另外 64 位 dHash（阈值 ≤6）在这份
+数据上也能分出这 10 组，但常规「重复图去重」会顺手删掉组内 691 张、毁掉全部缺陷样本——
+所以本版把「完全重复」和「同底板」分成两级，B 级只告警、永不自动删除。
+
+**标注质检规则**（逐行检查，永不抛异常；级别只影响排序与着色，不阻断导出/训练）
+
+| 级别 | 规则码 |
+| --- | --- |
+| error | `LBL_MISSING` 标注缺失、`LBL_FIELD` 字段数不符、`LBL_PARSE` 数值无法解析、`LBL_CLASS_RANGE` 类别越界、`LBL_COORD_RANGE` 坐标越界、`LBL_ZERO_AREA` 零面积 |
+| warn | `LBL_TINY` 面积 <0.01%、`LBL_HUGE` >60%、`LBL_BORDER` 贴边、`LBL_DUP_BOX` 同图两框 IoU>0.9、`LBL_CLASS_ABSENT` 某类缺失 |
+| info | `LBL_EMPTY` 空标注、`LBL_IMBALANCE` 某类占比 <2%、`GRP_LABEL_DIFF` 同底板同位置标了不同类别 |
+
+**按组划分（`group_by`）**
+
+- `none`（默认）：v1.6 起的逐图哈希划分，行为不变；
+- `prefix`：按文件名前缀分组（`01_xxx.jpg` 的前缀是 `01`），适合 `01_` 这种底板编号命名；
+- `dir`：按父目录名分组，适合「一块板一个文件夹」的组织方式。
+
+同组必须整组进同一个划分。实现是「补最大缺口」的贪心：每次取下一个组，放进
+（目标张数 − 当前张数）缺口最大的那一侧。组数少于 2 或单组过大时比例会明显偏离设定值，
+报告与 `manifest.json` 都会写明，这是刻意取舍——宁可比例不准，也不要泄漏。
+`manifest.json` 新增 `split_mode: {mode, groups, note}` 与 `group_signature`，事后可证。
+
+**缓存**：签名缓存到 `runtime/dsqc_cache.json`，键为 `绝对路径｜字节数｜纳秒mtime`，
+文件被覆盖即失效；`algo` 版本变化整体作废；上限 20000 条，超出按写入时间丢最旧一半。
+692 张首次约 1~10 秒，第二次走缓存基本瞬时。体检不改任何图片或标注文件。
+
+
+#### 良品图与操作点（v1.34.4）
+
+**应用场景**
+
+| 场景 | 用法 |
+| --- | --- |
+| 产线要评估「过杀」 | 把没有缺陷的 OK 图放进一个目录，填进「良品目录」→ 验证时统计良品误报率 |
+| 决定上线阈值 | 在验证报告的漏检-过杀曲线上选目标漏检率，看要付出多少过杀，再把点存成引擎工作点 |
+| 现场复现同一判定 | 推理页选中该引擎，conf 自动回填为验证时定下的值，不会再手抄错 |
+| 自动实验不看错方向 | `mAP` 涨了但过杀明显恶化时，`judge_round` 判 `DISCARD` |
+
+**参数说明**
+
+| 参数 | 默认 | 说明 |
+| --- | --- | --- |
+| `ok_dirs` | 空 | 良品目录，相对数据源根，多个用**分号**分隔（`ok;test/good`）。目录里的图**必须没有非空标注**，否则直接报错 |
+| `ok_split` | `val` | 良品图强制归入的划分：`val` / `test`（前端只给这两个选项，避免被填成 `train` 混进训练） |
+| `--target-miss-rate` | `0.01` | `tools/val_engine.py`：推荐操作点的目标漏检率，决定 `recommended_operating_point` 选哪个点 |
+| `--operating-confs` | 空 | 自定义扫描的 conf 列表（逗号或分号分隔）；留空用默认 19 点（0.05 → 0.95） |
+
+**关键语义（容易理解错的三条）**
+
+| 现象 | 真相 |
+| --- | --- |
+| 一张图没有 `.txt` | 是 **`missing`（漏标嫌疑）**，**不算良品**，不进过杀统计——否则过杀率会被假数据稀释 |
+| 一张图 `.txt` 是空文件 | 是 **`ok`（良品）**，参与过杀统计。导出良品图时写的就是空文件，不是不写 |
+| 没有良品图 | `ok_fp_rate` 返回 **`null`**。`null` = 没测过，`0.0` = 测过且一个没误报，两者必须能区分 |
+
+**操作点保存位置**：`<引擎文件名>.meta.json` 的 `operating_point` 字段，与 v1.34.2 的
+ONNX/引擎 sha256、来源训练 run 放在同一个旁挂文件里。**不修改引擎、不修改 `metadata.json`**，
+所以删掉这个字段就回到「推理页用默认 conf」的老行为。
+
+**验证**：`tools/test_operating_points.py` 48 项、`tools/test_dataset_workbench.py` 新增 23 项
+（脚本内自造临时数据，不依赖本机数据集）。
 
 ### 标注（v1.9 新增）
 
@@ -1997,6 +2114,54 @@ version_diff:
 
 详细复盘见 [../7-autoresearch-yolo/README.md](../7-autoresearch-yolo/README.md) §14.9 / §14.10 / v0.2.1。
 
+#### v1.34.0 变更点（相对 v1.33.3）——任务台账落盘、日志轮转、崩溃自动续训
+
+服务一重启，页面上所有历史任务消失，日志文件还在磁盘上却找不回来；`runtime/logs`
+只增不减；训练崩了只能人守着点续训。这一版补的就是这三件。
+
+| 事项 | 变化 |
+| --- | --- |
+| 任务台账 | 新增 `runtime/runs.jsonl`（追加写）。任务创建写 `running`，结束写完整快照 |
+| 重启恢复 | 启动时把仍为 `running` 的改判 `interrupted`（`orphan=true`），并追加一条记录 |
+| 历史接口 | 新增 `GET /api/runs/history?limit=50`（上限 500）。`/api/runs` 语义不变 |
+| 历史任务 | 只读：停止接口对历史 run 返回 404，日志接口照常可读 |
+| 前端 | 顶栏新增「历史」按钮 + 浮层；状态区分「完成 / 失败 / 已停止 / 已中断」 |
+| 日志轮转 | 单任务超过 20MB 滚动成 `.log.1`…，最多 3 份；读取接口跨分片拼接 |
+| 日志清理 | 启动时整族删除 30 天未更新的任务日志；`0` 关闭 |
+| 自动续训 | `yolo-train` 失败且有 `weights/last.pt` 时用 `--resume-from` 续跑一次 |
+
+**新增文件**：`backend/runledger.py`（台账）、`backend/logstore.py`（滚动写入 / 跨分片读取 / 过期清理）、
+`backend/tools/test_run_history.py`。
+
+**改动文件**：`config.py`（4 个环境变量 + 台账路径）、`runners.py`（写台账、轮转日志、
+`_maybe_resume`）、`app.py`（历史接口、日志接口走分片、启动恢复与清理、版本 1.34.0）、
+`frontend/js/{api,runsbar}.js`、`frontend/index.html`、`frontend/css/style.css`、
+`tools/{run_all_tests,test_runsbar}.mjs`。
+
+**测试**：`tools/test_run_history.py` 48 项；回归 `test_run_log.py` 22 项、
+`test_exit_codes.py` 6 项、`test_pipeline_log.py` 9 项、`test_pipeline_stages.py` 50 项、
+`test_concurrency.py` 全绿；前端 `test_runsbar.mjs` 41 项。
+
+**真机验证**（本机 T1000 / 8060）：启动打印「台账恢复：1 个上次未结束的任务已标记为中断」；
+运行中强杀服务后重启，历史列表显示 `anomalib-check-env / interrupted / orphan=true / 8.0s`，
+该任务日志仍可 `HTTP 200` 打开，停止接口返回 `404`。
+
+#### v1.33.3 变更点（相对 v1.33.2）——自动实验开始时退出推理进程
+
+960/batch4 训练约 5.5GB，推理进程懒加载后常驻约 1.7GB，叠在 8GB 卡上会在第一个 batch OOM。
+
+| 时机 | 行为 |
+| --- | --- |
+| `POST /api/autoexp/start` | 先 `inferproxy.yield_gpu("自动实验")`，再拉起 agent；子进程带 `AUTOEXP_INFER_YIELDED=1` |
+| 实验进行中 | `/api/infer/*` 返回 503；`/api/infer/worker/restart` 拒绝拉起 |
+| 任务结束（成功、失败、停止） | `on_finished` 调 `release_gpu_hold()`，**不**立刻重载 |
+| 下一次推理 | `call()` 发现没有让出标记，才按需拉起 `infer_worker`。进程停着但没有让出时，选后端不会把「还没问过 DLL」当成 DLL 坏了，否则这次请求到不了拉起那一步 |
+| 命令行 `agent` / `run` / `noise` | 向 `http://127.0.0.1:8060`（或 `AUTOEXP_WEB_URL`）发 `POST /api/infer/gpu-yield`；整场只让出一次，每一轮不会提前归还 |
+
+**改动文件**：`inferproxy.py`、`autoexp_api.py`、`runners.py`（`Run.on_finished`）、`app.py`（两个接口，版本 1.33.3）、`7-autoresearch-yolo/autoexp.py`。
+
+**测试**：`tools/test_infer_yield.py` 6 项；`test_autoexp_api.py` 16 项（含 409 不让出、启动失败必解除）；autoexp `run_all_tests.py` 56 项（含嵌套不能提前归还、开场事件能读到时间上限）。真机记录见 [../docs/TEST_PLAN_AUTOEXP_ROBUSTNESS.md](../docs/TEST_PLAN_AUTOEXP_ROBUSTNESS.md)。
+
 #### v1.33.2 变更点（相对 v1.33.1）——修「5 轮全 DISCARD」暴露的三个问题
 
 **背景**：v1.33.1 修完截断后，模型侧**首次做到 5 轮 0 失败**（目标达成）。
@@ -2987,6 +3152,125 @@ capabilities 的 `native_dialog`）、`frontend/js/main.js`（统一入口 + 提
 - 按钮状态机在 `frontend/js/logs.js` 的 `createLogActions()`；`test_log_actions.mjs` 覆盖
   「没 run 不能点」「没有日志不能复制」「切换任务要清空」三种情形。
 
+### 历史任务与任务台账（v1.34）
+
+`/api/runs` 只返回**本进程**创建的任务，服务一重启就空。所以 v1.34 加了一份落盘台账
+`runtime/runs.jsonl`（追加写、一个任务两行），并在顶栏加了一个「历史」按钮：
+
+| 项 | 行为 |
+| --- | --- |
+| 台账内容 | `run_id / kind / status / exit_code / started_at / finished_at / command / log_file / resumed_from` |
+| 何时写 | 任务创建时写一行 `running`，结束（成功/失败/被停止）时写一行完整快照 |
+| 重启恢复 | 启动时把仍是 `running` 的记录改判为 `interrupted`（`orphan=true`），启动日志会打印「台账恢复：N 个」 |
+| 接口 | `GET /api/runs/history?limit=50`（上限 500）。`/api/runs` 语义不变 |
+| 历史任务能做什么 | 看状态、看时长、打开日志。**不能停止**（`POST /api/runs/{id}/stop` 返回 404） |
+| 前端 | 顶栏「历史」按钮点开浮层；只在点开时请求一次，不参与 3 秒轮询 |
+
+为什么不存整个 `Run`：里面有 `Popen`、`asyncio.Queue`、`threading.Lock`，序列化既不可靠
+也会随字段改动失效；重启后真正需要的只是「它怎么结束的、日志在哪」。
+
+### 日志轮转与清理（v1.34）
+
+单次任务日志超过 `TRTFORGE_LOG_MAX_MB`（默认 20MB）就滚动成 `{run_id}.log.1`、
+`.log.2`…，最多留 `TRTFORGE_LOG_BACKUPS`（默认 3）份。读取接口会跨分片拼接，
+所以「日志文件」按钮拿到的仍是完整内容，`lines=N` 从最新分片往前取。
+
+任务日志还会按族清理：启动时删掉超过 `TRTFORGE_LOG_RETENTION_DAYS`（默认 30 天）
+没更新过的任务日志（所有分片一起删），设 `0` 关闭。只认 `{12位十六进制}.log[N]`
+这种文件名，同目录里 `infer_worker.log` 之类不会被误删。
+
+### 训练崩溃自动续训（v1.34）
+
+`yolo-train` 非零退出、且训练目录下存在 `weights/last.pt` 时，后端自动用
+`--resume-from <last.pt>` 再跑一次（`exist_ok=True`，写回同一个 `project/name`）。
+三条限制：**只续一次**（续训本身失败不再续）、**只对 YOLO**（Anomalib 没有等价的命令行
+续训入口）、**没有 last.pt 不续**（参数错误时重跑只会把失败拖成一直重跑）。
+关闭方式：`TRTFORGE_AUTO_RESUME=0`。续训出来的任务在台账里带 `resumed_from`。
+
+### 显存预检：实测峰值表 + 安全余量 + 自校准（v1.34.1）
+
+**为什么换掉公式**。旧公式 `2600 + 240 × batch × (imgsz/640)²` 是手工拟合的，与实测脱节：
+台账里 `640/batch=8` 的峰值是 1769 MB，公式却估 4520 MB；到了 `960/batch=4`，公式估
+4760 MB 就放行，实际仍然 OOM。显存占用与 `(batch, imgsz, 精度)` 不是一条固定系数能覆盖的，
+所以改成「跑过就记下来，下次按实测判断」。
+
+判定逻辑全部在 `6-web/backend/vram.py`，**网页端训练接口和 `7-autoresearch-yolo/autoexp.py`
+共用同一份**——历史上两处各写一份，已经在 960/batch=4 上给出过互斥结论。
+
+**实测峰值表**：`7-autoresearch-yolo/experiments/vram_samples.json`（`config.VRAM_SAMPLES`，
+可用 `TRTFORGE_VRAM_SAMPLES` 覆盖）。键 `imgsz x batch x 精度`，如 `640x8xfp32`：
+
+```json
+"640x8xfp32": {
+  "imgsz": 640, "batch": 8, "precision": "fp32",
+  "peak_mb": 2132.0,          // max_memory_reserved，历次取最大
+  "peak_allocated_mb": 1769.2, // 仅留档，不参与判定
+  "count": 1, "first_at": "...", "last_at": "..."
+}
+```
+
+**四档依据（按可信度从高到低）**
+
+| 来源 | 触发条件 | 需求计算 | 为什么 |
+| --- | --- | --- | --- |
+| `measured` | 同 `(imgsz, batch, 精度)` 有样本 | `peak × 1.15 + 400` | 最可信，直接用 |
+| `scaled` | 同 `imgsz`/精度，只有**更小** batch 的样本 | `peak × b/b₀ × 1.15 + 400` | 固定开销被重复计一遍，偏差方向**安全**；不做向下缩小，那正是「放行了会 OOM」的错 |
+| `capped` | 同 `imgsz`/精度，只有**更大** batch 的样本 | 取它的实测值作上界 | 显存随 batch 不减；少了这条会出现「batch 调小反而更吃显存」的荒唐建议 |
+| `formula` | 什么都没跑过 | `2600 + 300 × batch × (imgsz/640)²` | 刻意保守：它是闸门，不是预测器 |
+
+**自校准**：launcher 在 `on_train_end` 把 `torch.cuda.max_memory_reserved()` 通过
+`vram_peak` 事件带回，`runners._absorb_hardware()` 调 `vram.record_sample()` 写表。
+用 `reserved` 而不是 `allocated`：OOM 发生在向驱动申请那一刻，`allocated` 低估 30% 以上。
+样本键带精度（`fp32`/`fp16`）：同一张卡上两种精度的激活显存差近一倍，共用键会让
+「别处 fp16 的样本」放行「本机 fp32 的组合」。
+
+**本机实测**（T1000 8GB，fp32）：
+
+| 配置 | 依据 | 需求 | 旧公式 |
+| --- | --- | --- | --- |
+| `640/batch=8` | `measured`（2132 MB） | 2852 MB | 4520 MB ❌ |
+| `640/batch=16` | `scaled`（由 batch=8 外推） | 5304 MB | 7400 MB ❌ |
+| `640/batch=4` | `capped`（batch=8 作上界） | 2852 MB | 3800 MB ❌ |
+| `960/batch=8` | `formula`（没跑过 960） | 8000 MB | 8000 MB |
+
+**拦不住时让人自己决定**：`POST /api/train/yolo` 预检不过返回 **HTTP 409**，`detail` 以
+`VRAM_PREFLIGHT:` 开头并附可执行建议（降 batch 到多少、先停哪个进程）。页面弹出
+「仍然开始（显存可能不够）」，确认后带 `allow_low_vram=true` 重发。**闸门是建议，不是禁令。**
+
+**边界**：不做 batch 插值（插值等于回到「猜系数」）；样本只服务本机（不同卡/驱动不可比，
+不做跨机器合并）；`batch=auto` / `8,16` 这类非单点值直接放行并在返回里说明，预检自己
+绝不能抛异常——它是闸门，闸门出错会把「本来能跑的训练」拦成 500。
+
+### AMP 实际状态：检测、可见、可覆盖（v1.34.1）
+
+**问题**：页面上「混合精度 ✓」不等于真的用了 fp16。Ultralytics 8.4.192 有一份
+`AmpBlacklist`，命中就静默关闭 AMP —— 用户看到的是「训练变慢了、显存变高了」，却没有任何解释。
+
+`6-web/backend/ampcheck.py` 复刻了那份正则
+`(nvidia|geforce|quadro|tesla).*?(1660|1650|1630|t400|t550|t600|t1000|t1200|t2000|k40m)`，
+本机 T1000 命中 `t1000`，因此 `available=false`，提示词直接写明：
+
+> NVIDIA T1000 8GB 命中 ultralytics 8.4.192 的 AMP 黑名单（t1000）：这批卡用 fp16 会出现
+> NaN loss 或 zero-mAP，框架会在训练开始时关闭混合精度。
+> 本次训练实际走 fp32：显存占用明显更高（同等 batch 约为 fp16 的 1.5~2 倍），速度约慢一倍。
+> 即使传 `--amp` 也无法强制开启——关闭发生在框架内部。
+
+**三态 `amp`**（`YoloTrainRequest.amp`）：
+
+| 值 | 命令行 | 用途 |
+| --- | --- | --- |
+| 不传 / `null` | 不加参数（按本机自动） | 默认。黑名单机器自动走 fp32，白名单机器自动 fp16 |
+| `false` | `--no-amp` | 强制单精度 |
+| `true` | `--amp` | 显式请求（**黑名单机器上仍会被框架关掉**，页面会如实显示） |
+
+**回显靠事件，不靠参数**：launcher 在 `on_train_start` 发
+`{"event":"amp_state","amp_requested":true,"amp_effective":false,"precision":"fp32"}`，
+`_absorb_hardware()` 记进 `run.meta`，页面「算力体检」区显示「请求 / 实际」两列。
+真机 1 epoch 验证结果正是 `amp_requested=true / amp_effective=false`。
+
+**体检接口**：`GET /api/train/preflight?imgsz=640&batch=16`，不需要真的开训就能看到
+GPU 名称/总量/可用量与该组合的估算依据（`source` / `needed_mb` / `reason` / `hint`）。
+
 ## 前端视觉体系
 
 前端是**零构建**的：不装 npm、不打包、不引第三方库，改完刷新即可。视觉改造也遵守这条约束，
@@ -3089,6 +3373,12 @@ offset1 = cursor - p_image * scale1
 | `TRTFORGE_INFER_WORKERS` | **v1.31**：推理进程数，1~8。不设时按显存自动判断（≥6 GB 开 2，查不到显卡开 1）；设了就以它为准 | 自动（2 或 1） |
 | `TRTFORGE_INFER_QUEUE_TIMEOUT` | **v1.31**：所有推理进程都忙时，请求在队列里最多等几秒，超时返回 HTTP 503 | `30` |
 | `TRTFORGE_TEST_HOOKS` | **v1.28**：设为 `1` 启用测试钩子（仅自动化测试，生产勿开） | 未设 |
+| `TRTFORGE_RUNS_LEDGER` | **v1.34**：任务台账文件路径。测试/CI 指到临时文件，避免把假任务写进开发机的历史列表 | `6-web/runtime/runs.jsonl` |
+| `TRTFORGE_LOG_MAX_MB` | **v1.34**：单个任务日志的上限（MB），超过就滚动成 `.log.1`… | `20` |
+| `TRTFORGE_LOG_BACKUPS` | **v1.34**：每个任务保留几个滚动分片 | `3` |
+| `TRTFORGE_LOG_RETENTION_DAYS` | **v1.34**：任务日志保留天数，启动时整族清理更老的日志；`0` = 不清理 | `30` |
+| `TRTFORGE_AUTO_RESUME` | **v1.34**：YOLO 训练异常退出且有 `weights/last.pt` 时自动续训一次；`0` = 关闭 | `1`（启用） |
+| `TRTFORGE_DSQC_CACHE` | **v1.34.3**：数据集体检的签名缓存路径。测试/CI 指到临时文件，避免污染运行目录 | `6-web/runtime/dsqc_cache.json` |
 
 ## 后端接口
 
@@ -3096,7 +3386,7 @@ offset1 = cursor - p_image * scale1
 | --- | --- | --- |
 | GET | `/api/health` | 存活探针，返回 `{"ok":true,"version":"1.16.0"}`；版本号用来识别「连到了旧进程」 |
 | GET | `/api/capabilities` | 环境探测（前端状态灯用）；**v1.28** 起含 `infer_worker`（`enabled,state,pid,restarts,recent_crashes,last_error`，`state` 为 running/stopped/tripped/disabled） |
-| POST | `/api/train/yolo` | 启动 YOLO 训练 |
+| POST | `/api/train/yolo` | 启动 YOLO 训练；**v1.34.2** 起 `run.meta.dataset` 与 `run.meta.data_fp` 记录本次数据集指纹，子进程环境变量带 `TRTFORGE_DATASET_FP` / `TRTFORGE_RUN_ID` |
 | POST | `/api/train/anomalib` | 启动 Anomalib 训练 |
 | POST | `/api/train/{yolo\|anomalib}/check-env` | 环境自检（开训前查缺依赖） |
 | GET | `/api/warm/status` | **v1.25**：预热池状态（`enabled` + 每类 `state: idle/warming/ready`、`pid`、`age_seconds`） |
@@ -3113,8 +3403,10 @@ offset1 = cursor - p_image * scale1
 | POST | `/api/pipeline/{id}/stop` | **v1.17**：停止整条链（只停当前那一段） |
 | GET | `/api/pipeline/{id}/log?stage=&lines=` | **v1.17**：读某一段的日志尾巴（plain text）。服务重启后 run 已不在内存，只能靠它看历史阶段日志 |
 | GET | `/api/runs?limit=20` | 任务列表（**v1.25.2** 起支持 `limit` 取最近 N 条；`status=running` 表示还在跑） |
+| GET | `/api/runs/history?limit=50` | **v1.34**：历史任务（读 `runtime/runs.jsonl` 台账，跨服务重启）。上限 500；`history=true` 表示只读 |
+| GET | `/api/train/preflight?imgsz=640&batch=16` | **v1.34.1**：算力体检。返回 `{ok, vram:{...}, amp, amp_text, precision, sample_count, store, version}`；`vram.source` 为 `measured/scaled/capped/formula/skipped`。不开训也能看 |
 | GET | `/api/runs/{run_id}` | 单任务状态（snapshot 带 `log_file`，**v1.25.3** 起） |
-| GET | `/api/runs/{run_id}/log?lines=0` | **v1.25.3**：任务日志全文（`lines=N` 取尾巴）。纯文本 + `inline` 文件名，面板之外也能拿到完整日志 |
+| GET | `/api/runs/{run_id}/log?lines=0` | **v1.25.3**：任务日志全文（`lines=N` 取尾巴）。纯文本 + `inline` 文件名，面板之外也能拿到完整日志。**v1.34** 起跨滚动分片拼接 |
 | POST | `/api/runs/{run_id}/stop` | 停止任务 |
 | WS | `/ws/runs/{run_id}` | 事件流（训练日志 / 进度）。连上即补发最近 2000 条，用于刷新后接续；**v1.25.3** 起每条带自增 `seq`，前端据此去重 |
 | GET | `/api/browse?path=` | 目录浏览（页面内选择，远程访问时的兜底） |
@@ -3135,7 +3427,15 @@ offset1 = cursor - p_image * scale1
 | GET | `/api/engine/probe?onnx=` | 探测 ONNX 输入/输出形状，判断是否可用 |
 | POST | `/api/engine/build` | 用 trtexec 把 ONNX 编译成引擎 |
 | POST | `/api/dataset/scan` | 扫描数据集并按比例返回划分预览（不落盘） |
-| POST | `/api/dataset/export` | 按比例导出 YOLO / COCO / VOC |
+| POST | `/api/dataset/export` | 按比例导出 YOLO / COCO / VOC；写 `<输出目录>/manifest.json`，响应带 `data_fp` 与 `unchanged` |
+| GET | `/api/dataset/fingerprint?source=` | **v1.34.2** 只读算数据集指纹（不落盘、不缓存）；失败返回 `error` 字段而不报 5xx |
+| POST | `/api/dataset/qc` | **v1.34.3** 只读体检：`{source, task, threshold=8, limit=500}` → 分组 / 跨划分泄漏 / 标注问题 / `elapsed_ms`。不写任何数据文件，只更新签名缓存 |
+| POST | `/api/dataset/scan` | **v1.34.3** 起支持 `group_by: none\|prefix\|dir`，预览按组划分结果 |
+| POST | `/api/dataset/export` | **v1.34.3** 起支持 `group_by` 与 `with_qc`（把体检摘要写进 `manifest.json` 的 `qc`）；**v1.34.4** 起支持 `ok_dirs` 与 `ok_split` |
+| POST | `/api/dataset/scan` | **v1.34.4** 起支持 `ok_dirs` / `ok_split`，返回 `ok: {dirs, images, split, note}` |
+| POST | `/api/dataset/qc` | **v1.34.4** 起支持 `ok_dirs`：声明过的良品图不再报 `LBL_MISSING` / `LBL_EMPTY` |
+| POST | `/api/engine/operating-point` | **v1.34.4**：把验证曲线上的点写进 `<engine>.meta.json` 的 `operating_point`；`{engine, conf, iou, source, target_miss_rate, metrics}`，只写旁挂文件 |
+| GET | `/api/engine/operating-point?engine=` | **v1.34.4**：读回引擎工作点；没有则返回 `operating_point: null`（推理页据此决定要不要预填 conf） |
 | GET | `/api/annotation/project?path=` | 读取 `.tfanno`，返回工程 + `rev` / `mtime_ns` / 统计；文件不存在返回空白骨架 |
 | POST | `/api/annotation/project` | 保存工程，校验 `rev` 与 `stamp`，冲突返回 **409** 并附磁盘真实状态 |
 | GET | `/api/annotation/image?path=` | 图片流（支持中文与空格路径），MIME 按扩展名推断 |
@@ -3228,6 +3528,36 @@ offset1 = cursor - p_image * scale1
 | 字段 | 类型 | 默认 | 说明 |
 | --- | --- | --- | --- |
 | `resume_from` | str | 空 | `weights/last.pt` 的绝对路径。非空时 launcher 执行 `model.train(resume=该路径)`，并把该权重作为初始模型加载；为空则行为与升级前一致 |
+
+`POST /api/train/yolo` 的精度与显存字段（**v1.34.1**）：
+
+| 字段 | 类型 | 默认 | 说明 |
+| --- | --- | --- | --- |
+| `amp` | bool \| null | `null` | 三态：`null` = 不给命令行参数（按本机自动，黑名单机器走 fp32）；`false` = `--no-amp`；`true` = `--amp`（黑名单机器上框架仍会关掉，页面按 `amp_state` 事件显示实际值） |
+| `allow_low_vram` | bool | `false` | 预检不过时是否强行开训。`false` 且空间不足 → **HTTP 409**，`detail` 以 `VRAM_PREFLIGHT:` 开头；页面确认后带 `true` 重发 |
+
+`GET /api/train/preflight?imgsz=640&batch=16&amp=auto` 的返回字段（**v1.34.1**，只读、不启动训练、不缓存）：
+
+| 字段 | 说明 |
+| --- | --- |
+| `ok` | 是否放行（读不到显存时为 `true`，`vram.reason` 说明「已跳过预检」） |
+| `vram` | 预检详情，见下表 |
+| `amp` | `ampcheck.amp_status()` 原样结果：`available` / `matched` / `expected_precision` / `reason` / `note` / `upstream` |
+| `amp_requested` / `precision` | 本次请求的意图（`amp` 查询参数为 `auto`/`on`/`off`）与据此决定的精度 |
+| `amp_text` | 给页面直接显示的一句话结论 |
+| `sample_count` / `store` | 实测表里已有几个样本、表在哪（排查「为什么还在用公式」） |
+| `version` | `APP_VERSION`，用来识别「连到了旧进程」 |
+
+`vram` 子对象：
+
+| 字段 | 说明 |
+| --- | --- |
+| `ok` / `reason` / `hint` / `suggest_batch` | 是否放行、人话归因、被拦时「停哪个进程、batch 降到多少」的可执行建议 |
+| `source` | `measured`（精确命中实测）/ `scaled`（由更小 batch 外推）/ `capped`（更大 batch 作上界）/ `formula`（无样本）/ `skipped`（batch 非单点） |
+| `measured_mb` / `sample_batch` / `sample_count` | 依据的实测峰值与样本规模（`formula` 时 `measured_mb` 为 `null`） |
+| `needed_mb` / `formula_mb` / `margin` / `reserve_mb` | 需求及其构成（`峰值 × 1.15 + 400`） |
+| `free_mb` / `total_mb` / `gpu` | 即时探测结果（`nvidia-smi` 或 torch 任一可用即可） |
+| `key` | 对应的实测表键，如 `640x16xfp32` |
 
 `POST /api/train/dataset-overview` 的请求体：
 
@@ -3419,7 +3749,9 @@ offset1 = cursor - p_image * scale1
 │   ├── config.py         路径推导、环境变量与白名单（allowed_roots / is_path_allowed / 运行期放行）
 │   ├── nativedialog.py   **v1.20**：服务端原生对话框（子进程弹框 / 单例锁 / 超时 / 按字段记目录）
 │   ├── progress.py       引擎构建阶段识别 + 耗时自学习估算（trtexec 不给真实进度）
-│   ├── runners.py        子进程管理 + TRTFORGE_JSON 事件解析 + 广播 + 进度心跳（**v1.25**：warm 接管 / 冷启动回退 / 离线默认环境）
+│   ├── runners.py        子进程管理 + TRTFORGE_JSON 事件解析 + 广播 + 进度心跳（**v1.25**：warm 接管 / 冷启动回退 / 离线默认环境；**v1.34**：写台账 / 自动续训）
+│   ├── runledger.py      **v1.34**：任务台账（追加式 JSONL / 按 run_id 折叠 / 坏行跳过 / 启动恢复中断 / 体积折叠）
+│   ├── logstore.py       **v1.34**：任务日志（按体积滚动写入 / 跨分片读尾部与全文 / 过期日志族清理）
 │   ├── warmpool.py       **v1.25**：预热进程池（`--mode warm` 子进程 / stdin 交接任务 / 单任务后退出并异步补位 / 死进程回退 / 空闲回收 / `status()`）
 │   ├── infer.py          ctypes 调 DLL（结构体定义、LRU 句柄缓存、热能图渲染）；隔离关闭时由 inferproxy 直通调用
 │   ├── infer_worker.py   **v1.28**：推理工作进程（命名管道 + 共享内存，在此进程内加载各推理 DLL）
@@ -3428,7 +3760,10 @@ offset1 = cursor - p_image * scale1
 │   ├── onnx_fallback.py  **v1.16**：统一解析「引擎加载失败时该提示哪个 ONNX」
 │   ├── labels.py         标签文件解析 + 统一定义类别配色（后端绘制与前端共用）
 │   ├── models.py         训练产物扫描（引擎配对 ONNX / 标签 / metadata / 任务类型）
-│   ├── dataset.py        数据集扫描 / 固定哈希划分 / YOLO·COCO·VOC 导出
+│   ├── dataset.py        数据集扫描 / 固定哈希划分 / YOLO·COCO·VOC 导出 / 写 manifest.json；**v1.34.3** 起支持按组划分（`group_key` / `assign_splits_grouped`）
+│   ├── datasetqc.py      **v1.34.3**：数据集体检（256 位 dHash + 灰度 MAE 分组、A 级重复、跨划分泄漏、逐行标注质检；只读 + 签名缓存）
+│   ├── fingerprint.py    **v1.34.2**：数据集指纹（整批 / 分片 / 标注三个粒度，Web 与 autoexp 共用）
+│   ├── enginemeta.py     **v1.34.2**：引擎旁挂元数据（ONNX/引擎 sha256、来源训练 run、数据集指纹）
 │   ├── annotation.py     `.tfanno` 读写与规范化（2 点矩形 / 关键点单对象 / rev 乐观锁 / 相对路径解析）
 │   ├── annotationimport.py **v1.19**：YOLO 数据集导入（data.yaml 解析 / 坐标清洗 / 类别合并 / 去重 / 导入报告）
 │   ├── autolabel.py      自动标注双通道编排（本地引擎 + 可选外部 HTTP 服务）+ 草稿清洗
@@ -3460,6 +3795,7 @@ offset1 = cursor - p_image * scale1
 │       ├── test_infer_video.py        **v1.16**：视频验收（编码器探测 / 步长时长不变 / 帧数上限 / 失败路径）
 │       ├── test_pipeline_stages.py    **v1.17**：串联状态机验收（全成功 / 中途失败 / 停止 / 重启遗留 / 产物去重）
 │       ├── test_pipeline_log.py       **v1.17**：阶段日志接口验收（尾部截断 / 长行 / 路径穿越 / 404）
+│       ├── test_run_history.py        **v1.34**：台账 / 日志轮转清理 / 历史接口 / 自动续训闸门验收
 │       ├── test_run_log.py            **v1.25.3**：任务日志出口与事件 seq（全文/尾巴/越界 + 重连去重）
 │       ├── test_val_metrics.py        **v1.17**：mAP 验收（IoU 边界 / 多类 AP / P-R 曲线 / 无 GT 容错）
 │       ├── test_pipeline_resolve.py   **v1.18**：串联 resolve 验收（延迟派生 / 产物定位 / metadata 校验 / 动态 batch）
@@ -3517,12 +3853,25 @@ offset1 = cursor - p_image * scale1
 **一条命令跑完全部后端测试**（v1.15 起，CI 与本地共用同一个入口）：
 
 ```powershell
-D:\Anaconda3\envs\dpenv\python.exe 6-web\backend\tools\run_all_tests.py      # 35 个脚本（v1.25.3）
+D:\Anaconda3\envs\dpenv\python.exe 6-web\backend\tools\run_all_tests.py      # 52 个脚本（v1.34.3）
 D:\Anaconda3\envs\dpenv\python.exe 6-web\backend\tools\run_all_tests.py transd  # 只跑名字含 transd 的
 ```
 
 它会扫描目录自动收录 `test_*.py`（以后新增脚本不用改 CI），逐条打印耗时与通过数，
-任一脚本退出码非 0 即整体失败。**不需要 GPU / DLL / torch**，约 47 秒。
+任一脚本退出码非 0 即整体失败。**不需要 GPU / DLL / torch**，约 3 分钟。
+
+2026-11-11 数据集体检实测（v1.34.3）：
+
+| 脚本 | 结果 |
+| --- | --- |
+| `test_dataset_hygiene.py` | **43 / 43 通过**（只读不变式 / 分组 / 泄漏 / 完全重复 / 缓存 / `group_key` / `assign_splits_grouped` / 导出清单写 `qc` 与 `split_mode` / 逐条标注规则） |
+
+真实数据（`PCB data/PCB缺陷检测`，692 张）：256 位 dHash + MAE 复核得到 **10 组**，
+**10 组全部跨 train/tune/holdout**，涉及 **689 张**（组大小 120/118/60×6/59/32，另 3 张自成一类）；
+`labelqc.py` 无 error、无 warn，只有 10 条 info（每组一条「同位置异类标注」提示）。
+对照实验：同一批数据用 64 位 dHash（阈值 ≤6）也能分成这 10 组——但按「重复图去重」的
+常规做法会直接把组内 691 张判成重复并删掉，等于毁掉全部缺陷样本。这才是本版把
+「完全重复」与「同底板」分成两级、且 B 级永不自动删除的原因。
 
 CI 在 `.github/workflows/tests.yml`：Windows + Python 3.11 跑上面这条，另起一个
 Node 20 job 跑六个前端单测 + 所有 `js/*.js` 的 `node --check`。

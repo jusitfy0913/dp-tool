@@ -31,6 +31,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import csv
+import importlib
 import importlib.util
 import json
 import os
@@ -154,12 +155,16 @@ RESULTS_HEADER = [
     "map50",
     "precision",
     "recall",
+    "fp_per_image",
     "epochs_done",
     "train_seconds",
     "peak_vram_mb",
+    "peak_vram_reserved_mb",
     "imgsz",
     "batch_req",
     "batch_eff",
+    "amp",
+    "data_fp",
     "model",
     "budget_seconds",
     "status",
@@ -176,6 +181,7 @@ HOLDOUT_HEADER = [
     "map50",
     "precision",
     "recall",
+    "fp_per_image",
     "seconds",
     "num_images",
     "num_instances",
@@ -229,6 +235,38 @@ def save_json(path: Path, payload: Any) -> None:
     with path.open("w", encoding="utf-8", newline="\n") as handle:
         json.dump(payload, handle, ensure_ascii=False, indent=2)
         handle.write("\n")
+
+
+def annotate_exp_record(exp_id: str, extra: dict[str, Any]) -> None:
+    """在 ``experiments/exp_NNNN.json`` 上补记「训练后才知道」的事实。
+
+    为什么需要这一步：``exp_NNNN.json`` 是在开跑**之前**写的快照（那时只有请求参数），
+    而「实际用了 fp32 还是 fp16」「真正吃到多少显存」只有跑完才知道。
+    ``args.yaml`` 记的同样是请求值——黑名单卡上请求 ``amp=True`` 实际是 fp32，
+    不回写就永远查不到真相。只补键、不覆盖已有内容，失败只记一行日志。
+    """
+    path = EXPERIMENTS_DIR / f"{exp_id}.json"
+    if not path.is_file():
+        return
+    try:
+        payload = load_json(path)
+    except (OSError, ValueError):
+        return
+    if not isinstance(payload, dict):
+        return
+    changed = False
+    for key, value in extra.items():
+        if value is None or value == "":
+            continue
+        if payload.get(key) != value:
+            payload[key] = value
+            changed = True
+    if not changed:
+        return
+    try:
+        save_json(path, payload)
+    except OSError as exc:
+        log(f"{exp_id} 实验记录补记失败（不影响结论）：{exc}")
 
 
 def deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
@@ -567,6 +605,76 @@ def read_results_csv(csv_path: Path) -> dict[str, Any]:
     return payload
 
 
+#: val 集统计缓存：键是 dataset.yaml 的绝对路径字符串。
+#: autoexp 每轮都要用同一个 val 集，重复扫标签只是浪费 IO。
+_VAL_STATS_CACHE: dict[str, dict[str, int]] = {}
+
+
+def val_gt_stats(data_path: str) -> dict[str, int]:
+    """统计 val 划分的图片数与 GT 框数。读不到返回空字典。
+
+    这两项是用来把 Ultralytics 的 P/R 换算成「每图过杀数」的分母：
+    ``TP = R × GT``，``FP = TP × (1-P)/P``，``每图过杀 = FP / 图片数``。
+    拿不到就留空，绝不猜一个数填进台账。
+    """
+    try:
+        key = str(Path(resolve_data_path(data_path)).resolve())
+    except (FileNotFoundError, OSError):
+        return {}
+    if key in _VAL_STATS_CACHE:
+        return dict(_VAL_STATS_CACHE[key])
+    module = load_web_module("traininfo")
+    if module is None:
+        return {}
+    try:
+        splits = module.resolve_splits(key)
+        dirs = splits["splits"].get("val") or []
+        yaml_dir = Path(splits["yaml_dir"])
+        images = 0
+        instances = 0
+        for directory in dirs:
+            directory = Path(directory)
+            split_images = module.collect_images(directory)
+            images += len(split_images)
+            label_dir = module.labels_dir_for(directory, yaml_dir, "val")
+            for image_path in split_images:
+                label = label_dir / f"{image_path.stem}.txt"
+                if not label.is_file():
+                    continue
+                try:
+                    text = label.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    continue
+                instances += sum(1 for line in text.splitlines() if len(line.split()) >= 5)
+        stats = {"images": images, "instances": instances}
+    except Exception as exc:  # noqa: BLE001 - 统计失败只是少一列，不该让实验失败
+        log(f"val 集统计失败（过杀列将留空）：{exc}")
+        return {}
+    _VAL_STATS_CACHE[key] = stats
+    return dict(stats)
+
+
+def fp_per_image_from_pr(
+    precision: float | None,
+    recall: float | None,
+    instances: int | None,
+    images: int | None,
+) -> float | None:
+    """由 P / R / GT 数反推「每图过杀框数」。
+
+    ⚠ 这是**近似值**：Ultralytics 的 P/R 取自 best-F1 conf，不是固定 conf，
+    也不区分良品图。它的用途是在自动搜索里拦住「拿过杀换 mAP」的候选，
+    不能当成产线验收数字——那个要用 ``tools/val_engine.py`` 的曲线。
+    """
+    if precision is None or recall is None or not instances or not images:
+        return None
+    if precision <= 0.0 or recall <= 0.0:
+        return None
+    tp = recall * float(instances)
+    fp = tp * (1.0 - precision) / precision
+    return round(fp / float(images), 6)
+
+
 # ---------------------------------------------------------------------------
 # split：确定性切分 + 硬链接沙箱
 # ---------------------------------------------------------------------------
@@ -694,6 +802,45 @@ def load_yaml_minimal(path: Path) -> dict[str, Any]:
     return result
 
 
+def grouped_val_split(
+    images: list[Path], holdout_frac: float, group_by: str
+) -> tuple[list[Path], list[Path]] | None:
+    """把 val 图按「同一底板」整组切 tune / holdout，保证任何一组不跨两侧。
+
+    为什么不能沿用按图片洗牌：``splits/pcb`` 实测 10 个底板组全部同时出现在
+    train / tune / holdout 里——holdout 的 42 张每一张都能在 tune 里找到同底片的
+    兄弟。那样验收出来的分数衡量的是「记住了这几块板」，不是泛化。
+
+    返回 ``None`` 表示组数少于 2、无法在不拆组的前提下分两侧，由调用方决定是否报错。
+    """
+    module = load_web_module("dataset")
+    if module is None:
+        return None
+    keys = [module.group_key(image.name, group_by) for image in images]
+    groups: dict[str, list[Path]] = {}
+    for image, key in zip(images, keys):
+        groups.setdefault(key, []).append(image)
+    if len(groups) < 2:
+        return None
+
+    total = len(images)
+    holdout_target = max(1, round(total * holdout_frac))
+    targets = {"holdout": holdout_target, "tune": total - holdout_target}
+    got = {"holdout": 0, "tune": 0}
+    buckets: dict[str, list[Path]] = {"holdout": [], "tune": []}
+    order = sorted(groups, key=lambda key: (module.fnv1a64(f"{key}{module.SALT}"), key))
+    for key in order:
+        chosen = max(("holdout", "tune"), key=lambda name: targets[name] - got[name])
+        buckets[chosen].extend(groups[key])
+        got[chosen] += len(groups[key])
+    if not buckets["holdout"] or not buckets["tune"]:
+        return None
+    return (
+        sorted(buckets["holdout"], key=lambda p: str(p).lower()),
+        sorted(buckets["tune"], key=lambda p: str(p).lower()),
+    )
+
+
 def cmd_split(args: argparse.Namespace) -> int:
     source_yaml = Path(args.data).resolve()
     if not source_yaml.is_file():
@@ -720,17 +867,30 @@ def cmd_split(args: argparse.Namespace) -> int:
 
     # 确定性切分：排序后再用固定种子洗牌，保证同样的输入永远得到同样的两组
     ordered = sorted(val_images, key=lambda p: str(p).lower())
-    shuffled = list(ordered)
-    random.Random(args.seed).shuffle(shuffled)
-    holdout_count = max(1, round(len(shuffled) * args.holdout_frac))
-    holdout = sorted(shuffled[:holdout_count], key=lambda p: str(p).lower())
-    tune = sorted(shuffled[holdout_count:], key=lambda p: str(p).lower())
+    group_by = getattr(args, "group_by", "none")
+    if group_by and group_by != "none":
+        grouped = grouped_val_split(ordered, args.holdout_frac, group_by)
+        if grouped is None:
+            log(
+                f"按组切分失败：组数少于 2（{group_by}），无法在不拆组的前提下分两侧。"
+                " 加 --group-by none 可退回按图片切分。"
+            )
+            return 2
+        holdout, tune = grouped
+        log(f"按组切分（{group_by}）：holdout {len(holdout)} / tune {len(tune)}，同一组不跨两侧")
+    else:
+        shuffled = list(ordered)
+        random.Random(args.seed).shuffle(shuffled)
+        holdout_count = max(1, round(len(shuffled) * args.holdout_frac))
+        holdout = sorted(shuffled[:holdout_count], key=lambda p: str(p).lower())
+        tune = sorted(shuffled[holdout_count:], key=lambda p: str(p).lower())
 
     manifest_path = SPLITS_DIR / "_manifest.json"
     signature = {
         "source_yaml": str(source_yaml),
         "seed": args.seed,
         "holdout_frac": args.holdout_frac,
+        "group_by": group_by,
         "train_count": len(train_images),
         "val_count": len(val_images),
         "holdout": [p.name for p in holdout],
@@ -766,6 +926,12 @@ def cmd_split(args: argparse.Namespace) -> int:
             "counts": {"train": len(train_images), "tune": len(tune), "holdout": len(holdout)},
             "tune_yaml": str(SPLITS_DIR / "pcb_tune.yaml"),
             "holdout_yaml": str(SPLITS_DIR / "pcb_holdout.yaml"),
+            # 切分文件本身的内容身份。signature 只记文件名与 seed——holdout 的图
+            # 被改过标注后它完全不变，于是「验收通过」的结论会悄悄失效。
+            "data_fingerprint": dataset_fingerprint(SPLITS_DIR / "pcb_tune.yaml"),
+            # holdout 的图不在 tune 切分的 train/val 里，必须单独记一份，
+            # 否则改了 holdout 标注也发现不了。
+            "holdout_fingerprint": dataset_fingerprint(SPLITS_DIR / "pcb_holdout.yaml"),
         },
     )
     log(f"完成：train={len(train_images)} tune={len(tune)} holdout={len(holdout)}（{train_mode}/{tune_mode}/{holdout_mode}）")
@@ -777,28 +943,177 @@ def cmd_split(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 
 
-def load_gpulock() -> Any:
-    """加载 6-web 的 ``gpulock``（零第三方依赖，只用标准库）。
+#: 从 6-web/backend 加载的模块缓存（同一个名字只导入一次）。
+#: 存 None 也是有效缓存：表示「查过了，没有」，避免每轮实验都去摸磁盘。
+_WEB_MODULES: dict[str, Any] = {}
 
-    为什么复用 Web 那一份而不是自己再写一遍：锁文件的格式是两边共用的契约，
-    两份实现迟早会漂移（一边加字段、一边改判定），而漂移的表现是
-    「两个训练都以为自己是唯一持有者」——正好是最危险的失效方式。
+
+def load_web_module(name: str) -> Any:
+    """从 ``6-web/backend`` 加载一个模块（gpulock / vram / ampcheck）。
+
+    为什么复用 Web 那一份而不是自己再写一遍：锁文件的格式、AMP 黑名单、显存余量
+    都是两边共用的契约，两份实现迟早会漂移（一边加字段、一边改判定），而漂移的表现
+    是「页面说能跑，autoexp 说不能跑」——比任何单边错误都难查。
 
     为什么放在 6-web/backend：Web 打包脚本会把整个 backend 目录一起冻结，
-    放在那里才不会漏文件。取不到就返回 None，由调用方降级为「不做互斥」，
-    不要让一把锁成为训练跑不起来的原因。
+    放在那里才不会漏文件。取不到就返回 None，由调用方降级，不要让一个
+    「更好的估算」成为训练跑不起来的原因。
     """
+    if name in _WEB_MODULES:
+        return _WEB_MODULES[name]
+    module: Any = None
     backend = ROOT.parent / "6-web" / "backend"
-    if not (backend / "gpulock.py").is_file():
-        return None
-    if str(backend) not in sys.path:
-        sys.path.insert(0, str(backend))
-    try:
-        import gpulock  # noqa: PLC0415 - 刻意延迟导入，缺文件时才能降级
+    if (backend / f"{name}.py").is_file():
+        if str(backend) not in sys.path:
+            sys.path.insert(0, str(backend))
+        try:
+            module = importlib.import_module(name)
+        except Exception:  # noqa: BLE001 - 缺依赖/写坏了都当作「没有这个模块」
+            module = None
+    _WEB_MODULES[name] = module
+    return module
 
-        return gpulock
-    except Exception:  # noqa: BLE001 - 互斥失败不该阻断训练
-        return None
+
+def load_gpulock() -> Any:
+    """加载 6-web 的 ``gpulock``（零第三方依赖，只用标准库）。"""
+    return load_web_module("gpulock")
+
+
+def load_vram() -> Any:
+    """加载 6-web 的 ``vram``：显存预检与实测峰值表（两边唯一的实现）。"""
+    return load_web_module("vram")
+
+
+def load_fingerprint() -> Any:
+    """加载 6-web 的 ``fingerprint``：数据集指纹（两边唯一的实现）。
+
+    找不到时返回 ``None``，调用方把 ``dataset`` 块标成 ``unavailable``。
+    指纹是附加信息，不该因为少了一个文件就把一整轮实验拦下来。
+    """
+    return load_web_module("fingerprint")
+
+
+def dataset_fingerprint(data: str | Path) -> dict[str, Any]:
+    """算数据集指纹的精简块，写进 ``exp_NNNN.json`` / ``results.tsv`` / ``best.json``。
+
+    与 Web 训练页用同一份实现，四处记录的指纹才能互相对上。任何失败都收敛成
+    ``unavailable`` 或 ``error`` 字段，不抛异常。
+    """
+    module = load_fingerprint()
+    if module is None:
+        return {"algo": "", "unavailable": "找不到 6-web/backend/fingerprint.py"}
+    raw = str(data or "").strip()
+    if not raw:
+        return {"algo": "", "unavailable": "配置里没有 data 字段"}
+    target = Path(raw).expanduser()
+    if not target.is_absolute():
+        # autoexp 的配置里写的是相对 7-autoresearch-yolo 的路径（splits/xxx.yaml）。
+        # 用 __file__ 而不是 cwd：从 Web 后端拉起时 cwd 是仓库根，两者不一致。
+        target = Path(__file__).resolve().parent / target
+    try:
+        report = module.compute(target)
+    except Exception as exc:  # noqa: BLE001 - 指纹失败不阻断实验
+        return {"algo": "", "unavailable": f"{type(exc).__name__}: {exc}"}
+    return {
+        "algo": report.get("algo"),
+        "dataset_fingerprint": report.get("dataset_fingerprint"),
+        "short": report.get("short") or "",
+        "label_fingerprint": report.get("label_fingerprint"),
+        "split_fingerprints": report.get("split_fingerprints"),
+        "counts": report.get("counts"),
+        "error": report.get("error", ""),
+    }
+
+
+def qc_gate(cfg: dict[str, Any]) -> tuple[bool, list[str]]:
+    """开跑前的数据门禁：只看 error 级问题（字段数不对、类别越界、坐标越界等）。
+
+    为什么默认关闭：体检要解码整份数据（692 张约 1~10 秒，取决于缓存），而自动实验
+    一轮只跑几分钟。默认打开会让每轮多花一段时间，用户明确要检查时再加 ``--qc-gate``。
+
+    ``warn`` 级（极小框、贴边、跨划分）一律不拦——它们大多是「值得看一眼」，
+    而不是「数据已经坏了」。
+    """
+    module = load_web_module("datasetqc")
+    if module is None:
+        return True, []
+    raw = str(cfg.get("data") or "").strip()
+    if not raw:
+        return True, []
+    target = Path(raw).expanduser()
+    if not target.is_absolute():
+        # 配置里的 data 是相对 7-autoresearch-yolo 的路径（splits/xxx.yaml）
+        target = Path(__file__).resolve().parent / target
+    try:
+        report = module.inspect(target, "auto")
+    except Exception as exc:  # noqa: BLE001 - 体检失败不该变成训练跑不起来
+        return True, [f"数据体检失败，已跳过门禁：{type(exc).__name__}: {exc}"]
+
+    summary = report.get("summary") or {}
+    groups = report.get("groups") or {}
+    lines = [
+        "数据体检：错误 {} / 警告 {}，底板组 {}（跨划分 {}）".format(
+            summary.get("error", 0),
+            summary.get("warn", 0),
+            groups.get("total", 0),
+            groups.get("cross_split", 0),
+        )
+    ]
+    if groups.get("cross_split"):
+        lines.append("注意：同一底板跨划分，本次指标不能当作泛化能力。")
+    if not summary.get("error"):
+        return True, lines
+
+    shown = 0
+    for issue in report.get("issues") or []:
+        if issue.get("severity") != "error" or shown >= 10:
+            continue
+        where = issue.get("rel") or issue.get("split") or "全局"
+        if issue.get("line"):
+            where = f"{where}:{issue['line']}"
+        lines.append(f"  [{issue.get('code')}] {where}  {issue.get('detail')}")
+        shown += 1
+    return False, lines
+
+
+def check_split_drift(yaml_path: Path) -> bool:
+    """holdout 验收前核对数据是否变过。
+
+    ``splits/_manifest.json`` 里的 ``signature`` 只记文件名与 seed：把某张 holdout
+    图改个标注、换个同名文件，signature 一点都不会变，于是「验收通过」的结论
+    悄悄失效。指纹补上了这一环。
+
+    返回 True 表示一致或无法判断（升级前生成的切分没有指纹），False 表示确实变了。
+    """
+    manifest = SPLITS_DIR / "_manifest.json"
+    if not manifest.is_file():
+        return True
+    try:
+        payload = load_json(manifest) or {}
+    except (OSError, ValueError):
+        return True
+    if not isinstance(payload, dict):
+        return True
+
+    # holdout 的图不在 pcb_tune 的 train/val 里，所以优先比 holdout 的那份指纹
+    recorded = payload.get("holdout_fingerprint") or {}
+    expected = recorded.get("dataset_fingerprint") if isinstance(recorded, dict) else None
+    target = SPLITS_DIR / "pcb_holdout.yaml"
+    if not expected:
+        recorded = payload.get("data_fingerprint") or {}
+        expected = recorded.get("dataset_fingerprint") if isinstance(recorded, dict) else None
+        target = SPLITS_DIR / "pcb_tune.yaml"
+    if not expected or not target.is_file():
+        return True
+
+    actual = dataset_fingerprint(target).get("dataset_fingerprint")
+    if actual and actual != expected:
+        log(
+            f"警告：holdout 数据已变化（切分时 {str(expected)[:8]}，当前 {str(actual)[:8]}）。"
+            "之前的 holdout 验收结论不可沿用，请重新执行 split 与验收。"
+        )
+        return False
+    return True
 
 
 def derive_result_status(result: dict[str, Any], returncode: int) -> str:
@@ -923,6 +1238,80 @@ def _clear_child_pid() -> None:
         pass
 
 
+#: 父进程已经让推理进程退出时，子进程会继承这个环境变量。
+#: 子进程看到它就不再通知网页，也不会在每一轮训练结束时把显存让出提前还回去。
+INFER_YIELDED_ENV = "AUTOEXP_INFER_YIELDED"
+
+
+def _infer_web_bases() -> list[str]:
+    """网页服务地址。命令行跑实验时靠它通知正在运行的 6-web 退出推理进程。"""
+    explicit = os.environ.get("AUTOEXP_WEB_URL", "").strip().rstrip("/")
+    if explicit:
+        return [explicit]
+    return ["http://127.0.0.1:8060"]
+
+
+def _post_infer_control(path: str, reason: str = "") -> dict[str, Any] | None:
+    """通知网页端让出或归还推理显存。网页没开时返回 None，不当成训练失败。"""
+    import urllib.parse
+    import urllib.request
+
+    last_error = "没有可用地址"
+    for base in _infer_web_bases():
+        url = base + path
+        if reason:
+            url += "?reason=" + urllib.parse.quote(reason)
+        request = urllib.request.Request(
+            url,
+            data=b"{}",
+            method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=3) as response:
+                body = response.read().decode("utf-8", errors="replace")
+        except Exception as exc:  # noqa: BLE001 - 网页没开是正常情况
+            last_error = f"{type(exc).__name__}: {exc}"
+            continue
+        try:
+            data = json.loads(body) if body else {}
+        except json.JSONDecodeError:
+            data = {"ok": True}
+        return data if isinstance(data, dict) else {"ok": True}
+    log(f"通知网页推理进程失败（{path}）：{last_error}")
+    return None
+
+
+def acquire_infer_yield(reason: str) -> bool:
+    """让网页端退出 infer_worker。
+
+    返回 True 表示**这一层**新拿到了所有权，结束时必须调用 ``release_infer_yield(True)``。
+    父进程（或网页后端）已经让出时返回 False：嵌套的每一轮训练不能提前把显存还回去，
+    否则下一轮一开始推理进程又被页面点醒，8GB 卡会再次 OOM。
+    """
+    if os.environ.get(INFER_YIELDED_ENV) == "1":
+        return False
+    result = _post_infer_control("/api/infer/gpu-yield", reason)
+    if result is None:
+        log("网页端没有响应，推理进程可能仍占着显存。若训练一开始就 OOM，先在网页上停止推理。")
+        return False
+    os.environ[INFER_YIELDED_ENV] = "1"
+    log(
+        f"已让推理进程退出（{result.get('stopped', '?')} 个），显存留给训练。"
+        "全部训练结束后不会立刻重载，下次在网页上推理时才重新加载。"
+    )
+    return True
+
+
+def release_infer_yield(owned: bool) -> None:
+    """只有拿到所有权的那一层才能解除。解除后进程保持退出，等下次推理再加载。"""
+    if not owned:
+        return
+    _post_infer_control("/api/infer/gpu-release")
+    os.environ.pop(INFER_YIELDED_ENV, None)
+    log("训练结束，推理进程保持退出。下次在网页上推理时会自动重新加载。")
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     config_path = Path(args.config).resolve()
     override = load_json(config_path)
@@ -978,6 +1367,9 @@ def cmd_run(args: argparse.Namespace) -> int:
     else:
         log("注意：未找到 6-web/backend/gpulock.py，本次不做跨进程互斥")
 
+    # 锁到手之后、真正开训之前退出推理进程。放在预检前面：
+    # 预检读的是「现在还剩多少显存」，推理进程还活着时这个数是假的。
+    owned_yield = acquire_infer_yield("自动实验训练")
     try:
         return _run_locked(args, cfg, config_path, lock, lock_held)
     finally:
@@ -985,6 +1377,8 @@ def cmd_run(args: argparse.Namespace) -> int:
         # 放在 finally 里：按 Ctrl+C 中途退出也要释放，否则锁会挂到进程死亡才清。
         if lock is not None and lock_held:
             lock.release()
+        # 嵌套在 agent / noise 里时 owned_yield 为 False，不会把父进程的让出提前还回去。
+        release_infer_yield(owned_yield)
 
 
 def _run_locked(
@@ -1011,6 +1405,15 @@ def _run_locked(
         log(str(exc))
         return 4
 
+    # 数据门禁：放在写 exp_NNNN.json 之前，被拦下时台账里不留「从没跑过」的编号。
+    if getattr(args, "qc_gate", False):
+        passed, lines = qc_gate(cfg)
+        for line in lines:
+            log(line)
+        if not passed:
+            log("数据存在错误级标注问题，本次不启动。修完再跑，或去掉 --qc-gate 跳过检查。")
+            return 6
+
     snapshot = {
         "exp_id": exp_id,
         "created_at": now_iso(),
@@ -1019,6 +1422,9 @@ def _run_locked(
         "changed": cfg.get("changed", ""),
         "budget_seconds": int(cfg.get("budget_seconds", 600)),
         "resources_at_start": resources,
+        # 数据身份：开跑前算一次。跑完再算会混进「这期间源数据被改过」的情况，
+        # 那样记录的就不是「这一轮实际训练用的那批图」。
+        "dataset": dataset_fingerprint(cfg.get("data", "")),
         "resolved": cfg,
     }
     snapshot_path = EXPERIMENTS_DIR / f"{exp_id}.json"
@@ -1081,6 +1487,16 @@ def _run_locked(
             **{k: v for k, v in result.items() if k in ("exp_id", "elapsed_seconds")},
         }
 
+    # 过杀率（近似）：Ultralytics 的 P/R 是 best-F1 conf 下的值，配合 val 集的
+    # GT 数与图片数可反推「每图误报几个框」。拿不到统计就留空，绝不填 0。
+    val_stats = val_gt_stats(str(cfg.get("data") or "")) if status == "done" else {}
+    fp_per_image = fp_per_image_from_pr(
+        _as_float(result.get("precision")),
+        _as_float(result.get("recall")),
+        val_stats.get("instances"),
+        val_stats.get("images"),
+    )
+
     row = {
         "exp_id": exp_id,
         "created_at": snapshot["created_at"],
@@ -1091,12 +1507,19 @@ def _run_locked(
         "map50": result.get("map50", ""),
         "precision": result.get("precision", ""),
         "recall": result.get("recall", ""),
+        "fp_per_image": "" if fp_per_image is None else fp_per_image,
         "epochs_done": result.get("epochs_done", ""),
         "train_seconds": result.get("train_seconds", elapsed),
         "peak_vram_mb": result.get("peak_vram_mb", ""),
+        "peak_vram_reserved_mb": result.get("peak_vram_reserved_mb", ""),
         "imgsz": (cfg.get("train") or {}).get("imgsz", cfg.get("imgsz", "")),
         "batch_req": result.get("batch_requested", (cfg.get("train") or {}).get("batch", "")),
         "batch_eff": result.get("batch_effective", ""),
+        # 实际生效的精度（fp32/fp16/unknown）。黑名单卡永远是 fp32——
+        # 这一列存在的唯一目的就是让「这轮为什么慢」变得可回答。
+        "amp": result.get("precision", ""),
+        # 数据指纹短码。跨这一列不同的行不能直接横比：参数没变，数据变了。
+        "data_fp": (snapshot.get("dataset") or {}).get("short", ""),
         "model": cfg.get("model", ""),
         "budget_seconds": snapshot["budget_seconds"],
         "status": status,
@@ -1104,6 +1527,16 @@ def _run_locked(
         "changed": cfg.get("changed", ""),
     }
     append_tsv(RESULTS_TSV, RESULTS_HEADER, row)
+
+    # 把「跑完才知道」的事实回写进实验记录（args.yaml 里只有请求值）。
+    annotate_exp_record(
+        exp_id,
+        {
+            "amp_effective": result.get("amp_effective", ""),
+            "precision": result.get("precision", ""),
+            "peak_vram_reserved_mb": result.get("peak_vram_reserved_mb"),
+        },
+    )
 
     # batch 被 Ultralytics 自动降过，说明这次实验与请求的参数不是同一件事，
     # 后续和其它实验横向比较会失真，必须显式提示。
@@ -1142,32 +1575,71 @@ def free_vram_mb() -> float | None:
         return None
 
 
-def preflight_vram(imgsz: int, batch: int, need_mb: float | None = None) -> tuple[bool, str]:
+def read_trainer_amp(trainer: Any) -> bool | None:
+    """读 trainer 上**真正生效**的混合精度标志。
+
+    必须是 ``trainer.amp`` 而不是 ``args.amp``：黑名单显卡（T1000 等）上
+    ``args.amp`` 仍是 True，但 ``Trainer.__init__`` 里的 ``check_amp()`` 已经把它
+    关掉了。args 记录的是「我想要什么」，trainer.amp 记录的是「实际用了什么」。
+    """
+    value = getattr(trainer, "amp", None)
+    if value is None:
+        return None
+    try:
+        if hasattr(value, "item"):
+            return bool(value.item())
+        return bool(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def preflight_vram(
+    imgsz: int,
+    batch: int,
+    need_mb: float | None = None,
+    precision: str | None = None,
+) -> tuple[bool, str]:
     """开训前的显存预检。
 
     Ultralytics 的首轮 OOM 会自动把 batch 减半重来，这会**悄悄改变实验条件**：
     batch 一变，nbs 归一化后的等效学习率、正则强度全跟着变，于是这一次实验
     与台账里其它实验不再可比。所以宁可提前拒绝，也不要让它自动降级。
 
-    估算依据（本机 T1000 8GB 实测）：
-      - batch=8  @640 峰值约 1769 MB（PyTorch 统计值，不含 CUDA context / cudnn workspace）
-      - batch=16 @640 在 5302 MB 可用时仍然 OOM
-      - 这张卡在 Ultralytics 的 AMP 黑名单里，训练强制走 fp32，激活显存显著高于常规
-    因此这里的估算刻意保守：它是「显存紧时别开跑」的闸门，不是精确预测。
+    判定本身**不在这里**：委托给 ``6-web/backend/vram.py``，与 Web 训练页共用一份
+    实现（实测峰值表 + 1.15 倍余量 + 400MB 预留，无样本才回落到公式）。
+    历史上这里有一条写死的公式 ``2600 + 240*batch*(imgsz/640)**2``，已经因为
+    「960/batch=4 估算放行但实际 OOM」被废弃——两处各写一份必然出现这种矛盾。
+
+    ``need_mb`` 显式给出时按旧语义直接比（测试与「已知需求」的场景用）。
+    ``precision`` 为 None 时由 vram 按本机显卡判断（黑名单卡的 fp32 与 fp16 差近一倍）。
     """
     free = free_vram_mb()
     if free is None:
         return True, "无法读取显存（可能无 CUDA），跳过预检"
-    # 2600 MB 固定开销（CUDA context + cudnn workspace + fp32 缓冲），
-    # 240 MB/样本随 batch 与分辨率线性增长
-    estimate = need_mb if need_mb is not None else 2600.0 + 240.0 * max(batch, 1) * (imgsz / 640.0) ** 2
-    if free < estimate:
-        return False, (
-            f"可用显存 {free:.0f} MB < 保守需求 {estimate:.0f} MB"
-            f"（imgsz={imgsz} batch={batch}）。"
-            "请先释放显存（例如停掉 6-web 的 infer_worker 常驻进程），或把 batch 调小。"
-        )
-    return True, f"可用显存 {free:.0f} MB ≥ 保守需求 {estimate:.0f} MB"
+
+    if need_mb is not None:
+        if free < need_mb:
+            return False, (
+                f"可用显存 {free:.0f} MB < 保守需求 {need_mb:.0f} MB"
+                f"（imgsz={imgsz} batch={batch}）。"
+                "请先释放显存（例如停掉 6-web 的 infer_worker 常驻进程），或把 batch 调小。"
+            )
+        return True, f"可用显存 {free:.0f} MB ≥ 保守需求 {need_mb:.0f} MB"
+
+    module = load_vram()
+    if module is None:
+        # 降级：拿不到共享实现时用同一套公式手算，宁可保守也不要因为缺文件而放行
+        est = 2600.0 + 300.0 * max(int(batch), 1) * (int(imgsz) / 640.0) ** 2
+        if free < est:
+            return False, (
+                f"可用显存 {free:.0f} MB < 保守需求 {est:.0f} MB"
+                f"（imgsz={imgsz} batch={batch}，未找到 vram.py，按公式估算）。"
+                "请先释放显存或把 batch 调小。"
+            )
+        return True, f"可用显存 {free:.0f} MB ≥ 保守需求 {est:.0f} MB（按公式估算）"
+
+    report = module.preflight(imgsz, max(int(batch), 1), precision=precision, free_mb=free)
+    return bool(report.get("ok")), str(report.get("reason") or "")
 
 
 def cmd_exec(args: argparse.Namespace) -> int:
@@ -1213,7 +1685,13 @@ def cmd_exec(args: argparse.Namespace) -> int:
 
         # 显存预检：宁可提前失败，也不要让 Ultralytics 静默降 batch 改变实验条件
         batch_int = int(kwargs.get("batch", 16)) if str(kwargs.get("batch", "16")).lstrip("-").isdigit() else 8
-        ok, reason = preflight_vram(int(kwargs.get("imgsz", 640)), max(batch_int, 1))
+        imgsz_int = int(kwargs.get("imgsz", 640))
+        # 只有「显式关闭混合精度」是确定事实，其余交给 vram 按本机显卡判断：
+        # 黑名单卡（T1000/T1200/1660 等）上必然是 fp32，显存需求与 fp16 差近一倍，
+        # 用错精度去查实测表等于没查。
+        amp_requested = kwargs.get("amp", True)
+        precision_hint = "fp32" if amp_requested is False else None
+        ok, reason = preflight_vram(imgsz_int, max(batch_int, 1), precision=precision_hint)
         log(f"{exp_id} 显存预检：{reason}")
         if not ok:
             payload = {
@@ -1251,14 +1729,51 @@ def cmd_exec(args: argparse.Namespace) -> int:
             batch_effective = int(getattr(model.trainer, "batch_size", 0) or 0) or None
         except (TypeError, ValueError):
             batch_effective = None
+
+        # 峰值显存与**实际**生效的混合精度。
+        #
+        # peak_vram_mb 保持旧语义（max_memory_allocated），历史行仍可比；
+        # peak_vram_reserved_mb 是新口径：OOM 发生在向驱动申请那一刻，预留量
+        # 才是真正占住的显存，实测比 allocated 高 30%~50%。显存实测表用 reserved。
         peak_vram = None
+        peak_vram_reserved = None
         try:
             import torch
 
             if torch.cuda.is_available():
                 peak_vram = round(torch.cuda.max_memory_allocated() / (1024 ** 2), 1)
+                peak_vram_reserved = round(torch.cuda.max_memory_reserved() / (1024 ** 2), 1)
         except Exception:  # noqa: BLE001 - 显存读数失败不影响结论
             peak_vram = None
+            peak_vram_reserved = None
+
+        amp_effective = read_trainer_amp(model.trainer)
+        precision_actual = "unknown" if amp_effective is None else ("fp16" if amp_effective else "fp32")
+        # 自校准：把这次实测写进峰值表。用**实际生效**的 batch 与精度做键——
+        # 降级过的 batch 如果按请求值记账，下次预检会算出偏小的需求。
+        sample_batch = batch_effective or max(batch_int, 1)
+        if peak_vram_reserved:
+            module = load_vram()
+            if module is not None:
+                entry = module.record_sample(
+                    imgsz=imgsz_int,
+                    batch=sample_batch,
+                    peak_mb=peak_vram_reserved,
+                    peak_allocated_mb=peak_vram,
+                    precision=precision_actual,
+                    exp_id=exp_id,
+                )
+                if entry.get("skipped"):
+                    log(f"{exp_id} 显存样本未记录：{entry['skipped']}")
+                else:
+                    log(
+                        f"{exp_id} 显存样本已记录：{imgsz_int}x{sample_batch}x{precision_actual} "
+                        f"峰值 {entry.get('peak_mb')} MB（累计 {entry.get('count')} 次）"
+                    )
+        else:
+            log(f"{exp_id} 未取到峰值显存，本次不更新实测表")
+
+        log(f"{exp_id} 实际精度：{precision_actual}（请求 amp={amp_requested}）")
 
         payload = {
             "status": "done",
@@ -1266,6 +1781,10 @@ def cmd_exec(args: argparse.Namespace) -> int:
             "save_dir": str(save_dir),
             "weights": str(save_dir / "weights" / "best.pt"),
             "peak_vram_mb": peak_vram,
+            "peak_vram_reserved_mb": peak_vram_reserved,
+            "amp_requested": amp_requested if isinstance(amp_requested, bool) else str(amp_requested),
+            "amp_effective": "" if amp_effective is None else amp_effective,
+            "precision": precision_actual,
             "batch_requested": str(kwargs.get("batch", "")),
             "batch_effective": "" if batch_effective is None else str(batch_effective),
             "elapsed_seconds": round(time.time() - started, 1),
@@ -1350,6 +1869,7 @@ def cmd_holdout(args: argparse.Namespace) -> int:
     if not split_yaml.is_file():
         log(f"holdout 切分不存在：{split_yaml}，先跑 split 子命令")
         return 2
+    check_split_drift(split_yaml)
 
     # 分辨率必须跟随训练时用的值：拿 640 去验一个 960 训出来的模型，
     # 精度会因分辨率不匹配而暴跌，看起来像「这个配置过拟合」，其实是量错了尺子。
@@ -1422,6 +1942,7 @@ def cmd_holdout(args: argparse.Namespace) -> int:
         "map50": result.get("map50", ""),
         "precision": result.get("precision", ""),
         "recall": result.get("recall", ""),
+        "fp_per_image": result.get("fp_per_image", ""),
         "seconds": result.get("seconds", ""),
         "num_images": result.get("num_images", ""),
         "num_instances": result.get("num_instances", ""),
@@ -1471,6 +1992,7 @@ def cmd_holdout_exec(args: argparse.Namespace) -> int:
             imgsz=int(args.imgsz),
             batch=int(float(args.batch)) if str(args.batch).lstrip("-").replace(".", "", 1).isdigit() else 16,
             device=args.device,
+            workers=0,
             plots=False,
             verbose=False,
             project=str(out_dir),
@@ -1492,6 +2014,9 @@ def cmd_holdout_exec(args: argparse.Namespace) -> int:
             "precision": _round_or_none(_metric_from_results_dict(results_dict, "metrics/precision")),
             "recall": _round_or_none(_metric_from_results_dict(results_dict, "metrics/recall")),
         }
+        payload["fp_per_image"] = fp_per_image_from_pr(
+            payload["precision"], payload["recall"], payload["num_instances"], payload["num_images"]
+        )
         save_json(result_path, payload)
         return 0
     except BaseException as exc:  # noqa: BLE001
@@ -1510,6 +2035,16 @@ def cmd_noise(args: argparse.Namespace) -> int:
     base = load_json(BASE_JSON) if BASE_JSON.is_file() else {}
     cfg = deep_merge(base, override)
 
+    # 整段重复测量只让出一次。每一轮 cmd_run 看到环境变量就不会提前归还，
+    # 否则两轮之间网页一点推理，显存又被占回去。
+    owned_yield = acquire_infer_yield("噪声测量")
+    try:
+        return _cmd_noise_body(args, cfg)
+    finally:
+        release_infer_yield(owned_yield)
+
+
+def _cmd_noise_body(args: argparse.Namespace, cfg: dict[str, Any]) -> int:
     values: list[float] = []
     for index in range(1, args.repeat + 1):
         round_cfg = dict(cfg)
@@ -2188,6 +2723,8 @@ def judge_round(
     threshold_source: str | None = None,
     calibrated: bool | None = None,
     group: str | None = None,
+    fp_per_image: float | None = None,
+    incumbent_fp_per_image: float | None = None,
 ) -> tuple[str, str]:
     """按噪声阈值判定 keep / discard，返回 ``(结论, 理由)``。
 
@@ -2196,6 +2733,10 @@ def judge_round(
     ``calibrated=False`` 时必须把它写进理由：那意味着阈值是**别的配置**
     测出来的尺子，用它判 KEEP/DISCARD 都可能错。让这句话出现在台账和界面上，
     用户才知道该去补一次 ``noise`` 测量，而不是怀疑模型。
+
+    ``fp_per_image`` 是过杀率（每图误报框数，由 P/R 反推的近似值）。两边都有值时，
+    即使 mAP 提升超过噪声阈值，过杀恶化也必须拦下——产线上「多报」是有成本的，
+    拿过杀换 mAP 的改动不能靠 2σ 规则自动转正。
     """
     if fitness is None:
         return "DISCARD", "没有产出有效指标（崩溃或预检拦截），本轮不计入进展"
@@ -2211,6 +2752,17 @@ def judge_round(
         )
 
     if delta > threshold:
+        # 过杀拦截：只在两边都有数时生效。容差取 max(0.01, 基线×5%)——
+        # 低于这个量级的差异在近似算法下不可信，不能当成「过杀变差」。
+        if fp_per_image is not None and incumbent_fp_per_image is not None:
+            tolerance = max(0.01, float(incumbent_fp_per_image) * 0.05)
+            if float(fp_per_image) - float(incumbent_fp_per_image) > tolerance:
+                return (
+                    "DISCARD",
+                    f"mAP 提升 {delta:+.5f} 超过噪声阈值 {threshold:.5f}，"
+                    f"但过杀从 {float(incumbent_fp_per_image):.3f} 升到 {float(fp_per_image):.3f} 框/图"
+                    f"（容差 {tolerance:.3f}）——不拿过杀换 mAP{caveat}",
+                )
         return (
             "KEEP",
             f"提升 {delta:+.5f}，超过噪声阈值 {threshold:.5f}，可判定为真实改进{caveat}",
@@ -2290,6 +2842,9 @@ def update_best(
                 else round(fitness - noise_mean, 6)
             ),
             "holdout_map50_95": None,
+            # 这次 KEEP 依据的是哪批数据。换了数据集之后，「比基线高」这件事
+            # 可能只是数据变了，没有这一行就无法回头核对。
+            "dataset_fingerprint": row.get("data_fp") or None,
         },
         "note": (
             f"holdout 尚未验收，需人工执行：python autoexp.py holdout --exp-id {exp_id}"
@@ -2507,6 +3062,31 @@ def cmd_agent(args: argparse.Namespace) -> int:
     if int(llm_cfg.get("max_tokens") or 0) < 1500:
         log("注意：max_tokens 偏小。推理型模型会把「思考」和「正文」算进同一预算，"
             "容易被截断成半截 JSON（表现为「返回内容为空」）。建议改到 4096。")
+    # 整场 agent 只让出一次，盖住每一轮训练。网页后端启动时会自己让出并打上
+    # 环境变量，这里再调一次会直接返回，不会在中途把显存还回去。
+    owned_yield = acquire_infer_yield("自动实验")
+    try:
+        return _cmd_agent_loop(
+            args, llm, base, space, rounds_total, deadline, threshold, sigma, source,
+            hours, llm_cfg,
+        )
+    finally:
+        release_infer_yield(owned_yield)
+
+
+def _cmd_agent_loop(
+    args: argparse.Namespace,
+    llm: Any,
+    base: dict[str, Any],
+    space: dict[str, Any],
+    rounds_total: int,
+    deadline: float | None,
+    threshold: float,
+    sigma: float | None,
+    source: str,
+    hours: float,
+    llm_cfg: dict[str, Any],
+) -> int:
     emit_event({
         "type": "agent",
         "name": "agent_start",
@@ -2659,6 +3239,10 @@ def cmd_agent(args: argparse.Namespace) -> int:
             threshold_source=noise["source"],
             calibrated=noise["calibrated"],
             group=noise["group"],
+            fp_per_image=_as_float(row.get("fp_per_image")),
+            incumbent_fp_per_image=_as_float(
+                (incumbent.get("row") or {}).get("fp_per_image") if incumbent else None
+            ),
         )
 
         completed += 1
@@ -2848,6 +3432,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_split.add_argument("--seed", type=int, default=42, help="切分随机种子，默认 42")
     p_split.add_argument("--force", action="store_true", help="忽略已存在的切分，强制重建")
     p_split.add_argument("--copy", action="store_true", help="用复制代替硬链接（跨卷时用）")
+    p_split.add_argument(
+        "--group-by",
+        default="none",
+        choices=("none", "prefix", "dir"),
+        help="按组切分 val：同一底板的图整组进同一侧，默认 none（按图片洗牌，与旧版一致）",
+    )
     p_split.set_defaults(func=cmd_split)
 
     p_run = sub.add_parser("run", help="跑一次实验并追加台账")
@@ -2858,6 +3448,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--allow-low-resources",
         action="store_true",
         help="内存/显存体检不通过时仍然开跑（结果可能因 OOM 失败）",
+    )
+    p_run.add_argument(
+        "--qc-gate",
+        action="store_true",
+        help="开跑前做数据体检，存在错误级标注问题时拒绝启动（默认不检查）",
     )
     p_run.set_defaults(func=cmd_run)
 
