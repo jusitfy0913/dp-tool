@@ -187,6 +187,49 @@ export function shouldExpandDrafts({ draftCount = 0, reviewCount = 0, touched = 
   return Number(draftCount) > 0 || Number(reviewCount) > 0;
 }
 
+/**
+ * 画布 / 列表上显示的名字：`label` 优先，空则回退类别名。
+ *
+ * 抽出来是为了让"显示名"只有一处定义。导入的工程每个框都带 `label`，
+ * 如果显示规则散落在画布、表格、状态栏各处，改一处就会漏一处。
+ */
+export function displayName(label, className) {
+  const text = String(label ?? "").trim();
+  return text || String(className ?? "").trim();
+}
+
+/**
+ * 改了类别之后，这个框的 `label` 应该变成什么。
+ *
+ * 规则只有一条：**label 是不是用户自己起的名字**。
+ * - 空 label：表示"跟随类别名"，改完仍然是空（显示层回退到新类别名）；
+ * - label 与旧类别名相同：说明它是导入时自动写进去的副本（`annotationimport`
+ *   会把类别名塞进 label），必须同步成新名字，否则界面上会一直显示旧类别；
+ * - 其它情况：用户手工写的别名，原样保留。
+ *
+ * 这条规则同时解决了两个"看起来改不动"的场景：改框的类别、改名后旧框没跟着变。
+ */
+export function labelAfterClassChange(label, fromName, toName) {
+  const current = String(label ?? "").trim();
+  if (!current) return "";
+  if (current === String(fromName ?? "").trim()) return String(toName ?? "").trim();
+  return String(label ?? "");
+}
+
+/**
+ * 批量改「集合」前的计划：只挑出确实需要改的图片，不改入参。
+ *
+ * 返回 `targets` 是为了让调用方统一"先判断有没有变化、再进撤销栈"——
+ * 选中的图本来就都在目标集合里时不该产生一条空的撤销记录。
+ */
+export function planSplitChange(images, ids, split) {
+  const wanted = new Set(Array.isArray(ids) ? ids : []);
+  const target = String(split ?? "");
+  const list = Array.isArray(images) ? images : [];
+  const targets = target ? list.filter((image) => wanted.has(image.id) && image.split !== target) : [];
+  return { targets, changed: targets.length };
+}
+
 /** 全部图片的草稿总数，供 `shouldExpandDrafts` 使用。 */
 export function countAllDrafts(drafts) {
   if (!drafts) return 0;

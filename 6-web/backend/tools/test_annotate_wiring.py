@@ -168,7 +168,8 @@ def main() -> int:
         "annotate.js 从 ./annotateflow.js 引入引导逻辑",
         'from "./annotateflow.js"' in js,
     )
-    for symbol in ["buildAnnoSteps", "currentStep", "resolveGuideAction", "removeImageAt", "shouldExpandDrafts"]:
+    for symbol in ["buildAnnoSteps", "currentStep", "resolveGuideAction", "removeImageAt", "shouldExpandDrafts",
+                   "displayName", "labelAfterClassChange", "planSplitChange"]:
         check(f"annotate.js 使用 {symbol}", symbol in js)
         check(f"annotateflow.js 导出 {symbol}", f"export function {symbol}" in flow)
     check(
@@ -189,6 +190,21 @@ def main() -> int:
     check("空图片列表有占位提示", 'className = "empty"' in js)
 
     # ------------------------------------------------------------------
+    # 5b. 类别显示名同步与集合入口（v1.35.1）
+    #     这两条都是"界面上看不出来"的接线：CSS/HTML 都在，逻辑没接就完全没反应。
+    # ------------------------------------------------------------------
+    check("改类别时同步显示名（labelAfterClassChange）", "labelAfterClassChange(obj.label" in js)
+    check("画布/表格统一用 displayName 显示", "displayName(obj.label" in js)
+    check("「标签」已改名为「显示名」", 'field("显示名"' in js and 'field("标签"' not in js)
+    check("属性面板顶部固定图片卡片 anno-imagecard", 'className = "anno-imagecard"' in js)
+    check("图片卡片里的集合下拉 id 为 annoImageSplit", 'splitSelect.id = "annoImageSplit"' in js)
+    check("批量改集合调用 planSplitChange", "planSplitChange(" in js)
+    check("批量条按选中数量显隐", "state.imageSelection.size" in js and "updateBatchBar" in js)
+    for item in ["annoBatchBar", "annoBatchCount", "annoBatchTrain", "annoBatchVal", "annoBatchTest", "annoBatchClear"]:
+        check(f"批量条元素 {item} 存在于 index.html", item in html_ids)
+    check("多选不靠右键菜单（Ctrl / Shift 修饰键）", "event.ctrlKey" in js and "event.shiftKey" in js)
+
+    # ------------------------------------------------------------------
     # 6. 样式接线
     # ------------------------------------------------------------------
     for selector in [
@@ -202,6 +218,9 @@ def main() -> int:
         ".anno-help",
         ".anno-group-label",
         ".anno-actions",
+        ".anno-batchbar",
+        ".anno-imagecard",
+        ".anno-imagelist li.picked",
     ]:
         check(f"style.css 定义 {selector}", selector in css)
     check("引导条收起态样式存在", ".anno-guide.is-collapsed" in css)

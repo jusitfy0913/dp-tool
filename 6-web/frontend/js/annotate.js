@@ -47,7 +47,10 @@ import {
   buildAnnoSteps,
   countAllDrafts,
   currentStep,
+  displayName,
   hasCustomClass,
+  labelAfterClassChange,
+  planSplitChange,
   removeImageAt,
   resolveGuideAction,
   shouldExpandDrafts,
@@ -149,6 +152,15 @@ const state = {
     fillAlpha: 0.18,
   },
   hidden: new Set(),
+  /**
+   * 图片多选（Ctrl / Shift 点左栏列表）。
+   *
+   * 只服务于"批量改集合"这一件事，不影响当前图片：不加这层的话，
+   * 693 张图要对齐 train/val/test 只能一张一张点，几乎做不了。
+   */
+  imageSelection: new Set(),
+  /** Shift 连选的锚点下标；-1 表示还没点过。 */
+  imageAnchor: -1,
   /** 拖动会话：{ kind, index, start, original, startScreen, startOffset } */
   drag: null,
   saveTimer: 0,
@@ -1044,6 +1056,8 @@ async function adoptProject(data, path) {
   state.advDraftTouched = false;
   reviewPending = new Map();
   state.hidden.clear();
+  state.imageSelection.clear();
+  state.imageAnchor = -1;
   state.selectedId = "";
   state.pending = [];
   clearPrompt();
@@ -1139,6 +1153,8 @@ async function createProject() {
     state.exists = true;
     state.dirty = false;
     state.currentIndex = -1;
+    state.imageSelection.clear();
+    state.imageAnchor = -1;
     state.selectedId = "";
     state.undo.length = 0;
     state.redo.length = 0;
@@ -1600,7 +1616,7 @@ function drawPolygon(ctx, points, close) {
 
 function drawLabel(ctx, obj, anchor, color, dashed = false) {
   if (!state.opts.showLabels) return;
-  const name = obj.label || classById(obj.class_id).name;
+  const name = displayName(obj.label, classById(obj.class_id).name);
   const score = Number(obj.score);
   let text = state.opts.showScore && score >= 0 ? `${name} ${score.toFixed(2)}` : name;
   // 草稿标签带档位字：真机上绿/黄/红的观感会受图片底色影响，
@@ -2453,7 +2469,7 @@ function onPointerDown(event) {
       capturePointer(event);
       renderAll();
       renderCanvas();
-      setStatus(`选中 ${hit.label || classById(hit.class_id).name}`);
+      setStatus(`选中 ${displayName(hit.label, classById(hit.class_id).name)}`);
       return;
     }
 
@@ -3264,12 +3280,14 @@ function renderImageList() {
   el.imageList.innerHTML = "";
   const images = state.project?.images || [];
   if (el.imageCount) el.imageCount.textContent = String(images.length);
+  pruneImageSelection(images);
 
   images.forEach((image, index) => {
     const li = document.createElement("li");
     li.className = index === state.currentIndex ? "active" : "";
     if (index === state.currentIndex && state.dirty) li.classList.add("dirty");
     if (state.review.has(image.id)) li.classList.add("reviewed");
+    if (state.imageSelection.has(image.id)) li.classList.add("picked");
     const name = document.createElement("span");
     name.className = "name";
     name.textContent = image.id || image.path.split(/[\\/]/).pop();
@@ -3309,7 +3327,24 @@ function renderImageList() {
       removeImage(index);
     });
     li.append(flag, name, meta, split, remove);
-    li.addEventListener("click", () => switchImage(index));
+    // 单击 = 切图并清空多选；Ctrl 点 = 加/减选；Shift 点 = 从锚点连选。
+    // 不把"单击"也变成加选：切图是最高频操作，误加选中会让后续批量改集合改到不该改的图。
+    li.addEventListener("click", (event) => {
+      if (event.ctrlKey || event.metaKey) {
+        event.preventDefault();
+        toggleImageSelection(image.id, index);
+        return;
+      }
+      if (event.shiftKey) {
+        event.preventDefault();
+        selectImageRange(index);
+        return;
+      }
+      state.imageSelection.clear();
+      state.imageAnchor = index;
+      updateBatchBar();
+      switchImage(index);
+    });
     el.imageList.appendChild(li);
   });
 
@@ -3322,6 +3357,72 @@ function renderImageList() {
       : "先按第 1 步新建或打开一个 .tfanno 工程，再回来加图片。";
     el.imageList.appendChild(empty);
   }
+  updateBatchBar();
+}
+
+/**
+ * 清掉多选里已经不存在的图片 id。
+ *
+ * 导入 / 移除图片都会让 id 集合变化，留着旧 id 的后果是：批量改集合时
+ * "改了 3 张"的提示只改了 2 张，用户还不知道少了哪一张。
+ */
+function pruneImageSelection(images = state.project?.images || []) {
+  if (!state.imageSelection.size) return;
+  const alive = new Set(images.map((image) => image.id));
+  for (const id of [...state.imageSelection]) {
+    if (!alive.has(id)) state.imageSelection.delete(id);
+  }
+  if (state.imageAnchor >= images.length) state.imageAnchor = images.length - 1;
+}
+
+/** Ctrl 点：把这张图加进/移出多选。不改当前图片，避免"只是选一下却跳图"。 */
+function toggleImageSelection(id, index) {
+  if (state.imageSelection.has(id)) state.imageSelection.delete(id);
+  else state.imageSelection.add(id);
+  state.imageAnchor = index;
+  renderImageList();
+}
+
+/** Shift 点：从锚点到这一行整段选中（两端都含）。 */
+function selectImageRange(index) {
+  const images = state.project?.images || [];
+  if (!images.length) return;
+  const fallback = state.currentIndex >= 0 ? state.currentIndex : index;
+  const anchor = state.imageAnchor >= 0 && state.imageAnchor < images.length ? state.imageAnchor : fallback;
+  const from = Math.min(anchor, index);
+  const to = Math.max(anchor, index);
+  state.imageSelection.clear();
+  for (let i = from; i <= to; i += 1) state.imageSelection.add(images[i].id);
+  renderImageList();
+}
+
+/** 批量条只在选中 2 张以上时出现：1 张时右栏「集合」下拉已经够了。 */
+function updateBatchBar() {
+  if (!el.batchBar) return;
+  const count = state.imageSelection.size;
+  el.batchBar.classList.toggle("hidden", count < 2);
+  if (el.batchCount) el.batchCount.textContent = `已选 ${count} 张：`;
+}
+
+/**
+ * 批量把选中的图片设成同一个集合。
+ *
+ * 先计划再动手：`planSplitChange` 只返回真正需要改的图，全都一样时不进撤销栈，
+ * 否则用户会拿到一条"什么都没变"的撤销记录。
+ */
+function applySplitToSelected(split) {
+  const images = state.project?.images || [];
+  if (!images.length || !state.imageSelection.size) return;
+  const { targets, changed } = planSplitChange(images, [...state.imageSelection], split);
+  if (!changed) {
+    setStatus(`选中的图片本来就都在 ${split}`, "");
+    return;
+  }
+  pushHistory(true);
+  for (const image of targets) image.split = split;
+  afterEdit();
+  renderCanvas();
+  setStatus(`已把 ${changed} 张图片设为 ${split}`);
 }
 
 /**
@@ -3563,7 +3664,7 @@ function renderBoxTable() {
       ? `${Math.round(bounds.x)},${Math.round(bounds.y)}  ${Math.round(bounds.w)}×${Math.round(bounds.h)}` +
         (obj.shape_type === "rotated_rect" ? `  ${angle.toFixed(0)}°` : "")
       : "—";
-    for (const text of [String(index + 1), obj.label || classById(obj.class_id).name, shapeName, place]) {
+    for (const text of [String(index + 1), displayName(obj.label, classById(obj.class_id).name), shapeName, place]) {
       const td = document.createElement("td");
       td.textContent = text;
       tr.appendChild(td);
@@ -3574,7 +3675,7 @@ function renderBoxTable() {
       revealObject(obj);
       renderAll();
       renderCanvas();
-      setStatus(`选中 ${obj.label || classById(obj.class_id).name}`);
+      setStatus(`选中 ${displayName(obj.label, classById(obj.class_id).name)}`);
     });
     body.appendChild(tr);
     if (obj.id === state.selectedId && state.boxScrollId !== obj.id) {
@@ -3590,35 +3691,51 @@ function renderProps() {
   const image = currentImage();
   const obj = selectedObject();
 
+  // 图片级信息固定在面板最上方：选中框时也要能改「集合」。
+  // v1.35.0 之前这段被 `if (!obj)` 挡住，于是"训练/验证/测试"只能在
+  // 不选任何框的时候改，用户以为是改不了。
+  if (image) {
+    const card = document.createElement("div");
+    card.className = "anno-imagecard";
+    const head = document.createElement("p");
+    head.className = "anno-hint";
+    head.textContent =
+      `${image.id} · ${image.width}×${image.height}` +
+      (image.annotations.length ? ` · ${image.annotations.length} 个标注` : "");
+    head.title = image.path || image.id;
+    const splitRow = document.createElement("label");
+    splitRow.className = "anno-field";
+    const splitName = document.createElement("span");
+    splitName.textContent = "集合";
+    splitName.title = "train / val / test：导出时这张图进哪个划分。左栏 Ctrl / Shift 多选后可批量改。";
+    const splitSelect = document.createElement("select");
+    splitSelect.id = "annoImageSplit";
+    ["train", "val", "test"].forEach((name) => {
+      const option = document.createElement("option");
+      option.value = name;
+      option.textContent = name;
+      option.selected = image.split === name;
+      splitSelect.appendChild(option);
+    });
+    splitSelect.addEventListener("change", () => {
+      pushHistory();
+      image.split = splitSelect.value;
+      afterEdit();
+      renderCanvas();
+      setStatus(`${image.id} 已设为 ${image.split}`);
+    });
+    splitRow.append(splitName, splitSelect);
+    card.append(head, splitRow);
+    el.props.appendChild(card);
+  }
+
   if (!obj) {
     const hint = document.createElement("p");
     hint.className = "anno-hint";
     hint.textContent = image
-      ? `${image.id} · ${image.width}×${image.height} · ${image.annotations.length} 个标注`
+      ? "点画布上的框或右栏「标注框」列表，选中后可改类别、显示名、描述等属性"
       : "未选中标注";
     el.props.appendChild(hint);
-
-    if (image) {
-      const splitRow = document.createElement("label");
-      splitRow.className = "anno-toggle";
-      splitRow.append(document.createTextNode("集合 "));
-      const splitSelect = document.createElement("select");
-      ["train", "val", "test"].forEach((name) => {
-        const option = document.createElement("option");
-        option.value = name;
-        option.textContent = name;
-        option.selected = image.split === name;
-        splitSelect.appendChild(option);
-      });
-      splitSelect.addEventListener("change", () => {
-        pushHistory();
-        image.split = splitSelect.value;
-        afterEdit();
-        renderCanvas();
-      });
-      splitRow.appendChild(splitSelect);
-      el.props.appendChild(splitRow);
-    }
     return;
   }
 
@@ -3649,15 +3766,24 @@ function renderProps() {
     return input;
   };
 
-  field(
-    "标签",
-    textInput(obj.label, (event) => {
+  // 「显示名」而不是「标签」：训练用的类别只有一个（下面那个下拉），
+  // 这里改的只是画布/列表上看到的字。留空 = 跟随类别名。
+  const labelInput = textInput(
+    obj.label,
+    (event) => {
       pushHistory();
       obj.label = event.target.value;
       afterEdit();
       renderCanvas();
-    }),
+    },
+    classById(obj.class_id).name,
   );
+  labelInput.title = "只影响画布与列表上的显示；训练标签由「类别」决定。留空则跟随类别名。";
+  field("显示名", labelInput);
+  const labelHint = document.createElement("p");
+  labelHint.className = "anno-hint";
+  labelHint.textContent = "留空 = 显示类别名；改「类别」时，与旧类别同名的显示名会自动跟着改。";
+  el.props.appendChild(labelHint);
 
   const classSelect = document.createElement("select");
   for (const cls of state.project.classes) {
@@ -3669,9 +3795,15 @@ function renderProps() {
   }
   classSelect.addEventListener("change", () => {
     pushHistory();
-    obj.class_id = Number(classSelect.value);
+    const before = classById(obj.class_id);
+    const after = classById(Number(classSelect.value));
+    obj.class_id = after.id;
+    // 导入的工程每个框都带 label=类别名（annotationimport 自动写的），
+    // 不同步的话：class_id 已经改了，画布/表格却还显示旧名字，看起来"改不动"。
+    obj.label = labelAfterClassChange(obj.label, before.name, after.name);
     afterEdit();
     renderCanvas();
+    setStatus(`已把该标注改为「${displayName(obj.label, after.name)}」`);
   });
   field("类别", classSelect);
 
@@ -3830,9 +3962,15 @@ function applyClassToSelection(classId) {
     return;
   }
   pushHistory();
-  obj.class_id = classId;
+  const before = classById(obj.class_id);
+  const after = classById(classId);
+  obj.class_id = after.id;
+  // 与右栏「类别」下拉同一条规则：只有"自动写进去的类别名副本"才跟着改，
+  // 用户手写的显示名不动。
+  obj.label = labelAfterClassChange(obj.label, before.name, after.name);
   afterEdit();
   renderCanvas();
+  setStatus(`已把该标注改为「${displayName(obj.label, after.name)}」`);
 }
 
 function addClass() {
@@ -4515,6 +4653,9 @@ export function initAnnotate() {
     advDraft: document.getElementById("annoAdvDraft"),
     imageList: document.getElementById("annoImageList"),
     imageCount: document.getElementById("annoImageCount"),
+    // 图片多选后的批量改集合条（v1.35.1）
+    batchBar: document.getElementById("annoBatchBar"),
+    batchCount: document.getElementById("annoBatchCount"),
     addRoot: document.getElementById("annoAddRoot"),
     stage: document.getElementById("annoStage"),
     canvas: document.getElementById("annoCanvas"),
@@ -4608,6 +4749,18 @@ export function initAnnotate() {
   document.getElementById("annoSaveAs")?.addEventListener("click", saveAs);
   document.getElementById("annoAddImages")?.addEventListener("click", addImages);
   document.getElementById("annoAddFiles")?.addEventListener("click", addImagesByDialog);
+  // 批量改集合：只改选中的那几张，且全部已在目标集合时不动撤销栈
+  for (const split of ["train", "val", "test"]) {
+    document.getElementById(`annoBatch${split[0].toUpperCase()}${split.slice(1)}`)?.addEventListener("click", () => {
+      applySplitToSelected(split);
+    });
+  }
+  document.getElementById("annoBatchClear")?.addEventListener("click", () => {
+    state.imageSelection.clear();
+    state.imageAnchor = -1;
+    renderImageList();
+    setStatus("已取消图片多选", "");
+  });
   document.getElementById("annoImportPreview")?.addEventListener("click", previewImport);
   document.getElementById("annoImportApply")?.addEventListener("click", () => applyImport({ save: false }));
   document.getElementById("annoImportApplySave")?.addEventListener("click", () => applyImport({ save: true }));

@@ -1278,8 +1278,16 @@
             <button type="button" class="mini" id="annoAddFiles" title="一次选多张图片直接加入工程">选图片…</button>
           </div>
         </div>
-        <p class="anno-hint">加图只记录路径，不复制文件；行尾「×」只把图移出工程，不删磁盘上的图片。</p>
+        <p class="anno-hint">加图只记录路径，不复制文件；行尾「×」只把图移出工程，不删磁盘上的图片。Ctrl / Shift 点图片可多选，一次改「集合」。</p>
         <ul class="anno-imagelist" id="annoImageList"></ul>
+        <!-- 多选后才出现的批量条：693 张图逐张改「集合」不现实，Ctrl / Shift 选完一次改完 -->
+        <div class="anno-row anno-batchbar hidden" id="annoBatchBar">
+          <span class="anno-batchcount" id="annoBatchCount">已选 0 张：</span>
+          <button type="button" class="mini" id="annoBatchTrain" title="把选中的图片设为训练集">train</button>
+          <button type="button" class="mini" id="annoBatchVal" title="把选中的图片设为验证集">val</button>
+          <button type="button" class="mini" id="annoBatchTest" title="把选中的图片设为测试集">test</button>
+          <button type="button" class="mini" id="annoBatchClear" title="取消多选（不影响已改的集合）">取消</button>
+        </div>
 
         <!-- 导入已有 YOLO 标签：data.yaml 的 names 决定类别表，labels/*.txt 变成可编辑的框 -->
         <details class="anno-import" id="annoImportBox">

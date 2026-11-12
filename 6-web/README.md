@@ -1054,6 +1054,64 @@ python 6-web\backend\tools\run_all_tests.py            # 54 个脚本全绿
 - 草稿与审核不随撤销恢复：撤销栈只存 `.tfanno` 快照，草稿在旁挂文件里，恢复会写回一份与正文不一致的候选框。
 - 引导条不做「强制步骤门禁」：可以跳着做（例如先加类别再补工程），引导条只是提示，不拦截。
 
+#### 类别显示名与「集合」入口（v1.35.1）
+
+**要解决的问题**：两个"看起来改不动"的反馈，根因都不是数据层。
+
+| 现象 | 真正的原因 | 修法 |
+| --- | --- | --- |
+| 改了「类别」，画布和列表还显示旧的类别名 | 导入 YOLO 时 `annotationimport` 把类别名同时写进了每个框的 `label`（如 `label: "missing_hole"`），而界面显示规则是 `label \|\| 类别名`，于是 `class_id` 改了、`label` 没改，显示就跟不上 | 改类别时按 `labelAfterClassChange` 规则同步 `label`（见下表） |
+| 训练/验证/测试（集合）找不到入口 | 属性面板里「集合」下拉被 `if (!obj)` 挡住——**只有不选任何框时才显示** | 面板顶部固定一块「图片卡片」，选中框时也在 |
+
+**`label`（显示名）的同步规则**（`annotateflow.js` 的 `labelAfterClassChange`）
+
+| 原 `label` | 改类别后 | 为什么 |
+| --- | --- | --- |
+| 空 | 仍为空 | 空 = 跟随类别名，显示层用 `displayName` 回退 |
+| 等于旧类别名 | 改成新类别名 | 这是导入时自动写的副本，不是用户起的名字 |
+| 其它（用户手工改名） | 原样保留 | 自定义别名不能被系统覆盖 |
+
+字段文案也从「标签」改成「显示名」，输入框 `placeholder` 显示当前类别名，并在下面写明
+"留空 = 显示类别名；改「类别」时，与旧类别同名的显示名会自动跟着改"。
+**训练用的类别始终只有 `class_id`**（导出 YOLO/COCO/VOC 都只读它），`label` 不参与训练。
+
+**「集合」入口（图片级）**
+
+| 位置 | 能力 |
+| --- | --- |
+| 右栏属性面板顶部「图片卡片」 | 显示 `id · 宽×高 · 标注数`，固定一个 `集合` 下拉；**选中框时也可见可改** |
+| 左栏图片列表 + 批量条 | `Ctrl` 点加/减选、`Shift` 点从锚点连选；选中 ≥2 张时出现 `train / val / test / 取消`，一次改完 |
+| 撤销 | 批量改集合进整工程快照（`pushHistory(true)`），`Ctrl+Z` 可整体撤销 |
+
+批量改集合走 `planSplitChange(images, ids, split)` 纯函数：**只返回真正需要改的图片**。
+全都已经在目标集合里时不进撤销栈、只提示"本来就都在 xx"，避免产生一条空撤销记录。
+
+**新增/改动**
+
+| 文件 | 变化 |
+| --- | --- |
+| `frontend/js/annotateflow.js` | 新增 `displayName` / `labelAfterClassChange` / `planSplitChange`（仍不碰 DOM） |
+| `frontend/js/annotate.js` | 类别同步、图片卡片、多选与批量条、`applySplitToSelected`、`pruneImageSelection` |
+| `frontend/index.html` | 左栏批量条 `#annoBatchBar`（`annoBatchTrain/Val/Test/Clear`）、提示补充 Ctrl/Shift 用法 |
+| `frontend/css/style.css` | `.anno-imagelist li.picked` / `.anno-batchbar` / `.anno-imagecard` |
+
+**验收（v1.35.1 实测）**
+
+```powershell
+node 6-web\frontend\tests\test_annotate_flow.mjs       # 78 项（新增显示名同步 / 批量集合 21 项）
+python 6-web\backend\tools\test_annotate_wiring.py     # 81/81（新增 id 接线与 CSS 类检查）
+python 6-web\backend\tools\run_all_tests.py            # 54 个脚本全绿
+```
+
+浏览器实测（4 张图、每个框 `label` 与类别名相同的工程）：选中框改类别 → 表格与画布立即变新名字、
+状态栏提示"已把该标注改为 …"；把显示名改成自定义别名后再改类别 → 别名保留；
+`Ctrl` 点两张图 → 批量条出现"已选 2 张" → 点 `val` → 只改了实际需要改的 1 张；
+选中框的同时改「集合」→ 保存后 `.tfanno` 里 `split` 已落盘。
+
+**已知边界**
+
+- 显示名同步只处理"空 / 等于旧类别名"两种自动情形，无法判断用户是不是**故意**用类别名当别名——这类框会被一起改掉。
+- 批量条不提供"按目录/前缀批量分配"，那是数据集页「划分口径」的职责，两处不做重复实现。
 
 #### 导入已有 YOLO 标签（v1.19 新增）
 

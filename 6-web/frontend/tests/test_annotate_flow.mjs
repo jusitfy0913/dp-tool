@@ -12,7 +12,10 @@ import {
   buildAnnoSteps,
   countAllDrafts,
   currentStep,
+  displayName,
   hasCustomClass,
+  labelAfterClassChange,
+  planSplitChange,
   removeImageAt,
   resolveGuideAction,
   shouldExpandDrafts,
@@ -278,6 +281,59 @@ check("缺省参数不抛异常", shouldExpandDrafts(), false);
   check("null 草稿计数为 0", countAllDrafts(null), 0);
   // 坏数据不能把整页统计带崩
   check("非数组值被忽略", countAllDrafts({ a: "oops", b: [1] }), 1);
+}
+
+// ---------------------------------------------------------------------------
+// displayName / labelAfterClassChange / planSplitChange（v1.35.1）
+// ---------------------------------------------------------------------------
+group("显示名与改类别同步");
+check("label 优先", displayName("划痕", "missing_hole"), "划痕");
+check("label 空则用类别名", displayName("", "missing_hole"), "missing_hole");
+check("label 只有空格也回退", displayName("   ", "short"), "short");
+check("null label 回退", displayName(null, "spur"), "spur");
+check("两边都空给空串", displayName("", ""), "");
+
+// 导入的老工程：每个框的 label 就是导入时的类别名 → 改类别必须同步
+check("label 等于旧类别名时同步", labelAfterClassChange("missing_hole", "missing_hole", "short"), "short");
+check("label 空时保持空（跟随类别名）", labelAfterClassChange("", "missing_hole", "short"), "");
+check("自定义别名保留", labelAfterClassChange("第三工位划痕", "missing_hole", "short"), "第三工位划痕");
+check("前后空格不影响判断", labelAfterClassChange(" missing_hole ", "missing_hole", "short"), "short");
+check("旧类别名为空时不误判成别名", labelAfterClassChange("", "", "short"), "");
+check("null 输入不抛异常", labelAfterClassChange(null, "a", "b"), "");
+
+group("批量改集合");
+const images = () => [
+  { id: "a", split: "train" },
+  { id: "b", split: "val" },
+  { id: "c", split: "train" },
+];
+{
+  const plan = planSplitChange(images(), ["a", "c"], "test");
+  check("多选：两张都要改", plan.changed, 2);
+  checkDeep("多选：目标是 a 和 c", plan.targets.map((item) => item.id), ["a", "c"]);
+  check("不改入参", images()[0].split, "train");
+}
+{
+  const plan = planSplitChange(images(), ["b"], "test");
+  check("单张：只改 b", plan.changed, 1);
+  check("单张：目标正确", plan.targets[0].id, "b");
+}
+{
+  const plan = planSplitChange(images(), ["a"], "train");
+  check("本来就在目标集合：不改", plan.changed, 0);
+  check("本来就在目标集合：目标列表为空", plan.targets.length, 0);
+}
+{
+  const plan = planSplitChange(images(), [], "val");
+  check("没选中任何图片：不改", plan.changed, 0);
+}
+{
+  const plan = planSplitChange(images(), ["a"], "");
+  check("空集合名：不改（防手滑写坏 split）", plan.changed, 0);
+}
+{
+  const plan = planSplitChange(null, ["a"], "val");
+  check("空图片列表不抛异常", plan.changed, 0);
 }
 
 // ---------------------------------------------------------------------------

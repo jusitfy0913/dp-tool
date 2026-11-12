@@ -2375,6 +2375,34 @@ input[type="range"]:disabled { cursor: not-allowed; }
   cursor: default;
 }
 .anno-imagelist li.empty:hover { background: transparent; }
+/* 多选中的图片：加一条虚线外框而不是改背景，避免和"当前图片"（左实线）撞脸 */
+.anno-imagelist li.picked {
+  background: var(--cyan-a10);
+  box-shadow: inset 0 0 0 1px var(--cyan-a40);
+}
+.anno-imagelist li.picked.active {
+  box-shadow: inset 2px 0 0 var(--cyan), inset 0 0 0 1px var(--cyan-a40);
+}
+/* 批量改集合条：只在选中 ≥2 张时出现，所以样式可以做得紧凑一点 */
+.anno-batchbar {
+  flex-wrap: wrap;
+  gap: var(--sp-1);
+  align-items: center;
+  padding: 4px 6px;
+  border: 1px dashed var(--cyan-a40);
+  border-radius: var(--radius-sm);
+  font-size: var(--fs-2xs);
+}
+.anno-batchcount { color: var(--text-dim); margin-right: auto; }
+/* 属性面板顶部的图片卡片：把「集合」从"没选中框时才出现"里救出来 */
+.anno-imagecard {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+  padding-bottom: var(--sp-2);
+  margin-bottom: var(--sp-2);
+  border-bottom: 1px solid var(--line);
+}
 /* 行尾移除按钮：默认低对比，悬停才变红，避免误以为点整行就删。
    选择器带 .anno-imagelist 前缀是为了压过 button.mini / button.danger
    （那两个是 (0,1,1)，单类选择器 (0,1,0) 会输）。 */
