@@ -664,14 +664,17 @@ python autoexp.py agent --rounds 30 --hours 8 --events
 就让整个功能不可用。`llm-test` 则完全不发这个字段——自检只验证「能不能通」，
 不引入格式约束，避免把「模型不听话」误判成「配置错」。
 
-### 14.7 API Key 的三条安全边界
+### 14.7 API Key 的四条安全边界
 
 1. 只存在 `6-web/runtime/autoexp_llm.json`（`6-web/runtime/` 已 gitignore）。
-2. GET 接口**永不返回原文**，只给 `has_key` 与遮罩 `sk-****1a2b`；再保存时留空 = 不修改。
+   **v1.35.3 起该文件里存的是 Windows DPAPI 密文**（`api_key_dpapi` + `key_enc`），
+   只有本机 + 本 Windows 账户能解开；换电脑或换账户时网页提示「请重新输入」，
+   命令行侧读到解密失败也会给出明确告警而不是静默无 Key。
+2. GET 接口**永不返回原文**，只给 `has_key` / `key_masked` / `key_locked`；再保存时留空 = 不修改。
 3. 传给子进程**只走环境变量**，绝不进 `argv`。命令行会出现在「运行中」条 tooltip、
    `runtime/logs/*.log` 和 WebSocket 事件里，Key 一旦进 argv 就等于贴到界面上。
    `llm.py` 另有 `mask_key()`，所有对外文本都过它；`load_config()` 会主动剔除
-   `api_key` 字段，防止 Key 随配置字典流进日志与审计快照。
+   `api_key` / `api_key_dpapi` / `key_enc`，防止 Key 或密文随配置字典流进日志与审计快照。
 
 ### 14.8 审计与成本
 
@@ -852,7 +855,8 @@ Windows 实现把非控制台信号的 sig 直接交给 `TerminateProcess(handle
 **安全边界（新版本才有）**
 
 - `data` 字段做路径断言：解析后若落在 `pcb_holdout.yaml` 上直接拒绝，防止用验证集调参。
-- Key 只走环境变量传入子进程，不进 `argv`；`load_config()` 主动剔除 `api_key` 字段。
+- Key 只走环境变量传入子进程，不进 `argv`；`load_config()` 主动剔除 `api_key` /
+  `api_key_dpapi` / `key_enc` 字段（v1.35.3 起磁盘上的 Key 是 DPAPI 密文，密文同样不许进台账）。
 - 进程被停时必须杀整棵树（`autoexp.py agent` → `_exec` → launcher → PyTorch），
   只杀父进程会让界面显示「已停止」而显卡仍被占着。
 

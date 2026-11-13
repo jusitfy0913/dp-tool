@@ -191,7 +191,11 @@ def load_config(overrides: dict[str, Any] | None = None) -> dict[str, Any]:
     # 注释字段与密钥字段都不参与请求。
     # 特别是 api_key：Web 端的存储文件里带着它，若不在这里剔除，
     # 它会随配置字典流进日志、审计快照和 prompt 上下文——那等于把 Key 写进台账。
-    for noisy in ("_comment", "_note", "api_key", "key", "apikey"):
+    # api_key_dpapi / key_enc 同理：那是 Web 端的 DPAPI 密文与加密方式标记，
+    # 对命令行没有任何用处，却会被原样写进 round_*.json 审计快照——
+    # 密文不该离开它自己的存储文件。
+    for noisy in ("_comment", "_note", "api_key", "key", "apikey",
+                  "api_key_dpapi", "key_enc"):
         merged.pop(noisy, None)
     return merged
 

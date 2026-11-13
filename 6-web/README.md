@@ -1113,6 +1113,76 @@ python 6-web\backend\tools\run_all_tests.py            # 54 个脚本全绿
 - 显示名同步只处理"空 / 等于旧类别名"两种自动情形，无法判断用户是不是**故意**用类别名当别名——这类框会被一起改掉。
 - 批量条不提供"按目录/前缀批量分配"，那是数据集页「划分口径」的职责，两处不做重复实现。
 
+#### 安装包拆分：软件包 + 示例模型包（v1.35.2）
+
+**要解决的问题**：原来 `package_web_user.ps1` 一个包 1.8 GB。换一次演示模型就要重跑
+Nuitka 编译，而示例模型本身是"可替换的数据"，生命周期和程序完全不同。此外引擎绑显卡这一点
+让"把 `.engine` 打进包"这条路从一开始就不成立。
+
+| 包 | 脚本 | 产物 | 大小 |
+| --- | --- | --- | --- |
+| 软件包 | `packaging/package_web_user.ps1` | `dist/TRTForgeWeb_cuda118.zip` | 约 1.8 GB |
+| 示例模型包 | `packaging/package_demo_models.ps1` | `dist/TRTForgeWeb_models_demo.zip` | 约 39 MB |
+
+**后端一行没改**。模型包的布局是照着 `models.py` 的扫描契约反推出来的：
+
+| 扫描契约（`models.py`） | 模型包怎么满足 |
+| --- | --- |
+| 只扫 `launchers/runs` 与 `launchers/results` | 包里 `payload/` 就按这两个根摆，安装脚本原样复制 |
+| 引擎文件名带精度后缀，ONNX 不带 | 只发 ONNX；编出来的 `<名>_fp16.engine` 与 ONNX 同目录，`_strip_precision` 自动配对 |
+| YOLO 标签优先按 run 目录名精确匹配 | 打包时把 `labels_detect_v1.json` 改名成 `labels_pcb_demo.json`，`name` 也同步 |
+| anomalib 需要同目录 `metadata.json` 读阈值 | 原样带过去，但 `ckpt_path` 清空、`onnx_path` 改相对，安装时换绝对 |
+
+**为什么不带 `.engine`**：TensorRT 引擎序列化时绑定显卡型号与 TRT 版本，本机（T1000 / TRT 8.5.2）
+编好的引擎在别的显卡上报 serialization header 错误。目标机器上用「引擎构建」页编一次
+（PCB 960×960 FP16 实测 474 秒），后端不需要任何改动。
+
+**新增文件**
+
+| 文件 | 作用 |
+| --- | --- |
+| `packaging/package_demo_models.ps1` | 读清单 → 复制 → 自检（无引擎/无源码/transd/标签名）→ 写 manifest 与 README → 压缩 |
+| `packaging/models_manifest.json` | 示例模型清单：`source_dir`、`target_run`、`source_labels`/`source_metadata` |
+| `packaging/templates/install_demo_models.ps1` | 用户侧安装：找 `app\TRTForgeWeb.exe` → 复制 → SHA256 校验 → 改写 `onnx_path` → 打印下一步 |
+| `packaging/templates/install_demo_models.bat` | 双击入口，纯 ASCII（cmd 按系统代码页读 .bat） |
+| `packaging/secret_scan.ps1` | 密钥关卡：文件名黑名单 + 环境变量逐字比对 + 内容模式，命中即 `throw` |
+| `backend/tools/test_demo_models_package.py` | 70 项验收：真打包 + 真安装 + 假引擎占位 + `scan_models()` |
+| `backend/tools/test_packaging_secrets.py` | 25 项验收：干净的包放行、8 类风险全拦、公开 CA 证书放行、本机真实 Key 必拦 |
+
+**密钥进出包的边界（v1.35.2 起，v1.35.3 加密加强）**
+
+自动实验的 LLM Key 存在 `6-web/runtime/autoexp_llm.json`（网页上填过就落盘），
+**v1.35.3 起该文件里的 Key 是 Windows DPAPI 密文**（只有本机本账户能解开，见后文
+「自动实验 API Key 的加密存储」）。两个打包脚本在压缩前仍调用 `Assert-NoPackagedSecrets`，命中就停止打包：
+
+| 关卡 | 拦什么 |
+| --- | --- |
+| 文件名黑名单 | `autoexp_llm.json`、`*.local.json`、`.env`、`secrets.json`、`credentials.json` 等 |
+| 私钥内容 | `.pfx` / `.p12` 按后缀否决；`.pem` / `.key` 读内容，含 `PRIVATE KEY` 才否决（`cacert.pem` 这类公开根证书必须放行，否则软件包打不出来） |
+| 环境变量逐字比对 | `AUTOEXP_API_KEY` / `DEEPSEEK_API_KEY` / `OPENAI_API_KEY` 的真实值（覆盖无 `sk-` 前缀的网关 Key） |
+| 内容模式 | `sk-` + 20 位、`"api_key": "…"`、`Bearer <令牌>`、`KEY=value`、`"api_key_dpapi": "…"` |
+
+没有 `-SkipSecretScan` 这类开关：给一次例外，这道关就等于不存在。日志只印前 6 位，
+避免报错信息本身成为第二次泄露。`models.py` / 推理链路**一行没改**，这是纯打包侧改动。
+
+**验收（v1.35.2 实测）**
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\packaging\package_demo_models.ps1
+python 6-web\backend\tools\test_demo_models_package.py    # 70 项全通过
+python 6-web\backend\tools\test_packaging_secrets.py      # 25 项全通过
+```
+
+实测体积：解压 43.2 MB、zip 39.1 MB、打包 2.5 秒。测试里造的是假 engine（写几字节占位），
+所以断言的是"装对位置后后端能认出来"，不是"引擎能跑"；引擎能否跑必须在有显卡的机器上验。
+
+**已知边界**
+
+- 模型包只覆盖 YOLO 与 anomalib 两类；SAM / GroundingDINO 这些提示式标注模型仍走 `models\` + 模型仓库页，不在这个包里。
+- 安装脚本只写 `launchers\demo_models_installed.json` 作记录，软件目前不读它（避免为演示数据改启动流程）。
+- 安装脚本不做"已经是别人的模型就跳过"的判断，重复执行会覆盖同名文件（幂等，但不是增量）。
+- 密钥扫描只能抓文本文件；密钥被打进二进制（例如有人编译时把 Key 烧进 exe）它看不见。那种情况只能靠代码评审兜住。
+
 #### 导入已有 YOLO 标签（v1.19 新增）
 
 已经有 `data.yaml + images/ + labels/` 的数据集，不用先转格式：导入进来的框就是工程里
@@ -2171,13 +2241,35 @@ version_diff:
 | `autoexp.py run`，锁由自家后端持有 | 写入日志「显卡锁由网页后端持有」，正常训练 |
 | `autoexp.py run`，锁由别的进程持有 | 退出码 5，不建实验目录、不写台账 |
 
-**Key 的三条边界**
+**Key 的四条边界**
 
-1. 只落盘到 `runtime/autoexp_llm.json`（`runtime/` 已 gitignore）。
-2. `GET /api/autoexp/llm-config` 永不返回原文，只给 `has_key` + 遮罩（`sk-****1a2b`）；
-   保存时 `api_key` 留空 = 不修改，传 `__clear__` = 删除。
+1. **磁盘上是密文**：只落盘到 `runtime/autoexp_llm.json`（`runtime/` 已 gitignore），
+   v1.35.3 起 Key 用 Windows DPAPI 加密（字段 `api_key_dpapi` + `key_enc: "dpapi"`），
+   换电脑或换 Windows 账户解不开，用户重新输入即可。
+2. `GET /api/autoexp/llm-config` 永不返回原文，只给 `has_key` + `key_masked` + `key_locked`；
+   保存时 `api_key` 留空 = 不修改，传 `__clear__` = 删除（密文一起删）。
 3. 传子进程只走环境变量 `AUTOEXP_API_KEY`，不进 `argv`（argv 会出现在顶栏 tooltip、
    `runtime/logs/*.log` 与事件流里）。
+4. 密文字段不会随 `AUTOEXP_LLM_CONFIG` 流进审计快照：`llm.load_config()` 主动剔除
+   `api_key` / `api_key_dpapi` / `key_enc`。
+
+**自动实验 API Key 的加密存储（v1.35.3）**
+
+| 项目 | 说明 |
+| --- | --- |
+| 实现 | `backend/keyvault.py`，`ctypes` 调 `crypt32.dll` 的 `CryptProtectData` / `CryptUnprotectData`，不依赖 pywin32 |
+| 加密作用域 | DPAPI **当前用户**（不是 `LOCAL_MACHINE`）：只有本机 + 本 Windows 账户能解开 |
+| 附加熵 | 固定字符串 `trtforge.autoexp.llm.v1`，让别的程序产出的 blob 顶替不了 |
+| 磁盘字段 | `api_key_dpapi`（base64 密文）+ `key_enc`（`dpapi` / `plain`）；**不再写** `api_key` 明文 |
+| 读取 | `_read_store()` 解密后放进业务视图的 `api_key`，密文字段不外泄 |
+| 写入 | `_write_store()` 加密后落盘；Windows 上加密失败直接报错，不写明文 |
+| 旧文件 | 启动时 `migrate_key_store()` 就地迁移明文 → 密文；已迁移则跳过（幂等） |
+| 换机行为 | 解密失败 → `has_key=false` + `key_locked=true`，界面显示「需重输」，开跑前给出明确原因 |
+| 保留策略 | 解不开的机器上只改 `base_url` 时旧密文原样保留（拷回原机器仍可用）；`__clear__` 才删除 |
+| 非 Windows | 没有 DPAPI，退回明文并标 `key_enc: "plain"`，仅用于开发环境 |
+
+状态判定只有一处（`_llm_state()`），`/status`、`/llm-config`、保存响应共用同一套口径，
+避免出现「状态卡说已配置、点开始说没配」这种自相矛盾的界面。
 
 **改动文件**
 
@@ -3231,7 +3323,11 @@ capabilities 的 `native_dialog`）、`frontend/js/main.js`（统一入口 + 提
 | 服务跑在无桌面会话（计划任务 / NSSM 服务） | 子进程失败，前端自动退回页面内浏览并提示原因 |
 | 选中的路径在仓库外 | 该目录自动加入**运行期放行表**，不递归、不落盘、重启失效 |
 
-要用系统框的前提：Windows + 当前解释器带 `tkinter`（conda 官方包都带）。
+要用系统框的前提：Windows + 当前程序带 `tkinter`。
+
+- 开发环境：子进程是 `pythonw.exe -c`，conda 官方包都带 tkinter。
+- 安装包：没有 `python.exe`。子进程是 `TRTForgeWeb.exe --tool native_dialog`，跑的是同一段弹窗代码。以前误用 `-c`，exe 会把它当成再开一次网页，于是提示「系统选择窗口没有出现」并退回页面内浏览。
+
 `/api/capabilities` 的 `native_dialog` 字段就是这项探测结果，前端据此决定按钮走哪条路。
 
 ### 环境说明
@@ -4355,4 +4451,3 @@ Invoke-WebRequest http://127.0.0.1:8060/api/health -UseBasicParsing | Select-Obj
 事件解析逻辑都在里面）。确认 Web 版功能覆盖后再归档到 `5-reference`。
 
 详见提案：`openspec/changes/add-web-studio/`。
-

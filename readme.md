@@ -6,6 +6,15 @@
 
 要发给别人使用、又不附带源码时，在开发机执行 `packaging/package_web_user.ps1`。对方电脑需为 CUDA 11.8，先运行安装包里的 `install_train_env.bat` 配置训练环境（不必预先安装 Anaconda；无 AVX2 的机器会自动改用 Polars 兼容包），再用 `config.json` 填写数据目录。细节见 [WORKFLOW_GUIDE 7.1.3](docs/WORKFLOW_GUIDE.md)。
 
+**安装包分两个**，因为模型换得比软件勤，合在一起会让每次换模型都重打 1.8 GB：
+
+| 包 | 脚本 | 产物 | 大小 | 内容 |
+| --- | --- | --- | --- | --- |
+| 软件包 | `packaging/package_web_user.ps1` | `dist/TRTForgeWeb_cuda118.zip` | 约 1.8 GB | 程序、运行库、训练环境脚本、手册；**不含模型** |
+| 示例模型包 | `packaging/package_demo_models.ps1` | `dist/TRTForgeWeb_models_demo.zip` | 约 40 MB | PCB 检测 + EfficientAd 异常检测，**只有 ONNX** |
+
+两个包解压到同一层目录，双击示例模型包里的 `install_demo_models.bat` 合体；模型按 `launchers\runs` / `launchers\results` 落位，并逐个校验 SHA256。示例模型不带 `.engine`：TensorRT 引擎绑定显卡型号与 TRT 版本，必须在目标机器上用「引擎构建」页编一次。要换示例模型只改 `packaging/models_manifest.json`，不用动脚本。
+
 ## 主要模块
 
 | 路径 | 说明 |
@@ -24,7 +33,7 @@
 | `1-python-yolo/ultralytics-main` | YOLO 训练、验证、导出的 Python 开源工程来源 |
 | `7-autoresearch-yolo` | **YOLO 自主实验循环**：固定时间预算 + 单一适应度 + 台账留痕，在 PCB 数据集上做超参与增强的自动化实验。v1.33.0 起含 **LLM 决策层**（`agent` 子命令）：大模型提议下一组参数，`keep / discard` 由代码按 2σ 噪声阈值判定。**对生产 launcher 零改动**，只 import 其纯函数；产物严格收敛在该目录内。用法与参数见 `7-autoresearch-yolo/README.md` |
 | `7-autoresearch-master` | Karpathy autoresearch 原始副本（LLM 预训练方法论来源），**仅供参考，不参与本工程构建** |
-| `docs` | 架构设计、推理流程、部署总结等中文文档。操作入口：[Web 操作手册](docs/TRTForge_Web操作手册.md)。发给使用人员、不附源码的安装包见 [packaging/package_web_user.ps1](packaging/package_web_user.ps1) |
+| `docs` | 架构设计、推理流程、部署总结等中文文档。操作入口：[Web 操作手册](docs/TRTForge_Web操作手册.md)。发给使用人员、不附源码的安装包见 [packaging/package_web_user.ps1](packaging/package_web_user.ps1)（软件）与 [packaging/package_demo_models.ps1](packaging/package_demo_models.ps1)（示例模型） |
 | `openspec` | 需求规格和变更提案 |
 
 ## GitHub 仓库
@@ -152,6 +161,185 @@ python tf_anomalib_launcher.py --mode check-env
 引擎构建页选择 ONNX 后会在后台线程自动识别第一个输入 tensor 的名称和维度，并弹出“ONNX 加载中”进度提示；识别完成后提供统一 `H/W` 输入，修改一次高度和宽度即可同步覆盖 `min / opt / max` 三组动态 shape。
 
 ## 版本更新记录
+
+### v1.35.3 — 2026-11-12（自动实验 API Key 改用 Windows DPAPI 加密存储）
+
+**一句话**：`6-web/runtime/autoexp_llm.json` 里的 API Key 不再以明文落盘，
+改用 Windows DPAPI 加密——**只有这台电脑 + 这个 Windows 账户能解开**；
+拷到别的机器或换个账户，程序会明确提示「需要重新输入」，而不是当没配过。
+
+**为什么做**
+
+| 原来的风险 | 现在 |
+| --- | --- |
+| 明文躺在仓库目录里，`runtime/` 虽已 gitignore，但 U 盘 / 网盘同步 / 一句 `robocopy` 就带走了 | 磁盘上是密文，离开本机等于一串无用字节 |
+| 打包脚本靠「碰巧没拷 `runtime`」来防泄露 | 两道防线：打包前密钥扫描 + 文件本身加密 |
+| Key 泄露后只能去厂商后台吊销重发 | 拷贝出去也解不开，风险降到「本机被入侵」这一档 |
+
+**怎么工作（状态只有四种）**
+
+```mermaid
+flowchart TD
+    A[读 autoexp_llm.json] --> B{有 api_key_dpapi?}
+    B -- 有 --> C{本机 DPAPI 能解开?}
+    C -- 能 --> D[has_key=true<br/>显示 sk-3****a2b9]
+    C -- 不能 --> E[has_key=false<br/>key_locked=true<br/>界面：请重新输入]
+    B -- 没有 --> F{有旧格式明文 api_key?}
+    F -- 有 --> G[正常读出<br/>启动时自动迁移成密文]
+    F -- 没有 --> H[未配置]
+```
+
+**改动**
+
+| 文件 | 改动 |
+| --- | --- |
+| `6-web/backend/keyvault.py`（新增） | `ctypes` 直接调 `crypt32` 的 `CryptProtectData` / `CryptUnprotectData`，零第三方依赖；附 `describe()` 供界面显示加密状态 |
+| `6-web/backend/autoexp_api.py` | 读写层改成「磁盘密文 ↔ 业务明文」一刀切：`_read_store()` 解密、`_write_store()` 加密；新增 `migrate_key_store()` 自动迁移旧明文；新增 `_llm_state()` 统一 `has_key` / `key_locked` / `key_masked` 口径 |
+| `6-web/backend/app.py` | 启动时跑一次迁移（不在 GET 里偷偷写磁盘） |
+| `7-autoresearch-yolo/llm.py` | `load_config()` 增加剔除 `api_key_dpapi` / `key_enc`，密文不会流进审计快照与 prompt |
+| `7-autoresearch-yolo/run_pending_checks.py` | 复用 `keyvault` 解密，命令行补测能读到网页里保存的 Key |
+| `6-web/frontend/js/autoexp.js` | Key 徽章新增「需重输」态；提示语说明本机加密；开跑前检查也区分「未配置」与「解不开」 |
+| `packaging/secret_scan.ps1` | 新增内容模式 `"api_key_dpapi": "…"`：DPAPI 密文也算密钥材料，改名也绕不过 |
+| `6-web/backend/tools/test_dpapi_keystore.py`（新增，20 条） | 往返、磁盘无明文、换机模拟、迁移幂等、非 Windows 降级、加密失败不写明文 |
+
+**边界（写清楚，不假装）**
+
+- **换电脑 / 重装系统 / 换 Windows 账户 → 旧密文解不开**，这是设计目标而不是缺陷。用户重新输一次 Key 即可，
+  旧密文在「只改 base_url」这类保存里会被原样保留（拷回原机器仍可用），点「清空」才会真正删除。
+- **非 Windows 平台没有 DPAPI**，退回明文并标注 `"key_enc": "plain"`（仅限开发环境）。
+- **Windows 上加密失败则保存直接报错**（HTTP 500），绝不静默降级写明文。
+- 这台机器上的真实文件已迁移完成：字段从 `api_key` 变成 `api_key_dpapi` + `key_enc: "dpapi"`，解密验证通过。
+
+**验证**
+
+```bash
+python 6-web/backend/tools/test_dpapi_keystore.py    # 20/20
+python 6-web/backend/tools/test_autoexp_api.py       # 16/16
+python 6-web/backend/tools/test_packaging_secrets.py # 25/25
+python 6-web/backend/tools/run_all_tests.py          # 57 个脚本全通过
+python 7-autoresearch-yolo/run_all_tests.py          # 71/71
+```
+
+### v1.35.2 — 2026-11-12（安装包拆分：软件包 1.8 GB + 示例模型包 40 MB）
+
+**一句话**：把原来一个 1.8 GB 的大包拆成「软件」和「示例模型」两个独立包，
+模型只带 ONNX（引擎绑显卡，必须在目标机器上编），换模型不用重打软件包。
+
+**为什么拆**
+
+| 原来的问题 | 现在的做法 |
+| --- | --- |
+| 换一次演示模型要重打整个 1.8 GB（Nuitka 编译 10 分钟起步） | 模型包 40 MB，改 `packaging/models_manifest.json` 后几十秒重打 |
+| 有人只要软件，仍要下 1.8 GB | 软件包独立，装完就能训练、标注、建引擎 |
+| 包里的 `.engine` 换台机器就失效，看着像"模型坏了" | 模型包只放 `.onnx`，引擎在目标机器上编（PCB 模型实测 474 秒） |
+| 示例模型塞进 `models\`，后端扫不到 | 按 `models.py` 的扫描根落位：`launchers\runs` 与 `launchers\results` |
+
+**新增文件**
+
+| 文件 | 作用 |
+| --- | --- |
+| `packaging/package_demo_models.ps1` | 打示例模型包；清单驱动、布局自检、生成说明与 SHA256 清单 |
+| `packaging/models_manifest.json` | 示例模型清单，换模型只改这里（源目录、目标 run 名、标签、metadata） |
+| `packaging/templates/install_demo_models.ps1` | 用户侧安装脚本：找软件目录、复制、校验 SHA256、改写 metadata 的 `onnx_path` |
+| `packaging/templates/install_demo_models.bat` | 双击入口（纯 ASCII，避免 cmd 代码页乱码） |
+| `packaging/secret_scan.ps1` | **打包密钥扫描关卡**：两个包共用的最后一道检查，见下一节 |
+| `6-web/backend/tools/test_demo_models_package.py` | 70 项验收：真打包 → 真安装 → 假引擎占位 → 调 `models.scan_models()` |
+| `6-web/backend/tools/test_packaging_secrets.py` | 24 项验收：干净的包放行、8 类真实风险全拦、公开证书放行、本机真实 Key 必拦 |
+
+**改动文件**
+
+| 文件 | 改动 |
+| --- | --- |
+| `packaging/package_web_user.ps1` | 预建 `launchers\runs` 与 `launchers\results`（空目录压缩会丢）；`models\README.txt` 说明模型去哪拿；新增 `-WithDemoModels` / `-DemoModelsDir` 支持单包交付；打包末尾调用密钥扫描 |
+| `packaging/使用说明.md` | 两个包的分工、装示例模型的三步、目录结构表、"包里不含 Key" |
+| `readme.md` / `docs/WORKFLOW_GUIDE.md` / `docs/TRTForge_Web操作手册.md` / `6-web/README.md` | 同步说明与验收命令 |
+
+**密钥不进包（同一版一起做的）**
+
+自动实验的 LLM Key 在开发机上存在 `6-web/runtime/autoexp_llm.json`（网页上填过就落盘）。
+它在仓库目录里、名字像普通配置。原来打包脚本"碰巧没拷 `runtime`"，但这是没有守卫的巧合——
+谁加一句 `robocopy 6-web/runtime`，Key 就跟着安装包发给客户，发出去无法收回，只能吊销重发。
+
+**这一版起，磁盘上的 Key 本身也是加密的**（Windows DPAPI，只有这台机器 + 这个 Windows 账户能解开）。
+详见下面「Key 的本机加密存储」，那是比"不打包"更底层的一道防线：
+即使有人整目录拷走，拷到别的机器上也读不出明文。
+
+所以新增 `packaging/secret_scan.ps1`，两个包在压缩前都必须过这一关，**没有跳过开关**：
+
+| 关卡 | 拦什么 | 举例 |
+| --- | --- | --- |
+| 文件名黑名单 | 专门存密钥的文件 | `autoexp_llm.json`、`llm.local.json`、`*.local.json`、`.env`、`*.pem`、`*.key` |
+| 环境变量逐字比对 | 当前进程里的真实 Key（含不带 `sk-` 前缀的自建网关 Key） | `AUTOEXP_API_KEY` / `DEEPSEEK_API_KEY` / `OPENAI_API_KEY` |
+| 内容模式 | 密钥样式 | `sk-` + 20 位以上、`"api_key": "…"` 有值、`Bearer <令牌>`、`KEY=value`、`"api_key_dpapi": "…"`（DPAPI 密文同样算密钥材料） |
+
+命中即 `throw`，压缩包不会产生。日志里只打印前 6 位（`sk-336***`），避免报错信息本身变成第二次泄露。
+另外确认过：`6-web/runtime/` 已在 `.gitignore` 里，`git ls-files` 与历史提交均**没有**这个 Key 文件，
+所以不需要去厂商后台吊销。
+
+**包内布局（示例模型包）**
+
+```
+TRTForgeWeb_models_demo/
+├─ install_demo_models.bat / .ps1
+├─ manifest.json                 # 目标相对路径 + 字节数 + SHA256
+├─ README_示例模型.md
+└─ payload/
+   ├─ launchers/runs/pcb_demo/{args.yaml, labels_pcb_demo.json, weights/best.transd.onnx}
+   └─ launchers/results/EfficientAd/pcb_demo/v0/weights/lightning/{model.onnx, metadata.json}
+```
+
+| 硬约束（脚本会拒绝打包） | 违反后的现象 |
+| --- | --- |
+| 不许出现 `.engine` | 跨机器失效，且用户以为已经有模型 |
+| YOLO 必须 `*.transd.onnx` | 编出的引擎解码越界，框位置全错 |
+| 标签必须 `labels_<run>.json` | 扫描器退化成"取第一份"，多份标签会选错 |
+| anomalib 必须带 `metadata.json` | DLL 拿不到阈值与输入尺寸，加载失败 |
+| `args.yaml` 由脚本生成 | 训练目录那份含开发机绝对路径，泄露内部目录 |
+
+**实测（本机 T1000 8GB / TRT 8.5.2）**
+
+| 项 | 数值 |
+| --- | --- |
+| 示例模型包解压后 | 43.2 MB（PCB 检测 12.4 MB + EfficientAd 30.8 MB + 标签/参数） |
+| 示例模型包 zip | 39.1 MB |
+| 打包耗时 | 2.5 秒 |
+| 模型包验收断言 | 70 项全通过 |
+| 密钥扫描验收断言 | 24 项全通过（含本机真实 Key 文件改名后仍被拦、`cacert.pem` 放行） |
+| 后端全量测试 | **56 个脚本全绿**（新增 2 个：模型包 + 密钥扫描） |
+
+**密钥关卡的第一次真实拦截**
+
+第一次用新脚本打包软件包时，这道关自己报了错——但报的是误报：
+`app\certifi\cacert.pem` 被最初的「`*.pem` 一律拒绝」规则拦下，导致包打不出来。
+这条恰恰说明关卡必须有测试：`cacert.pem` 是公开的 CA 根证书，certifi 依赖它，每个软件包都必然带。
+
+| 规则 | 结果 |
+| --- | --- |
+| ~~`*.pem` / `*.key` 一律拒绝~~ | 误伤 `cacert.pem`，软件包永远打不出来 |
+| 读内容：含 `PRIVATE KEY` 才否决 | 私钥被拦、公开证书放行，24 项测试覆盖两个方向 |
+
+顺带一个正面结论：这次扫描也确认了软件包里 `0.7 MB` 文本文件中**没有**任何 Key 痕迹。
+
+**安装脚本的运算符优先级 bug（同一版顺手修掉）**
+
+端到端装一次包时发现安装脚本报了 `[WARN] metadata.json 里的 onnx_path 没写进去：Invalid JSON primitive: task.`：
+
+| 写法 | 实际结果 |
+| --- | --- |
+| `[string]$file.path.ToLower().EndsWith("metadata.json")` | 布尔被转成 `"True"`/`"False"`，非空字符串恒为真 → **每个文件都算 metadata**，YOLO 的 `args.yaml` 被拿去 `ConvertFrom-Json` |
+| `$relativePath.ToLower().EndsWith("metadata.json")` | 只在真的是 metadata 时成立 |
+
+更危险的是：`args.yaml` 如果不是合法 JSON 就只是报错，**如果是合法 JSON 就会被覆盖写坏**。
+修完顺带补了两条断言：安装过程不许出现任何 `WARN`；`args.yaml` 装完后内容不变。
+另外 `Test-Path -LiteralPath ""` 在 `$ErrorActionPreference='Stop'` 下会直接终止脚本
+（YOLO 模型没有 metadata，`$metaFile` 就是空串），已改成先判空再 `Test-Path`。
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\packaging\package_web_user.ps1            # 软件包
+powershell -NoProfile -ExecutionPolicy Bypass -File .\packaging\package_demo_models.ps1        # 示例模型包
+D:\Anaconda3\envs\dpenv\python.exe 6-web\backend\tools\test_demo_models_package.py              # 验收：模型包装得对不对
+D:\Anaconda3\envs\dpenv\python.exe 6-web\backend\tools\test_packaging_secrets.py                # 验收：Key 出不出得去
+```
 
 ### v1.35.1 — 2026-11-12（标注页：改类别立刻可见、「集合」随时可改、Ctrl/Shift 多选批量分配）
 
@@ -2461,6 +2649,7 @@ TRTForge 标注工作台支持在底部设置 `train / val / test` 自动划分�
 | `docs/机器视觉引导对位系统精度解构与验证方法.md` | 说明机器视觉引导对位系统中工装治具、执行机构、视觉测量、手眼标定和工艺过程误差的拆解、验证方法与现场问题归因 |
 | `docs/DefectVision_AI_Studio_软件结构优化计划.md` | 第二阶段软件结构优化计划，说明 `MainWindow` 拆分、`AppSettings`、统一日志事件和目录整理策略 |
 | `docs/异常检测模型对比与选型_PatchCore_PaDiM_EfficientAd.md` | **三模型选型必读**：PatchCore / PaDiM / EfficientAd 的原理、训练耗时、ONNX 与引擎体积、编译耗时、推理延迟、实测准确率、阈值校准与踩坑记录 |
+| `docs/异常检测模型对照_AnomalyCLIP与Anomalib.md` | AnomalyCLIP 与 Anomalib 源码 21 个模型的对照：只有 3 个有本机实测，其余只做了原理分类 |
 | `docs/WORKFLOW_GUIDE.md` | **全流程作业指南**：环境准备 → 标注 → 训练 → ONNX 导出 → trtexec 编译 → 推理验证 → 故障排查 |
 | `docs/TRTForge_yolo_infer与anomalib_infer_DLL调用与源码打包说明.md` | 说明 `yolo_infer` / `anomalib_infer` 的 C API、调用顺序、内存与依赖，以及 `package_inference_sdk.ps1` 离线打包源码与文档 |
 | `docs/trtexec_gui_YOLO_TRT推理流程说明.md` | 说明 TRTForge YOLO TensorRT 推理库的加载、前处理、解码、坐标还原和 C API |
@@ -2540,7 +2729,7 @@ TRTForge 训练导出页新增 `Anomalib 异常检测` 模式，支持 `PatchCor
 
 ### 三个异常检测模型速查
 
-实测环境：T1000 8GB / CUDA 11.8 / TensorRT 8.5.2 / 输入 256×256 / FP16 引擎，数据集 `bottle`（训练正常图 225，测试正常 20 + 异常 44）。完整分析见 `docs/异常检测模型对比与选型_PatchCore_PaDiM_EfficientAd.md`。
+实测环境：T1000 8GB / CUDA 11.8 / TensorRT 8.5.2 / 输入 256×256 / FP16 引擎，数据集 `bottle`（训练正常图 225，测试正常 20 + 异常 44）。完整分析见 `docs/异常检测模型对比与选型_PatchCore_PaDiM_EfficientAd.md`。`10-AnomalyCLIP-main` 没有接到这条链路，对照见 `docs/异常检测模型对照_AnomalyCLIP与Anomalib.md`。
 
 | 对比项 | PatchCore | PaDiM | EfficientAd |
 | --- | --- | --- | --- |

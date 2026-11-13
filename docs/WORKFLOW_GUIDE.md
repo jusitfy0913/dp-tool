@@ -851,7 +851,7 @@ python tf_anomalib_launcher.py --mode train-export --model efficientad `
   --project results --name my_efficientad --input-size 256 --max-epochs 20
 ```
 
-**模型怎么选**：见 `docs/异常检测模型对比与选型_PatchCore_PaDiM_EfficientAd.md`。
+**模型怎么选**：见 `docs/异常检测模型对比与选型_PatchCore_PaDiM_EfficientAd.md`。`anomalib-main` 源码还有 18 个模型没有接到这里，也没有本机实测，对照见 `docs/异常检测模型对照_AnomalyCLIP与Anomalib.md`。
 
 ### 3.4 训练产物
 
@@ -1609,6 +1609,175 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\packaging\package_web_user
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\packaging\package_web_user.ps1 -WithOcr
 ```
+
+#### 示例模型为什么单独一个包（v1.35.2）
+
+软件包**默认不含任何模型**，示例模型打成第二个包：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\packaging\package_demo_models.ps1
+```
+
+产物 `dist\TRTForgeWeb_models_demo`（约 43 MB）与 zip（约 39 MB）。拆开的三个理由：
+
+| 理由 | 具体影响 |
+| --- | --- |
+| 模型换得比软件勤 | 换演示模型只重打 40 MB，不用再等 Nuitka 编 1.8 GB |
+| 引擎绑显卡 | `.engine` 只能在目标机器上编，软件包带引擎是无效体积 |
+| 有人只要软件 | 下载时间少一截，装完就能训练和标注 |
+
+包内布局**直接对应安装目录**，所以安装脚本只是纯复制 + SHA256 校验：
+
+```
+TRTForgeWeb_models_demo/
+├─ install_demo_models.bat        # 双击安装；自动找 ../TRTForgeWeb
+├─ install_demo_models.ps1        #   （找不到就问路径），逐个校验 SHA256
+├─ manifest.json                  # 每个文件：目标相对路径 + 字节数 + SHA256
+├─ README_示例模型.md              # 按清单现场生成，不会和清单脱节
+└─ payload/
+   ├─ launchers/runs/pcb_demo/                         # YOLO 检测
+   │  ├─ args.yaml                                     #   只写 task/imgsz/model
+   │  ├─ labels_pcb_demo.json                          #   文件名必须与 run 目录同名
+   │  └─ weights/best.transd.onnx
+   └─ launchers/results/EfficientAd/pcb_demo/v0/weights/lightning/
+      ├─ model.onnx
+      └─ metadata.json                                 #   ckpt_path 清空，onnx_path 改为相对
+```
+
+几条硬约束（`package_demo_models.ps1` 会直接报错拒绝打包）：
+
+| 约束 | 违反后的现象 |
+| --- | --- |
+| 只能放 `.onnx`，不能放 `.engine` | 换台机器报 serialization header 错误，且看起来「模型有了」 |
+| YOLO 必须是 `*.transd.onnx` | 编出的引擎解码越界，框位置全错 |
+| 标签必须叫 `labels_<run>.json` | `models.py` 退化成「取第一份」，一个 run 多份标签会选错 |
+| anomalib 必须带 `metadata.json` | DLL 缺阈值与输入尺寸，加载直接失败 |
+| `args.yaml` 由脚本生成，不拷训练目录那份 | 训练目录那份含开发机绝对路径（`data: D:\...`），既没用又泄露内部目录 |
+
+装好之后 `models.py` 不会立刻列出模型——它只认 `.engine`。所以流程是「装模型 → 引擎构建页选 ONNX → 输出引擎留空（自动落到同一个 weights 目录）→ 推理页出现」。`install_demo_models.ps1` 会把要填的 ONNX 绝对路径直接打印出来。
+
+换示例模型只改 `packaging/models_manifest.json`（`source_dir` 指向训练产物目录），脚本与文档自动跟着变。验收命令：
+
+```powershell
+python 6-web\backend\tools\test_demo_models_package.py
+```
+
+它会真的打一次包、装进临时目录、再造一个假引擎占位，最后调后端 `models.scan_models()` 断言两个模型都能被认出来（70 项断言）。本机没有训练产物时打印 `[SKIP]` 并返回 0，不阻塞 CI。
+
+#### 打包不能把自动实验的 API Key 带走（v1.35.2，v1.35.3 起文件本身也加密）
+
+自动实验（LLM 决策层）的 Key 在开发机上存在两处：环境变量
+`AUTOEXP_API_KEY` / `DEEPSEEK_API_KEY` / `OPENAI_API_KEY`，以及
+**`6-web/runtime/autoexp_llm.json`**（在网页「自动实验」页填过一次就落盘）。
+
+第二处是真正的风险：它在仓库目录里、文件名像普通配置。
+**v1.35.3 起该文件里的 Key 已是 Windows DPAPI 密文**（见后文「API Key 的加密存储」），
+但打包仍然必须排除它——密文在原机器原账户上**可以解开**，发出去等于把钥匙寄给客户。
+两个打包脚本在压缩前都必须过 `packaging/secret_scan.ps1` 这一关：
+
+| 关卡 | 拦什么 |
+| --- | --- |
+| 文件名黑名单 | `autoexp_llm.json`、`llm.local.json`、`*.local.json`、`secrets.json`、`credentials.json`、`.env` |
+| 私钥内容 | `.pfx` / `.p12` 按后缀否决；`.pem` / `.key` 读内容，含 `PRIVATE KEY` 才否决 |
+| 环境变量逐字比对 | 当前进程里 `AUTOEXP_API_KEY` 等变量的**真实值**（覆盖不带 `sk-` 前缀的自建网关 Key） |
+| 内容模式 | `sk-` + 20 位以上、`"api_key": "…"` 有值、`Bearer <令牌>`、`KEY=value`、`"api_key_dpapi": "…"` |
+
+> `.pem` **不能**一律拒绝：软件包里的 `app\certifi\cacert.pem` 是公开的 CA 根证书，
+> 第一次跑这道关就被误拦了（实测）。所以改成读内容判断——只有含 `PRIVATE KEY` 才否决，
+> 公开证书放行。这条误报也写进了测试，避免以后又把规则改回去。
+
+命中直接 `throw`，zip 不会生成。刻意**不提供 `-SkipSecretScan`**：给一次例外，这道关就等于不存在。
+日志只打印前 6 位（如 `sk-336***`），不让报错信息变成第二次泄露。
+
+修法对应到具体原因：
+
+| 命中位置 | 怎么修 |
+| --- | --- |
+| `6-web\runtime\autoexp_llm.json` | 把 `runtime` 从打包范围里去掉（本来也不该拷，它是开发机本地数据） |
+| `*\configs\llm.local.json` | 同上，这是本机私有配置，`.gitignore` 里已经排除 |
+| 文档/示例里的字符串 | 换成占位符 `sk-xxxxxxxx` |
+| 已经真的发出去 | 立刻去厂商后台吊销并重发，删文件没用 |
+
+验收：
+
+```powershell
+python 6-web\backend\tools\test_packaging_secrets.py
+```
+
+25 项：干净的包必须放行（防止有人因为误伤而加跳过开关），8 类真实风险必须拦下，
+公开 CA 证书（`cacert.pem`）必须放行，二进制文件不得误判，
+另外两项用**本机真实的** `autoexp_llm.json` 验证——包括把它改名成
+`ordinary-settings.json` 之后，内容扫描仍然能抓到（v1.35.3 起抓的是
+`"api_key_dpapi"` 这个密文字段，明文正则已抓不到，因为文件里本来就没有明文了）。
+
+> 补充：这一版实测跑软件包打包时，`app\certifi\cacert.pem` 被最初的「`*.pem` 一律拒绝」规则
+> 误拦，导致包打不出来。规则已改成读内容判断（只有 `PRIVATE KEY` 才否决），
+> 并把这条误报做成测试用例。这说明这道关本身也要有测试，否则它要么漏、要么挡死正常打包。
+
+顺带确认过：`6-web/runtime/` 在 `.gitignore` 里，`git ls-files` 与历史提交
+都没有这份 Key 文件，所以不需要吊销。
+
+#### API Key 的加密存储：Windows DPAPI（v1.35.3）
+
+**要解决的问题**：Key 明文躺在 `6-web/runtime/autoexp_llm.json` 里。打包那一道关只是防
+「打包发出去了」，防不住「整个目录被拷走 / 网盘同步 / 别人借这台机器看一眼文件」。
+
+**用的方案**：Windows 自带的 DPAPI（`CryptProtectData` / `CryptUnprotectData`），
+通过 `ctypes` 直接调 `crypt32.dll`，零第三方依赖（不装 pywin32）。
+
+| 方案 | 为什么不用 / 为什么用 |
+| --- | --- |
+| 自己写 AES + 固定密钥 | 密钥还得存在某处，等于把锁和钥匙放同一个抽屉 |
+| 密码派生（PBKDF2） | 每次启动要人输密码，网页服务没法无人值守启动 |
+| 机器绑定的简单加密 | 换机拷走密文反而能解开，正好是我们要防的场景 |
+| **DPAPI（默认用户作用域）** | 密钥由 Windows 用「当前用户登录凭据」派生并托管；密文离开这台机器或换个账户就解不开 |
+
+**状态只有四种，判定只在一处**（`autoexp_api._llm_state()`，`/status`、`/llm-config`、
+保存响应共用，避免「状态卡说已配置、点开始说没配」）：
+
+```mermaid
+flowchart TD
+    A[读 autoexp_llm.json] --> B{有 api_key_dpapi?}
+    B -- 有 --> C{CryptUnprotectData 成功?}
+    C -- 成功 --> D[has_key=true<br/>key_masked=sk-3****a2b9<br/>可正常开跑]
+    C -- 失败 --> E[has_key=false<br/>key_locked=true<br/>文案：在这台电脑上解不开，请重新输入]
+    B -- 没有 --> F{有旧格式明文 api_key?}
+    F -- 有 --> G[读出明文<br/>启动时 migrate_key_store 自动转密文]
+    F -- 没有 --> H[has_key=false<br/>key_locked=false<br/>文案：尚未配置 Key]
+```
+
+**磁盘格式**
+
+| 字段 | 含义 |
+| --- | --- |
+| `api_key_dpapi` | base64 的 DPAPI 密文（附加熵 `trtforge.autoexp.llm.v1`） |
+| `key_enc` | `dpapi`（Windows）或 `plain`（非 Windows 降级） |
+| `api_key` | **只在旧文件里出现**，仅用于读取兼容；Windows 上不再写入 |
+
+**行为约定（每条都有测试）**
+
+| 场景 | 行为 |
+| --- | --- |
+| 保存 Key | 加密后落盘；Windows 上加密失败直接 HTTP 500，**绝不静默写明文** |
+| 升级后第一次启动 | `migrate_key_store()` 就地迁移明文 → 密文；已是密文则跳过（幂等） |
+| 换电脑 / 换 Windows 账户 | 解密失败 → `key_locked`，开跑/连通性测试给出「请重新输入」 |
+| 解不开的机器上只改 `base_url` | 旧密文**原样保留**（拷回原机器仍可用），不会被这次保存删掉 |
+| 点「清空 Key」 | 明文与密文字段一起删除 |
+| 非 Windows 开发环境 | 没有 DPAPI，退回明文并标 `key_enc: "plain"` |
+| 子进程 / 审计快照 | `llm.load_config()` 剔除 `api_key`、`api_key_dpapi`、`key_enc`，密文不进台账 |
+
+**验收**
+
+```powershell
+python 6-web\backend\tools\test_dpapi_keystore.py     # 20 项：往返、磁盘无明文、换机模拟、迁移、降级
+python 6-web\backend\tools\test_autoexp_api.py        # 16 项：接口契约不受影响
+python 7-autoresearch-yolo\run_all_tests.py           # 71 项：load_config 剔除字段
+```
+
+> 踩坑记录：`LocalFree` 必须传 `pbData` 的**值**（`cast(pbData, c_void_p)`），
+> 不能传 `byref(pbData)`——后者给出去的是「指针变量所在地址」，系统会去释放一块不属于堆的内存，
+> 进程直接以 `0xC0000374`（堆损坏）崩在 `crypt32` 内部。第一次实现就是这么崩的，
+> 靠 `faulthandler` 才定位到 `_local_free`。
 
 日常操作仍看 `docs/TRTForge_Web操作手册.md`。开发机自己用继续双击 `启动Web端.bat`，不要用这份安装包代替源码目录。
 

@@ -39,6 +39,13 @@ def _run_tool(name: str, argv: list[str]) -> int:
     if name == "int8_launch":
         from tools.int8_launch import main
         return main(argv)
+    if name == "native_dialog":
+        # 安装包没有 python.exe，不能再用「python -c」弹系统选择框。
+        if len(argv) != 2:
+            print("native_dialog 需要请求文件和结果文件两个参数", file=sys.stderr)
+            return 2
+        from nativedialog import serve_dialog
+        return serve_dialog(argv[0], argv[1])
     print(f"未知工具：{name}", file=sys.stderr)
     return 2
 

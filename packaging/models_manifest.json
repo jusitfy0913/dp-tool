@@ -1,0 +1,33 @@
+{
+  "schema": "trtforge.demo_models.v1",
+  "_comment": "示例模型清单：package_demo_models.ps1 只读这个文件，换模型不用改脚本。source_dir 相对仓库根；target 由 kind 决定，脚本按安装目录布局自动推导。",
+  "models": [
+    {
+      "id": "pcb_demo",
+      "kind": "yolo",
+      "title": "PCB 缺陷检测（6 类，YOLOv8n，960×960）",
+      "task": "detect",
+      "source_dir": "1-python-yolo/launcher/runs/pcb/detect_v1",
+      "source_weight": "weights/best.transd.onnx",
+      "source_labels": "labels_detect_v1.json",
+      "target_run": "pcb_demo",
+      "args": {
+        "task": "detect",
+        "imgsz": 960,
+        "model": "yolov8n.pt"
+      },
+      "note": "训练集是 PCB 六类缺陷：missing_hole / mouse_bite / open_circuit / short / spur / spurious_copper。"
+    },
+    {
+      "id": "efficientad_demo",
+      "kind": "anomalib",
+      "title": "EfficientAd 异常检测（256×256）",
+      "source_dir": "2-python-anomaly/launcher/results/EfficientAd/cmp_efficientad/v0/weights/lightning",
+      "source_weight": "model.onnx",
+      "source_metadata": "metadata.json",
+      "target_algo": "EfficientAd",
+      "target_run": "pcb_demo",
+      "note": "异常检测只判断「像不像好件」，不需要框；metadata.json 里的阈值原样带过去。"
+    }
+  ]
+}

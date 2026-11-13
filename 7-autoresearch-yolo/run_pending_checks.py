@@ -16,6 +16,51 @@ ROOT = Path(__file__).resolve().parent
 PY = Path(r"D:\Anaconda3\envs\dpenv\python.exe")
 LOG = ROOT / "experiments" / "_pending_checks.log"
 LLM_STORE = Path(r"d:\test\deeplearning\dp-tool\6-web\runtime\autoexp_llm.json")
+#: Web 端把 Key 用 Windows DPAPI 加密后存在上面那个文件里。
+#: 这里直接复用它的解密实现（按文件路径加载），而不是再抄一份 DPAPI 调用——
+#: 两份加密代码早晚会走偏，而走偏的代价是「命令行读不出 Key」这种难查故障。
+KEYVAULT_PY = ROOT.parent / "6-web" / "backend" / "keyvault.py"
+
+
+def _load_keyvault():
+    import importlib.util
+
+    if not KEYVAULT_PY.is_file():
+        return None
+    try:
+        spec = importlib.util.spec_from_file_location("_trtforge_keyvault", KEYVAULT_PY)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    except Exception:  # noqa: BLE001 - 只是辅助脚本，解不开就让调用方降级
+        return None
+
+
+def _read_saved_key() -> str:
+    """从 Web 的配置文件里取 Key：兼容「DPAPI 密文」与「旧格式明文」。"""
+    try:
+        saved = json.loads(LLM_STORE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return ""
+    if not isinstance(saved, dict):
+        return ""
+
+    legacy = str(saved.get("api_key") or "").strip()
+    if legacy:
+        return legacy
+
+    cipher = str(saved.get("api_key_dpapi") or "").strip()
+    if not cipher:
+        return ""
+    vault = _load_keyvault()
+    if vault is None:
+        print("[warn] 找不到 6-web/backend/keyvault.py，无法解开已加密的 Key")
+        return ""
+    try:
+        return str(vault.unprotect(cipher) or "").strip()
+    except Exception as exc:  # noqa: BLE001
+        print(f"[warn] 已保存的 Key 在这台机器上解不开：{exc}")
+        return ""
 
 
 def _child_env() -> dict[str, str]:
@@ -26,11 +71,7 @@ def _child_env() -> dict[str, str]:
     if not LLM_STORE.is_file():
         return env
     env["AUTOEXP_LLM_CONFIG"] = str(LLM_STORE)
-    try:
-        saved = json.loads(LLM_STORE.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return env
-    key = str(saved.get("api_key") or "").strip()
+    key = _read_saved_key()
     if key:
         env["AUTOEXP_API_KEY"] = key
     return env

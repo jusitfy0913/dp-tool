@@ -152,6 +152,10 @@ build/infer_dlls/
 # PaddleOCR 官方源码（约 129MB）与飞桨 OCR 模型（约 538MB），本地参考与模型来源，不入库；
 # 自研 OCR 推理代码在 ocr/ocr_infer
 /9-python-paddleOCR/
+
+# AnomalyCLIP 官方源码与预训练权重（约 692MB，105 个文件），仅作算法对照参考，不入库；
+# 对照结论沉淀在 docs/异常检测模型对照_AnomalyCLIP与Anomalib.md
+/10-AnomalyCLIP-main/
 # Anomalib 本地训练产物（PatchCore bottle，约 780MB），测试一致性对比用，可重新训练得到
 2-python-anomaly/launcher/resultsbottle/
 # 仓库根目录运行产物（调试截图等）

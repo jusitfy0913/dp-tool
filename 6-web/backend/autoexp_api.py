@@ -38,6 +38,7 @@ from pydantic import BaseModel, Field
 import config
 import gpulock
 import inferproxy
+import keyvault
 import runners
 from runners import manager
 
@@ -54,8 +55,20 @@ AGENT_DIR = AUTOEXP_DIR / "experiments" / "agent"
 SPLITS_DIR = AUTOEXP_DIR / "splits"
 PROMPT_MD = AUTOEXP_DIR / "prompts" / "experimenter.md"
 
-#: 模型接口配置（含 Key）的存放位置。runtime 目录已 gitignore。
+#: 模型接口配置（Key 加密后）的存放位置。runtime 目录已 gitignore。
 LLM_STORE = config.RUNTIME_DIR / "autoexp_llm.json"
+
+#: 明文写在文件里的 Key 字段（**只读兼容**，仅在迁移旧文件时读，绝不新写）。
+FIELD_LEGACY_KEY = "api_key"
+
+#: 解密失败时挂在读取结果上的内部标记（不落盘）。
+#: 与「没配 Key」区分开：前者是数据还在、只是这台机器解不开；后者是真没有。
+LOCKED_FLAG = "_key_locked"
+
+#: 解不开的原始密文在内部视图里的暂存键。
+#: 为什么需要：用户在解不开的机器上只改 base_url 时，不能让这次保存
+#: 把旧密文顺手删了——密文本身没坏，拷回原来那台机器还能用。
+CIPHER_FLAG = "_key_cipher"
 
 #: 「检查 + 创建」同锁：双击按钮的两个请求不能都通过检查。
 _START_LOCK = threading.Lock()
@@ -118,6 +131,31 @@ def _mask(key: str) -> str:
     return "*" * len(text) if len(text) <= 8 else f"{text[:3]}****{text[-4:]}"
 
 
+def _llm_state() -> dict[str, Any]:
+    """Key 的四种状态，只在一处判定。
+
+    为什么必须集中：状态一旦散落在三个接口里各写一遍，就会出现
+    「状态卡显示已配置、点开始却报未配置」这种自相矛盾的界面。
+    前端拿到的永远是这一份口径：
+
+    | 状态 | has_key | key_locked | 界面该说什么 |
+    | --- | --- | --- | --- |
+    | 本机加密且能解开 | True | False | 已保存：``sk-3****a2b9`` |
+    | 密文解不开（换机/换账户） | False | True | Key 还在，但这台机器解不开，请重新输入 |
+    | 旧格式明文 | True | False | 同第一种，并提示已加密 |
+    | 从没配过 | False | False | 未配置 |
+    """
+    store = _read_store()
+    key = str(store.get(FIELD_LEGACY_KEY) or "")
+    locked = bool(store.get(LOCKED_FLAG))
+    return {
+        "has_key": bool(key),
+        "key_masked": _mask(key),
+        "key_locked": locked,
+        "key_storage": keyvault.describe(),
+    }
+
+
 # ---------------------------------------------------------------------------
 # 配置读写
 # ---------------------------------------------------------------------------
@@ -150,28 +188,130 @@ class AgentStartRequest(BaseModel):
 
 
 def _read_store() -> dict[str, Any]:
+    """读配置文件，返回**业务视图**：Key 已解密成明文放在 ``api_key`` 里。
+
+    磁盘格式与业务格式在这里一刀切开，好处是所有调用点（``has_key``、
+    启动子进程、``/llm-test``）都不用关心加密细节，也不会有人不小心把
+    密文当明文用、或者把明文写回磁盘。
+
+    三种情况必须区分开（这是本函数存在的主要理由）：
+
+    | 磁盘上 | 返回 |
+    | --- | --- |
+    | 有 ``api_key_dpapi`` 且能解开 | ``api_key`` = 明文 |
+    | 有 ``api_key_dpapi`` 但解不开 | ``api_key`` = ""、``_key_locked`` = True |
+    | 旧格式明文 ``api_key`` | 原样返回（迁移由 :func:`migrate_key_store` 负责） |
+    """
     try:
         data = json.loads(LLM_STORE.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return {}
-    return data if isinstance(data, dict) else {}
+    if not isinstance(data, dict):
+        return {}
+
+    store = dict(data)
+    cipher = str(store.pop(keyvault.FIELD_CIPHERTEXT, "") or "").strip()
+    if cipher:
+        try:
+            store[FIELD_LEGACY_KEY] = keyvault.unprotect(cipher)
+        except keyvault.KeyVaultError:
+            # 不抛异常：读配置是页面每次刷新都会走的路，
+            # 一个解不开的旧文件不该让整页报错。改成把状态带给前端。
+            store[FIELD_LEGACY_KEY] = ""
+            store[LOCKED_FLAG] = True
+            store[CIPHER_FLAG] = cipher
+    store.pop(keyvault.FIELD_SCHEME, None)
+    return store
 
 
 def _write_store(payload: dict[str, Any]) -> None:
-    """原子写入：先写临时文件再替换，避免并发读到半个 JSON。
+    """原子写入。Key 先加密再落盘，磁盘上不会出现明文。
 
-    POSIX 上顺手把权限收到 0600。Windows 没有等价的简易语义，
-    依赖用户目录本身的访问控制——这一点在文档里写清楚，不假装做到了。
+    Windows 上加密失败会**抛错**，不写明文——静默降级等于这道防线在最需要时自己消失。
+    非 Windows（没有 DPAPI）才退回明文，并在文件里标 ``key_enc = "plain"`` 让状态可查。
     """
+    disk: dict[str, Any] = {}
+    for key, value in payload.items():
+        if key.startswith("_"):  # 内部标记（例如 _key_locked）不进文件
+            continue
+        disk[key] = value
+
+    # 解不开的旧密文：本次没有新 Key 就原样带回去，别把用户的数据删掉。
+    stale_cipher = str(payload.get(CIPHER_FLAG) or "").strip()
+
+    secret = str(disk.pop(FIELD_LEGACY_KEY, "") or "").strip()
+    disk.pop(keyvault.FIELD_CIPHERTEXT, None)
+    if secret:
+        if keyvault.available():
+            try:
+                disk[keyvault.FIELD_CIPHERTEXT] = keyvault.protect(secret)
+                disk[keyvault.FIELD_SCHEME] = keyvault.SCHEME_DPAPI
+            except keyvault.KeyVaultError as exc:
+                raise OSError(
+                    f"Key 加密失败，已放弃保存（避免明文落盘）：{exc.reason}"
+                ) from exc
+        else:
+            # 只有非 Windows 才走到这里，是明确的降级而不是失败。
+            disk[FIELD_LEGACY_KEY] = secret
+            disk[keyvault.FIELD_SCHEME] = keyvault.SCHEME_PLAIN
+    elif stale_cipher:
+        disk[keyvault.FIELD_CIPHERTEXT] = stale_cipher
+        disk[keyvault.FIELD_SCHEME] = keyvault.SCHEME_DPAPI
+
     LLM_STORE.parent.mkdir(parents=True, exist_ok=True)
     tmp = LLM_STORE.with_suffix(f".tmp{os.getpid()}")
-    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.write_text(json.dumps(disk, ensure_ascii=False, indent=2), encoding="utf-8")
     os.replace(tmp, LLM_STORE)
     if os.name != "nt":
         try:
             os.chmod(LLM_STORE, 0o600)
         except OSError:
             pass
+
+
+def migrate_key_store() -> dict[str, Any]:
+    """把旧格式（明文 ``api_key``）的文件就地改成加密格式。
+
+    什么时候跑：服务启动时一次（见 ``app.py`` 的 lifespan）。挂在读取路径上做
+    会变成「GET 请求偷偷写磁盘」，一旦写失败还会让页面莫名其妙报错。
+
+    返回摘要供日志使用，不抛异常：迁移失败不该挡住服务启动，
+    下次保存配置时还会再试一次。
+    """
+    result = {"migrated": False, "reason": ""}
+    try:
+        raw_text = LLM_STORE.read_text(encoding="utf-8")
+    except OSError:
+        result["reason"] = "配置文件不存在，无需迁移"
+        return result
+    try:
+        data = json.loads(raw_text)
+    except ValueError:
+        result["reason"] = "配置文件不是合法 JSON，跳过"
+        return result
+    if not isinstance(data, dict):
+        result["reason"] = "配置文件不是对象，跳过"
+        return result
+
+    plain = str(data.get(FIELD_LEGACY_KEY, "") or "").strip()
+    if not plain:
+        result["reason"] = "没有明文 Key，无需迁移"
+        return result
+    if not keyvault.available():
+        result["reason"] = "当前平台没有 DPAPI，保留明文"
+        return result
+
+    view = dict(data)
+    view[FIELD_LEGACY_KEY] = plain
+    try:
+        _write_store(view)
+    except OSError as exc:
+        result["reason"] = f"迁移失败（下次保存时会重试）：{exc}"
+        return result
+
+    result["migrated"] = True
+    result["reason"] = "明文 Key 已改成本机 DPAPI 加密"
+    return result
 
 
 def _effective_config() -> dict[str, Any]:
@@ -304,12 +444,7 @@ def get_status() -> dict[str, Any]:
         "noise": noise,
         "best_json": best,
         "active_run": _active_run(),
-        "llm": {
-            "config": {k: v for k, v in _effective_config().items()
-                       if k in ("base_url", "model", "temperature", "max_tokens")},
-            "has_key": bool(_read_store().get("api_key")),
-            "key_masked": _mask(str(_read_store().get("api_key") or "")),
-        },
+        "llm": _llm_state(),
     }
 
 
@@ -354,17 +489,23 @@ def get_history(limit: int = 60) -> dict[str, Any]:
 
 @router.get("/llm-config")
 def get_llm_config() -> dict[str, Any]:
-    """返回生效中的接口配置。**Key 只给遮罩**，永不返回原文。"""
-    store = _read_store()
+    """返回生效中的接口配置。**Key 只给遮罩**，永不返回原文。
+
+    额外返回 ``key_locked``：区分「这台机器解不开已有密文」和「从没配过」。
+    前者引导用户重输，后者引导用户首次填写——两者界面提示完全不同。
+    """
     effective = _effective_config()
     module = _load_llm()
+    state = _llm_state()
     return {
         "base_url": effective.get("base_url", ""),
         "model": effective.get("model", ""),
         "temperature": effective.get("temperature", 0.7),
         "max_tokens": effective.get("max_tokens", 4096),
-        "has_key": bool(store.get("api_key")),
-        "key_masked": _mask(str(store.get("api_key") or "")),
+        "has_key": state["has_key"],
+        "key_masked": state["key_masked"],
+        "key_locked": state["key_locked"],
+        "key_storage": state["key_storage"],
         "store_path": str(LLM_STORE),
         # 让用户知道「不填也一样能跑」的兜底顺序
         "key_envs": list(getattr(module, "KEY_ENVS", ())) if module else [],
@@ -397,19 +538,28 @@ def save_llm_config(request: LlmConfigRequest) -> dict[str, Any]:
 
     incoming = request.api_key
     if incoming == "__clear__":
-        store.pop("api_key", None)
+        # 清除要把密文一起删掉，否则 _write_store 会把旧密文又写回去。
+        store.pop(FIELD_LEGACY_KEY, None)
+        store.pop(CIPHER_FLAG, None)
+        store.pop(LOCKED_FLAG, None)
     elif incoming.strip():
-        store["api_key"] = incoming.strip()
+        # 覆盖即视为「用户刚在本机重新输入过」：解不开的旧密文一并作废，
+        # 不清掉 _key_locked 的话页面会一直显示「请重新输入」。
+        store[FIELD_LEGACY_KEY] = incoming.strip()
+        store.pop(LOCKED_FLAG, None)
 
     try:
         _write_store(store)
     except OSError as exc:
         raise HTTPException(status_code=500, detail=f"写入配置失败：{exc}") from exc
 
+    state = _llm_state()
     return {
         "ok": True,
-        "has_key": bool(store.get("api_key")),
-        "key_masked": _mask(str(store.get("api_key") or "")),
+        "has_key": state["has_key"],
+        "key_masked": state["key_masked"],
+        "key_locked": state["key_locked"],
+        "key_storage": state["key_storage"],
         "base_url": store.get("base_url", ""),
         "model": store.get("model", ""),
         "max_tokens": store.get("max_tokens", ""),
@@ -429,7 +579,15 @@ def test_llm() -> dict[str, Any]:
 
     store = _read_store()
     effective = _effective_config()
-    key = str(store.get("api_key") or "").strip()
+    key = str(store.get(FIELD_LEGACY_KEY) or "").strip()
+    if not key and store.get(LOCKED_FLAG):
+        return {
+            "ok": False,
+            "error": (
+                "已保存的 API Key 在这台机器上解不开（换过电脑或 Windows 账户），"
+                "请重新输入后再测试。"
+            ),
+        }
     if not key:
         # 也允许只配环境变量的用户（命令行习惯），这里如实告知而不是硬失败
         key = ""
@@ -471,8 +629,18 @@ def start_agent(request: AgentStartRequest) -> dict[str, Any]:
         raise HTTPException(status_code=503, detail=f"找不到 {AUTOEXP_PY}")
 
     store = _read_store()
-    key = str(store.get("api_key") or "").strip()
+    key = str(store.get(FIELD_LEGACY_KEY) or "").strip()
     if not key:
+        if store.get(LOCKED_FLAG):
+            # 换了电脑/账户：密文还在但解不开，必须说清楚是「解不开」不是「没填」，
+            # 否则用户会以为自己填的 Key 丢了，去翻备份。
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "已保存的 API Key 在这台机器上解不开（换过电脑或 Windows 账户），"
+                    "请在「模型接口」卡片里重新输入一次。"
+                ),
+            )
         # 没有 Key 时不让它起：否则第一轮就在等一个必然失败的请求，
         # 用户看到的只是一行「模型调用失败」，很难联想到「你没填 Key」。
         raise HTTPException(

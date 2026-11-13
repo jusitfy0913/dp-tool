@@ -384,6 +384,40 @@ def test_api(tmp: Path) -> None:
             os.environ.pop("TRTFORGE_BROWSE_ROOTS", None)
 
 
+def test_packaged_command(tmp: Path) -> None:
+    """安装包必须走 --tool，不能把 -c 丢给 TRTForgeWeb.exe。"""
+    request = tmp / "request.json"
+    result = tmp / "result.json"
+    saved = os.environ.get("TRTFORGE_TOOL_EXE")
+    os.environ.pop("TRTFORGE_TOOL_EXE", None)
+    try:
+        dev = nativedialog.dialog_command(request, result)
+        check("开发环境：用 -c 跑弹窗脚本", dev[1] == "-c", str(dev[:2]))
+        check("开发环境：请求和结果文件在命令末尾", dev[-2:] == [str(request), str(result)], str(dev[-2:]))
+
+        os.environ["TRTFORGE_TOOL_EXE"] = r"D:\TRTForge\app\TRTForgeWeb.exe"
+        packed = nativedialog.dialog_command(request, result)
+        check(
+            "安装包：用 --tool native_dialog，而不是 -c",
+            packed == [
+                r"D:\TRTForge\app\TRTForgeWeb.exe",
+                "--tool",
+                "native_dialog",
+                str(request),
+                str(result),
+            ],
+            str(packed),
+        )
+    finally:
+        if saved is None:
+            os.environ.pop("TRTFORGE_TOOL_EXE", None)
+        else:
+            os.environ["TRTFORGE_TOOL_EXE"] = saved
+
+    entry = (Path(__file__).resolve().parent.parent / "frozen_entry.py").read_text(encoding="utf-8")
+    check("安装包入口认识 native_dialog", 'name == "native_dialog"' in entry, "frozen_entry.py 未处理该工具")
+
+
 def main() -> int:
     print(f"原生对话框可用：{nativedialog.available()}  解释器：{nativedialog.interpreter()}")
     check("环境：Windows 上应可用", nativedialog.available() or os.name != "nt")
@@ -400,6 +434,7 @@ def main() -> int:
         test_remember(tmp)
         test_allowlist(tmp)
         test_api(tmp)
+        test_packaged_command(tmp)
 
     print()
     if FAILED:

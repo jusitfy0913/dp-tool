@@ -15,8 +15,9 @@
 
 实现要点
 --------
-1. **单独进程**：tkinter 的事件循环不能塞进 uvicorn 的线程池里。用
-   ``pythonw.exe`` 起一个短命子进程，主进程只等结果，超时直接 kill。
+1. **单独进程**：tkinter 的事件循环不能塞进 uvicorn 的线程池里。开发环境用
+   ``pythonw.exe -c`` 跑下面的脚本；安装包里没有 Python，改由
+   ``TRTForgeWeb.exe --tool native_dialog`` 跑同一段脚本（见 :func:`dialog_command`）。
 2. **传参走文件**：中文、空格、引号在命令行里都是坑，payload 写临时 JSON，
    结果也写临时 JSON，子进程 stdout 不参与通信。
 3. **单例锁**：同时弹两个模态框，用户会分不清哪个属于哪个字段。已有框打开时
@@ -229,6 +230,46 @@ def _tkinter_available() -> bool:
     return bool(_TK_OK)
 
 
+def packaged_exe() -> str:
+    """安装包里的网页程序。没设置时返回空串，表示仍在开发环境。
+
+    启动脚本会把 ``TRTFORGE_TOOL_EXE`` 指到 ``TRTForgeWeb.exe``。
+    双击 exe 而没走启动脚本时，Nuitka 会把 ``sys.frozen`` 设上，这时解释器就是 exe 自己。
+    """
+    tool_exe = os.environ.get("TRTFORGE_TOOL_EXE", "").strip()
+    if tool_exe:
+        return tool_exe
+    if getattr(sys, "frozen", False):
+        return sys.executable
+    return ""
+
+
+def dialog_command(request_file: Path, result_file: Path) -> list[str]:
+    """拼出弹窗子进程的命令。最后两项永远是请求文件和结果文件。
+
+    开发环境是 ``python -c <脚本>``。安装包里的 ``TRTForgeWeb.exe`` 不认识 ``-c``，
+    以前会把这次启动当成再开一个网页，窗口自然不会出现。
+    """
+    tool_exe = packaged_exe()
+    if tool_exe:
+        return [tool_exe, "--tool", "native_dialog", str(request_file), str(result_file)]
+    return [interpreter(), "-c", _SCRIPT, str(request_file), str(result_file)]
+
+
+def serve_dialog(request_path: str, result_path: str) -> int:
+    """在当前进程里弹一次框。只给安装包的 ``--tool native_dialog`` 用。
+
+    这里显式 import tkinter，是为了让 Nuitka 把对话框库编进 exe。
+    真正的弹窗逻辑仍是上面的 ``_SCRIPT``，开发和安装包不会各写一份。
+    """
+    import tkinter  # noqa: F401
+    from tkinter import filedialog  # noqa: F401
+
+    sys.argv = ["native_dialog", request_path, result_path]
+    exec(compile(_SCRIPT, "<native_dialog>", "exec"), {"__name__": "__dialog__"})
+    return 0
+
+
 def interpreter() -> str:
     """挑选运行对话框脚本的解释器。
 
@@ -389,7 +430,7 @@ def _run(kind: str, **kwargs) -> dict:
     try:
         try:
             completed = subprocess.run(
-                [interpreter(), "-c", _SCRIPT, str(request_file), str(result_file)],
+                dialog_command(request_file, result_file),
                 capture_output=True,
                 timeout=TIMEOUT_SECONDS,
                 creationflags=creationflags,

@@ -216,6 +216,13 @@ def configure_warm_pool() -> None:
 async def lifespan(app: FastAPI):
     """服务启动时准备目录与事件循环，退出时清理子进程与句柄。"""
     config.ensure_dirs()
+    # 旧的明文 Key 就地改成 DPAPI 密文。启动时做一次而不是读接口里做：
+    # GET 请求不该偷偷写磁盘，写失败还会让页面莫名报错。
+    try:
+        migrated = autoexp_api.migrate_key_store()
+        print(f"[app] API Key 存储：{migrated['reason']}", flush=True)
+    except Exception as exc:  # noqa: BLE001 - 迁移失败不能挡住服务启动
+        print(f"[app] API Key 迁移失败：{type(exc).__name__}: {exc}", flush=True)
     manager.bind_loop(asyncio.get_running_loop())
     # 上次进程被强杀时，台账里会留下状态为 running 的「僵尸任务」。
     # 这里改判为 interrupted：前端能看见「它没跑完」，而不是一条永远转圈的记录。

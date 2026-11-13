@@ -3,7 +3,13 @@
 #
 # 包里有：编译后的网页程序、编译后的训练启动器、推理 DLL、
 # CUDA 11.8 / TensorRT / OpenCV 运行库、网页文件、config.json。
-# 包里没有：C++ 源码、网页后端 .py、YOLO/Anomalib 源码树、Qt 程序。
+# 包里没有：C++ 源码、网页后端 .py、YOLO/Anomalib 源码树、Qt 程序，**也不含示例模型**。
+#
+# 示例模型是另一个包（packaging\package_demo_models.ps1），理由：
+#   - 模型换得比软件勤，塞在一起会让每次换模型都重打 1.8 GB；
+#   - 示例模型只带 ONNX（引擎绑显卡），需要在目标机器上编一次，生命周期和软件不同；
+#   - 只要软件不要模型的人，下载时间能少一截。
+# 两个包解压到同一层目录，双击模型包里的 install_demo_models.bat 即可合体。
 #
 # 在 dp-tool 目录执行：
 #   powershell -NoProfile -ExecutionPolicy Bypass -File .\packaging\package_web_user.ps1
@@ -11,12 +17,17 @@
 # 可选：
 #   -OutDir D:\dist
 #   -SkipZip
+#   -WithDemoModels          把示例模型一起打进来（默认不带：模型单独出一个包，
+#                            包里只有 ONNX，见 packaging\package_demo_models.ps1）
+#   -DemoModelsDir <目录>    已解压的示例模型包目录（默认 <OutDir>\TRTForgeWeb_models_demo）
 
 param(
     [string]$OutDir = "",
     [switch]$SkipZip,
     [switch]$WithOcr,
-    [string]$OcrModelDir = ""
+    [string]$OcrModelDir = "",
+    [switch]$WithDemoModels,
+    [string]$DemoModelsDir = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -57,6 +68,9 @@ function Copy-Utf8 {
 }
 
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+# 密钥扫描器：打包最后一步必须过这一关。见 packaging\secret_scan.ps1 顶部说明。
+. (Join-Path $scriptDir "secret_scan.ps1")
+
 $repoRoot = Find-RepoRoot -StartDir $scriptDir
 if (-not $repoRoot) { throw "找不到仓库根目录（需要 6-web 和 4-qt-studio）。" }
 
@@ -77,6 +91,11 @@ New-Item -ItemType Directory -Path $dest | Out-Null
 New-Item -ItemType Directory -Path (Join-Path $dest "bin") | Out-Null
 New-Item -ItemType Directory -Path (Join-Path $dest "launchers") | Out-Null
 New-Item -ItemType Directory -Path (Join-Path $dest "models") | Out-Null
+# 示例模型的落点。软件包自己不带模型（示例模型单独一个包），
+# 但这两个目录必须预先建好，否则用户把示例模型包解压进来时会被多套一层目录，
+# 后端扫不到（models.py 只认 launchers\runs 与 launchers\results）。
+New-Item -ItemType Directory -Path (Join-Path $dest "launchers\runs") | Out-Null
+New-Item -ItemType Directory -Path (Join-Path $dest "launchers\results") | Out-Null
 New-Item -ItemType Directory -Path $build | Out-Null
 
 Write-Host "[1/6] 复制推理运行库（CUDA 11.8 / TensorRT / ONNX Runtime / OpenCV）"
@@ -301,15 +320,100 @@ if (Test-Path -LiteralPath $manualImages) {
     & robocopy $manualImages (Join-Path $dest "docs\images\trtforge_web_manual") /E /NFL /NDL /NJH /NJS /nc /ns /np | Out-Null
 }
 
+# ---------------------------------------------------------------------------
+# 示例模型的落点说明
+#
+# 软件包默认**不带**模型：模型换得比软件勤，合成一个包会让每次换模型都得重打 1.8 GB。
+# 但空目录在压缩包里会被丢掉，所以每个目录放一份说明文件当占位；
+# 这也顺便告诉用户"模型去哪拿"，避免他以为软件坏了。
+# ---------------------------------------------------------------------------
+$modelsReadme = @"
+示例模型不在这台安装包里。
+
+模型单独打一个包（约 40 MB），里面只有 ONNX，没有 .engine：
+
+    1. 把示例模型包解压到本目录**旁边**（与本目录同级）
+    2. 双击示例模型包里的 install_demo_models.bat
+    3. 打开软件 →「引擎构建」页 → 选 ONNX → 输出引擎留空 → 开始构建
+    4. 回到「推理演示」页，模型下拉里就会出现示例模型
+
+为什么不直接放 .engine：
+    TensorRT 引擎绑定显卡型号与 TRT 版本，开发机编好的引擎换台机器会报错，
+    必须在对方显卡上编一次（PCB 模型约 8 分钟）。
+
+不打示例模型也能正常使用软件：训练、标注、引擎构建、文字识别都不依赖它，
+只是推理页的下拉列表一开始是空的。
+"@
+[System.IO.File]::WriteAllText((Join-Path $dest "models\README.txt"), $modelsReadme, $utf8)
+
+$runsReadme = @"
+本目录放 YOLO 训练产物，结构：runs\<实验名>\weights\<引擎>，标签 labels_<实验名>.json 放在实验根。
+
+示例模型包会装到 runs\pcb_demo\。没有示例模型时这里是空的，不影响使用。
+"@
+[System.IO.File]::WriteAllText((Join-Path $dest "launchers\runs\README.txt"), $runsReadme, $utf8)
+
+$resultsReadme = @"
+本目录放异常检测训练产物，结构：results\<算法>\<实验名>\v0\weights\lightning\<引擎 + metadata.json>。
+
+示例模型包会装到 results\EfficientAd\pcb_demo\。没有示例模型时这里是空的，不影响使用。
+"@
+[System.IO.File]::WriteAllText((Join-Path $dest "launchers\results\README.txt"), $resultsReadme, $utf8)
+
+if ($WithDemoModels) {
+    # 只有明确要求时才把示例模型并进软件包（离线交付、对方不会解压第二个包的场景）。
+    if (-not $DemoModelsDir) { $DemoModelsDir = Join-Path $OutDir "TRTForgeWeb_models_demo" }
+    $demoPayload = Join-Path $DemoModelsDir "payload"
+    if (-not (Test-Path -LiteralPath $demoPayload)) {
+        throw "找不到示例模型：$demoPayload。先跑 packaging\package_demo_models.ps1，或去掉 -WithDemoModels。"
+    }
+    $demoManifest = Join-Path $DemoModelsDir "manifest.json"
+    if (-not (Test-Path -LiteralPath $demoManifest)) { throw "示例模型包缺少 manifest.json：$demoManifest" }
+    $demoSpec = Get-Content -LiteralPath $demoManifest -Raw -Encoding UTF8 | ConvertFrom-Json
+    $demoFiles = 0
+    foreach ($model in @($demoSpec.models)) {
+        foreach ($file in @($model.files)) {
+            $relative = [string]$file.path
+            $source = Join-Path $demoPayload $relative
+            if (-not (Test-Path -LiteralPath $source)) { throw "示例模型包缺文件：$source" }
+            $target = Join-Path $dest $relative
+            $targetDir = Split-Path -Parent $target
+            if (-not (Test-Path -LiteralPath $targetDir)) {
+                New-Item -ItemType Directory -Path $targetDir -Force | Out-Null
+            }
+            Copy-Item -LiteralPath $source -Destination $target -Force
+            $demoFiles += 1
+        }
+        # anomalib 的 metadata.json 里 onnx_path 要指向安装目录内的真实位置，
+        # 因为换机器后降级推理要靠它找回同源 ONNX。
+        foreach ($file in @($model.files)) {
+            if (-not ([string]$file.path).ToLower().EndsWith("metadata.json")) { continue }
+            $metaPath = Join-Path $dest ([string]$file.path)
+            $meta = Get-Content -LiteralPath $metaPath -Raw -Encoding UTF8 | ConvertFrom-Json
+            $onnxPath = ""
+            foreach ($peer in @($model.files)) {
+                if (([string]$peer.path).ToLower().EndsWith(".onnx")) {
+                    $onnxPath = Join-Path $dest ([string]$peer.path)
+                }
+            }
+            $meta | Add-Member -NotePropertyName "onnx_path" -NotePropertyValue $onnxPath -Force
+            [System.IO.File]::WriteAllText($metaPath, ($meta | ConvertTo-Json -Depth 8), $utf8)
+        }
+    }
+    Copy-Utf8 -Source (Join-Path $DemoModelsDir "README_示例模型.md") -Dest (Join-Path $dest "docs\示例模型说明.md")
+    Write-Host "  已并入示例模型：$demoFiles 个文件（只有 ONNX，引擎仍需在目标机器上编）"
+}
+
 $stamp = @"
 打包时间: $(Get-Date -Format "yyyy-MM-dd HH:mm:ss")
 编译解释器: $python
 CUDA: 11.8
 说明: 本目录是给使用人员的安装包，不是源码仓库。
+不含: 源码、示例模型、自动实验的 API Key 与 runtime 数据。
 "@
 [System.IO.File]::WriteAllText((Join-Path $dest "BUILD.txt"), $stamp, $utf8)
 
-Write-Host "[6/6] 检查有没有把源码打进去"
+Write-Host "[6/6] 检查有没有把源码和密钥打进去"
 $leaks = Get-ChildItem -LiteralPath $dest -Recurse -File | Where-Object {
     $_.Name -in @(
         "app.py", "config.py", "infer.py", "frozen_entry.py",
@@ -327,6 +431,16 @@ foreach ($stubName in @("tf_yolo_launcher.py", "tf_anomalib_launcher.py")) {
     if ($lines.Count -gt 12) { throw "$stubName 不是短启动桩，拒绝打包。" }
 }
 
+# ---------------------------------------------------------------------------
+# 密钥扫描：自动实验（LLM 决策层）的 API Key 绝不能进安装包
+#
+# Key 在开发机上有一份明文存在 6-web\runtime\autoexp_llm.json（网页上填过就落盘），
+# 文件名看着像普通配置，且就在仓库目录里。本脚本目前不拷 runtime，
+# 但"目前没拷"不是保证——这里显式拦一道，将来谁加了参数也发不出去。
+# 细节与修法见 packaging\secret_scan.ps1。
+# ---------------------------------------------------------------------------
+Assert-NoPackagedSecrets -Root $dest -Label "软件安装包"
+
 if (-not $SkipZip) {
     $zip = Join-Path $OutDir "TRTForgeWeb_cuda118.zip"
     if (Test-Path -LiteralPath $zip) { Remove-Item -LiteralPath $zip -Force }
@@ -338,3 +452,9 @@ if (-not $SkipZip) {
 Write-Host ""
 Write-Host "安装目录: $dest" -ForegroundColor Green
 Write-Host "把整个 TRTForgeWeb 文件夹交给对方。对方先运行 install_train_env.bat，再双击 start_web.bat。"
+Write-Host ""
+if (-not $WithDemoModels) {
+    Write-Host "本包不含示例模型。需要演示数据时另打一个模型包（约 40 MB，只有 ONNX）：" -ForegroundColor Cyan
+    Write-Host "    powershell -NoProfile -ExecutionPolicy Bypass -File .\packaging\package_demo_models.ps1" -ForegroundColor Cyan
+    Write-Host "对方解压到软件目录旁边，双击 install_demo_models.bat 即可。" -ForegroundColor Cyan
+}

@@ -438,7 +438,11 @@ async function refreshStatus() {
   const problems = [];
   if (!status.available) problems.push("找不到 7-autoresearch-yolo/autoexp.py");
   if (!status.splits_ready) problems.push("还没有切分数据（先跑 autoexp.py split）");
-  if (status.llm && !status.llm.has_key) problems.push("还没填 API Key");
+  if (status.llm && status.llm.key_locked) {
+    problems.push("API Key 需要在这台电脑上重新输入（换过电脑或 Windows 账户）");
+  } else if (status.llm && !status.llm.has_key) {
+    problems.push("还没填 API Key");
+  }
   if (problems.length) {
     if (dom.startHint) dom.startHint.textContent = `暂时不能开始：${problems.join("；")}`;
   } else if (dom.startHint) {
@@ -446,8 +450,11 @@ async function refreshStatus() {
   }
 
   if (dom.keyBadge) {
+    const locked = Boolean(status.llm?.key_locked);
     const hasKey = Boolean(status.llm?.has_key);
-    dom.keyBadge.textContent = hasKey ? status.llm.key_masked : "未配置";
+    dom.keyBadge.textContent = locked
+      ? "需重输"
+      : (hasKey ? status.llm.key_masked : "未配置");
     dom.keyBadge.className = `badge${hasKey ? " ok" : " warn"}`;
   }
 
@@ -469,13 +476,25 @@ async function refreshLlmConfig() {
     if (dom.temperature) dom.temperature.value = cfg.temperature ?? 0.7;
     if (dom.maxTokens) dom.maxTokens.value = cfg.max_tokens ?? 4096;
     if (dom.keyBadge) {
-      dom.keyBadge.textContent = cfg.has_key ? cfg.key_masked : "未配置";
+      // 「解不开」必须和「没配」分开显示：前者数据还在，只是换机/换账户，
+      // 用户该做的是重输一次；后者是从没配过。两者提示完全不同。
+      const locked = Boolean(cfg.key_locked);
+      dom.keyBadge.textContent = locked
+        ? "需重输"
+        : (cfg.has_key ? cfg.key_masked : "未配置");
       dom.keyBadge.className = `badge${cfg.has_key ? " ok" : " warn"}`;
     }
     if (dom.llmHint) {
-      dom.llmHint.textContent = cfg.has_key
-        ? `已保存：${cfg.key_masked}（不会回填明文，改 Key 直接覆盖）`
-        : "尚未保存 Key。也可以不用页面，改成设置环境变量后重启服务。";
+      if (cfg.key_locked) {
+        dom.llmHint.textContent =
+          "已保存的 Key 在这台电脑上解不开（换过电脑或 Windows 账户）。" +
+          "请重新输入一次，覆盖后即可正常使用。";
+      } else if (cfg.has_key) {
+        dom.llmHint.textContent =
+          `已保存：${cfg.key_masked}（本机 DPAPI 加密，不会回填明文，改 Key 直接覆盖）`;
+      } else {
+        dom.llmHint.textContent = "尚未保存 Key。也可以不用页面，改成设置环境变量后重启服务。";
+      }
     }
   } catch (error) {
     if (dom.llmHint) dom.llmHint.textContent = `读取配置失败：${error.message}`;

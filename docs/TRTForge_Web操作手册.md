@@ -863,10 +863,45 @@ YOLO：
 powershell -NoProfile -ExecutionPolicy Bypass -File .\packaging\package_web_user.ps1
 ```
 
-得到 `dist\TRTForgeWeb`。把整个文件夹给对方。对方安装显卡驱动和 VC++ 运行库后：
+得到 `dist\TRTForgeWeb`。**这个包里没有模型**，推理页的模型下拉一开始是空的。
+想要现成模型，再打一个示例模型包：
 
-1. 双击 `install_train_env.bat`（要联网。不必事先安装 Anaconda，脚本会自己准备 Python，并装上训练库）。
-2. 用记事本打开 `config.json`，在 `data_roots` 里填图片所在的文件夹。
-3. 双击 `start_web.bat`。
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\packaging\package_demo_models.ps1
+```
+
+得到 `dist\TRTForgeWeb_models_demo`（约 43 MB）。把两个文件夹都给对方，摆成同级：
+
+```
+D:\TRTForgeWeb\                 ← 软件
+D:\TRTForgeWeb_models_demo\     ← 示例模型
+```
+
+### 对方要做的事
+
+1. 双击软件里的 `install_train_env.bat`（要联网。不必事先安装 Anaconda，脚本会自己准备 Python，并装上训练库）。
+2. 用记事本打开软件的 `config.json`，在 `data_roots` 里填图片所在的文件夹。
+3. 双击软件里的 `start_web.bat`。
+4. 要示例模型的话，双击示例模型包里的 `install_demo_models.bat`，然后到「引擎构建」页把
+   示例模型的 ONNX 编成引擎（输出引擎留空，会自动落到该模型旁边）。编完推理页就能选到。
+
+```mermaid
+flowchart LR
+    A[开发机<br/>package_web_user.ps1] --> B[TRTForgeWeb<br/>1.8 GB 软件]
+    C[开发机<br/>package_demo_models.ps1] --> D[TRTForgeWeb_models_demo<br/>43 MB 示例模型<br/>只有 ONNX]
+    B --> E[对方电脑<br/>install_train_env.bat]
+    D --> F[对方电脑<br/>install_demo_models.bat]
+    F --> G[引擎构建页<br/>ONNX → engine<br/>约 8 分钟]
+    G --> H[推理演示页<br/>下拉出现示例模型]
+    E --> H
+```
+
+### 为什么模型要单独一个包
+
+| 原因 | 说明 |
+| --- | --- |
+| 引擎不能跨机器 | `.engine` 绑定显卡型号与 TensorRT 版本，在你的机器上编好、拷给别人会直接报错。模型包只放 `.onnx`，让对方自己编一次 |
+| 换模型不用重打软件 | 改 40 MB 的模型包只要几十秒，重打 1.8 GB 软件包要十几分钟 |
+| 有人只要软件 | 训练、标注、引擎构建、文字识别都不依赖示例模型 |
 
 网页界面仍然能在浏览器里看到。C++ 推理源码和网页后端源码不会出现在这个文件夹里。训练用的 Ultralytics 是 AGPL-3.0，由对方机器在线安装，发放前请确认许可。
