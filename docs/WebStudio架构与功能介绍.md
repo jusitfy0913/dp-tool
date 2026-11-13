@@ -273,7 +273,7 @@ flowchart TD
 | --- | --- | --- |
 | 页面 | HTML、CSS、原生 JavaScript | `6-web/frontend`。没有 npm 打包，改完刷新即可 |
 | 页面通信 | `fetch` + WebSocket | `js/api.js` 发请求，`js/ws.js` 收训练和构建日志 |
-| 网页服务 | Python、FastAPI、Uvicorn | `6-web/backend/app.py`（装配层）+ `routers/`，当前版本 **1.38.0** |
+| 网页服务 | Python、FastAPI、Uvicorn | `6-web/backend/app.py`（装配层）+ `routers/`，当前版本 **1.39.0** |
 | 上传与图像 | python-multipart、OpenCV、Pillow、NumPy | 收图片、解码、数据集预览 |
 | 配置文件 | PyYAML | 读 OCR 的 `inference.yml` |
 | 训练 · 检测 | Ultralytics **8.4.192**、PyTorch **2.3.0**（CUDA 11.8 轮子） | 缺陷种类固定、能画框时用。检测、分割、姿态、旋转框。入口 `tf_yolo_launcher.py` |
@@ -332,7 +332,11 @@ flowchart LR
 | `pipeline.js` | 训练到验证的串联 |
 | `engine.js` | 引擎构建 |
 | `dataset.js` | 划分和导出 |
-| `annotate.js` | 标注和预标注审核 |
+| `annotate.js` | 标注和预标注审核（画布、交互、落盘） |
+| `annotate/tiers.js` | **v1.39.0** 草稿置信度分档：阈值 0.7 / 0.4、颜色、文案、计数 |
+| `annotate/history.js` | **v1.39.0** 撤销重做双栈（深度 50） |
+| `annotate/geometry.js` | **v1.39.0** 命中测试、手柄、吸附、正交约束、角点 |
+| `annotate/importplan.js` | **v1.39.0** 导入计划（能不能导入）与汇总文案 |
 | `infer.js` | 单张推理 |
 | `inferbatch.js` | 目录、视频、摄像头 |
 | `ocr.js` | OCR 模型列表、文字表、多边形 |

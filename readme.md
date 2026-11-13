@@ -162,6 +162,33 @@ python tf_anomalib_launcher.py --mode check-env
 
 ## 版本更新记录
 
+### v1.39.0 — 2026-11-13（标注页前端拆模块：4700 行 → 4 个可单测的纯逻辑模块）
+
+**一句话**：标注页里"算"的部分搬进 `js/annotate/`，页面结构、DOM id、快捷键一行没改；
+从此置信度分档、撤销栈、命中测试、导入计划都有 `.mjs` 单测，不再只能靠手点。
+
+| 改前 | 改后 |
+| --- | --- |
+| `annotate.js` 4700 行，绘制、命中、撤销、分档、导入全在一个文件 | 4 个模块：`annotate/tiers.js`、`history.js`、`geometry.js`、`importplan.js` |
+| 判定直接读全局 `state`，测之前要先造假 DOM | 纯函数只吃显式参数（`scale` / `objects` / `pending` / `report`），`node` 直接跑 |
+| "为什么这条草稿变红"要翻两千行 | 阈值、颜色、文案集中在 `tiers.js`，画布与列表共用一份 |
+| 接口之间字段改名没人拦 | `tools/test_full_chain.py` 串起 8 个环节（建工程 → 加图 → 写标注 → 导出 → 扫数据集 → 枚举产物 → 造包校验 → 推理） |
+
+**顺带修掉两个老 bug**：
+
+| 现象 | 原因 |
+| --- | --- |
+| 画线段时按 Shift 约束方向，端点变成 `NaN` | `constrainOrthogonal` 用 `point.x` 判断却返回 `point[0]`，而 `toImage()` 返回 `{x, y}` |
+| 草稿 `score` 为 `null` 时整批标红（看起来像模型全在猜） | `Number(null) === 0` 被当成"低置信度"；现在 `null` 归 `unknown`（琥珀色） |
+
+两处行为微调：预览 **0 图**时「导入」按钮保持禁用（新建模式会把现有工程覆盖成空工程）；
+草稿计数徽标加了"高 3 / 中 5 / 低 2"的 tooltip。
+
+验收：前端 12 个套件全绿（新增 4 个，共 +202 项断言）、后端 62 个脚本全绿、
+全链路自检 8 环节通过；浏览器 e2e（可选，Playwright）可本地跑。细节见
+[6-web/README](6-web/README.md#标注页前端拆模块-jsannotatev1390) 与
+[docs/WORKFLOW_GUIDE](docs/WORKFLOW_GUIDE.md) 的「2.10 全链路自检与浏览器 e2e」。
+
 ### v1.38.0 — 2026-11-13（后端按域拆分：`app.py` 4800 行 → 195 行装配层）
 
 **一句话**：网页后端的 86 条接口从一个大文件搬进 `routers/` 九个按域划分的模块，

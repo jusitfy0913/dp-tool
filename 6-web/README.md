@@ -3732,6 +3732,46 @@ D:\Anaconda3\envs\dpenv\python.exe 6-web\backend\tools\route_table.py --update
 验收：`run_all_tests.py` 61 个脚本全绿（新增 `test_route_table.py` / `test_app_assembly.py`），
 前端 8 个套件不受影响，安装包需另出一份实机验证「双击 exe → 推理页能选模型」。
 
+## 标注页前端拆模块 `js/annotate/`（v1.39.0）
+
+`annotate.js` 一度 4700 行：画布绘制、命中测试、撤销栈、置信度分档、导入预览全在一个文件里。
+表现是「想知道草稿为什么变红要翻两千行」，更实际的问题是**这些判定没法单测**——
+它们都直接读全局 `state`，测之前得先造一个假 DOM。
+
+v1.39.0 把四类**纯逻辑**搬到 `js/annotate/` 下，`annotate.js` 只留"把 state 喂进去 + 画到界面上"。
+页面结构、DOM id、快捷键、交互一个都没改。
+
+### 四个模块
+
+| 模块 | 管什么 | 导出 |
+| --- | --- | --- |
+| `annotate/tiers.js` | 草稿置信度分档：阈值、颜色、文案、计数 | `tierOf` / `tierColor` / `tierText` / `tierClass` / `countByTier` / `tierCountText`；常量 `TIER_HIGH=0.7`、`TIER_MID=0.4` |
+| `annotate/history.js` | 撤销/重做双栈（深度 50） | `pushSnapshot` / `undoStep` / `redoStep` / `canUndo` / `canRedo` / `historyButtons` |
+| `annotate/geometry.js` | 命中测试、手柄、吸附、正交约束、角点 | `hitTest` / `hitHandle` / `hitEdge` / `snapPoint` / `rotateHandlePoint` / `shapeCorners` / `bboxOf` / `constrainOrthogonal` / `pointInPolygon` / `distanceToSegment` |
+| `annotate/importplan.js` | 导入计划（能不能导入）与汇总文案 | `planImport` / `blockingReasons` / `importSummaryText` / `summarizeReport` / `countUnit` |
+
+`annotate.js` 这侧只保留薄包装：把 `state.view.scale`、`currentImage()`、`state.hidden`
+显式传进去。单测因此能脱离浏览器跑——这就是拆模块的全部意义。
+
+### 三条约束
+
+| 约束 | 为什么 | 谁在盯 |
+| --- | --- | --- |
+| 纯逻辑不许读全局 `state` | 读一次就得造一个假 DOM，测试成本上来后就没人写了 | 模块内没有 `state` / `document` 引用，靠 `tests/test_*.mjs` 直接 import 验证 |
+| 阈值与配色只有一份 | 画布用 JS 配色、列表用 CSS 类，两边各写一套就会出现"同一批草稿两种绿" | `tiers.js` 的 `TIER_COLORS` 与 `style.css` 的 `--ok/--amber/--danger` 同值，`tiers.js` 被两端共用 |
+| 拆分不改交互 | 这一版目标是"能测"，不是"重做标注页" | 只搬函数不改 DOM；接口路由由 `test_route_table.py` 守住，页面由 `tools/e2e_browser.py` 冒烟 |
+
+### 顺带修掉的两个老 bug
+
+| 现象 | 原因 | 现在 |
+| --- | --- | --- |
+| 画线段时按 Shift 约束方向，端点坐标变成 `NaN` | `constrainOrthogonal` 用 `point.x` 判断却返回 `point[0]`，而 `toImage()` 返回的是 `{x, y}` 对象 | `xy()` 同时吃 `{x,y}` 与 `[x,y]`，恒返回 `[x,y]`（`tests/test_geometry.mjs` 覆盖两种入参） |
+| 草稿 `score` 为 `null` 时被算成低置信度（整批标红） | `Number(null) === 0` | `null` / `""` 单独判成 `unknown`（琥珀色），与"通道没给置信度"的语义一致 |
+
+另外两处行为微调（都是"少一次误操作"）：
+- 预览结果为 **0 图**时，「导入」按钮保持禁用——新建模式点下去会把现有工程覆盖成空工程；
+- 草稿计数徽标加了 tooltip，悬停显示「高 3 / 中 5 / 低 2」，不用逐条数。
+
 ## 环境变量
 
 | 变量 | 作用 | 默认 |
@@ -4187,6 +4227,8 @@ D:\Anaconda3\envs\dpenv\python.exe 6-web\backend\tools\route_table.py --update
 │       ├── route_table.py             **v1.38.0**：导出运行期 `METHOD /path` 快照（`route_table.json`）
 │       ├── test_route_table.py        **v1.38.0**：路由快照比对（缺一条、多一条都失败；`--update` 才允许改快照）
 │       ├── test_app_assembly.py       **v1.38.0**：装配层约束（app.py ≤400 行 / 无路由注册 / routers 不反向 import app / 兼容转发）
+│       ├── test_full_chain.py         **v1.39.0**：全链路自检（建工程→加图→写标注→导出→扫数据集→枚举产物→造包校验→推理；`--step` 单步）
+│       ├── e2e_browser.py             **v1.39.0**：可选浏览器 e2e（Playwright；没装则跳过，CI 不跑）
 │       ├── test_transd_onnx.py        .transd.onnx 转置验收（四任务头 / 输出重排 / 通道校验）
 │       ├── test_export_request.py     导出命令拼装验收（开关透传 / 非法参数提前拒绝）
 │       ├── test_infer_jobs.py         **v1.16**：批量产物验收（文件收集 / 命名净化 / CSV BOM / zip / 路径穿越）
@@ -4237,12 +4279,22 @@ D:\Anaconda3\envs\dpenv\python.exe 6-web\backend\tools\route_table.py --update
 │   │   ├── main.js       页签 / 环境状态 / 路径选择（**v1.20**：原生对话框优先，Shift 或失败时回退页面内浏览）
 │   │   ├── runsbar.js    **v1.25.2**：顶栏「运行中任务」条（全局可见 + 随时停止 + 后端心跳）
 │   │   └── logs.js       **v1.25.3**：日志出口（复制 + 打开完整日志文件；剪贴板双兜底）
+│   ├── js/annotate/      **v1.39.0**：标注页抽出的纯逻辑（全部零依赖、可直接 node 单测）
+│   │   ├── tiers.js      置信度分档：阈值 / 颜色 / 文案 / 计数
+│   │   ├── history.js    撤销重做双栈（深度 50，纯函数返回新栈）
+│   │   ├── geometry.js   命中测试 / 手柄 / 吸附 / 角点 / 正交约束（只吃 scale，不读 state）
+│   │   └── importplan.js 导入计划（阻塞原因）与汇总文案
 │   └── tests/            零依赖前端单测（node 直跑）
 │       ├── test_viewer_math.mjs  缩放锚点、坐标互逆、滚轮归一化
 │       ├── test_engine_out.mjs   **v1.18.1**：输出引擎路径规范化（目录补文件名 / 后缀识别 / 不误改）
 │       ├── test_splitpanes.mjs   **v1.25.1**：分栏比例夹取 / 存档值按当前宽度折算（15.61% 那类脏值）
 │       ├── test_runsbar.mjs      **v1.25.2**：运行中条的时长格式 / kind 中文名 / 哪些任务该出现
 │       ├── test_log_actions.mjs  **v1.25.3**：事件去重（模拟重连）/ 日志文件地址 / 按钮状态机
+│       ├── test_annotate_flow.mjs **v1.35.0**：五步引导 / 移出图片 / 手动折叠不被弹开（78 项）
+│       ├── test_tiers.mjs        **v1.39.0**：阈值闭区间（0.7·0.4）/ 颜色文案一致 / 档位计数（33 项）
+│       ├── test_history.mjs      **v1.39.0**：深度上限与丢弃 / undo-redo 往返 30 次 / 入参不被改（40 项）
+│       ├── test_geometry.mjs     **v1.39.0**：内点与边框容差 / 缩放不变量 / 旋转框角点顺序 / 吸附与正交（76 项）
+│       ├── test_importplan.mjs   **v1.39.0**：阻塞原因优先级 / 0 图不许导入 / 汇总文案与单位（53 项）
 │       └── test_contrast.mjs     设计令牌对比度核算（WCAG AA）
 └── runtime/              上传临时文件与任务日志（已 gitignore）
 ```
@@ -4252,12 +4304,40 @@ D:\Anaconda3\envs\dpenv\python.exe 6-web\backend\tools\route_table.py --update
 **一条命令跑完全部后端测试**（v1.15 起，CI 与本地共用同一个入口）：
 
 ```powershell
-D:\Anaconda3\envs\dpenv\python.exe 6-web\backend\tools\run_all_tests.py      # 54 个脚本（v1.35.0）
+D:\Anaconda3\envs\dpenv\python.exe 6-web\backend\tools\run_all_tests.py      # 62 个脚本（v1.39.0）
 D:\Anaconda3\envs\dpenv\python.exe 6-web\backend\tools\run_all_tests.py transd  # 只跑名字含 transd 的
 ```
 
 它会扫描目录自动收录 `test_*.py`（以后新增脚本不用改 CI），逐条打印耗时与通过数，
 任一脚本退出码非 0 即整体失败。**不需要 GPU / DLL / torch**，约 3 分钟。
+
+**全链路自检**（v1.39.0：接口之间"字段名改了对面没改"这类断裂，单测拦不住）：
+
+```powershell
+# 8 个环节走一遍：建工程 → 加图 → 写标注 → 导出 → 扫数据集 → 枚举产物 → 造包校验 → 推理
+D:\Anaconda3\envs\dpenv\python.exe 6-web\backend\tools\test_full_chain.py
+
+# 只跑到某个环节（前面的环节会自动先跑，因为后面的要用前面的产物）
+D:\Anaconda3\envs\dpenv\python.exe 6-web\backend\tools\test_full_chain.py --step dataset
+D:\Anaconda3\envs\dpenv\python.exe 6-web\backend\tools\test_full_chain.py --list    # 环节名
+D:\Anaconda3\envs\dpenv\python.exe 6-web\backend\tools\test_full_chain.py --keep    # 保留临时目录
+```
+
+失败时会打印**该环节的请求与响应体**（截断 400 字），不用再手工复现。它已被
+`run_all_tests.py` 自动收录，CI 也会跑（CI 里 `pip install httpx` 提供 TestClient）。
+
+**浏览器 e2e（可选，v1.39.0）**：真开 Chromium 加载页面，专治"import 路径写错导致白屏"。
+
+```powershell
+pip install playwright
+playwright install chromium        # 约 118 MB，一次就够
+D:\Anaconda3\envs\dpenv\python.exe 6-web\backend\tools\e2e_browser.py            # 自动挑空闲端口
+D:\Anaconda3\envs\dpenv\python.exe 6-web\backend\tools\e2e_browser.py --headed   # 看得见浏览器
+```
+
+没装 playwright 时直接跳过（退出码 0），不会拦住任何人。截图与失败时的控制台摘要
+落在 `runtime/e2e/`。**CI 故意不跑它**：下载 Chromium 大，无头浏览器在容器里也容易
+因字体/沙箱失败。
 
 2026-11-11 数据集体检实测（v1.34.3）：
 
@@ -4272,8 +4352,8 @@ D:\Anaconda3\envs\dpenv\python.exe 6-web\backend\tools\run_all_tests.py transd  
 常规做法会直接把组内 691 张判成重复并删掉，等于毁掉全部缺陷样本。这才是本版把
 「完全重复」与「同底板」分成两级、且 B 级永不自动删除的原因。
 
-CI 在 `.github/workflows/tests.yml`：Windows + Python 3.11 跑上面这条，另起一个
-Node 20 job 跑六个前端单测 + 所有 `js/*.js` 的 `node --check`。
+CI 在 `.github/workflows/tests.yml`：Windows + Python 3.11 跑上面这条（含全链路自检），另起一个
+Node 20 job 跑十二个前端单测 + 所有 `js/**/*.js` 的 `node --check`（`js/annotate/` 子目录也在内）。
 
 单个脚本也可以独立跑：
 

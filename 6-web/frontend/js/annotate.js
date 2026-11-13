@@ -55,41 +55,51 @@ import {
   resolveGuideAction,
   shouldExpandDrafts,
 } from "./annotateflow.js";
+// 标注页的纯逻辑按职责拆到 js/annotate/ 下（各自有 .mjs 单测）：
+// 分档、撤销栈、几何命中、导入计划。本文件只做"把 state 喂进去 + 画到界面上"。
+import {
+  TIER_HIGH as DRAFT_TIER_HIGH,
+  TIER_MID as DRAFT_TIER_MID,
+  countByTier,
+  tierClass as draftTierClass,
+  tierColor as draftTierColor,
+  tierCountText,
+  tierOf as draftTier,
+  tierText as draftTierText,
+} from "./annotate/tiers.js";
+import {
+  HISTORY_LIMIT,
+  canRedo,
+  canUndo,
+  historyButtons,
+  pushSnapshot,
+  redoStep,
+  undoStep,
+} from "./annotate/history.js";
+import {
+  HANDLE_RADIUS,
+  SNAP_RADIUS,
+  constrainOrthogonal,
+  hitEdge as hitEdgeGeom,
+  hitHandle as hitHandleGeom,
+  hitTest as hitTestGeom,
+  rotateHandlePoint as rotateHandlePointGeom,
+  shapeCorners,
+  snapPoint as snapPointGeom,
+} from "./annotate/geometry.js";
+import { countUnit, importSummaryText, planImport } from "./annotate/importplan.js";
 
 // ---------------------------------------------------------------------------
 // 常量
 // ---------------------------------------------------------------------------
 
-/** 撤销历史深度。对齐 Qt 版的 50，兼顾内存与"够用"。 */
-const HISTORY_LIMIT = 50;
+/** 撤销历史深度（来自 annotate/history.js）。对齐 Qt 版的 50，兼顾内存与"够用"。 */
 /** 自动保存防抖间隔（毫秒）。改慢会丢更多编辑，改快会把磁盘打满。 */
 const SAVE_DEBOUNCE = 3000;
 /** 草稿落盘防抖：草稿比工程小得多，且审核是连续操作，短一点手感更好。 */
 const DRAFTS_SAVE_DEBOUNCE = 800;
-/**
- * 草稿置信度分档。
- *
- * 阈值不是拍脑袋：`0.70` 是 Ultralytics 默认 val 的置信度基准之上，
- * 现场审核时"基本不用看"的那一档；`0.40` 以下基本是模型在猜，需要人逐条看。
- * 两侧都取闭区间上界，避免 0.7 / 0.4 正好落在缝里。
- */
-const DRAFT_TIER_HIGH = 0.7;
-const DRAFT_TIER_MID = 0.4;
-const DRAFT_TIER_COLORS = {
-  // 与 style.css 的 --ok / --amber / --danger 取同一组值：
-  // 列表用 CSS、画布用 JS，两边数值不同的话同一批草稿会有两种"绿"，看着像 bug。
-  high: [52, 211, 153],
-  mid: [251, 191, 36],
-  low: [248, 113, 113],
-  unknown: [251, 191, 36],
-};
-const DRAFT_TIER_TEXT = { high: "高", mid: "中", low: "低", unknown: "?" };
-/** 顶点手柄的屏幕半径（像素）。固定屏幕尺寸，缩放时不变。 */
-const HANDLE_RADIUS = 5;
-/** 命中测试的容差（屏幕像素）。太小点不中，太大容易误选。 */
-const HIT_TOLERANCE = 6;
-/** 吸附半径（屏幕像素）。 */
-const SNAP_RADIUS = 9;
+// 草稿置信度分档的阈值 / 颜色 / 文案由 annotate/tiers.js 提供，
+// 画布与列表共用同一套，避免同一批草稿出现两种"绿"。
 /** 画布绝对最小倍率，防止把图缩成看不见的一点。 */
 const MIN_SCALE_ABS = 0.05;
 
@@ -287,34 +297,10 @@ function currentDrafts() {
 }
 
 // ---------------------------------------------------------------------------
-// 草稿置信度分档
+// 草稿分档（实现见 annotate/tiers.js）
 // ---------------------------------------------------------------------------
-/**
- * 草稿置信度档位。
- *
- * `score < 0` 是"通道没给置信度"（外部服务常见），单独一档：
- * 把它算成低置信度会让整批红框看起来像"模型全在猜"，反而让人不敢信绿框。
- */
-function draftTier(score) {
-  const value = Number(score);
-  if (!Number.isFinite(value) || value < 0) return "unknown";
-  if (value >= DRAFT_TIER_HIGH) return "high";
-  if (value >= DRAFT_TIER_MID) return "mid";
-  return "low";
-}
-
-function draftTierColor(score) {
-  return DRAFT_TIER_COLORS[draftTier(score)];
-}
-
-function draftTierText(score) {
-  return DRAFT_TIER_TEXT[draftTier(score)];
-}
-
-/** 草稿列表项的颜色类名，CSS 与画布共用同一套分档。 */
-function draftTierClass(score) {
-  return `tier-${draftTier(score)}`;
-}
+// 这里不再保留 draftTier* 的本地实现：阈值与颜色只有一份，
+// 否则"画布绿、列表红"这种 bug 会反复出现。
 
 // ---------------------------------------------------------------------------
 // 草稿落盘：旁挂 `<工程名>.drafts.json`
@@ -932,21 +918,25 @@ function applySnapshot(entry) {
  *
  * 顺序很重要——必须"先快照再改"，否则撤销会退回到改动后的状态，看起来像没生效。
  * 快照只存单图标注数组，不存图像位图：50 步深度才不会吃光内存。
+ * 栈的操作交给 annotate/history.js（纯函数），这里只负责读写 state 与刷新按钮。
  */
 function pushHistory(full = false) {
   const entry = snapshot(full);
   if (!entry) return;
-  state.undo.push(entry);
-  if (state.undo.length > HISTORY_LIMIT) state.undo.shift();
-  state.redo.length = 0;
+  const result = pushSnapshot({ undo: state.undo, entry, limit: HISTORY_LIMIT });
+  state.undo = result.undo;
+  state.redo = result.redo;
   updateHistoryButtons();
 }
 
 function undo() {
-  if (!state.undo.length) return false;
-  const entry = state.undo.pop();
-  state.redo.push(snapshot(entry.full));
-  const indexChanged = applySnapshot(entry);
+  if (!canUndo(state.undo)) return false;
+  // 先取栈顶条目，才知道"要不要把整份工程"作为当前快照放进 redo 栈
+  const top = state.undo[state.undo.length - 1];
+  const result = undoStep({ undo: state.undo, redo: state.redo, current: snapshot(Boolean(top.full)) });
+  state.undo = result.undo;
+  state.redo = result.redo;
+  const indexChanged = applySnapshot(result.entry);
   markDirty();
   renderAll();
   if (indexChanged) loadCurrentImage();
@@ -957,10 +947,12 @@ function undo() {
 }
 
 function redo() {
-  if (!state.redo.length) return false;
-  const entry = state.redo.pop();
-  state.undo.push(snapshot(entry.full));
-  const indexChanged = applySnapshot(entry);
+  if (!canRedo(state.redo)) return false;
+  const top = state.redo[state.redo.length - 1];
+  const result = redoStep({ undo: state.undo, redo: state.redo, current: snapshot(Boolean(top.full)) });
+  state.undo = result.undo;
+  state.redo = result.redo;
+  const indexChanged = applySnapshot(result.entry);
   markDirty();
   renderAll();
   if (indexChanged) loadCurrentImage();
@@ -971,8 +963,9 @@ function redo() {
 }
 
 function updateHistoryButtons() {
-  if (el.undo) el.undo.disabled = state.undo.length === 0;
-  if (el.redo) el.redo.disabled = state.redo.length === 0;
+  const { undoDisabled, redoDisabled } = historyButtons(state.undo, state.redo);
+  if (el.undo) el.undo.disabled = undoDisabled;
+  if (el.redo) el.redo.disabled = redoDisabled;
 }
 
 // ---------------------------------------------------------------------------
@@ -1569,38 +1562,8 @@ function toImage(point) {
   return screenToImage(point, state.view.scale, state.view.offset);
 }
 
-/** 形状的顶点（图像坐标）；矩形类的两点表示在这里展开成 4 个角点用于绘制。 */
-function shapeCorners(obj) {
-  const points = obj.points || [];
-  if (obj.shape_type === "rectangle" && points.length >= 2) {
-    const [a, b] = points;
-    return [
-      [a[0], a[1]],
-      [b[0], a[1]],
-      [b[0], b[1]],
-      [a[0], b[1]],
-    ];
-  }
-  if (obj.shape_type === "rotated_rect" && points.length >= 2) {
-    const [a, b] = points;
-    const cx = (a[0] + b[0]) / 2;
-    const cy = (a[1] + b[1]) / 2;
-    const angle = Number(obj.rotation) || 0;
-    const halfW = Math.abs(b[0] - a[0]) / 2;
-    const halfH = Math.abs(b[1] - a[1]) / 2;
-    const corners = [];
-    for (const [sx, sy] of [[-1, -1], [1, -1], [1, 1], [-1, 1]]) {
-      const rx = sx * halfW;
-      const ry = sy * halfH;
-      corners.push([
-        cx + rx * Math.cos(angle) - ry * Math.sin(angle),
-        cy + rx * Math.sin(angle) + ry * Math.cos(angle),
-      ]);
-    }
-    return corners;
-  }
-  return points;
-}
+// shapeCorners（矩形的两点表示 → 4 个角点）来自 annotate/geometry.js：
+// 绘制与命中测试必须用同一套角点，否则"画出来的框"和"点得中的框"会错位。
 
 function drawPolygon(ctx, points, close) {
   if (!points.length) return;
@@ -2105,183 +2068,62 @@ function renderMini() {
 }
 
 // ---------------------------------------------------------------------------
-// 命中测试与几何
+// 命中测试与几何（实现见 annotate/geometry.js）
+//
+// 下面几个薄包装只做一件事：把 state 里的"当前图 / 缩放 / 隐藏集合"喂给纯函数。
+// 纯函数那边不读全局 state，单测才能直接跑（tests/test_geometry.mjs）。
 // ---------------------------------------------------------------------------
-function pointInPolygon(point, polygon) {
-  let inside = false;
-  for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i, i += 1) {
-    const [xi, yi] = polygon[i];
-    const [xj, yj] = polygon[j];
-    if (yi > point.y !== yj > point.y && point.x < ((xj - xi) * (point.y - yi)) / (yj - yi || 1e-9) + xi) {
-      inside = !inside;
-    }
-  }
-  return inside;
-}
-
-function distanceToSegment(point, a, b) {
-  const dx = b[0] - a[0];
-  const dy = b[1] - a[1];
-  const lengthSq = dx * dx + dy * dy;
-  if (lengthSq === 0) return Math.hypot(point.x - a[0], point.y - a[1]);
-  let t = ((point.x - a[0]) * dx + (point.y - a[1]) * dy) / lengthSq;
-  t = Math.max(0, Math.min(1, t));
-  return Math.hypot(point.x - (a[0] + t * dx), point.y - (a[1] + t * dy));
-}
 
 /**
  * 命中测试：返回命中的对象。
  *
  * 从后往前遍历——后画的在上层，用户点哪个就该选中看到的那个。
- * 点在形状内部也算命中（填充分明就会点进去），线段和点只能靠距离。
+ * 标注与草稿合成一条绘制顺序，隐藏的跳过。
  */
 function hitTest(point) {
   const image = currentImage();
   if (!image) return null;
-  const tolerance = HIT_TOLERANCE / state.view.scale;
-  const ordered = [
-    ...image.annotations.map((obj) => ({ obj })),
-    ...currentDrafts().map((obj) => ({ obj })),
-  ];
-
-  for (let i = ordered.length - 1; i >= 0; i -= 1) {
-    const obj = ordered[i].obj;
-    if (state.hidden.has(obj.id)) continue;
-    const points = obj.points || [];
-    if (!points.length) continue;
-
-    if (obj.shape_type === "point") {
-      if (Math.hypot(point.x - points[0][0], point.y - points[0][1]) <= tolerance + 4) return obj;
-      continue;
-    }
-    if (obj.shape_type === "line") {
-      for (let k = 1; k < points.length; k += 1) {
-        if (distanceToSegment(point, points[k - 1], points[k]) <= tolerance) return obj;
-      }
-      continue;
-    }
-    if (obj.shape_type === "keypoints") {
-      for (const p of points) {
-        if (Math.hypot(point.x - p[0], point.y - p[1]) <= tolerance + 3) return obj;
-      }
-      continue;
-    }
-    const corners = shapeCorners(obj);
-    if (corners.length >= 3 && pointInPolygon(point, corners)) return obj;
-    // 内部没点中时再判边框，这样"框挨着但没套住"也能选中
-    for (let k = 1; k <= corners.length; k += 1) {
-      if (distanceToSegment(point, corners[k - 1], corners[k % corners.length]) <= tolerance) return obj;
-    }
-  }
-  return null;
+  const objects = [...image.annotations, ...currentDrafts()];
+  return hitTestGeom(point, {
+    objects,
+    scale: state.view.scale,
+    hidden: state.hidden,
+  });
 }
 
 /** 旋转框顶部外侧的圆点（图像坐标）。普通矩形没有这个点，所以不能转。 */
 function rotateHandlePoint(obj) {
-  if (!obj || obj.shape_type !== "rotated_rect") return null;
-  const corners = shapeCorners(obj);
-  if (corners.length !== 4) return null;
-  const mid = [(corners[0][0] + corners[1][0]) / 2, (corners[0][1] + corners[1][1]) / 2];
-  const [a, b] = obj.points || [];
-  if (!a || !b) return null;
-  const cx = (a[0] + b[0]) / 2;
-  const cy = (a[1] + b[1]) / 2;
-  const dx = mid[0] - cx;
-  const dy = mid[1] - cy;
-  const len = Math.hypot(dx, dy) || 1;
-  const gap = 22 / state.view.scale;
-  return [mid[0] + (dx / len) * gap, mid[1] + (dy / len) * gap];
+  return rotateHandlePointGeom(obj, state.view.scale);
 }
 
+/** 手柄命中（旋转点 / 角点 / 顶点 / 边中点插点）。 */
 function hitHandle(obj, point) {
-  const tolerance = (HANDLE_RADIUS + 3) / state.view.scale;
-  if (obj.shape_type === "rectangle" || obj.shape_type === "rotated_rect") {
-    const knob = rotateHandlePoint(obj);
-    if (knob && Math.hypot(point.x - knob[0], point.y - knob[1]) <= tolerance + 2 / state.view.scale) {
-      return { kind: "rotate" };
-    }
-    const corners = shapeCorners(obj);
-    for (let index = 0; index < corners.length; index += 1) {
-      if (Math.hypot(point.x - corners[index][0], point.y - corners[index][1]) <= tolerance) {
-        return { kind: "corner", index };
-      }
-    }
-    return null;
-  }
-  const points = obj.points || [];
-  for (let index = 0; index < points.length; index += 1) {
-    if (Math.hypot(point.x - points[index][0], point.y - points[index][1]) <= tolerance) {
-      return { kind: "vertex", index };
-    }
-  }
-  if (obj.shape_type === "polygon") {
-    for (let index = 0; index < points.length; index += 1) {
-      const next = (index + 1) % points.length;
-      const mid = [(points[index][0] + points[next][0]) / 2, (points[index][1] + points[next][1]) / 2];
-      if (Math.hypot(point.x - mid[0], point.y - mid[1]) <= (4 + 3) / state.view.scale) {
-        return { kind: "insert", index };
-      }
-    }
-  }
-  return null;
+  return hitHandleGeom(obj, point, { scale: state.view.scale });
 }
 
+/** 矩形边中点命中（整体拖边）。 */
 function hitEdge(obj, point) {
-  if (obj.shape_type !== "rectangle" && obj.shape_type !== "rotated_rect") return null;
-  const corners = shapeCorners(obj);
-  if (corners.length !== 4) return null;
-  const tolerance = 6 / state.view.scale;
-  for (let index = 0; index < 4; index += 1) {
-    const a = corners[index];
-    const b = corners[(index + 1) % 4];
-    const mid = [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2];
-    if (Math.hypot(point.x - mid[0], point.y - mid[1]) <= tolerance) return { kind: "edge", index };
-  }
-  return null;
+  return hitEdgeGeom(obj, point, { scale: state.view.scale });
 }
 
 // ---------------------------------------------------------------------------
-// 吸附
+// 吸附（实现见 annotate/geometry.js）
 // ---------------------------------------------------------------------------
-function snapPoint(point, { allowClose = false } = {}) {
-  // 契约：**永远**返回 `{ point: [x, y], snap }`。
-  // 调用方一律按数组取 `point[0] / point[1]`；如果这里有的分支返回 `{x, y}` 对象，
-  // 取到的就是 undefined，代价是画出"空点"标注并且拖拽画框永远收不了尾。
-  const origin = [point.x, point.y];
-  if (!state.opts.snap) return { point: origin, snap: null };
+/**
+ * 吸附：闭合吸附 + 顶点吸附。
+ *
+ * 契约：**永远**返回 `{ point: [x, y], snap }`（由 geometry.js 保证），
+ * 调用方一律按数组取 `point[0] / point[1]`。
+ */
+function snapPoint(point, options = {}) {
   const image = currentImage();
-  if (!image) return { point: origin, snap: null };
-  const radius = SNAP_RADIUS / state.view.scale;
-
-  // 闭合吸附：多边形靠近起点时直接吸上去，否则"精确点回起点"几乎做不到
-  if (allowClose && state.pending.length >= 3) {
-    const first = state.pending[0];
-    if (Math.hypot(point.x - first[0], point.y - first[1]) <= radius) {
-      return { point: [first[0], first[1]], snap: first };
-    }
-  }
-
-  // 顶点吸附：贴着已有标注的顶点画，能画出严格对齐的数据
-  let best = null;
-  let bestDistance = radius;
-  for (const obj of image.annotations) {
-    for (const p of obj.points || []) {
-      const distance = Math.hypot(point.x - p[0], point.y - p[1]);
-      if (distance < bestDistance) {
-        bestDistance = distance;
-        best = p;
-      }
-    }
-  }
-  if (best) return { point: [best[0], best[1]], snap: best };
-  return { point: origin, snap: null };
-}
-
-/** 线段正交吸附：按住 Shift 时把端点约束到水平或垂直。 */
-function constrainOrthogonal(anchor, point) {
-  const dx = Math.abs(point.x - anchor[0]);
-  const dy = Math.abs(point.y - anchor[1]);
-  return dx >= dy ? [point[0], anchor[1]] : [anchor[0], point[1]];
+  return snapPointGeom(point, {
+    enabled: Boolean(state.opts.snap) && Boolean(image),
+    candidates: image ? image.annotations : [],
+    pending: state.pending,
+    scale: state.view.scale,
+    allowClose: Boolean(options.allowClose),
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -3551,7 +3393,12 @@ function renderDraftList() {
   if (!el.draftList) return;
   el.draftList.innerHTML = "";
   const drafts = currentDrafts();
-  if (el.draftCount) el.draftCount.textContent = String(drafts.length);
+  if (el.draftCount) {
+    el.draftCount.textContent = String(drafts.length);
+    // 悬停能看到"高 3 / 中 5 / 低 2"，不用逐条数徽标
+    const tierText = tierCountText(countByTier(drafts));
+    el.draftCount.title = tierText ? `按置信度：${tierText}` : "当前图没有草稿";
+  }
 
   drafts.forEach((draft, index) => {
     const li = document.createElement("li");
@@ -4207,42 +4054,21 @@ function importPayload(dryRun) {
   };
 }
 
-function formatImportReport(report, issues) {
-  const lines = [];
-  const splitText = Object.entries(report.per_split || {})
-    .map(([name, item]) => `${name} ${item.images} 图 / ${item.objects} 框`)
-    .join("　");
-  lines.push(
-    `任务 ${report.task} ｜ ${(report.classes || []).length} 类 ｜ ` +
-      `${report.images} 图 / ${report.objects} ${report.task === "classify" ? "张" : "框"}`,
-  );
-  if (splitText) lines.push(splitText);
-
-  const bits = [];
-  if (report.added_images) bits.push(`新增 ${report.added_images} 图 / ${report.added_objects} 框`);
-  if (report.skipped_existing) bits.push(`跳过已存在 ${report.skipped_existing} 图`);
-  if (report.replaced_images) bits.push(`覆盖 ${report.replaced_images} 图`);
-  if (report.empty_images) bits.push(`空标注 ${report.empty_images} 图`);
-  if (report.unknown_class_objects) bits.push(`未知类别 ${report.unknown_class_objects} 框`);
-  if (report.orphan_labels) bits.push(`孤儿标签 ${report.orphan_labels}`);
-  if (report.malformed_lines) bits.push(`畸形行 ${report.malformed_lines}`);
-  if (report.truncated) bits.push("已按上限截断");
-  if (bits.length) lines.push(bits.join(" ｜ "));
-
-  lines.push(`图片路径：${report.path_mode === "relative" ? "相对工程目录（可搬移）" : "绝对路径"}`);
-  (report.warnings || []).forEach((text) => lines.push(`⚠ ${text}`));
-  (issues || []).forEach((text) => lines.push(`✗ ${text}`));
-  return lines.join("\n");
-}
+// 报告 → 文案的拼接在 annotate/importplan.js（`importSummaryText`），
+// 这里只负责把结果写到预览区。
 
 async function previewImport() {
   const payload = importPayload(true);
-  if (!payload.source) {
-    setImportReport("请先填 data.yaml 或数据集根目录", "bad");
-    return;
-  }
-  if (payload.mode === "merge" && !state.project) {
-    setImportReport("先打开一个工程，或把导入方式改成「新建工程」", "bad");
+  // 阻塞原因的判定与文案都在 annotate/importplan.js（有单测），这里只负责显示
+  const plan = planImport({
+    mode: payload.mode,
+    source: payload.source,
+    projectPath: payload.project_path,
+    hasProject: Boolean(state.project),
+    previewReady: false,
+  });
+  if (!plan.ok) {
+    setImportReport(plan.blocking[0], "bad");
     return;
   }
   setImportEnabled(false);
@@ -4250,9 +4076,18 @@ async function previewImport() {
   try {
     const data = await importAnnotationProject(payload);
     state.importReport = data.report;
-    const bad = (data.issues || []).length > 0;
-    setImportReport(formatImportReport(data.report, data.issues), bad ? "warn" : "ok");
-    setImportEnabled(true);
+    const next = planImport({
+      mode: payload.mode,
+      source: payload.source,
+      projectPath: payload.project_path,
+      hasProject: Boolean(state.project),
+      previewReady: true,
+      report: data.report,
+      issues: data.issues,
+    });
+    // 预览出 0 图时不再放开按钮：新建模式下点导入会把现有工程覆盖成空工程
+    setImportReport(next.text, next.ok ? (next.needsReview ? "warn" : "ok") : "bad");
+    setImportEnabled(next.ok);
   } catch (error) {
     state.importReport = null;
     setImportReport(`预览失败：${error.message}`, "bad");
@@ -4260,12 +4095,20 @@ async function previewImport() {
 }
 
 async function applyImport({ save }) {
-  if (!state.importReport) {
-    setImportReport("请先「预览」，确认图数与框数没问题再导入", "warn");
-    return;
-  }
   const mode = el.importMode?.value || "new";
   const payload = importPayload(false);
+  const guard = planImport({
+    mode,
+    source: payload.source,
+    projectPath: payload.project_path,
+    hasProject: Boolean(state.project),
+    previewReady: Boolean(state.importReport),
+    report: state.importReport,
+  });
+  if (!guard.ok) {
+    setImportReport(guard.blocking[0], "warn");
+    return;
+  }
 
   if (mode === "new") {
     const raw = (el.path?.value || "").trim();
@@ -4336,8 +4179,8 @@ async function applyImport({ save }) {
     const suffix = save
       ? `，已写入 ${(state.path.split(/[\\/]/).pop() || ".tfanno")}`
       : "，记得按 Ctrl+S 保存";
-    setImportReport(`${formatImportReport(report, data.issues)}\n✓ 导入完成${suffix}`, "ok");
-    setStatus(`导入 ${report.added_images} 图 / ${report.added_objects} 框`);
+    setImportReport(`${importSummaryText(report, data.issues)}\n✓ 导入完成${suffix}`, "ok");
+    setStatus(`导入 ${report.added_images} 图 / ${report.added_objects} ${countUnit(report.task)}`);
   } catch (error) {
     setImportReport(`导入失败：${error.message}`, "bad");
   } finally {

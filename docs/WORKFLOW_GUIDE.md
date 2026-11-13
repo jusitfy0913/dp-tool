@@ -194,7 +194,7 @@ python 6-web\backend\tools\test_dataset_workbench.py
 
 ### 2.6 前端单测（零依赖，只需 node）
 
-前端是零构建的，所以单测也不装任何框架，直接 `node` 跑。这六项不需要启动服务：
+前端是零构建的，所以单测也不装任何框架，直接 `node` 跑。这十二项不需要启动服务：
 
 ```powershell
 node 6-web\frontend\tests\test_viewer_math.mjs
@@ -214,6 +214,18 @@ node 6-web\frontend\tests\test_log_actions.mjs
 
 node 6-web\frontend\tests\test_contrast.mjs
 # 期望：✓ 全部通过：23 项
+
+# v1.39.0：标注页拆出来的 4 个纯逻辑模块
+node 6-web\frontend\tests\test_annotate_flow.mjs
+# 期望：✓ 全部通过：78 项
+node 6-web\frontend\tests\test_tiers.mjs
+# 期望：✓ 全部通过（33 项）
+node 6-web\frontend\tests\test_history.mjs
+# 期望：✓ 全部通过（40 项）
+node 6-web\frontend\tests\test_geometry.mjs
+# 期望：✓ 全部通过（76 项）
+node 6-web\frontend\tests\test_importplan.mjs
+# 期望：✓ 全部通过（53 项）
 ```
 
 | 脚本 | 守住什么 |
@@ -224,6 +236,11 @@ node 6-web\frontend\tests\test_contrast.mjs
 | `test_runsbar.mjs` | 顶栏「运行中任务」条：时长格式（`1:02:05`）、kind 中文名（`pipeline-*` 统一叫「全流程串联」）、哪些任务该出现（已结束的不出现、2 秒的自检不闪现、训练不能误伤） |
 | `test_log_actions.mjs` | 事件去重（模拟重连：先收 1..3，再收 1..5，结果必须正好是 1,2,3,4,5）、没有 `seq` 的旧格式不能丢、日志文件 URL 编码、复制/日志文件两个按钮的启用条件（没 run 不能点、没内容不能复制、切任务要清空） |
 | `test_contrast.mjs` | 从 `style.css` 读设计令牌按 WCAG 公式核算，正文与面板底色不低于 4.5:1，网格/扫描线不透明度 ≤ 0.05 |
+| `test_annotate_flow.mjs` | 五步引导的判定（哪一步算完成）、移出图片的下标夹取、草稿面板"用户手动折叠后不许自动弹开" |
+| `test_tiers.mjs` | 分档阈值的**闭区间**落点（0.7 归高、0.4 归中）、四个档位的颜色/文案/类名一一对应、`countByTier` 的键顺序（tooltip 拼接依赖它） |
+| `test_history.mjs` | 深度上限 50（第 51 步丢最老的一条）、压入清空 redo、undo/redo 往返 30 次后深度与栈顶、纯函数**不改入参** |
+| `test_geometry.mjs` | 容差按 `scale` 换算（放大 2 倍后图像坐标容差减半 = 屏幕手感不变）、hitTest 后画的优先、旋转框角点顺序、吸附最近点、`constrainOrthogonal` 同时吃 `{x,y}` 与 `[x,y]` |
+| `test_importplan.mjs` | 阻塞原因的优先级与文案、预览 0 图时不许导入、`issues` 只提示不阻塞、汇总文案里的单位（框/张）与跳过原因 |
 
 改配色的正确流程：改令牌 → 跑 `test_contrast` → 不达标就再调，别靠眼睛判断。
 改分栏的正确流程：改 `minPx / maxRatio` → 跑 `test_splitpanes` → 再在 1024/1181/1600/1920
@@ -362,7 +379,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_web_studio.ps1
 ```powershell
 python 6-web\backend\tools\test_annotation_drafts.py   # 期望 87/87（v1.24 含 v2 审核块）
 python 6-web\backend\tools\test_autolabel_batch.py     # 期望 42/42
-python 6-web\backend\tools\run_all_tests.py            # 期望 61 个脚本全绿（v1.38.0 起含 test_route_table / test_app_assembly）
+python 6-web\backend\tools\run_all_tests.py            # 期望 62 个脚本全绿（v1.39.0 起含 test_full_chain）
 ```
 
 真跑参考（PCB 6 张、`best.transd_fp16.engine`、`conf=0.3`）：
@@ -605,6 +622,42 @@ python 6-web\backend\tools\run_all_tests.py            # 期望 54 个脚本全�
 
 真机自检顺序（已在本机跑过）：新建工程 → 批量加入 3 张 → 行尾「×」删中间那张 → 磁盘文件仍在、
 列表变 2 张 → `Ctrl+Z` 恢复 3 张 → 加类别看引导条跳到第 4 步 → 点引导条按钮自动切到矩形工具。
+
+### 2.10 全链路自检与浏览器 e2e（v1.39.0）
+
+单个脚本各验一段逻辑，验不出"接口之间字段名改了对面没改"。这两个工具补的就是这一段：
+
+**接口全链路（必跑，已在 CI 里）**
+
+```powershell
+# 8 个环节：建工程 → 加图 → 写标注 → 导出 → 扫数据集 → 枚举产物 → 造包校验 → 推理
+python 6-web\backend\tools\test_full_chain.py
+# 期望：✓ 全链路自检通过：8 个环节
+
+python 6-web\backend\tools\test_full_chain.py --list       # 看环节名
+python 6-web\backend\tools\test_full_chain.py --step dataset   # 只跑到某环节（前面的自动先跑）
+python 6-web\backend\tools\test_full_chain.py --keep       # 保留临时目录，事后翻产物
+```
+
+走的是真实 HTTP（FastAPI `TestClient`，不启服务、不用 GPU），推理环节用**假引擎桩**：
+验的是"接口契约 + 出图 + 耗时字段补齐"，不是模型精度。失败时会打印该环节的
+请求参数与响应体（截断 400 字），不用手工复现。
+
+**浏览器端到端（可选，CI 不跑）**
+
+```powershell
+pip install playwright
+playwright install chromium     # 约 118 MB，一次就够
+python 6-web\backend\tools\e2e_browser.py            # 自动挑空闲端口
+python 6-web\backend\tools\e2e_browser.py --headed   # 看得见浏览器
+```
+
+它真正加载页面，专治"`import` 路径写错 → 控制台 404 → 整页白屏"这类问题——
+`test_full_chain.py` 只调接口，发现不了前端模块加载失败。检查点：首页无脚本错误 →
+切到标注页三栏渲染 → 关键控件齐全 → 切到推理页。截图落在 `runtime/e2e/`，
+失败时把控制台摘要写到 `runtime/e2e/console.txt`。
+
+没装 playwright 时脚本直接跳过（退出码 0），不会拦住没装的人。
 
 ---
 

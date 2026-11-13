@@ -1,10 +1,12 @@
 name: tests
 
 # 为什么要有 CI：
-# 后端 29 个脚本、约 1220 项断言，全靠人肉跑。改一行代码忘了跑某个脚本，
+# 后端脚本已经 60+ 个、断言上千条，全靠人肉跑。改一行代码忘了跑某个脚本，
 # 问题要到用户点开页面才暴露（v1.15 的 `--simplify true` 就是这么漏出去的）。
-# 这里只跑「不需要 GPU / DLL / torch / 真实权重」的纯逻辑测试，约 47 秒。
+# 这里只跑「不需要 GPU / DLL / torch / 真实权重」的纯逻辑测试。
 # 新增脚本会被 run_all_tests.py 自动收录，不需要改本文件。
+# 浏览器 e2e（tools/e2e_browser.py）**故意不跑**：要下载 Chromium，容器里也容易
+# 因字体/沙箱失败，把它留作本地回归工具。
 
 on:
   push:
@@ -29,7 +31,8 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r 6-web/backend/requirements.txt
-          pip install onnx pillow
+          # httpx 是 TestClient 的依赖：全链路自检（test_full_chain.py）用它走 ASGI
+          pip install onnx pillow httpx
 
       - name: 跑全部后端测试
         env:
@@ -65,10 +68,27 @@ jobs:
       - name: 日志出口与事件去重
         run: node 6-web/frontend/tests/test_log_actions.mjs
 
+      # 标注页拆出来的 4 个纯逻辑模块（js/annotate/）。抽模块的意义就在于
+      # 这些判定能脱离浏览器跑，所以每个模块都必须有对应的 .mjs 单测。
+      - name: 标注五步引导
+        run: node 6-web/frontend/tests/test_annotate_flow.mjs
+
+      - name: 草稿置信度分档
+        run: node 6-web/frontend/tests/test_tiers.mjs
+
+      - name: 撤销重做双栈
+        run: node 6-web/frontend/tests/test_history.mjs
+
+      - name: 几何命中与吸附
+        run: node 6-web/frontend/tests/test_geometry.mjs
+
+      - name: 导入计划与汇总文案
+        run: node 6-web/frontend/tests/test_importplan.mjs
+
       - name: 语法检查（所有前端模块）
         shell: pwsh
         run: |
-          Get-ChildItem 6-web/frontend/js/*.js | ForEach-Object {
+          Get-ChildItem 6-web/frontend/js -Recurse -Filter *.js | ForEach-Object {
             node --check $_.FullName
             if ($LASTEXITCODE -ne 0) { throw "语法错误：$($_.Name)" }
           }

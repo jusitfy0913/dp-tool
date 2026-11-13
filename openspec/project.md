@@ -51,7 +51,13 @@ ocr/                               （PaddleOCR 推理，独立子工程）
 
 - 后端自测脚本集中在 `6-web/backend/tools/test_*.py`，使用 `python tools/xxx.py` 直接运行，
   不依赖 pytest 也能跑；每个脚本自觉打印通过数。
-- 前端改动必须通过 `node --check` 语法检查（13 个 `js/*.js`）。
+- 前端改动必须通过 `node --check` 语法检查（`js/**/*.js`，含 `js/annotate/` 子目录）。
+- **纯逻辑必须抽模块并有 `.mjs` 单测**：凡是不碰 DOM、不读全局 `state` 的判定
+  （阈值分档、撤销栈、几何命中、导入计划、比例换算……）都放到独立 ES 模块，
+  并在 `6-web/frontend/tests/test_<模块>.mjs` 里覆盖边界值。留在页面脚本里的判定
+  等于永远不测——那正是标注页 4700 行时的状态。
+- 跨模块契约用 `tools/test_full_chain.py`（真实 HTTP、假引擎桩、8 个环节）守住，
+  接口之间字段改名这类断链由它拦；页面是否真能加载用 `tools/e2e_browser.py`（可选，CI 不跑）。
 - 精度与等价性用专门的对比脚本产出 JSON + CSV 报告，不靠肉眼判断：
   `tools/val_engine.py`、`tools/val_anomaly.py`、`2-python-anomaly/anomalib-main/compare_ckpt_onnx_inference.py`。
 - 新增推理后端必须附带「与既有后端的一致性对比」用例，缺样例时明确失败而不是跳过。
