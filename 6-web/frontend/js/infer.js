@@ -30,6 +30,15 @@ let sourceObjectUrl = "";
 
 // 模型清单与上次参数，用于"命中缓存"提示与自动填充
 let models = [];
+/**
+ * 模型包列表（`GET /api/models` 的 `bundles` 段）。
+ *
+ * 与 `models` 分开存：模型包是「交付物」，散装条目是「过程产物」。
+ * 界面上分组显示，提交时用不同的字段（`bundle` vs `engine`）。
+ */
+let bundles = [];
+/** 当前选中的模型包 id；非空时提交 bundle 字段，路径输入框只作展示。 */
+let activeBundle = "";
 let lastParamKey = "";
 let lastResult = null;
 let lastKind = "yolo";
@@ -131,6 +140,12 @@ export function initInfer() {
       updateWeightHint();
       if (id === "yoloEngine") applyEngineOperatingPoint();
     });
+  }
+
+  // 随包路径被手改 → 退出模型包模式。用 input 而不是 change：
+  // 用户一边打字一边就该看到提示变化，而不是等失焦后才说「已经不是模型包了」。
+  for (const id of ["yoloEngine", "yoloLabels", "anomEngine", "anomMetadata"]) {
+    document.getElementById(id)?.addEventListener("input", releaseBundleIfHandEdited);
   }
 
   // metadata 路径一改就重读推荐值：手动输入走 change（失焦提交），
@@ -418,6 +433,7 @@ async function loadModels(manual) {
   try {
     const data = await getJSON("/api/models");
     models = data.entries || [];
+    bundles = data.bundles || [];
     renderModelOptions(data);
   } catch (error) {
     dom.modelHint.textContent = `扫描失败：${error.message}`;
@@ -434,10 +450,28 @@ function renderModelOptions(data) {
   placeholder.textContent = "— 手工填写下面的路径 —";
   select.appendChild(placeholder);
 
+  // 模型包排在最前：它是唯一「点一下就把引擎、标签、metadata 都填好」的选项。
+  // 散装条目保留在后面，老用户的下拉习惯不变。
+  if (bundles.length) {
+    const group = document.createElement("optgroup");
+    group.label = "模型包（推荐）";
+    for (const entry of bundles) {
+      const option = document.createElement("option");
+      option.value = `bundle:${entry.id}`;
+      const level = entry.verify?.level || "ok";
+      const mark = level === "block" ? " ✖" : level === "warn" ? " ⚠" : "";
+      const fmt = entry.runtime?.format === "onnx" ? "ONNX" : "引擎";
+      option.textContent = `${entry.title || entry.id} · ${entry.kind}/${fmt}${mark}`;
+      if (level === "block") option.textContent += ` · ${entry.verify?.reason || "校验不通过"}`;
+      group.appendChild(option);
+    }
+    select.appendChild(group);
+  }
+
   // 按类型分组，避免 YOLO 与 Anomalib 混在一个长列表里
   for (const kind of ["yolo", "anomalib"]) {
     const group = document.createElement("optgroup");
-    group.label = kind === "yolo" ? "YOLO 目标检测" : "Anomalib 异常检测";
+    group.label = kind === "yolo" ? "训练产物（散装）YOLO" : "训练产物（散装）Anomalib";
     const items = models.filter((item) => item.kind === kind);
     if (!items.length) {
       const none = document.createElement("option");
@@ -457,12 +491,14 @@ function renderModelOptions(data) {
     select.appendChild(group);
   }
 
-  if (previous && models.some((item) => item.path === previous)) {
+  if (previous && (bundles.some((item) => `bundle:${item.id}` === previous)
+                   || models.some((item) => item.path === previous))) {
     select.value = previous;
   }
 
   const broken = (data.roots || []).filter((root) => !root.ok);
   const parts = [`共 ${data.total ?? models.length} 个引擎`];
+  if (bundles.length) parts.push(`· ${bundles.length} 个模型包`);
   if (data.truncated) parts.push(`（已截断到 ${models.length} 个）`);
   for (const root of broken) {
     parts.push(`· ${root.kind} 目录未扫描：${root.reason}`);
@@ -550,7 +586,24 @@ function onWeightChange() {
   applyModelToForm(item);
 }
 
+function currentBundle() {
+  if (!activeBundle) return null;
+  return bundles.find((entry) => entry.id === activeBundle) || null;
+}
+
 function onModelChange() {
+  const raw = dom.modelSelect.value || "";
+  if (raw.startsWith("bundle:")) {
+    const id = raw.slice("bundle:".length);
+    const entry = bundles.find((item) => item.id === id);
+    if (entry) {
+      applyBundleToForm(entry);
+      return;
+    }
+  }
+
+  // 选的是散装条目（或占位项）：退出模型包模式
+  activeBundle = "";
   const item = currentModel();
   if (!item) {
     updateWeightHint();
@@ -561,6 +614,83 @@ function onModelChange() {
   syncKind();
   syncWeightOptions(item);
   applyModelToForm(item);
+}
+
+/**
+ * 选中模型包：把包内三个路径填进表单，并锁成随包只读。
+ *
+ * 为什么还要填路径（而不是只提交 bundle）：用户需要看见「到底用的是哪个文件」，
+ * 全部隐藏会让人无法确认自己选的是不是想要的那次训练。
+ * 只读只是提示性质——用户真要改，input 事件会立刻退出模型包模式。
+ */
+function applyBundleToForm(entry) {
+  const kind = entry.kind === "anomalib" ? "anomalib" : entry.kind === "yolo" ? "yolo" : "";
+  if (!kind) {
+    dom.modelHint.textContent = `模型包 ${entry.id} 没有记录种类，无法确定用哪个推理页签。`;
+    dom.modelHint.classList.add("hint-warn");
+    return;
+  }
+
+  activeBundle = entry.id;
+  dom.kind.value = kind;
+  syncKind();
+
+  if (kind === "yolo") {
+    setValue("yoloEngine", entry.model_path || "");
+    setValue("yoloLabels", entry.labels_path || "");
+    if (entry.task && ["detect", "segment", "pose", "obb"].includes(entry.task)) {
+      setValue("inferTask", entry.task);
+    }
+    if (dom.weight) {
+      dom.weight.value = String(entry.model_path || "").toLowerCase().endsWith(".onnx")
+        ? "onnx" : "engine";
+    }
+  } else {
+    setValue("anomEngine", entry.model_path || "");
+    setValue("anomMetadata", entry.metadata_path || "");
+    refreshMetaThresholds();
+  }
+
+  lockBundleFields(kind, true);
+  markParamsDirty();
+
+  const level = entry.verify?.level || "ok";
+  dom.modelHint.classList.toggle("hint-warn", level !== "ok");
+  if (level === "block") {
+    dom.modelHint.textContent =
+      `✖ 模型包「${entry.title || entry.id}」校验不通过：${entry.verify?.reason || ""}。`
+      + "请重新构建这个包，或改选其它模型。";
+  } else if (level === "warn") {
+    dom.modelHint.textContent =
+      `⚠ 模型包「${entry.title || entry.id}」已选用，但有需要注意的地方：`
+      + `${entry.verify?.reason || "运行时信息不完整"}。`;
+  } else {
+    dom.modelHint.textContent = `已选用模型包「${entry.title || entry.id}」（引擎、标签、metadata 随包）。`;
+  }
+
+  if (kind === "yolo") applyEngineOperatingPoint();
+}
+
+/** 把模型包填进去的三个路径标成只读，提醒用户「这些是包里带的」。 */
+function lockBundleFields(kind, locked) {
+  const ids = kind === "yolo" ? ["yoloEngine", "yoloLabels"] : ["anomEngine", "anomMetadata"];
+  for (const id of ids) {
+    const el = document.getElementById(id);
+    if (!el) continue;
+    el.dataset.fromBundle = locked ? "1" : "";
+    el.classList.toggle("is-bundle", Boolean(locked));
+  }
+}
+
+/** 用户手工动过随包路径 → 立刻退出模型包模式，按散装提交。 */
+function releaseBundleIfHandEdited(event) {
+  const el = event.target;
+  if (!el || el.dataset?.fromBundle !== "1") return;
+  activeBundle = "";
+  lockBundleFields("yolo", false);
+  lockBundleFields("anomalib", false);
+  dom.modelHint.classList.remove("hint-warn");
+  dom.modelHint.textContent = "已改为手工路径，不再按模型包提交。";
 }
 
 /** 把条目内容填进表单：路径按当前权重格式取引擎或 ONNX，其余字段两份共用。 */
@@ -683,6 +813,14 @@ async function onSubmit(event) {
     setHint("请选择检测模型和识别模型");
     return;
   }
+  // 校验为 block 的模型包属于确定性错误（哈希不符、种类冲突等），
+  // 放过去只会得到空结果或越界解码，比拒绝更难排查。
+  const bundleEntry = currentBundle();
+  if (bundleEntry && bundleEntry.verify?.level === "block") {
+    setHint(`模型包「${bundleEntry.title || bundleEntry.id}」校验不通过：`
+      + `${bundleEntry.verify?.reason || "原因未知"}。请重新构建或改选其它模型。`);
+    return;
+  }
 
   const paramKey = currentParamKey();
   const cached = paramKey === lastParamKey;
@@ -719,6 +857,7 @@ async function onSubmit(event) {
     form.append("nms", value("inferNms"));
     const labels = value("yoloLabels");
     if (labels) form.append("labels", labels);
+    if (activeBundle) form.append("bundle", activeBundle);
   } else {
     url = "/api/infer/anomalib";
     form.append("engine", value("anomEngine"));

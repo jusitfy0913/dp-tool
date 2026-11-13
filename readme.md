@@ -2651,6 +2651,7 @@ TRTForge 标注工作台支持在底部设置 `train / val / test` 自动划分�
 | `docs/异常检测模型对比与选型_PatchCore_PaDiM_EfficientAd.md` | **三模型选型必读**：PatchCore / PaDiM / EfficientAd 的原理、训练耗时、ONNX 与引擎体积、编译耗时、推理延迟、实测准确率、阈值校准与踩坑记录 |
 | `docs/异常检测模型对照_AnomalyCLIP与Anomalib.md` | AnomalyCLIP 与 Anomalib 源码 21 个模型的对照：只有 3 个有本机实测，其余只做了原理分类 |
 | `docs/WORKFLOW_GUIDE.md` | **全流程作业指南**：环境准备 → 标注 → 训练 → ONNX 导出 → trtexec 编译 → 推理验证 → 故障排查 |
+| `docs/模型包说明.md` | **模型交付必读**：`.tfbundle` 目录结构、`manifest.json` 字段表、`ok/warn/block` 三档含义与排查步骤 |
 | `docs/TRTForge_yolo_infer与anomalib_infer_DLL调用与源码打包说明.md` | 说明 `yolo_infer` / `anomalib_infer` 的 C API、调用顺序、内存与依赖，以及 `package_inference_sdk.ps1` 离线打包源码与文档 |
 | `docs/trtexec_gui_YOLO_TRT推理流程说明.md` | 说明 TRTForge YOLO TensorRT 推理库的加载、前处理、解码、坐标还原和 C API |
 | `openspec/changes/add-anomalib-training-export` | Anomalib 异常检测训练导出集成设计，覆盖 PatchCore、PaDiM、EfficientAd 的 Qt UI、Python launcher、ONNX 导出和 metadata 契约 |

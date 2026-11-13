@@ -3445,6 +3445,56 @@ sha256/来源 run 同文件。**引擎文件和 `metadata.json` 都不动**，�
 
 ---
 
+## 7.5 交付模型包（v1.36.0）
+
+训练 + 编译完成后，如果这个模型要交给别人（现场机器、客户、SDK 使用者），
+不要直接拷 `weights/` 目录里的五六个文件，而是先造一个模型包。
+
+### 为什么
+
+`.engine` 二进制里不带 GPU 型号与 TensorRT 版本。换一台机器加载失败时，
+现场只能看到 `nvinfer` 的英文报错，无法判断是「显卡架构不对」还是「文件拷坏了」。
+模型包把这两件事写进 `manifest.json`，加载前就能判定。
+
+### 怎么造
+
+网页：引擎构建页勾选「同时生成模型包」（默认已勾），构建成功即生成。
+
+已有旧产物，用接口补造：
+
+```powershell
+curl -X POST http://127.0.0.1:8060/api/bundles/build `
+  -H "Content-Type: application/json" `
+  -d '{"model":"D:/.../weights/best.transd_fp16.engine","bundle_id":"pcb_detect_v1","kind":"yolo","task":"detect"}'
+
+# 校验（含 sha256）
+curl -X POST http://127.0.0.1:8060/api/bundles/verify `
+  -H "Content-Type: application/json" `
+  -d '{"bundle":"pcb_detect_v1","kind":"yolo","task":"detect"}'
+```
+
+产物在 `6-web/runtime/bundles/<包名>.tfbundle/`。整个目录拷走即可，
+不要只拷其中的 `model.engine`。
+
+### 到目标机器上第一件事
+
+先在推理页选中这个包：
+
+- 结论 `ok` → 直接推理；
+- 结论 `warn` → 看提示内容。最常见是「显卡架构不同」，这种情况**大概率加载不了**，
+  在那台机器上用「引擎构建」页把同一个 ONNX 重编一次（约 1 分钟）；
+- 结论 `block` → 不要绕过。按提示里的 `fix` 处理，通常是重新构建或换一个包。
+
+### 单测
+
+```powershell
+python 6-web\backend\tools\test_model_bundle.py    # 29 项，不需要 GPU
+```
+
+字段表与三档判定细节见 [模型包说明](模型包说明.md)。
+
+---
+
 ## 8. 常见故障排查
 
 | 现象 | 可能原因 | 排查动作 |

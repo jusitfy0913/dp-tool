@@ -1066,6 +1066,13 @@
           <input type="text" id="engExtra" placeholder="可选，原样追加给 trtexec，如 --verbose">
         </label>
 
+        <!-- v1.36.0：构建成功顺手造模型包。默认勾选——这是唯一「刚好知道全部字段」
+             的时刻（ONNX 布局、精度、run_id、输入尺寸都在手上）。 -->
+        <label>
+          <input type="checkbox" id="engAutoBundle" checked>
+          同时生成模型包（推荐，换机器前能提前判断能不能跑）
+        </label>
+
         <div class="actions">
           <button type="submit" class="primary" id="btnBuild">开始构建</button>
           <button type="button" id="btnBuildStop" disabled>停止</button>

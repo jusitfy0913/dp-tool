@@ -1867,6 +1867,13 @@ input[type="range"]:disabled { cursor: not-allowed; }
   padding: var(--sp-2) var(--sp-3);
   border-radius: var(--radius-sm);
 }
+/* 模型包填入的路径：用左侧色条提示"这一项来自包内，不是你手填的"。
+   只是视觉提示，不是 disabled——用户要改随时能改，改完 JS 会立刻去掉这个类。 */
+input.is-bundle,
+textarea.is-bundle {
+  border-left: 3px solid var(--ok);
+  background: var(--ok-a12);
+}
 .hint.hint-ok {
   color: var(--ok);
   background: var(--ok-a12);

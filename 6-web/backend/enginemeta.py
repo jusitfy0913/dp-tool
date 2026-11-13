@@ -76,6 +76,42 @@ def find_train_meta(onnx_path: Path) -> dict[str, Any] | None:
     return None
 
 
+def _runtime_block(
+    engine_path: Path,
+    onnx_path: Path,
+    precision: str,
+    imgsz: int | None,
+    dynamic: bool,
+) -> dict[str, Any]:
+    """采集「这个引擎怎么来的」所需的环境信息。
+
+    为什么放在 enginemeta 而不是 bundle：引擎构建成功后就要写这份说明，
+    而造模型包可能永远不发生。记录在一处，两边都能读。
+
+    任何异常都返回空字段——版本读不到不该让引擎构建被记成失败。
+    """
+    try:
+        import bundle  # noqa: PLC0415 - 避免 enginemeta 在只做文件写入时也拖上它
+
+        snapshot = bundle.runtime_snapshot(
+            engine_path, precision=precision, imgsz=imgsz, dynamic=dynamic
+        )
+        snapshot["onnx_layout"] = "transposed" if ".transd." in onnx_path.name.lower() else "raw"
+        return snapshot
+    except Exception:  # noqa: BLE001
+        return {
+            "format": "engine",
+            "precision": precision,
+            "dynamic": bool(dynamic),
+            "imgsz": [imgsz, imgsz] if imgsz else None,
+            "trt_version": None,
+            "cuda_version": None,
+            "gpu_name": None,
+            "compute_cap": None,
+            "onnx_layout": "transposed" if ".transd." in onnx_path.name.lower() else "raw",
+        }
+
+
 def write_meta(
     engine_path: Path,
     *,
@@ -85,9 +121,15 @@ def write_meta(
     run_id: str = "",
     dynamic: bool = False,
     app_version: str = "",
+    imgsz: int | None = None,
     extra: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """写 ``<engine>.meta.json``，返回写进文件的 payload（含 ``error`` 字段时表示失败）。"""
+    """写 ``<engine>.meta.json``，返回写进文件的 payload（含 ``error`` 字段时表示失败）。
+
+    ``runtime`` 区块（TensorRT/CUDA 版本、显卡、compute capability、输入尺寸）
+    是为模型包准备的：``.engine`` 二进制里没有这些信息，而「这个引擎在眼前这台
+    机器上能不能跑」恰恰只能靠它们回答。采集失败只让字段为空，不影响构建结果。
+    """
     engine_path = Path(engine_path)
     onnx_path = Path(onnx_path)
     train_meta = find_train_meta(onnx_path)
@@ -107,6 +149,7 @@ def write_meta(
         "data_fp": (dataset or {}).get("short") if dataset else "",
         "written_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "app_version": app_version,
+        "runtime": _runtime_block(engine_path, onnx_path, precision, imgsz, dynamic),
     }
     if extra:
         payload.update(extra)

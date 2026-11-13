@@ -50,7 +50,7 @@ LOG_BACKUPS = max(0, int(os.environ.get("TRTFORGE_LOG_BACKUPS", "3")))
 
 #: 应用版本号。放在 config 而不是 app：数据集导出（dataset.py）也要把它写进 manifest，
 #: 而 dataset 反过来 import app 会形成循环。app.py 只做 `APP_VERSION = config.APP_VERSION`。
-APP_VERSION = "1.35.3"
+APP_VERSION = "1.36.0"
 
 # 任务日志的保留天数（按整个任务的所有分片一起判断，最旧一份多久没更新就删）。
 # 之所以还要这一层：单任务有上限，但「任务数 × 上限」仍然会无限增长。

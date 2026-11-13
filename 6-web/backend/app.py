@@ -42,6 +42,7 @@ import augpreview
 import autolabel
 import autolabeljobs
 import autoexp_api
+import bundle as bundle_mod
 import checkpoints
 import config
 import dataset
@@ -1147,6 +1148,28 @@ class EngineBuildRequest(BaseModel):
     max_shape: str = Field(default="", description="如 8x3x640x640")
     workspace_mb: int = Field(default=4096, ge=256, le=32768)
     extra_args: str = Field(default="", description="追加的原始 trtexec 参数")
+    auto_bundle: bool = Field(default=True, description="构建成功后同时生成模型包")
+    bundle_id: str = Field(default="", description="模型包名，留空按引擎名推导")
+
+
+class BundleBuildRequest(BaseModel):
+    """造模型包的参数。
+
+    ``kind`` 留空时按模型文件所在目录推断（`runs` → yolo，`results` → anomalib）；
+    推断不出就记 ``unknown``，校验时只提示不阻拦——不能因为猜不到类型就不许用户造包。
+    """
+
+    model: str = Field(..., description="引擎或 ONNX 的绝对路径")
+    bundle_id: str = Field(..., description="包名，也是目录名（不含 .tfbundle）")
+    title: str = Field(default="", description="给人看的名字，留空用包名")
+    out_root: str = Field(default="", description="存放目录，留空用 runtime/bundles")
+    kind: str = Field(default="", description="yolo / anomalib，留空自动推断")
+    task: str = Field(default="", description="detect / segment / pose / obb / classify / anomaly")
+    labels: str = Field(default="", description="标签文件，留空自动查找")
+    metadata: str = Field(default="", description="异常检测 metadata.json，留空自动查找")
+    precision: str = Field(default="", description="fp32 / fp16 / int8，留空按文件推断")
+    imgsz: int = Field(default=0, ge=0, le=16384, description="输入边长，留空不记")
+    overwrite: bool = Field(default=False, description="目标已存在时是否覆盖")
 
 
 def _probe_onnx(onnx_path: Path) -> dict:
@@ -1437,12 +1460,57 @@ def build_engine(request: EngineBuildRequest) -> dict:
                 run_id=created[0].run_id if created else "",
                 dynamic=request.dynamic,
                 app_version=APP_VERSION,
+                imgsz=imgsz,
             )
         except Exception as exc:  # noqa: BLE001 - 元数据失败不影响构建结果
             print(f"[enginemeta] 元数据写入异常（不影响构建）：{type(exc).__name__}: {exc}", flush=True)
             return
         if report.get("error"):
             print(f"[enginemeta] 元数据写入失败（不影响构建）：{report['error']}", flush=True)
+            return
+        _auto_build_bundle(engine_path, onnx_path, created[0].run_id if created else "")
+
+    def _auto_build_bundle(target: Path, source_onnx: Path, run_id: str) -> None:
+        """引擎构建成功后顺手造一个模型包。
+
+        为什么默认做：这是唯一「刚好知道全部字段」的时刻——ONNX 布局、精度、
+        run_id、输入尺寸都在手上。用户之后要拿模型去交付时，直接有包可用。
+
+        失败一律只打日志：引擎已经编译好了，为了一份清单把它判成失败是本末倒置。
+        用配置开关 ``auto_bundle`` 可以关掉（现场想只留散装产物时用）。
+        """
+        if not request.auto_bundle:
+            return
+        try:
+            kind = models_mod.guess_kind(target)
+            companions = models_mod.companion_files(target, kind)
+            built = bundle_mod.build_bundle(
+                target,
+                bundle_mod.default_root(),
+                request.bundle_id.strip() or f"{target.parent.parent.name}_{target.stem}",
+                labels=companions.get("labels"),
+                metadata=companions.get("metadata"),
+                kind=kind,
+                task=None,
+                precision=request.precision,
+                imgsz=imgsz,
+                dynamic=request.dynamic,
+                origin_extra={
+                    "title": target.stem,
+                    "created_by": f"TRTForge Web Studio {APP_VERSION}",
+                    "app_version": APP_VERSION,
+                    "run_id": run_id,
+                    "onnx_layout": "transposed" if ".transd." in source_onnx.name.lower() else "raw",
+                    "onnx_sha256": enginemeta.file_sha256(source_onnx),
+                },
+                overwrite=True,
+            )
+            if built.get("ok"):
+                print(f"[bundle] 已生成模型包：{built['path']}", flush=True)
+            else:
+                print(f"[bundle] 造包失败（不影响构建）：{built.get('error')}", flush=True)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[bundle] 造包异常（不影响构建）：{type(exc).__name__}: {exc}", flush=True)
 
     with _START_LOCK:
         _reject_if_busy()
@@ -2962,24 +3030,85 @@ def _run_yolo_once(
     return result, warning
 
 
+def _apply_bundle(
+    bundle_id: str,
+    *,
+    kind: str,
+    task: str = "",
+    engine: str = "",
+    labels: str = "",
+    metadata: str = "",
+) -> dict[str, Any]:
+    """把「选了模型包」翻译成推理接口要的一组路径。
+
+    只有显式给了 ``bundle`` 才会走到这里，散装用法完全不受影响。
+    校验为 ``block`` 时直接 400：这类错误是确定性的（哈希不符、种类冲突），
+    放过去只会得到空结果或越界解码，比拒绝更难排查。
+    """
+    resolved = bundle_mod.resolve_bundle(bundle_id)
+    if not resolved.get("ok"):
+        raise HTTPException(status_code=400, detail=str(resolved.get("error") or "模型包不可用"))
+
+    verdict = bundle_mod.verify_bundle(
+        resolved["path"], kind=kind, task=task or None
+    )
+    if verdict["level"] == bundle_mod.LEVEL_BLOCK:
+        reasons = "；".join(
+            item["detail"] for item in verdict["checks"] if item["level"] == bundle_mod.LEVEL_BLOCK
+        )
+        raise HTTPException(status_code=400, detail=f"模型包校验不通过：{reasons}")
+
+    return {
+        "engine": resolved["model"],
+        "task": task or str(resolved.get("task") or ""),
+        "labels": labels or resolved.get("labels") or "",
+        "metadata": metadata or resolved.get("metadata") or "",
+        "bundle": {
+            "id": Path(resolved["path"]).name,
+            "path": resolved["path"],
+            "kind": resolved.get("kind"),
+            "level": verdict["level"],
+            "warnings": [
+                item["detail"] for item in verdict["checks"] if item["level"] == bundle_mod.LEVEL_WARN
+            ],
+        },
+    }
+
+
 @app.post("/api/infer/yolo")
 def infer_yolo(
     image: UploadFile = File(...),
-    engine: str = Form(...),
+    engine: str = Form(""),
     task: str = Form("detect"),
     conf: float = Form(0.25),
     nms: float = Form(0.45),
     labels: str = Form(""),
+    bundle: str = Form(""),
 ) -> JSONResponse:
     """YOLO 推理：返回检测框、类别名与标注后的结果图（base64 JPEG）。
 
     DLL 优先；DLL 不可用时自动降级到 onnxruntime，返回结构完全一致。
     `labels` 是标签文件路径，缺失时框上只有 `cls{id}`，不报错。
 
+    `bundle` 与 `engine` 二选一：给了模型包就从包里取模型、标签与任务，
+    页面不需要再填三个输入框，也不会出现「引擎换了标签没换」。
+
     标注图用 JPEG 而不是 PNG：一张 3034x1586 的 PCB 图，PNG 编码 155 ms、5.8 MB，
     JPEG(q=90) 只要 12 ms、0.78 MB，画面差异肉眼看不出来。这张图只用于导出，
     查看时前端用的是本地原图 + SVG 叠加层。
     """
+    bundle_info: dict[str, Any] | None = None
+    if bundle.strip():
+        applied = _apply_bundle(
+            bundle, kind="yolo", task=task, engine=engine, labels=labels,
+        )
+        engine = applied["engine"]
+        task = applied["task"] or task
+        labels = applied["labels"]
+        bundle_info = applied["bundle"]
+    if not engine.strip():
+        raise HTTPException(status_code=400, detail="engine 与 bundle 必须提供其中一个")
+
     started = time.perf_counter()
     data = _read_upload(image)
     try:
@@ -3009,6 +3138,8 @@ def infer_yolo(
     result["annotated_mime"] = "image/jpeg"
     if warning:
         result["warning"] = warning
+    if bundle_info:
+        result["bundle"] = bundle_info
     return _finish_infer(result, started)
 
 
@@ -3215,12 +3346,13 @@ def _select_anomalib_backend(engine: str, metadata: str) -> tuple[bool, str, str
 @app.post("/api/infer/anomalib")
 def infer_anomalib(
     image: UploadFile = File(...),
-    engine: str = Form(...),
-    metadata: str = Form(...),
+    engine: str = Form(""),
+    metadata: str = Form(""),
     model_type: str = Form("Auto"),
     image_threshold: float = Form(-1.0),
     pixel_threshold: float = Form(-1.0),
     heatmap_colormap: str = Form("TURBO"),
+    bundle: str = Form(""),
 ) -> JSONResponse:
     """Anomalib 推理：返回分数、判定、叠加图、轮廓图与热能图（base64）。
 
@@ -3230,7 +3362,20 @@ def infer_anomalib(
     阈值语义与 DLL 一致：`>= 0` 覆盖 metadata，`< 0` 沿用 metadata。
     响应里 `thresholds` 同时给出"本次生效值"与"metadata 文件原值"，
     因为 `ai_get_metadata` 拿到的已经是覆盖后的值，原值只能自己读文件。
+
+    `bundle` 与 `engine` 二选一：给了模型包就用包里的引擎与 metadata。
     """
+    bundle_info: dict[str, Any] | None = None
+    if bundle.strip():
+        applied = _apply_bundle(bundle, kind="anomalib", engine=engine, metadata=metadata)
+        engine = applied["engine"]
+        metadata = applied["metadata"]
+        bundle_info = applied["bundle"]
+    if not engine.strip():
+        raise HTTPException(status_code=400, detail="engine 与 bundle 必须提供其中一个")
+    if not metadata.strip():
+        raise HTTPException(status_code=400, detail="metadata 与 bundle 必须提供其中一个")
+
     use_dll, onnx_path, warning = _select_anomalib_backend(engine, metadata)
     started = time.perf_counter()
 
@@ -3277,6 +3422,8 @@ def infer_anomalib(
     result.setdefault("overlay_mime", "image/jpeg" if result.get("overlay_jpg") else None)
     if warning:
         result["warning"] = warning
+    if bundle_info:
+        result["bundle"] = bundle_info
     return _finish_infer(result, started)
 
 
@@ -3664,6 +3811,141 @@ def list_models(limit: int = models_mod.MAX_ENTRIES) -> dict:
         return models_mod.scan_models(limit=max(1, min(int(limit), models_mod.MAX_ENTRIES)))
     except OSError as exc:
         raise HTTPException(status_code=500, detail=f"扫描训练产物失败：{exc}") from exc
+
+
+@app.get("/api/bundles")
+def list_bundles() -> dict:
+    """列出全部模型包（只做轻量校验，不算哈希）。
+
+    与 ``/api/models`` 分开的理由：模型包是**交付物**，模型文件是**过程产物**。
+    前端模型下拉把两者分组显示，后端也就分两个接口，各自可以独立演进。
+    """
+    try:
+        items = bundle_mod.enumerate_bundles()
+    except Exception as exc:  # noqa: BLE001 - 枚举失败要给出原因而不是 500
+        raise HTTPException(status_code=500, detail=f"枚举模型包失败：{exc}") from exc
+
+    payload = []
+    for item in items:
+        verdict = bundle_mod.quick_check(item["path"])
+        payload.append({**item, "verify": verdict})
+    return {
+        "bundles": payload,
+        "total": len(payload),
+        "root": str(bundle_mod.default_root()),
+    }
+
+
+@app.post("/api/bundles/build")
+def build_bundle(request: BundleBuildRequest) -> dict:
+    """把散装产物造成模型包。
+
+    原始产物一个字节都不改：模型文件优先用硬链接，跨分区才复制。
+    目标已存在时默认拒绝——静默覆盖用户手里的包是不可接受的。
+    """
+    model_path = _ensure_allowed_path(request.model)
+    if not model_path.is_file():
+        raise HTTPException(status_code=400, detail=f"模型文件不存在：{model_path}")
+
+    if request.out_root.strip():
+        out_root = _ensure_allowed_path(request.out_root)
+    else:
+        out_root = bundle_mod.default_root()
+    try:
+        out_root.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise HTTPException(status_code=400, detail=f"无法创建存放目录：{out_root}（{exc}）") from exc
+
+    kind = request.kind.strip().lower() or models_mod.guess_kind(model_path)
+    labels_path: Path | None = None
+    metadata_path: Path | None = None
+
+    # 留空时自动找配套文件，规则与推理页完全一致（models.companion_files）
+    if model_path.suffix.lower() in {".engine", ".trt", ".plan"} and kind in {"yolo", "anomalib"}:
+        companions = models_mod.companion_files(model_path, kind)
+        labels_path = companions.get("labels")
+        metadata_path = companions.get("metadata")
+    if request.labels.strip():
+        labels_path = _ensure_allowed_path(request.labels)
+    if request.metadata.strip():
+        metadata_path = _ensure_allowed_path(request.metadata)
+
+    imgsz = request.imgsz or None
+    if imgsz is None:
+        # 引擎旁边有 ONNX 时用它的输入尺寸；异常检测用 metadata 里的 input_size
+        if metadata_path is not None:
+            try:
+                meta = json.loads(metadata_path.read_text(encoding="utf-8-sig"))
+                size = meta.get("input_size") if isinstance(meta, dict) else None
+                if isinstance(size, list) and len(size) == 2:
+                    imgsz = int(size[0])
+            except (OSError, ValueError, TypeError):
+                imgsz = None
+
+    onnx_layout = "unknown"
+    if model_path.suffix.lower() == ".onnx":
+        onnx_layout = bundle_mod._layout_of(model_path)
+
+    origin_extra: dict[str, Any] = {
+        "title": request.title.strip() or request.bundle_id,
+        "created_by": f"TRTForge Web Studio {APP_VERSION}",
+        "app_version": APP_VERSION,
+        "onnx_layout": onnx_layout,
+    }
+
+    built = bundle_mod.build_bundle(
+        model_path,
+        out_root,
+        request.bundle_id,
+        labels=labels_path,
+        metadata=metadata_path,
+        kind=kind,
+        task=request.task or None,
+        precision=request.precision or None,
+        imgsz=imgsz,
+        dynamic=False,
+        origin_extra=origin_extra,
+        overwrite=bool(request.overwrite),
+    )
+    if not built.get("ok"):
+        raise HTTPException(status_code=400, detail=str(built.get("error") or "造包失败"))
+
+    return {
+        "ok": True,
+        "path": built["path"],
+        "manifest": built["manifest"],
+        "verify": bundle_mod.quick_check(built["path"]),
+    }
+
+
+@app.post("/api/bundles/verify")
+def verify_bundle(payload: dict) -> dict:
+    """完整校验（含哈希）。由用户点「校验」时调用，不在列表接口里跑。"""
+    raw = str(payload.get("bundle") or payload.get("path") or "").strip()
+    if not raw:
+        raise HTTPException(status_code=400, detail="bundle 不能为空")
+
+    target = bundle_mod.find_bundle(raw)
+    if target is None:
+        raise HTTPException(status_code=404, detail=f"找不到模型包：{raw}")
+
+    return bundle_mod.verify_bundle(
+        target,
+        kind=(str(payload.get("kind") or "").strip() or None),
+        task=(str(payload.get("task") or "").strip() or None),
+    )
+
+
+@app.get("/api/bundles/{bundle_id}/manifest")
+def bundle_manifest(bundle_id: str) -> dict:
+    """原文返回清单，供页面显示全部字段与排障。"""
+    target = bundle_mod.find_bundle(bundle_id)
+    if target is None:
+        raise HTTPException(status_code=404, detail=f"找不到模型包：{bundle_id}")
+    manifest = bundle_mod.read_manifest(target)
+    if manifest is None:
+        raise HTTPException(status_code=400, detail=f"清单不可读：{target}")
+    return {"path": str(target), "manifest": manifest}
 
 
 @app.get("/api/infer/cache")

@@ -350,6 +350,7 @@ export function initEngine() {
       max_shape: shapeInputs.max.value.trim(),
       workspace_mb: Number(workspace.value) || 4096,
       extra_args: extra.value.trim(),
+      auto_bundle: document.getElementById("engAutoBundle")?.checked !== false,
     };
 
     if (!body.onnx) {

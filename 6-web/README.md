@@ -1183,6 +1183,72 @@ python 6-web\backend\tools\test_packaging_secrets.py      # 25 项全通过
 - 安装脚本不做"已经是别人的模型就跳过"的判断，重复执行会覆盖同名文件（幂等，但不是增量）。
 - 密钥扫描只能抓文本文件；密钥被打进二进制（例如有人编译时把 Key 烧进 exe）它看不见。那种情况只能靠代码评审兜住。
 
+#### 模型包契约：<名字>.tfbundle（v1.36.0）
+
+训练产物一直是「五六个文件散在不同目录」，配对关系靠 `models.py` 的启发式规则猜
+（该文件自己写着这些规则来自「实测的真实现象」）。猜错的后果不是报错，是**框位置乱掉
+或什么都检测不到**。v1.36.0 把「一个模型」升级成一个自描述目录。
+
+| 改前 | 改后 |
+| --- | --- |
+| 引擎 / ONNX / 标签 / metadata 靠文件名猜配对 | `manifest.json` 显式登记每个文件的角色与哈希 |
+| 换机器加载失败只看到底层英文报错 | 清单记 TensorRT 版本、CUDA、显卡、compute capability，加载前就能判定 |
+| 异常阈值与类别名要去别处找 | 阈值与类别表随包携带，选中即填 |
+| 交付给客户靠口头说明 | 包内 `README.txt` + `manifest.json`，拷走整个目录即可 |
+
+**目录**（默认落在 `6-web/runtime/bundles/`）
+
+```
+pcb_detect_v1.tfbundle/
+  manifest.json     清单（唯一入口）
+  model.engine      模型文件（ONNX 包为 model.onnx）
+  labels.json       类别表
+  metadata.json     异常阈值（仅异常检测）
+  origin.meta.json  来源：原文件、run_id、构建时间
+  README.txt        给现场人看的一页说明
+```
+
+**三档结论**
+
+| 档位 | 触发 | 界面 |
+| --- | --- | --- |
+| `ok` | 全部通过 | 正常推理 |
+| `warn` | 小版本不同、架构不同、运行时字段缺失 | 黄色提示，**仍可推理** |
+| `block` | 哈希不符、schema 不认识、越界路径、种类/任务冲突、异常检测缺 metadata | **禁用推理**并给修复建议 |
+
+关键取舍：**旧产物只给 `warn` 不给 `block`**。本版本之前没有记录 TensorRT 与显卡字段，
+如果按缺失就拦，用户升级后手里的老模型会一次性全部不可用。
+
+**接口**
+
+| 接口 | 用途 |
+| --- | --- |
+| `GET /api/bundles` | 列出全部模型包（轻量校验，不算哈希） |
+| `POST /api/bundles/build` | 从散装产物造包，模型文件优先硬链接 |
+| `POST /api/bundles/verify` | 完整校验（含 sha256），返回逐项 `checks` |
+| `GET /api/bundles/{id}/manifest` | 原文返回清单 |
+
+`GET /api/models` 新增 `bundles` 段，原有 `entries` 字段与含义不变；
+`POST /api/infer/yolo` 与 `/api/infer/anomalib` 新增 `bundle` 表单字段，
+与 `engine` 二选一（`engine` 由必填改为可选，老调用不受影响）。
+
+`app.py` 的引擎构建回调在写 `<engine>.meta.json` 后自动造包，失败只打日志——
+引擎已经编译好了，为了一份清单把构建判成失败是本末倒置。
+
+**验收（v1.36.0）**
+
+```powershell
+python 6-web\backend\tools\test_model_bundle.py    # 29 项全通过
+```
+
+**已知边界**
+
+- 只覆盖 YOLO 与 anomalib 两类；`kind: "ocr"` 在 schema 里预留但本期不实现。
+- 清单不记录验证精度（mAP / 漏检率），只记 `operating_point` 建议值——
+  把报告内联进清单会让它随每次验证膨胀。
+- 不做加密与授权保护（商业化范围外）。
+- `block` 的判定依赖 `bin/nvinfer.dll` 能读到版本；读不到只给 `warn`。
+
 #### 导入已有 YOLO 标签（v1.19 新增）
 
 已经有 `data.yaml + images/ + labels/` 的数据集，不用先转格式：导入进来的框就是工程里

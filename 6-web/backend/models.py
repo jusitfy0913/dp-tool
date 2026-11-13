@@ -205,6 +205,11 @@ def _iter_engines(root: Path, max_depth: int = MAX_DEPTH):
         for item in children:
             name_lower = item.name.lower()
             if item.is_dir():
+                # 模型包是交付物，里面有 model.engine。它自己会作为条目出现，
+                # 内部文件不能再被当成一个散装引擎（否则下拉里同一个模型出现两次，
+                # 一次带校验一次不带，用户无从选择）。
+                if name_lower.endswith(".tfbundle"):
+                    continue
                 if name_lower in SKIP_DIR_NAMES or name_lower.startswith("."):
                     continue
                 stack.append((item, depth + 1))
@@ -218,6 +223,38 @@ def _relative_label(path: Path, root: Path) -> str:
         return str(path.relative_to(root)).replace("\\", "/")
     except ValueError:
         return str(path)
+
+
+def companion_files(engine: Path, kind: str) -> dict:
+    """引擎的配套文件：ONNX、标签、metadata。
+
+    模型包构建与推理页走同一套查找规则，否则会出现「页面能自动填、造包填不上」
+    这种同源不一致。``kind`` 只影响标签查找（异常检测没有标签文件）。
+    """
+    onnx_path, transposed = _find_onnx(engine)
+    labels_path = _find_labels(engine, kind)
+    metadata_path, calibrated_path = _find_metadata(engine)
+    return {
+        "onnx": onnx_path,
+        "transposed": bool(transposed),
+        "labels": labels_path,
+        "metadata": metadata_path,
+        "metadata_calibrated": calibrated_path,
+    }
+
+
+def guess_kind(model_path: Path) -> str:
+    """从路径猜产物类型，供自动造包使用。
+
+    依据是仓库既定的布局：YOLO 在 ``launcher/runs``，异常检测在 ``launcher/results``。
+    猜不出来返回 ``unknown``——宁可让校验提示「无法核对」，也不给一个错误结论。
+    """
+    lowered = str(model_path).lower().replace("\\", "/")
+    if "/results/" in lowered or "anomalib" in lowered:
+        return "anomalib"
+    if "/runs/" in lowered or "yolo" in lowered:
+        return "yolo"
+    return "unknown"
 
 
 def scan_models(limit: int = MAX_ENTRIES) -> dict:
@@ -294,12 +331,34 @@ def scan_models(limit: int = MAX_ENTRIES) -> dict:
                 "metadata_calibrated": str(calibrated_path) if calibrated_path else None,
                 "model_type": model_type,
                 "input_size": input_size,
+                # 散装条目显式标注来源：模型列表里两种东西语义不同，
+                # 前端据此分组，将来接 SDK 时也能区分「交付物」与「过程产物」。
+                "origin": "loose",
+                "bundle": None,
             })
 
     entries.sort(key=lambda item: item["mtime"], reverse=True)
     truncated = len(entries) > limit
+
+    # 模型包单独一段返回。它不能混进 entries：entries 的每条都是一个「模型文件」，
+    # 而模型包是一个目录，字段语义不同（它有校验结论、有运行时环境）。
+    bundles: list[dict] = []
+    try:
+        import bundle as bundle_mod  # noqa: PLC0415 - 避免 models 在纯扫描场景拖上 ctypes
+
+        for item in bundle_mod.enumerate_bundles():
+            verdict = bundle_mod.quick_check(item["path"])
+            bundles.append({**item, "verify": verdict})
+    except Exception as exc:  # noqa: BLE001 - 枚举模型包失败不能拖垮模型列表
+        bundles = []
+        roots_info.append({
+            "kind": "bundle", "path": "", "ok": False,
+            "reason": f"模型包枚举失败：{type(exc).__name__}: {exc}",
+        })
+
     return {
         "entries": entries[:limit],
+        "bundles": bundles,
         "total": len(entries),
         "truncated": truncated,
         "roots": roots_info,
