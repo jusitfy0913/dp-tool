@@ -3627,6 +3627,59 @@ offset1 = cursor - p_image * scale1
 布局用 `repeat(auto-fit, minmax(300px,1fr))` 而不是 flex：flex 在最后一行只剩一两个元素时会把它们
 拉满，导致同行窗口宽度不一致。超过三个窗口时切为定列数并允许横向滚动，不压缩窗口。
 
+## 安装包启动器 `launcher.py`（v1.37.0）
+
+开发环境仍然直接跑 `uvicorn app:app`。**发给使用人员的那份**由 Nuitka 编译成
+`app\TRTForgeWeb.exe`，无参数启动时进 `launcher.run()`：
+
+```
+install_root() → load_config() → apply_environment()
+      → 单实例（Local\TRTForgeWebStudio）
+      → 端口三态判定（空闲 / 本软件 / 别人占）
+      → uvicorn.run + 后台线程等 /api/health → webbrowser.open
+```
+
+### 为什么从 PowerShell 搬到 Python
+
+以前的链路是 `start_web.bat` → `powershell -ExecutionPolicy Bypass -File start_user.ps1`
+→ 设 20 个环境变量 → 调 exe。三个问题：
+
+| 问题 | 后果 |
+| --- | --- |
+| 要先找到并双击 `start_web.bat` | 看起来不像一个软件，现场人员会去点 `app\` 里的 exe，然后环境变量全缺 |
+| 杀毒软件把 `ExecutionPolicy Bypass` 当可疑行为 | 直接拦掉，弹的是英文报错 |
+| 报错在 PowerShell 窗口里 | 窗口一闪而过，用户拿不到任何可读信息 |
+
+搬进 exe 之后：双击即用；失败弹 `MessageBoxW` 中文三段式（发生了什么 / 为什么 / 怎么办）；
+全过程写 `runtime/logs/launcher.log`。
+
+### 与旧脚本的关系
+
+| 文件 | v1.37.0 之后的角色 |
+| --- | --- |
+| `launcher.py` | **唯一**的环境变量与启动流程实现 |
+| `packaging/templates/start_web.bat` | 只设 `TRTFORGE_HOME` 后转调 exe，供快捷方式/被拦时使用 |
+| `packaging/templates/start_web_cmd.bat` | 转调 `start_web.bat`，不再有自己的 `PORT` / `WEBHOST` |
+| `packaging/templates/start_user.ps1` | 排障脚本：设 `TRTFORGE_LEGACY_START=1` 后直跑 uvicorn（不抢锁、不开浏览器） |
+
+`tools/test_launcher.py` 会断言 `start_user.ps1` 里**没有** `$env:TRTFORGE_BIN_DIR` 这类行
+（`TRTFORGE_HOME` / `PYTHONIOENCODING` / `PYTHONUNBUFFERED` 除外），防止有人把设置搬回脚本，
+形成第二份会漂移的真相。
+
+### 几个容易踩的点
+
+| 点 | 处理 |
+| --- | --- |
+| 无控制台时 `sys.stdout is None` | `ensure_stdio()` 在 import `app` **之前**把 stdout/stderr 重定向到日志；否则任何 `print` 都是 `AttributeError` 闪退 |
+| 端口占用 vs 已有实例 | 用 `/api/health` 的 `version` 区分：读得到 = 本软件的旧实例（开浏览器后退出），读不到 = 别人占着（弹框让改 `port`） |
+| 单实例不用「探测端口」 | 探测有竞态；用 `CreateMutexW` + `Local\`（按会话隔离，远程桌面各开各的互不影响） |
+| `0.0.0.0` 不能给浏览器 | 监听 `0.0.0.0` 时页面地址换 `127.0.0.1` |
+| `uvicorn.run` 会阻塞 | 「等就绪再开浏览器」放后台线程 |
+| 打包控制台模式 | `--windows-console-mode=attach`：双击无黑框，从 cmd/bat 启动仍能看日志 |
+
+验收除了 `tools/test_launcher.py`（35 项），还应手工验证：双击 exe 无黑框并自动开浏览器、
+重复双击只开一个实例、占用端口时弹中文框、`start_web.bat` 启动能看到日志。
+
 ## 环境变量
 
 | 变量 | 作用 | 默认 |
@@ -3663,6 +3716,8 @@ offset1 = cursor - p_image * scale1
 | `TRTFORGE_LOG_RETENTION_DAYS` | **v1.34**：任务日志保留天数，启动时整族清理更老的日志；`0` = 不清理 | `30` |
 | `TRTFORGE_AUTO_RESUME` | **v1.34**：YOLO 训练异常退出且有 `weights/last.pt` 时自动续训一次；`0` = 关闭 | `1`（启用） |
 | `TRTFORGE_DSQC_CACHE` | **v1.34.3**：数据集体检的签名缓存路径。测试/CI 指到临时文件，避免污染运行目录 | `6-web/runtime/dsqc_cache.json` |
+| `TRTFORGE_LEGACY_START` | **v1.37.0**：设为 `1` 时启动器跳过单实例与浏览器，直接按环境变量跑 uvicorn（排障用） | 未设 |
+| `TRTFORGE_HOME` | **v1.37.0**：安装根。启动器据此找 `config.json`、`frontend`、`bin`、`models` | 编译时按 exe 位置推导 |
 
 ## 后端接口
 
@@ -4060,6 +4115,8 @@ offset1 = cursor - p_image * scale1
 │   ├── pipeline.py       **v1.17**：串联编排（阶段状态机 / 停止 / 重启遗留清理 / 磁盘持久化 / `resolve` 延迟派生命令）
 │   ├── anomalymetrics.py **v1.18**：异常检测指标（AUROC 秩统计 / 阈值混淆矩阵 / F1 最优阈值 / 直方图 AUROC）
 │   ├── valmetrics.py     **v1.17**：COCO 口径 mAP 计算（IoU 0.50:0.95 全点插值，带边界容差）
+│   ├── launcher.py       **v1.37.0**：安装包启动器（安装根 / config.json / 20 个环境变量 / 单实例互斥量 / 端口三态 / 中文错误框 / launcher.log）
+│   ├── frozen_entry.py   **v1.37.0**：Nuitka 编译入口（无参数 → launcher；`--tool xxx` → 工具分支）
 │   └── tools/
 │       ├── abi_probe.cpp       打印 C 侧结构体布局，用于和 Python 对齐比对
 │       ├── infer_batch.py      **v1.16**：目录批量推理 CLI（YOLO / Anomalib，事件走 TRTFORGE_JSON）
@@ -4072,6 +4129,7 @@ offset1 = cursor - p_image * scale1
 │       ├── test_annotation_project.py 标注工程验收（往返 / 冲突 / 回退 / 导出回读）
 │       ├── test_annotation_import.py  **v1.19**：YOLO 导入验收（四任务几何 / 脏数据 / 合并 / 去重 / PCB 冒烟）
 │       ├── test_engine_progress.py    构建进度与耗时估算验收（真实日志回放 + 自学习）
+│       ├── test_launcher.py           **v1.37.0**：启动器验收（配置容错 / 环境变量清单 / 互斥量 / 端口三态 / 无控制台 / 入口分派）
 │       ├── test_transd_onnx.py        .transd.onnx 转置验收（四任务头 / 输出重排 / 通道校验）
 │       ├── test_export_request.py     导出命令拼装验收（开关透传 / 非法参数提前拒绝）
 │       ├── test_infer_jobs.py         **v1.16**：批量产物验收（文件收集 / 命名净化 / CSV BOM / zip / 路径穿越）

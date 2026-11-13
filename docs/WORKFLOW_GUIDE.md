@@ -1600,7 +1600,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\packaging\package_web_user
 1. 安装显卡驱动和 VC++ 2015–2022 x64 运行库。不必再装 CUDA 工具包。
 2. 双击 `install_train_env.bat`（需联网。没有 Anaconda 也会自己下载 micromamba 或 Miniconda，生成 `train-env`，并写入 `config.json`。同时安装 `polars-runtime-compat`、`onnx`、`onnxruntime`，避免无 AVX2 的机器导入 Polars 时崩溃）。
 3. 在 `config.json` 的 `data_roots` 里填图片所在文件夹。车间其他电脑要访问时，把 `host` 改成 `0.0.0.0`。
-4. 双击 `start_web.bat`。对方电脑没有 PowerShell 时，改双击 `start_web_cmd.bat`，说明见 `docs/无PowerShell启动说明.md`。
+4. 双击 `app\TRTForgeWeb.exe`。浏览器会自己打开软件。不需要 PowerShell，启动失败会弹中文说明框，
+   详见 `docs/启动与排障说明.md`。
 
 训练库里的 Ultralytics 是 AGPL-3.0，由对方机器在线安装，不放进安装包。对外发放前确认许可。
 
@@ -1609,6 +1610,25 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\packaging\package_web_user
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\packaging\package_web_user.ps1 -WithOcr
 ```
+
+**v1.37.0 起启动方式变了**，打包参数也随之改了两处，别改回去：
+
+| 参数 / 文件 | 值 | 为什么 |
+| --- | --- | --- |
+| Nuitka `--windows-console-mode` | `attach`（以前是 `force`） | 双击时不弹黑框；从 cmd / `start_web.bat` 启动时仍附着到调用方控制台，日志看得见 |
+| `--include-module` | 增加 `launcher` | 启动流程在 `6-web/backend/launcher.py`，漏掉它 exe 双击就没有入口逻辑 |
+
+启动流程：`install_root()` → 读 `config.json` → `apply_environment()`（20 个环境变量，**唯一**实现）→
+`CreateMutexW(Local\TRTForgeWebStudio)` 单实例 → 端口三态判定 → `uvicorn.run` +
+后台线程等 `/api/health` → `webbrowser.open`。失败弹 `MessageBoxW` 三段式中文框，并写
+`runtime\logs\launcher.log`（UTF-8）。
+
+打包后至少要验这四件事（`tools/test_launcher.py` 覆盖不到的部分）：
+
+1. 双击 `app\TRTForgeWeb.exe`，**没有**黑色控制台窗口，浏览器自动打开；
+2. 再双击一次，不会起第二个实例，只把浏览器重新打开；
+3. 先用别的程序占住 `config.json` 里的端口，双击后弹中文框，写明端口号与改法；
+4. 从 cmd 运行 `start_web.bat`，窗口里能看到 `INFO: Uvicorn running on ...` 等实时日志。
 
 #### 示例模型为什么单独一个包（v1.35.2）
 
@@ -3568,7 +3588,7 @@ python 6-web\backend\tools\test_model_bundle.py    # 29 项，不需要 GPU
 | 三个异常检测模型怎么选 | `docs/异常检测模型对比与选型_PatchCore_PaDiM_EfficientAd.md` |
 | Web 工作站怎么用 | `docs/TRTForge_Web操作手册.md`。开发细节仍看 `6-web/README.md` |
 | 把网页版打给别人、不附源码 | `packaging/package_web_user.ps1`，说明见下文 7.1.3 |
-| 对方电脑没有 PowerShell | `docs/无PowerShell启动说明.md`（双击 `start_web_cmd.bat`） |
+| 启动失败、端口冲突、改端口与地址 | `docs/启动与排障说明.md` |
 | 项目整体结构与层级 | `readme.md` |
 | DLL C API 调用与打包 | `docs/TRTForge_yolo_infer与anomalib_infer_DLL调用与源码打包说明.md` |
 | 三个推理 DLL 能怎么并发（同步/异步、单/多线程、多模型） | 本节 7.14；细节看 `3-cpp-tensorrt/{yolo,anomalib,onnx}_infer/README.md` |

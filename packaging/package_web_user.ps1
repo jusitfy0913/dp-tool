@@ -239,7 +239,8 @@ $serverArgs = @(
     "--output-filename=TRTForgeWeb.exe",
     "--assume-yes-for-downloads",
     "--enable-plugin=tk-inter",
-    "--windows-console-mode=force",
+    "--windows-console-mode=attach",
+    "--include-module=launcher",
     "--include-module=tools.val_engine",
     "--include-module=tools.val_anomaly",
     "--include-module=tools.infer_batch",
@@ -311,10 +312,10 @@ if (Test-Path -LiteralPath $manual) {
     New-Item -ItemType Directory -Path (Join-Path $dest "docs") -Force | Out-Null
     Copy-Utf8 -Source $manual -Dest (Join-Path $dest "docs\TRTForge_Web操作手册.md")
 }
-$noPsDoc = Join-Path $repoRoot "docs\无PowerShell启动说明.md"
+$noPsDoc = Join-Path $repoRoot "docs\启动与排障说明.md"
 if (Test-Path -LiteralPath $noPsDoc) {
     New-Item -ItemType Directory -Path (Join-Path $dest "docs") -Force | Out-Null
-    Copy-Utf8 -Source $noPsDoc -Dest (Join-Path $dest "docs\无PowerShell启动说明.md")
+    Copy-Utf8 -Source $noPsDoc -Dest (Join-Path $dest "docs\启动与排障说明.md")
 }
 if (Test-Path -LiteralPath $manualImages) {
     & robocopy $manualImages (Join-Path $dest "docs\images\trtforge_web_manual") /E /NFL /NDL /NJH /NJS /nc /ns /np | Out-Null

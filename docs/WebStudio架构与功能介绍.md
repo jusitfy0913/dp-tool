@@ -370,7 +370,7 @@ flowchart LR
 
 1. 有支持 CUDA 11.8 的显卡驱动，以及 VC++ 2015–2022 x64 运行库。
 2. 要训练就双击 `install_train_env.bat`。不必事先安装 Anaconda。脚本自己准备 Python 3.12，并装上训练库。
-3. 只检测可以跳过训练环境，直接 `start_web.bat`。
+3. 只检测可以跳过训练环境，直接双击 `app\TRTForgeWeb.exe`（不需要 PowerShell）。
 
 文字识别运行库大约 1.7GB，打包时要另加 `-WithOcr`，默认不带。
 
@@ -384,5 +384,5 @@ flowchart LR
 | [TRTForge_Web操作手册.md](TRTForge_Web操作手册.md) | 只想知道点哪里 |
 | [WORKFLOW_GUIDE.md](WORKFLOW_GUIDE.md) | 要照着命令验收产物 |
 | [6-web/README.md](../6-web/README.md) | 改网页、查接口和版本记录 |
-| [无PowerShell启动说明.md](无PowerShell启动说明.md) | 现场电脑不能开 PowerShell |
+| [启动与排障说明.md](启动与排障说明.md) | 现场电脑打不开、端口冲突、要不要装 PowerShell |
 | [packaging/使用说明.md](../packaging/使用说明.md) | 拿到安装文件夹的人 |

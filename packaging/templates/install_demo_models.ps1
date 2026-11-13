@@ -216,7 +216,7 @@ if ($failed.Count -eq 0) {
 Write-Host ""
 Write-Host "下一步：在对方显卡上把 ONNX 编成引擎（引擎不能跨机器拷贝）"
 Write-Host ""
-Write-Host "  1. 双击软件目录里的 start_web.bat"
+Write-Host "  1. 双击软件目录里的 app\TRTForgeWeb.exe（不需要 PowerShell）"
 Write-Host "  2. 打开左侧「引擎构建」页"
 Write-Host "  3. 「ONNX 文件」填下面任意一行，「输出引擎」留空，精度选 FP16，点开始构建"
 Write-Host ""

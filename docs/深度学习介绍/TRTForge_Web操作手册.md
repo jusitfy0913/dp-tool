@@ -743,6 +743,6 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\packaging\package_web_user
 
 1. 双击 `install_train_env.bat`（要联网。不必事先安装 Anaconda，脚本会自己准备 Python，并装上训练库）。
 2. 用记事本打开 `config.json`，在 `data_roots` 里填图片所在的文件夹。
-3. 双击 `start_web.bat`。
+3. 双击 `app\TRTForgeWeb.exe`。浏览器会自己打开软件，不需要 PowerShell。
 
 网页界面仍然能在浏览器里看到。C++ 推理源码和网页后端源码不会出现在这个文件夹里。训练用的 Ultralytics 是 AGPL-3.0，由对方机器在线安装，发放前请确认许可。

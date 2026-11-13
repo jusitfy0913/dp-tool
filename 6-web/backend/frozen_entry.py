@@ -4,7 +4,7 @@
 开发时仍然用 uvicorn 直接跑 app.py，不经过本文件。
 打包脚本用 Nuitka 把本文件编译成 TRTForgeWeb.exe：
 
-- 不带参数：启动网页服务
+- 不带参数：走 :mod:`launcher`（读 config.json、设环境、单实例、开浏览器）
 - ``--tool val_engine`` 等：执行原来 tools 目录里的那个命令
 - ``--tool infer_worker``：推理工作进程（由网页服务自己拉起，不要手动运行）
 
@@ -13,7 +13,6 @@
 
 from __future__ import annotations
 
-import os
 import sys
 
 
@@ -50,22 +49,14 @@ def _run_tool(name: str, argv: list[str]) -> int:
     return 2
 
 
-def _serve() -> int:
-    """按环境变量里的地址启动网页。地址由安装目录的启动脚本写入。"""
-    import uvicorn
-
-    import app as app_module
-
-    host = os.environ.get("TRTFORGE_WEB_HOST", "127.0.0.1").strip() or "127.0.0.1"
-    port = int(os.environ.get("TRTFORGE_WEB_PORT", "8060"))
-    uvicorn.run(app_module.app, host=host, port=port, log_level="info")
-    return 0
-
-
 def main() -> int:
+    # 带参数（工具分支）绝不走启动流程：那些分支由服务进程自己拉起，
+    # 弹消息框、抢互斥量、开浏览器都会干扰调用方。
     if len(sys.argv) >= 3 and sys.argv[1] == "--tool":
         return _run_tool(sys.argv[2], sys.argv[3:])
-    return _serve()
+    import launcher
+
+    return launcher.run()
 
 
 if __name__ == "__main__":

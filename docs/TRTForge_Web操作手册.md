@@ -79,6 +79,10 @@ flowchart TD
 3. 看右上角。绿灯「环境就绪」就可以用。
 4. 版本号在标题下面，例如 `v1.27.0`。改过程序却觉得界面没变时，先对一下这个版本号：端口上可能还是旧进程。
 
+> 用的是**发给现场人员的安装包**时，入口不是 `启动Web端.bat`：双击安装目录里的
+> `app\TRTForgeWeb.exe`（或 `start_web.bat`，两者等价）。不需要 PowerShell；
+> 启动失败会弹中文说明框，详见 `docs\启动与排障说明.md`。
+
 常用启动方式：
 
 | 你想做的事 | 怎么启动 |
@@ -892,7 +896,7 @@ D:\TRTForgeWeb_models_demo\     ← 示例模型
 
 1. 双击软件里的 `install_train_env.bat`（要联网。不必事先安装 Anaconda，脚本会自己准备 Python，并装上训练库）。
 2. 用记事本打开软件的 `config.json`，在 `data_roots` 里填图片所在的文件夹。
-3. 双击软件里的 `start_web.bat`。
+3. 双击软件里的 `app\TRTForgeWeb.exe`。浏览器会自己打开软件，不需要 PowerShell。
 4. 要示例模型的话，双击示例模型包里的 `install_demo_models.bat`，然后到「引擎构建」页把
    示例模型的 ONNX 编成引擎（输出引擎留空，会自动落到该模型旁边）。编完推理页就能选到。
 

@@ -4,7 +4,7 @@
 
 日常操作请用浏览器版。给人看的步骤、截图和流程图在 [Web 操作手册](docs/TRTForge_Web操作手册.md)。整套网页怎么拼、用了哪些技术，看 [Web Studio 架构与功能介绍](docs/WebStudio架构与功能介绍.md)。现有缺陷、安全漏洞和商业化路线图看 [商业化差距分析与优化建议](docs/商业化差距分析与优化建议.md)。桌面版步骤仍看 [Qt 操作手册](docs/TRTForge_操作手册.md)。
 
-要发给别人使用、又不附带源码时，在开发机执行 `packaging/package_web_user.ps1`。对方电脑需为 CUDA 11.8，先运行安装包里的 `install_train_env.bat` 配置训练环境（不必预先安装 Anaconda；无 AVX2 的机器会自动改用 Polars 兼容包），再用 `config.json` 填写数据目录。细节见 [WORKFLOW_GUIDE 7.1.3](docs/WORKFLOW_GUIDE.md)。
+要发给别人使用、又不附带源码时，在开发机执行 `packaging/package_web_user.ps1`。对方电脑需为 CUDA 11.8，先运行安装包里的 `install_train_env.bat` 配置训练环境（不必预先安装 Anaconda；无 AVX2 的机器会自动改用 Polars 兼容包），再用 `config.json` 填写数据目录。**启动只需双击 `app\TRTForgeWeb.exe`，不需要 PowerShell**；启动失败会弹中文说明框并写 `runtime\logs\launcher.log`，排障步骤见 [启动与排障说明](docs/启动与排障说明.md)。细节见 [WORKFLOW_GUIDE 7.1.3](docs/WORKFLOW_GUIDE.md)。
 
 **安装包分两个**，因为模型换得比软件勤，合在一起会让每次换模型都重打 1.8 GB：
 
@@ -161,6 +161,36 @@ python tf_anomalib_launcher.py --mode check-env
 引擎构建页选择 ONNX 后会在后台线程自动识别第一个输入 tensor 的名称和维度，并弹出“ONNX 加载中”进度提示；识别完成后提供统一 `H/W` 输入，修改一次高度和宽度即可同步覆盖 `min / opt / max` 三组动态 shape。
 
 ## 版本更新记录
+
+### v1.37.0 — 2026-11-13（双击即用：启动逻辑从 PowerShell 搬进 exe）
+
+**一句话**：发给使用人员的那份程序，双击 `app\TRTForgeWeb.exe` 就能开，
+不再需要 PowerShell，也不再闪一下就没了——失败会弹中文说明框。
+
+| 改前 | 改后 |
+| --- | --- |
+| `start_web.bat` → `powershell -ExecutionPolicy Bypass` → 设 20 个环境变量 → 调 exe | 双击 exe，环境变量由程序自己的 `launcher.py` 一次设好 |
+| 杀毒软件可能拦 `ExecutionPolicy Bypass` | 不调用 PowerShell，没有这个特征 |
+| 双击有黑框，报错一闪而过 | 无黑框；失败弹 `MessageBoxW` 三段式中文框（发生了什么 / 为什么 / 怎么办） |
+| 重复双击起第二个实例，端口冲突后报错 | 用 `Local\TRTForgeWebStudio` 互斥量 + `/api/health` 版本号识别，只开浏览器 |
+| 端口配置散在 `config.json` 与 `start_web_cmd.bat` | 只有 `config.json` 一处 |
+
+**判断「端口被占」不再靠猜**：`/api/health` 读得到版本号 = 本软件的旧实例（直接开浏览器），
+读不到 = 别人占着（让你改 `config.json` 的 `port`）。这两种情况给的提示完全不同。
+
+**排障入口保留**：`start_user.ps1` 设 `TRTFORGE_LEGACY_START=1` 后可跳过单实例与浏览器直跑 uvicorn；
+`start_web.bat` 只设 `TRTFORGE_HOME` 后转调 exe，从命令行启动仍能看到实时日志。
+
+测试：`6-web/backend/tools/test_launcher.py`（35 项）。文档：[启动与排障说明](docs/启动与排障说明.md)。
+开发细节见 `6-web/README.md` 的「安装包启动器 `launcher.py`（v1.37.0）」。
+
+### v1.36.0 — 2026-11-12（模型包契约 `.tfbundle`）
+
+**一句话**：交付模型从「五六个文件散在不同目录、靠文件名猜配对」变成一个自描述目录。
+`manifest.json` 显式登记每个文件的角色与哈希，并记下 TensorRT 版本、CUDA、显卡与
+compute capability，加载前就能判定兼容性（`ok` / `warn` / `block` 三档）。
+
+详见 [模型包说明](docs/模型包说明.md) 与 `6-web/README.md` 的同名小节。
 
 ### v1.35.3 — 2026-11-12（自动实验 API Key 改用 Windows DPAPI 加密存储）
 

@@ -323,7 +323,7 @@ $readme = New-Object System.Collections.ArrayList
 [void]$readme.Add('2. 双击 `install_demo_models.bat`。脚本会自动找到软件目录，把模型按正确结构拷进去，')
 [void]$readme.Add('   并逐个校验 SHA256；找不到就问你一句路径。')
 [void]$readme.Add('')
-[void]$readme.Add('3. 双击软件的 `start_web.bat`，打开「引擎构建」页，把下面的 ONNX 编成引擎')
+[void]$readme.Add('3. 双击软件的 `app\TRTForgeWeb.exe`（不需要 PowerShell），打开「引擎构建」页，把下面的 ONNX 编成引擎')
 [void]$readme.Add('   （输出引擎**留空**即可，会自动落在同一个 weights 目录）。')
 [void]$readme.Add('')
 [void]$readme.Add('## 包里有什么')
