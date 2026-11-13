@@ -162,6 +162,39 @@ python tf_anomalib_launcher.py --mode check-env
 
 ## 版本更新记录
 
+### v1.38.0 — 2026-11-13（后端按域拆分：`app.py` 4800 行 → 195 行装配层）
+
+**一句话**：网页后端的 86 条接口从一个大文件搬进 `routers/` 九个按域划分的模块，
+**地址、请求体、响应体一个字没改**，前端一行都不用动。
+
+| 改前 | 改后 |
+| --- | --- |
+| `6-web/backend/app.py` 4800 行、86 条路由全挤在一起 | `app.py` 195 行：版本号、lifespan、异常处理、`include_router`、静态挂载 |
+| 加一个推理参数要在几千行里翻位置 | 改 `routers/infer.py` 就够，改动面收敛在一个域 |
+| 评审看到的是「整文件都被改过」 | 每个域一个文件，diff 能看清上下文 |
+| 两个人同时改必然冲突 | 不同域互不干扰 |
+| 拆完没人知道接口有没有漏 | `tools/route_table.json` 快照 + 测试逐条比对，缺一条、多一条都失败 |
+
+**九个域**：`system`（8）· `train`（9）· `engine`（4）· `pipeline`（6）· `dataset`（4）·
+`runs`（6）· `infer`（14）· `models`（9）· `annotation`（17），共 77 条；
+`/api/autoexp/*` 仍是独立模块，一起挂进去。
+
+**新增两条护栏**：
+
+| 文件 | 作用 |
+| --- | --- |
+| `tools/test_route_table.py` | 运行时路由与快照逐条比对；确实要改接口才用 `--update`，重建时会把新增/删除逐条打印出来 |
+| `tools/test_app_assembly.py` | `app.py` 行数 ≤400、禁止出现 `@app.get(`、`routers/*` 不许反向 import `app`、兼容转发可用 |
+
+**几处踩过的坑（都写进文档了）**：`include_router` 顺序必须让 `/api/runs/checkpoints`
+排在 `/api/runs/{run_id}` 前；测试里的 `monkeypatch` 要打 `routers.<域>` 而不是 `app`；
+共享管理器统一写 `web_state.manager.xxx`，避免出现「两个管理器」；
+打包要加 `--include-package=routers` 并在编译后检查目录存在。
+
+验收：后端 61 个测试脚本全绿（新增 2 个）、前端 8 个套件全绿；详细说明见
+[6-web/README](6-web/README.md#后端路由拆分-routersv1380) 与
+[WORKFLOW_GUIDE §7.22](docs/WORKFLOW_GUIDE.md)。
+
 ### v1.37.0 — 2026-11-13（双击即用：启动逻辑从 PowerShell 搬进 exe）
 
 **一句话**：发给使用人员的那份程序，双击 `app\TRTForgeWeb.exe` 就能开，

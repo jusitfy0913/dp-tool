@@ -28,6 +28,9 @@ _WEB_ROOT = Path(__file__).resolve().parents[1]
 REPO_ROOT = Path(os.environ.get("TRTFORGE_REPO_ROOT", "").strip() or _WEB_ROOT.parent).resolve()
 
 WEB_ROOT = _WEB_ROOT
+#: 后端代码目录（6-web/backend）。子进程脚本路径、工具命令都以它为基准，
+#: 不依赖启动时的工作目录——从仓库根启动和从 backend 启动必须都能跑。
+BACKEND_DIR = _WEB_ROOT / "backend"
 # 安装包把网页文件放在安装目录的 frontend\，不跟编译后的程序挤在一起。
 _frontend_env = os.environ.get("TRTFORGE_FRONTEND_DIR", "").strip()
 FRONTEND_DIR = Path(_frontend_env).resolve() if _frontend_env else (WEB_ROOT / "frontend")
@@ -50,7 +53,7 @@ LOG_BACKUPS = max(0, int(os.environ.get("TRTFORGE_LOG_BACKUPS", "3")))
 
 #: 应用版本号。放在 config 而不是 app：数据集导出（dataset.py）也要把它写进 manifest，
 #: 而 dataset 反过来 import app 会形成循环。app.py 只做 `APP_VERSION = config.APP_VERSION`。
-APP_VERSION = "1.37.0"
+APP_VERSION = "1.38.0"
 
 # 任务日志的保留天数（按整个任务的所有分片一起判断，最旧一份多久没更新就删）。
 # 之所以还要这一层：单任务有上限，但「任务数 × 上限」仍然会无限增长。

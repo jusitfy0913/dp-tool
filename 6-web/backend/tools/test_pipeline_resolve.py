@@ -28,6 +28,7 @@ sys.path.insert(0, str(BACKEND))
 
 import app as backend_app  # noqa: E402
 import pipeline  # noqa: E402
+import routers.pipeline as pipeline_routes  # noqa: E402
 
 PASSED: list[str] = []
 FAILED: list[str] = []
@@ -353,9 +354,9 @@ def main() -> int:
             json.dumps({"image_threshold": 0.5, "pixel_threshold": 0.4}), encoding="utf-8"
         )
         fake_probe = {"input_shape": [-1, 3, -1, -1], "input_name": "input"}
-        original_probe = backend_app._probe_onnx
+        original_probe = pipeline_routes._probe_onnx
         try:
-            backend_app._probe_onnx = lambda _path: fake_probe  # type: ignore[assignment]
+            pipeline_routes._probe_onnx = lambda _path: fake_probe  # type: ignore[assignment]
             try:
                 backend_app._probe_anomaly_metadata(
                     {"metadata": str(dynamic_hw), "onnx": str(onnx)}
@@ -374,7 +375,7 @@ def main() -> int:
                 str(detail),
             )
         finally:
-            backend_app._probe_onnx = original_probe  # type: ignore[assignment]
+            pipeline_routes._probe_onnx = original_probe  # type: ignore[assignment]
     finally:
         shutil.rmtree(tmp_root, ignore_errors=True)
 

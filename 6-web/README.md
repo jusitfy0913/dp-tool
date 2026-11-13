@@ -3680,6 +3680,58 @@ install_root() → load_config() → apply_environment()
 验收除了 `tools/test_launcher.py`（35 项），还应手工验证：双击 exe 无黑框并自动开浏览器、
 重复双击只开一个实例、占用端口时弹中文框、`start_web.bat` 启动能看到日志。
 
+## 后端路由拆分 `routers/`（v1.38.0）
+
+拆分前 `app.py` 4800 行、86 条路由挤在一个文件里：加一个推理参数要在几千行里翻位置，
+评审看到的是「整文件都被改过」，两个人同时改必然冲突。v1.38.0 只做**搬家**，
+URL、请求体、响应体、WebSocket 地址一字未改。
+
+### 拆完的结构
+
+| 文件 | 路由数 | 职责 |
+| --- | --- | --- |
+| `app.py` | 0 | 装配层：版本号、lifespan、异常处理器、`include_router`、静态挂载、静态缓存头 |
+| `web_state.py` | — | 共享状态：`manager` / `pipeline_manager` / `_START_LOCK` / `_reject_if_busy` / `_ensure_allowed_path` / `RUN_KIND_LABELS` |
+| `routers/system.py` | 8 | warm、health、capabilities、目录浏览、原生对话框、首页 |
+| `routers/train.py` | 9 | 训练命令拼装、预检、YOLO·Anomalib 训练、导出、checkpoint、check-env |
+| `routers/engine.py` | 4 | ONNX 探测、工作点、引擎构建 |
+| `routers/pipeline.py` | 6 | YOLO / Anomalib 串联编排与查询 |
+| `routers/dataset.py` | 4 | 数据集扫描、体检、导出、指纹 |
+| `routers/runs.py` | 6 | 任务列表 / 历史 / 日志 / WebSocket 事件流 |
+| `routers/infer.py` | 14 | 单图、OCR、异常检测、批量、视频、单帧、产物、缓存、熔断类 |
+| `routers/models.py` | 9 | `/api/models`、`/api/bundles*`（模型包）、`/api/modelzoo*`（下载） |
+| `routers/annotation.py` | 17 | 标注工程、草稿、导入导出、自动标注、提示标注 |
+
+`/api/autoexp/*` 仍是独立模块 `autoexp_api.py`，在 `app.py` 里和其它 router 一起 `include_router`。
+
+### 三条约束（都有测试盯着）
+
+| 约束 | 为什么 | 谁在盯 |
+| --- | --- | --- |
+| 接口集合不许变 | 拆模块最容易「漏 include_router 一整域」或路径打错 | `tools/test_route_table.py` 比对 86 条 `METHOD /path`，缺一条、多一条都失败 |
+| `app.py` 只做装配 | 否则一年后又长回 4800 行 | `tools/test_app_assembly.py`：行数 ≤400、禁止 `@app.get(`、`routers/*` 不许 import `app` |
+| 共享状态只有一份 | `manager` 被复制进多个模块命名空间会出现「两个管理器」 | 路由里统一写 `web_state.manager.create(...)`，不 `from web_state import manager` |
+
+改了接口（新增/删除路由）时要显式重建快照：
+
+```powershell
+D:\Anaconda3\envs\dpenv\python.exe 6-web\backend\tools\route_table.py --update
+```
+
+重建会单独出现在提交 diff 里，评审一眼能看到「接口集合真的变了」。
+
+### 几个踩过的坑
+
+| 坑 | 处理 |
+| --- | --- |
+| `include_router` 顺序 | FastAPI 按注册顺序匹配：`GET /api/runs/checkpoints` 必须排在 `GET /api/runs/{run_id}` 之前，否则 `checkpoints` 被当成 run_id。顺序按各域在原 `app.py` 里首次出现的行号排 |
+| 测试里的 `monkeypatch` | 要打「函数真正查找的名字」所在的模块：`app._run_yolo_once` → `routers.infer._run_yolo_once`，`app._is_local_request` → `routers.system._is_local_request`，`app._probe_onnx` → `routers.pipeline._probe_onnx`；`app` 上的旧名字只是**转发**，给它赋值不会影响路由 |
+| 旧脚本仍按 `app.<名字>` 引用 | `app.py` 末尾用模块级 `__getattr__` 转发到各 router / `web_state`（只读够用）。新代码请直接从 `routers.<域>` 取 |
+| Nuitka 漏打新包 | `packaging/package_web_user.ps1` 加 `--include-package=routers`，并在编译后检查 `frozen_entry.dist\routers` 存在，缺了直接中止打包 |
+
+验收：`run_all_tests.py` 61 个脚本全绿（新增 `test_route_table.py` / `test_app_assembly.py`），
+前端 8 个套件不受影响，安装包需另出一份实机验证「双击 exe → 推理页能选模型」。
+
 ## 环境变量
 
 | 变量 | 作用 | 默认 |
@@ -4084,7 +4136,9 @@ install_root() → load_config() → apply_environment()
 ```
 6-web/
 ├── backend/
-│   ├── app.py            FastAPI 路由
+│   ├── app.py            **v1.38.0**：装配层（版本号 / lifespan / 异常处理 / include_router / 静态挂载），195 行
+│   ├── web_state.py      **v1.38.0**：跨路由共享状态（`manager` / `pipeline_manager` / `_START_LOCK` / `_reject_if_busy` / 路径白名单 / 运行类别标签）
+│   ├── routers/          **v1.38.0**：按域拆开的路由（system / train / engine / pipeline / dataset / runs / infer / models / annotation，共 77 条）
 │   ├── config.py         路径推导、环境变量与白名单（allowed_roots / is_path_allowed / 运行期放行）
 │   ├── nativedialog.py   **v1.20**：服务端原生对话框（子进程弹框 / 单例锁 / 超时 / 按字段记目录）
 │   ├── progress.py       引擎构建阶段识别 + 耗时自学习估算（trtexec 不给真实进度）
@@ -4130,6 +4184,9 @@ install_root() → load_config() → apply_environment()
 │       ├── test_annotation_import.py  **v1.19**：YOLO 导入验收（四任务几何 / 脏数据 / 合并 / 去重 / PCB 冒烟）
 │       ├── test_engine_progress.py    构建进度与耗时估算验收（真实日志回放 + 自学习）
 │       ├── test_launcher.py           **v1.37.0**：启动器验收（配置容错 / 环境变量清单 / 互斥量 / 端口三态 / 无控制台 / 入口分派）
+│       ├── route_table.py             **v1.38.0**：导出运行期 `METHOD /path` 快照（`route_table.json`）
+│       ├── test_route_table.py        **v1.38.0**：路由快照比对（缺一条、多一条都失败；`--update` 才允许改快照）
+│       ├── test_app_assembly.py       **v1.38.0**：装配层约束（app.py ≤400 行 / 无路由注册 / routers 不反向 import app / 兼容转发）
 │       ├── test_transd_onnx.py        .transd.onnx 转置验收（四任务头 / 输出重排 / 通道校验）
 │       ├── test_export_request.py     导出命令拼装验收（开关透传 / 非法参数提前拒绝）
 │       ├── test_infer_jobs.py         **v1.16**：批量产物验收（文件收集 / 命名净化 / CSV BOM / zip / 路径穿越）

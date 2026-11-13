@@ -35,6 +35,7 @@ from fastapi import HTTPException, UploadFile  # noqa: E402
 import app  # noqa: E402
 import config  # noqa: E402
 import infer_batch  # noqa: E402
+import routers.infer as infer_routes  # noqa: E402
 
 PASSED: list[str] = []
 FAILED: list[str] = []
@@ -105,7 +106,7 @@ def main() -> int:
     root = Path(tempfile.mkdtemp(prefix="test-infer-batch-", dir=str(config.RUNTIME_DIR)))
     original_status = infer_batch.infer.status
     original_run_yolo = infer_batch.infer.run_yolo
-    original_once = app._run_yolo_once
+    original_once = infer_routes._run_yolo_once
 
     try:
         engine = root / "best_fp16.engine"
@@ -336,7 +337,7 @@ def main() -> int:
             "image_height": 48,
             "timing": {"inference_ms": 3.2},
         }
-        app._run_yolo_once = lambda *args, **kwargs: (dict(fake_result), None)
+        infer_routes._run_yolo_once = lambda *args, **kwargs: (dict(fake_result), None)
         upload = UploadFile(filename="frame.jpg", file=io.BytesIO(frame_png))
         response = app.infer_frame(image=upload, engine=str(engine), task="detect", conf=0.25, nms=0.45, labels=str(labels))
         payload = json.loads(response.body)
@@ -402,7 +403,7 @@ def main() -> int:
     finally:
         infer_batch.infer.status = original_status
         infer_batch.infer.run_yolo = original_run_yolo
-        app._run_yolo_once = original_once
+        infer_routes._run_yolo_once = original_once
         shutil.rmtree(root, ignore_errors=True)
 
     print()

@@ -2,7 +2,7 @@
 
 > 本文回答一个核心问题：**从原始图片到产线推理，每一步该做什么、用什么命令、产出什么文件、怎么验证。**
 > 面向对象：需要独立跑通全流程的工程师（不需要深入算法细节）。
-> 最后更新：2026-11-11（v1.34.1：显存预检改实测峰值表 + AMP 状态可见可覆盖，见 §7.18；v1.34.0：任务台账落盘 / 日志轮转 / 训练崩溃自动续训，见 §7.1、§7.16；v1.33.0：LLM 决策层，见 §7.17；v1.32.0：YOLO 自主实验循环，见 §7.16；v1.31.0：网页端推理改成进程池，见 §7.15；v1.30.6：分类走 `onnx_infer.dll`，见 §7.13；v1.30.5：OCR 往返拆解 + 识别 batch 按设备取值，见 §7.12；v1.30.4：OCR 文字醒目化 + 异常检测改回「区域」，见 §7.11；v1.30.3：推理往返耗时优化，见 §7.10；v1.30.2：OCR `mklml.dll` 加载修复，见 §7.7.1；v1.30.1：分类真机闭环，见 §7.9；v1.30.0：YOLO 整图分类；v1.28.0：推理进程隔离 infer_worker，见 §7.8；v1.27.0 OCR 见 §7.7）
+> 最后更新：2026-11-13（v1.38.0：后端按域拆成 `routers/`，`app.py` 只做装配，接口集合由路由快照测试守着，见 §7.22；v1.37.0：安装版改成双击 exe，环境变量下沉进 `launcher.py`，见 §7.1.3；v1.34.1：显存预检改实测峰值表 + AMP 状态可见可覆盖，见 §7.18；v1.34.0：任务台账落盘 / 日志轮转 / 训练崩溃自动续训，见 §7.1、§7.16；v1.33.0：LLM 决策层，见 §7.17；v1.32.0：YOLO 自主实验循环，见 §7.16；v1.31.0：网页端推理改成进程池，见 §7.15；v1.30.6：分类走 `onnx_infer.dll`，见 §7.13；v1.30.5：OCR 往返拆解 + 识别 batch 按设备取值，见 §7.12；v1.30.4：OCR 文字醒目化 + 异常检测改回「区域」，见 §7.11；v1.30.3：推理往返耗时优化，见 §7.10；v1.30.2：OCR `mklml.dll` 加载修复，见 §7.7.1；v1.30.1：分类真机闭环，见 §7.9；v1.30.0：YOLO 整图分类；v1.28.0：推理进程隔离 infer_worker，见 §7.8；v1.27.0 OCR 见 §7.7）
 
 
 ---
@@ -362,7 +362,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_web_studio.ps1
 ```powershell
 python 6-web\backend\tools\test_annotation_drafts.py   # 期望 87/87（v1.24 含 v2 审核块）
 python 6-web\backend\tools\test_autolabel_batch.py     # 期望 42/42
-python 6-web\backend\tools\run_all_tests.py            # 期望 41 个脚本全绿（v1.28.0 起含 test_infer_worker；v1.27.0 起含 test_ocr_*）
+python 6-web\backend\tools\run_all_tests.py            # 期望 61 个脚本全绿（v1.38.0 起含 test_route_table / test_app_assembly）
 ```
 
 真跑参考（PCB 6 张、`best.transd_fp16.engine`、`conf=0.3`）：
@@ -3462,6 +3462,71 @@ sha256/来源 run 同文件。**引擎文件和 `metadata.json` 都不动**，�
 
 **边界**：良品图只做验收、不参与训练；自动实验的 `fp_per_image` 是 P/R 反推的近似值，
 只用于拦明显恶化；异常检测是单阈值判定，不提供该曲线。
+
+---
+
+## 7.22 后端代码怎么组织、改完怎么自检（v1.38.0）
+
+v1.38.0 之前，网页后端全部路由挤在 `6-web/backend/app.py` 一个文件里（4800 行、86 条）。
+现在按功能域拆到 `routers/`，`app.py` 只剩下 195 行装配代码。**接口地址、请求体、
+响应体一个字都没改**，只是代码位置变了。
+
+### 结构
+
+| 文件 | 管什么 |
+| --- | --- |
+| `app.py` | 版本号、lifespan（启动/退出）、异常处理器、`include_router`、`/static` 挂载 |
+| `web_state.py` | 路由之间共享的任务管理器、串联管理器、并发闸门、路径白名单 |
+| `routers/system.py` | 健康检查、能力探测、目录浏览、原生对话框、首页 |
+| `routers/train.py` | 训练命令拼装、显存预检、训练、导出、checkpoint |
+| `routers/engine.py` | ONNX 探测、工作点、引擎构建 |
+| `routers/pipeline.py` | 全流程串联 |
+| `routers/dataset.py` | 数据集扫描、体检、导出、指纹 |
+| `routers/runs.py` | 任务列表、历史、日志、WebSocket |
+| `routers/infer.py` | 单图、OCR、异常检测、批量、视频、单帧、产物下载 |
+| `routers/models.py` | `/api/models`、模型包 `.tfbundle`、内置模型仓库 |
+| `routers/annotation.py` | 标注工程、草稿、导入导出、自动标注 |
+
+### 加一个接口要动哪
+
+1. 找对域，改 `routers/<域>.py`，写 `@router.get("/api/xxx")`（模块里已有 prefix 时只写后缀）；
+2. 跑 `python 6-web\backend\tools\test_app_assembly.py`，确认没往 `app.py` 里塞路由；
+3. 跑 `python 6-web\backend\tools\route_table.py --update` 重建快照，
+   提交时让这份 diff 单独可见——评审只要看这一处就知道「接口集合真的变了」；
+4. 跑全量测试。
+
+```powershell
+D:\Anaconda3\envs\dpenv\python.exe 6-web\backend\tools\test_route_table.py    # 期望「路由表与快照一致：86 条」
+D:\Anaconda3\envs\dpenv\python.exe 6-web\backend\tools\test_app_assembly.py   # 期望 15 项全过
+D:\Anaconda3\envs\dpenv\python.exe 6-web\backend\tools\run_all_tests.py       # 期望 61 个脚本全绿
+```
+
+### 四条硬规矩
+
+| 规矩 | 违反了会怎样 |
+| --- | --- |
+| 接口集合与 `route_table.json` 必须逐条相等 | 漏 `include_router` 会让一整域接口 404，快照测试直接失败 |
+| `app.py` 不许出现 `@app.get(` / `@app.post(` | 业务又长回去了；`test_app_assembly.py` 行数 ≤400 + 关键字检查会拦住 |
+| `routers/*` 不许 import `app` | 一 import 就成循环依赖，`import routers.infer` 会把整个服务拉起来 |
+| 共享管理器一律写 `web_state.manager.xxx` | 用 `from web_state import manager` 会复制一份引用，出现「两个管理器」：闸门说空闲、启动却又撞车 |
+
+### 测试里改判定的注意事项
+
+`app.<旧名字>` 现在只是**只读转发**（模块级 `__getattr__`），给它赋值不会影响路由。
+要替换一个函数/对象，打在它真正被查找的模块上：
+
+| 以前 | 现在 |
+| --- | --- |
+| `app._run_yolo_once = ...` | `routers.infer._run_yolo_once = ...` |
+| `app._is_local_request = ...` | `routers.system._is_local_request = ...` |
+| `app._probe_onnx = ...` | `routers.pipeline._probe_onnx = ...` |
+| `app.manager = FakeManager()` | `web_state.manager = FakeManager()` |
+
+### 打包注意
+
+`packaging/package_web_user.ps1` 必须带 `--include-package=routers`，并在编译后检查
+`frozen_entry.dist\routers` 目录存在，缺了直接中止打包——这类问题只在安装形态下暴露，
+开发机跑 uvicorn 永远看不到。
 
 ---
 

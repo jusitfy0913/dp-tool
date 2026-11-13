@@ -113,6 +113,7 @@ def test_backend() -> None:
         return
 
     import app as backend_app
+    import web_state
 
     tmp = Path(tempfile.mkdtemp(prefix="augapi_"))
     data_yaml = tmp / "dataset.yaml"
@@ -142,8 +143,11 @@ def test_backend() -> None:
             captured["command"] = command
             return FakeRun()
 
-    original_manager = backend_app.manager
-    backend_app.manager = FakeManager()
+    # manager 是共享单例，放在 web_state 里；路由按 `web_state.manager` 动态取，
+    # 所以只换这一处就够。不换的话第一发请求会真的起一个训练进程，第二发被 409 挡回来。
+    original_manager = web_state.manager
+    fake_manager = FakeManager()
+    web_state.manager = fake_manager
     try:
         with TestClient(backend_app.app) as client:
             # 3a. 不填增强参数 -> 命令行里不应出现任何增强 flag
@@ -178,7 +182,7 @@ def test_backend() -> None:
             resp = client.post("/api/train/yolo", json={"data": str(data_yaml), "close_mosaic": -1})
             check("close_mosaic=-1 返回 400", resp.status_code == 400, f"实际 {resp.status_code}")
     finally:
-        backend_app.manager = original_manager
+        web_state.manager = original_manager
 
 
 def main() -> int:

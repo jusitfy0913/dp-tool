@@ -241,6 +241,9 @@ $serverArgs = @(
     "--enable-plugin=tk-inter",
     "--windows-console-mode=attach",
     "--include-module=launcher",
+    # 路由按域拆在 routers/ 包里（v1.38.0）。逐个列子模块会漏，包名一次覆盖全部。
+    "--include-package=routers",
+    "--include-module=web_state",
     "--include-module=tools.val_engine",
     "--include-module=tools.val_anomaly",
     "--include-module=tools.infer_batch",
@@ -270,6 +273,11 @@ if ($LASTEXITCODE -ne 0) { throw "编译网页程序失败" }
 
 $distDir = Join-Path $serverOut "frozen_entry.dist"
 if (-not (Test-Path -LiteralPath $distDir)) { throw "找不到编译结果：$distDir" }
+# 路由包必须真进包：漏了 `routers`，exe 一起来就是 404，而且只在安装形态下炸。
+# 这里核对编译产物里有没有 routers 目录，别等用户双击才发现。
+if (-not (Test-Path -LiteralPath (Join-Path $distDir "routers"))) {
+    throw "编译结果缺少 routers 包（检查 Nuitka 的 --include-package=routers）"
+}
 & robocopy $distDir (Join-Path $dest "app") /E /NFL /NDL /NJH /NJS /nc /ns /np | Out-Null
 if ($LASTEXITCODE -ge 8) { throw "复制编译结果失败" }
 

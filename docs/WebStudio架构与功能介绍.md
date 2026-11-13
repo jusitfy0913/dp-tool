@@ -273,7 +273,7 @@ flowchart TD
 | --- | --- | --- |
 | 页面 | HTML、CSS、原生 JavaScript | `6-web/frontend`。没有 npm 打包，改完刷新即可 |
 | 页面通信 | `fetch` + WebSocket | `js/api.js` 发请求，`js/ws.js` 收训练和构建日志 |
-| 网页服务 | Python、FastAPI、Uvicorn | `6-web/backend/app.py`，当前版本 **1.28.0** |
+| 网页服务 | Python、FastAPI、Uvicorn | `6-web/backend/app.py`（装配层）+ `routers/`，当前版本 **1.38.0** |
 | 上传与图像 | python-multipart、OpenCV、Pillow、NumPy | 收图片、解码、数据集预览 |
 | 配置文件 | PyYAML | 读 OCR 的 `inference.yml` |
 | 训练 · 检测 | Ultralytics **8.4.192**、PyTorch **2.3.0**（CUDA 11.8 轮子） | 缺陷种类固定、能画框时用。检测、分割、姿态、旋转框。入口 `tf_yolo_launcher.py` |
@@ -345,7 +345,17 @@ flowchart LR
 
 | 文件 | 管哪一块 |
 | --- | --- |
-| `app.py` | 全部 HTTP 路由，版本号 |
+| `app.py` | **v1.38.0** 起只做装配：版本号、lifespan、异常处理、挂载 `routers/`、静态文件 |
+| `web_state.py` | **v1.38.0**：路由之间共享的任务管理器、并发闸门、路径白名单 |
+| `routers/system.py` | 健康检查、能力探测、目录浏览、原生对话框、首页 |
+| `routers/train.py` | 训练命令拼装、预检、训练、导出、checkpoint |
+| `routers/engine.py` | ONNX 探测、工作点、引擎构建 |
+| `routers/pipeline.py` | 全流程每一段的状态 |
+| `routers/dataset.py` | 数据集扫描、体检、导出、指纹 |
+| `routers/runs.py` | 任务列表、历史、日志、WebSocket |
+| `routers/infer.py` | 单图、OCR、异常检测、批量、视频、单帧、产物下载 |
+| `routers/models.py` | 模型列表、模型包 `.tfbundle`、内置模型仓库 |
+| `routers/annotation.py` | 标注工程、草稿、导入导出、自动标注 |
 | `runners.py` | 启动训练、导出、构建子进程 |
 | `infer.py` | YOLO / Anomalib / ONNX 动态库实现（worker 或直通模式调用） |
 | `infer_worker.py` / `inferproxy.py` | **v1.28**：推理工作进程与 Web 侧代理（超时、熔断、重启） |

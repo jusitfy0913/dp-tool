@@ -313,6 +313,7 @@ def test_api(tmp: Path) -> None:
     from fastapi.testclient import TestClient
 
     import app as webapp
+    import routers.system as system_routes  # 断言要打在「函数真正查找的名字」所在的模块上
 
     prior_roots = os.environ.get("TRTFORGE_BROWSE_ROOTS", "")
     os.environ["TRTFORGE_BROWSE_ROOTS"] = str(tmp) + os.pathsep + str(BACKEND.parent)
@@ -332,9 +333,9 @@ def test_api(tmp: Path) -> None:
                 self.client = type("C", (), {"host": host})()
 
         for host in ("127.0.0.1", "::1", "::ffff:127.0.0.1", "localhost"):
-            check(f"接口：{host} 视为本机", webapp._is_local_request(FakeRequest(host)))
+            check(f"接口：{host} 视为本机", system_routes._is_local_request(FakeRequest(host)))
         for host in ("192.168.1.9", "10.0.0.2", "testclient", ""):
-            check(f"接口：{host or '(空)'} 视为远程", not webapp._is_local_request(FakeRequest(host)))
+            check(f"接口：{host or '(空)'} 视为远程", not system_routes._is_local_request(FakeRequest(host)))
 
         # 本机路径：把 select 换成替身，验证「选中即放行」这条链路
         outside = tmp / "api_outside"
@@ -342,18 +343,18 @@ def test_api(tmp: Path) -> None:
         picked = outside / "best.pt"
         picked.write_bytes(b"x")
 
-        original_select = webapp.nativedialog.select
-        original_local = webapp._is_local_request
-        webapp.nativedialog.select = lambda *a, **k: {"paths": [str(picked)], "cancelled": False, "elapsed_ms": 5}
-        webapp._is_local_request = lambda request: True
+        original_select = nativedialog.select
+        original_local = system_routes._is_local_request
+        nativedialog.select = lambda *a, **k: {"paths": [str(picked)], "cancelled": False, "elapsed_ms": 5}
+        system_routes._is_local_request = lambda request: True
         try:
             response = client.post(
                 "/api/browse/dialog",
                 json={"kind": "file", "field": "expWeights", "patterns": [".pt"]},
             )
         finally:
-            webapp.nativedialog.select = original_select
-            webapp._is_local_request = original_local
+            nativedialog.select = original_select
+            system_routes._is_local_request = original_local
 
         body = response.json()
         check("接口：本机来源返回选中路径", body.get("paths") == [str(picked)], response.text[:300])
@@ -365,13 +366,13 @@ def test_api(tmp: Path) -> None:
         check("接口：放行后图片接口不再 403", config.is_path_allowed(picked))
         config.clear_runtime_allowed()
 
-        webapp.nativedialog._ACTIVE_CANCEL["path"] = tmp / "api-cancel.flag"
-        webapp._is_local_request = lambda request: True
+        nativedialog._ACTIVE_CANCEL["path"] = tmp / "api-cancel.flag"
+        system_routes._is_local_request = lambda request: True
         try:
             cancelled = client.post("/api/browse/cancel")
         finally:
-            webapp.nativedialog._ACTIVE_CANCEL["path"] = None
-            webapp._is_local_request = original_local
+            nativedialog._ACTIVE_CANCEL["path"] = None
+            system_routes._is_local_request = original_local
         check(
             "接口：取消会写出标记",
             cancelled.status_code == 200 and (tmp / "api-cancel.flag").is_file(),
