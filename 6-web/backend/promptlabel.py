@@ -215,29 +215,6 @@ def _polygon_area(points: list[list[float]]) -> float:
     return abs(total) / 2.0
 
 
-def mask_to_boxes(mask: np.ndarray, min_area_ratio: float = MIN_AREA_RATIO) -> list[list[float]]:
-    """掩码 → 外接矩形 ``[x1, y1, x2, y2]``（文本通道细化失败时的降级用）。"""
-    import cv2
-
-    array = np.asarray(mask)
-    if array.ndim == 3:
-        array = array.squeeze()
-    if array.ndim != 2 or array.size == 0:
-        return []
-    binary = (array > 0.5).astype(np.uint8) if array.dtype != np.uint8 else (array > 0).astype(np.uint8)
-    if binary.max() == 0:
-        return []
-    height, width = binary.shape[:2]
-    min_area = max(1.0, float(min_area_ratio) * height * width)
-    contours = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[-2]
-    boxes = []
-    for contour in contours:
-        if cv2.contourArea(contour) < min_area:
-            continue
-        x, y, w, h = cv2.boundingRect(contour)
-        boxes.append([float(x), float(y), float(x + w), float(y + h)])
-    return boxes
-
 
 # ---------------------------------------------------------------------------
 # ONNX 会话

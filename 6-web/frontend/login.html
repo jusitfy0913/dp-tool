@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>登录 · TRTForge Web Studio</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='3' fill='%23070a0e'/%3E%3Cpath d='M3 11.5V4.5h2.6l1.4 3.2 1.4-3.2H11v7' stroke='%2322d3ee' stroke-width='1.6' fill='none' stroke-linecap='square'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/static/css/style.css">
+<!-- 登录页也跟随已存主题：否则从深色主页被踢回登录页时会白一下 -->
+<script src="/static/js/theme.js"></script>
+<style>
+  /* 登录页只用一个居中卡片，样式写在页面里：它必须在拿不到登录态时也能正常显示，
+     所以不依赖 js/ 下的任何模块。 */
+  .login-wrap {
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: var(--sp-5);
+  }
+  .login-card {
+    width: min(420px, 100%);
+    background: var(--surface-1);
+    border: 1px solid var(--line);
+    border-radius: var(--radius-md);
+    padding: var(--sp-5);
+    /* 走阴影令牌：浅色主题下这层投影会自动退成柔和的灰，不会糊成一块黑 */
+    box-shadow: var(--shadow-3);
+  }
+  .login-card h1 {
+    margin: 0 0 var(--sp-2);
+    font-size: 18px;
+    color: var(--text);
+  }
+  .login-card p.sub {
+    margin: 0 0 var(--sp-5);
+    color: var(--text-dim);
+    font-size: var(--fs-sm);
+    line-height: 1.7;
+  }
+  .login-card label {
+    display: block;
+    font-size: var(--fs-sm);
+    color: var(--text-dim);
+    margin-bottom: var(--sp-2);
+  }
+  .login-card input[type="password"] {
+    width: 100%;
+    box-sizing: border-box;
+    background: var(--surface-2);
+    border: 1px solid var(--line-strong);
+    border-radius: var(--radius-sm);
+    color: var(--text);
+    font-size: var(--fs-base);
+    padding: 10px 12px;
+    margin-bottom: var(--sp-4);
+  }
+  .login-card input[type="password"]:focus {
+    outline: 2px solid var(--cyan);
+    outline-offset: 1px;
+  }
+  .login-card button {
+    width: 100%;
+    padding: 10px 12px;
+    border-radius: var(--radius-sm);
+    border: 1px solid var(--cyan);
+    background: var(--cyan);
+    /* 主色填充上的文字走令牌：深色主题是深青字，浅色主题自动翻成白字 */
+    color: var(--ink-on-accent);
+    font-size: var(--fs-base);
+    font-weight: 600;
+    cursor: pointer;
+  }
+  .login-card button:disabled {
+    opacity: 0.6;
+    cursor: progress;
+  }
+  .login-msg {
+    min-height: 20px;
+    margin-top: var(--sp-3);
+    font-size: var(--fs-sm);
+    color: var(--danger);
+  }
+  .login-hint {
+    margin-top: var(--sp-4);
+    font-size: var(--fs-2xs);
+    color: var(--text-dim);
+    line-height: 1.7;
+    word-break: break-all;
+  }
+  .login-hint code {
+    color: var(--amber);
+  }
+</style>
+</head>
+<body>
+<div class="login-wrap">
+  <form class="login-card" id="loginForm" autocomplete="off">
+    <h1>TRTForge Web Studio</h1>
+    <p class="sub">这台机器已开放给局域网访问，需要访问令牌才能操作。</p>
+
+    <label for="token">访问令牌</label>
+    <input id="token" name="token" type="password" spellcheck="false" autofocus required>
+    <button id="submitBtn" type="submit">登录</button>
+    <div class="login-msg" id="msg"></div>
+    <div class="login-hint" id="hint"></div>
+  </form>
+</div>
+
+<script>
+  // 只用原生 fetch，不 import 任何模块：登录页必须在"还没有凭据"的状态下可靠工作。
+  const form = document.getElementById("loginForm");
+  const input = document.getElementById("token");
+  const button = document.getElementById("submitBtn");
+  const msg = document.getElementById("msg");
+  const hint = document.getElementById("hint");
+
+  // next 由后端在 302 时带上，只接受站内路径（后端 safe_next 也会再校验一次）。
+  const params = new URLSearchParams(location.search);
+  const rawNext = params.get("next") || "/";
+  const next = rawNext.startsWith("/") && !rawNext.startsWith("//") ? rawNext : "/";
+
+  // 令牌文件位置由 /api/auth/status 给出。它不是秘密（文件内容才是），
+  // 但只在"本机访问"时显示：远程用户拿到路径也没用，只会困惑。
+  fetch("/api/auth/status", { headers: { Accept: "application/json" } })
+    .then((r) => (r.ok ? r.json() : null))
+    .then((data) => {
+      if (!data) return;
+      if (!data.required) {
+        // 本机访问本来不需要令牌，直接进主页，省一次输入。
+        location.replace(next);
+        return;
+      }
+      if (data.token_file) {
+        hint.innerHTML =
+          "令牌在服务端文件里：<code>" + escapeHtml(data.token_file) + "</code><br>" +
+          "也可以用环境变量 <code>TRTFORGE_WEB_TOKEN</code> 指定。";
+      }
+    })
+    .catch(() => {});
+
+  function escapeHtml(text) {
+    return String(text).replace(/[&<>"']/g, (ch) => ({
+      "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+    }[ch]));
+  }
+
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    msg.textContent = "";
+    button.disabled = true;
+    try {
+      const response = await fetch("/api/auth/login", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Accept: "application/json" },
+        body: JSON.stringify({ token: input.value.trim(), next }),
+      });
+      const payload = await response.json().catch(() => null);
+      if (response.ok) {
+        location.replace((payload && payload.next) || next);
+        return;
+      }
+      msg.textContent = (payload && payload.detail) || `登录失败（HTTP ${response.status}）`;
+      input.select();
+    } catch (error) {
+      msg.textContent = "无法连接服务：" + error.message;
+    } finally {
+      button.disabled = false;
+    }
+  });
+</script>
+</body>
+</html>

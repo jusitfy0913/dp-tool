@@ -27,20 +27,10 @@ from pathlib import Path
 BACKEND = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(BACKEND))
 
+from _harness import check, finish  # noqa: E402# noqa: E402
+
 import annotation  # noqa: E402
 import annotationimport  # noqa: E402
-
-PASSED: list[str] = []
-FAILED: list[str] = []
-
-
-def check(name: str, ok: bool, detail: str = "") -> None:
-    if ok:
-        PASSED.append(name)
-        print(f"[PASS] {name}")
-    else:
-        FAILED.append(name)
-        print(f"[FAIL] {name} {detail}")
 
 
 def close(actual, expected, tol: float = 1e-6) -> bool:
@@ -409,15 +399,7 @@ def main() -> int:
     test_merge()
     test_options()
     test_pcb_smoke()
-
-    print()
-    if FAILED:
-        print(f"失败：{len(PASSED)} 项通过，{len(FAILED)} 项失败")
-        for name in FAILED:
-            print(f"  ✗ {name}")
-        return 1
-    print(f"全部通过：{len(PASSED)} 项")
-    return 0
+    return finish()
 
 
 if __name__ == "__main__":

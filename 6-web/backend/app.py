@@ -31,8 +31,10 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
+import auth
 import autoexp_api
 import config
+import operator_auth
 import inferproxy
 import logstore
 import web_state
@@ -65,6 +67,8 @@ APP_VERSION = config.APP_VERSION
 async def lifespan(app: FastAPI):
     """服务启动时准备目录与事件循环，退出时清理子进程与句柄。"""
     config.ensure_dirs()
+    # 令牌/模式只在这里打印一次：现场忘了令牌时，日志第一段就能看到文件位置。
+    auth.announce()
     # 旧的明文 Key 就地改成 DPAPI 密文。启动时做一次而不是读接口里做：
     # GET 请求不该偷偷写磁盘，写失败还会让页面莫名报错。
     try:
@@ -123,6 +127,8 @@ async def _worker_error(_request, exc: inferproxy.WorkerError) -> JSONResponse:
 # 路由装配
 # ---------------------------------------------------------------------------
 for _router in (
+    auth.router,
+    operator_auth.router,
     system_routes.router,
     train_routes.router,
     engine_routes.router,
@@ -158,6 +164,11 @@ async def no_cache_static(request, call_next):
     if request.url.path.startswith("/static/"):
         response.headers["Cache-Control"] = "no-cache, must-revalidate"
     return response
+
+
+# 访问令牌与来源校验。挂在这里（最后注册）才会成为最外层中间件——
+# Starlette 的 add_middleware 是「后注册的在更外层」，校验必须先于业务跑。
+auth.install(app)
 
 
 # ---------------------------------------------------------------------------

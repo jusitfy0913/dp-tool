@@ -57,8 +57,16 @@ export function connectRunEvents(runId, handlers = {}) {
       onError?.("事件流连接出错");
     };
 
-    socket.onclose = () => {
+    socket.onclose = (event) => {
       if (closedByUser) return;
+      // 4401：后端说这次连接没有有效登录态。重连多少次都一样，直接去登录页。
+      // 不这么做时表现为「日志永远不刷新」，用户完全看不出是权限问题。
+      if (event?.code === 4401) {
+        onError?.("登录已失效，正在跳转登录页…");
+        const next = location.pathname + location.search;
+        location.replace(`/login.html?next=${encodeURIComponent(next)}`);
+        return;
+      }
       // 任务没结束时短暂断线，退避重连
       retries += 1;
       if (retries > 5) {

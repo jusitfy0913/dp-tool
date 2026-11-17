@@ -50,6 +50,7 @@ from PIL import Image
 
 import config
 import dataset
+import jsonio
 
 #: 算法版本。阈值或判据变化时必须改这个值，否则新旧报告会被误当作可比。
 ALGO = "dsqc-v1"
@@ -160,10 +161,7 @@ def _save_cache(entries: dict[str, Any], keep: Iterable[str]) -> None:
         merged = dict(ordered[:CACHE_LIMIT])
     payload = {"algo": ALGO, "entries": merged}
     try:
-        CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        tmp = CACHE_PATH.with_suffix(".tmp")
-        tmp.write_text(json.dumps(payload), encoding="utf-8")
-        tmp.replace(CACHE_PATH)
+        jsonio.write_json(CACHE_PATH, payload, indent=None)
     except OSError:
         pass
 

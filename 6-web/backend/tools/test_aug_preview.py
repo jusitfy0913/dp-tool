@@ -28,19 +28,9 @@ import numpy as np
 BACKEND = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(BACKEND))
 
+from _harness import check, finish  # noqa: E402
+
 import augpreview  # noqa: E402
-
-PASSED: list[str] = []
-FAILED: list[str] = []
-
-
-def check(name: str, ok: bool, detail: str = "") -> None:
-    if ok:
-        PASSED.append(name)
-        print(f"[PASS] {name}")
-    else:
-        FAILED.append(name)
-        print(f"[FAIL] {name} {detail}")
 
 
 def decode(uri: str) -> np.ndarray:
@@ -201,8 +191,7 @@ def main() -> int:
         except Exception as exc:  # noqa: BLE001 - 这里就要它抛
             check("空训练集给出可读错误", "没有可用图片" in str(exc), str(exc))
 
-    print(f"\n通过 {len(PASSED)} 项，失败 {len(FAILED)} 项")
-    return 1 if FAILED else 0
+    return finish()
 
 
 if __name__ == "__main__":

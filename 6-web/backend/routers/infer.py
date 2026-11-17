@@ -16,6 +16,7 @@ from pydantic import BaseModel, Field
 
 import bundle as bundle_mod
 import config
+import imagetype
 import infer
 import inferjobs
 import inferproxy
@@ -60,6 +61,12 @@ def _read_upload(upload: UploadFile) -> bytes:
         )
     if not data:
         raise HTTPException(status_code=400, detail="上传的图片是空的")
+    # 后缀是客户端自己填的字符串，必须再用文件头确认它真的是图片。
+    # 顺序有意如此：先判大小（413 更贴切），再判内容（400）。
+    try:
+        imagetype.check(data, suffix)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     return data
 
 
@@ -400,6 +407,16 @@ def infer_yolo(
     if not engine.strip():
         raise HTTPException(status_code=400, detail="engine 与 bundle 必须提供其中一个")
 
+    # 服务端路径校验：白名单 + 存在 + 后缀。不校验时这个字段就是「让后端读任意文件」。
+    engine_path = _require_file(engine, "引擎文件")
+    if engine_path.suffix.lower() not in ENGINE_SUFFIXES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"引擎需为 {', '.join(sorted(ENGINE_SUFFIXES))} 之一，实际 {engine_path.suffix}",
+        )
+    if labels.strip():
+        _require_file(labels, "标签文件")
+
     started = time.perf_counter()
     data = _read_upload(image)
     try:
@@ -668,6 +685,15 @@ def infer_anomalib(
         raise HTTPException(status_code=400, detail="engine 与 bundle 必须提供其中一个")
     if not metadata.strip():
         raise HTTPException(status_code=400, detail="metadata 与 bundle 必须提供其中一个")
+
+    # 与 YOLO 侧同一套：engine / metadata 都是服务端可读路径，必须过白名单。
+    engine_path = _require_file(engine, "引擎文件")
+    if engine_path.suffix.lower() not in ENGINE_SUFFIXES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"引擎需为 {', '.join(sorted(ENGINE_SUFFIXES))} 之一，实际 {engine_path.suffix}",
+        )
+    _require_file(metadata, "metadata.json")
 
     use_dll, onnx_path, warning = _select_anomalib_backend(engine, metadata)
     started = time.perf_counter()
@@ -1057,6 +1083,24 @@ def infer_frame(
             status_code=413,
             detail=f"单帧超过 {frame_limit // (1024 * 1024)} MB，请调小采集分辨率",
         )
+    # 摄像头帧同样来自浏览器，不能因为「是自家页面」就跳过内容校验：
+    # 篡改页面或用脚本直接打这个接口都能塞进任意字节。
+    suffix = Path(image.filename or "frame.jpg").suffix or ".jpg"
+    try:
+        imagetype.check(data, suffix)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    # 摄像头接口每秒调用 10 次，但路径校验只做两次字符串比较 + 一次 resolve，
+    # 相对 DLL 推理的毫秒级开销可以忽略。不校验的后果和单图接口完全一样。
+    engine_path = _require_file(engine, "引擎文件")
+    if engine_path.suffix.lower() not in ENGINE_SUFFIXES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"引擎需为 {', '.join(sorted(ENGINE_SUFFIXES))} 之一，实际 {engine_path.suffix}",
+        )
+    if labels.strip():
+        _require_file(labels, "标签文件")
 
     try:
         array = infer.decode_image(data)

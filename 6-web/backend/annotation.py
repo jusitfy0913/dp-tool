@@ -23,8 +23,9 @@ import json
 import os
 import threading
 import time
-import uuid
 from pathlib import Path
+
+import jsonio
 
 # ---------------------------------------------------------------------------
 # 常量：与 Qt 端逐项对齐
@@ -638,25 +639,16 @@ def _lock_for(target: Path) -> threading.Lock:
 
 
 def _atomic_write(target: Path, text: str) -> None:
-    """先写临时文件再替换。
+    """先写临时文件再替换（实现见 :func:`jsonio.write_text`）。
 
     直接覆盖写在中途失败（磁盘满、进程被杀）时会留下半截 JSON，
     用户的工程就废了。原子替换把损失限制在「没保存成功」。
 
-    临时文件名带 uuid：只用 pid 的话，同进程内的两个请求会写同一个临时文件，
-    互相把对方的半截内容 replace 成正式文件。
+    这里额外要求 ``newline="\\n"``：工程文件要跨机器协作，
+    CRLF 会让 diff 全是噪音。临时文件名带 pid + uuid 的细节在 jsonio 里，
+    ``test_annotation_project.py`` 那条「不许留 .tmp 残留」的断言仍然有效。
     """
-    target.parent.mkdir(parents=True, exist_ok=True)
-    temp = target.with_suffix(target.suffix + f".tmp{os.getpid()}.{uuid.uuid4().hex[:8]}")
-    try:
-        temp.write_text(text, encoding="utf-8", newline="\n")
-        os.replace(temp, target)
-    finally:
-        if temp.exists():
-            try:
-                temp.unlink()
-            except OSError:
-                pass
+    jsonio.write_text(target, text, newline="\n")
 
 
 def save(

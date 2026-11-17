@@ -9,6 +9,7 @@ import re
 from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import Response
 
+import auth
 import logstore
 import runledger
 import web_state
@@ -110,7 +111,16 @@ async def run_events(websocket: WebSocket, run_id: str) -> None:
     """把任务事件实时推给浏览器。
 
     连接建立后先补发历史事件，保证刷新页面不丢日志。
+
+    鉴权放在 ``accept`` 前后各一步：浏览器的 WebSocket 不能自定义请求头，
+    只认 Cookie；不通过时**先 accept 再 close(4401)**——直接 close 只能得到
+    一个 403 握手失败，前端分不清「没登录」和「服务挂了」。
     """
+    if not auth.ws_authorized(websocket):
+        await websocket.accept()
+        await websocket.close(code=4401)
+        return
+
     await websocket.accept()
 
     subscribed = web_state.manager.subscribe(run_id)

@@ -29,6 +29,7 @@ import re
 import sys
 from html.parser import HTMLParser
 from pathlib import Path
+from _harness import check, finish  # noqa: E402# noqa: E402
 
 WEB = Path(__file__).resolve().parents[2]
 HTML_PATH = WEB / "frontend" / "index.html"
@@ -36,18 +37,6 @@ CSS_PATH = WEB / "frontend" / "css" / "style.css"
 JS_PATH = WEB / "frontend" / "js" / "annotate.js"
 FLOW_PATH = WEB / "frontend" / "js" / "annotateflow.js"
 TEST_PATH = WEB / "frontend" / "tests" / "test_annotate_flow.mjs"
-
-PASSED: list[str] = []
-FAILED: list[str] = []
-
-
-def check(name: str, ok: bool, detail: str = "") -> None:
-    if ok:
-        PASSED.append(name)
-        print(f"[PASS] {name}")
-    else:
-        FAILED.append(name)
-        print(f"[FAIL] {name} {detail}")
 
 
 def read(path: Path) -> str:
@@ -242,14 +231,7 @@ def main() -> int:
     # ------------------------------------------------------------------
     # 结果
     # ------------------------------------------------------------------
-    total = len(PASSED) + len(FAILED)
-    print(f"\n通过 {len(PASSED)} / {total} 项")
-    if FAILED:
-        print("失败项：")
-        for item in FAILED:
-            print(f"  - {item}")
-        return 1
-    return 0
+    return finish()
 
 
 if __name__ == "__main__":

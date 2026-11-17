@@ -30,22 +30,12 @@ from pathlib import Path
 BACKEND = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(BACKEND))
 
+from _harness import check, finish  # noqa: E402
+
 import config  # noqa: E402
 import infer  # noqa: E402
 import labels  # noqa: E402
 import models  # noqa: E402
-
-PASSED: list[str] = []
-FAILED: list[str] = []
-
-
-def check(name: str, ok: bool, detail: str = "") -> None:
-    if ok:
-        PASSED.append(name)
-        print(f"[PASS] {name}")
-    else:
-        FAILED.append(name)
-        print(f"[FAIL] {name} {detail}")
 
 
 def close(actual, expected, tol: float = 1e-5) -> bool:
@@ -569,14 +559,7 @@ def main() -> int:
 
         shutil.rmtree(tmp, ignore_errors=True)
 
-    print()
-    print(f"通过 {len(PASSED)} / {len(PASSED) + len(FAILED)}")
-    if FAILED:
-        print("失败项：")
-        for name in FAILED:
-            print(f"  - {name}")
-        return 1
-    return 0
+    return finish()
 
 
 if __name__ == "__main__":

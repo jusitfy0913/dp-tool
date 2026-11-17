@@ -29,41 +29,13 @@ from pathlib import Path
 BACKEND = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BACKEND))
 
+from _harness import case, check_eq, finish, require, run_cases  # noqa: E402
+
 import keyvault  # noqa: E402
 import autoexp_api  # noqa: E402
 
-PASSED: list[str] = []
-FAILED: list[tuple[str, str]] = []
 
 SECRET = "sk-dpapi-test-9f3a7c1e5b2d"
-
-
-def case(name: str):
-    def wrap(func):
-        def runner():
-            try:
-                func()
-            except Exception as exc:  # noqa: BLE001
-                FAILED.append((name, f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}"))
-                print(f"  [FAIL] {name}")
-            else:
-                PASSED.append(name)
-                print(f"  [ ok ] {name}")
-
-        runner.__name__ = func.__name__
-        return runner
-
-    return wrap
-
-
-def check(condition: bool, message: str) -> None:
-    if not condition:
-        raise AssertionError(message)
-
-
-def check_eq(actual, expected, label: str) -> None:
-    if actual != expected:
-        raise AssertionError(f"{label}：期望 {expected!r}，实际 {actual!r}")
 
 
 class TempStore:
@@ -120,9 +92,9 @@ def test_cipher_has_no_plaintext():
         print("        （跳过：本机没有 DPAPI）")
         return
     cipher = keyvault.protect(SECRET)
-    check(SECRET not in cipher, "base64 密文里出现了明文")
+    require(SECRET not in cipher, "base64 密文里出现了明文")
     raw = base64.b64decode(cipher)
-    check(SECRET.encode() not in raw, "二进制密文里出现了明文")
+    require(SECRET.encode() not in raw, "二进制密文里出现了明文")
 
 
 @case("keyvault：加解密往返一致")
@@ -139,7 +111,7 @@ def test_not_deterministic():
     if not keyvault.available():
         print("        （跳过：本机没有 DPAPI）")
         return
-    check(keyvault.protect(SECRET) != keyvault.protect(SECRET), "两次密文相同")
+    require(keyvault.protect(SECRET) != keyvault.protect(SECRET), "两次密文相同")
 
 
 @case("keyvault：非法输入一律抛 KeyVaultError，不抛裸异常")
@@ -166,7 +138,7 @@ def test_foreign_blob():
     try:
         keyvault.unprotect(foreign)
     except keyvault.KeyVaultError as exc:
-        check("重新输入" in exc.reason, f"提示应引导用户重输，实际：{exc.reason}")
+        require("重新输入" in exc.reason, f"提示应引导用户重输，实际：{exc.reason}")
         return
     raise AssertionError("外来密文不应被解开")
 
@@ -174,11 +146,11 @@ def test_foreign_blob():
 @case("keyvault：describe 不含任何密钥材料")
 def test_describe_has_no_secret():
     info = keyvault.describe()
-    check("available" in info, "缺少 available")
-    check("scheme" in info, "缺少 scheme")
+    require("available" in info, "缺少 available")
+    require("scheme" in info, "缺少 scheme")
     text = json.dumps(info, ensure_ascii=False)
-    check(SECRET not in text, "describe 泄漏了明文 Key")
-    check("sk-" not in text, "describe 出现了疑似 Key 的片段")
+    require(SECRET not in text, "describe 泄漏了明文 Key")
+    require("sk-" not in text, "describe 出现了疑似 Key 的片段")
 
 
 # ---------------------------------------------------------------------------
@@ -190,11 +162,11 @@ def test_disk_has_no_plaintext():
     with TempStore() as store:
         autoexp_api._write_store({"api_key": SECRET, "model": "deepseek-chat"})
         raw = store.read_text(encoding="utf-8")
-        check(SECRET not in raw, f"磁盘上出现了明文 Key：{raw[:200]}")
+        require(SECRET not in raw, f"磁盘上出现了明文 Key：{raw[:200]}")
         data = json.loads(raw)
         if keyvault.available():
-            check("api_key" not in data, "Windows 上不应再写明文 api_key 字段")
-            check(bool(data.get(keyvault.FIELD_CIPHERTEXT)), "缺少 api_key_dpapi 字段")
+            require("api_key" not in data, "Windows 上不应再写明文 api_key 字段")
+            require(bool(data.get(keyvault.FIELD_CIPHERTEXT)), "缺少 api_key_dpapi 字段")
             check_eq(data.get(keyvault.FIELD_SCHEME), "dpapi", "加密方式标记")
         else:
             check_eq(data.get(keyvault.FIELD_SCHEME), "plain", "非 Windows 应标 plain")
@@ -206,8 +178,8 @@ def test_read_decrypts():
         autoexp_api._write_store({"api_key": SECRET})
         store = autoexp_api._read_store()
         check_eq(store.get("api_key"), SECRET, "读出的 Key")
-        check(not store.get("_key_locked"), "不应被标记为解不开")
-        check(keyvault.FIELD_CIPHERTEXT not in store, "业务视图不该暴露密文字段")
+        require(not store.get("_key_locked"), "不应被标记为解不开")
+        require(keyvault.FIELD_CIPHERTEXT not in store, "业务视图不该暴露密文字段")
 
 
 @case("旧格式明文文件能读出来（向后兼容）")
@@ -227,9 +199,9 @@ def test_migration():
         if not keyvault.available():
             print("        （跳过断言：本机没有 DPAPI）")
             return
-        check(result["migrated"] is True, f"应完成迁移，实际：{result}")
+        require(result["migrated"] is True, f"应完成迁移，实际：{result}")
         raw = store.read_text(encoding="utf-8")
-        check(SECRET not in raw, "迁移后磁盘仍有明文")
+        require(SECRET not in raw, "迁移后磁盘仍有明文")
         check_eq(autoexp_api._read_store().get("api_key"), SECRET, "迁移后仍能读出原值")
         check_eq(autoexp_api._read_store().get("base_url"), "https://x", "其它字段不丢")
 
@@ -240,8 +212,8 @@ def test_migration_idempotent():
         autoexp_api._write_store({"api_key": SECRET})
         first = autoexp_api.migrate_key_store()
         second = autoexp_api.migrate_key_store()
-        check(first["migrated"] is False, f"第二次不该再迁移：{first}")
-        check(second["migrated"] is False, f"第三次不该再迁移：{second}")
+        require(first["migrated"] is False, f"第二次不该再迁移：{first}")
+        require(second["migrated"] is False, f"第三次不该再迁移：{second}")
 
 
 @case("换机场景：密文解不开时标记 key_locked，而不是当作没配")
@@ -286,7 +258,7 @@ def test_rewrite_clears_locked():
         check_eq(autoexp_api._read_store().get("_key_locked"), True, "初始应为 locked")
         autoexp_api._write_store({"api_key": "sk-new-key-1234"})
         check_eq(autoexp_api._read_store().get("api_key"), "sk-new-key-1234", "新 Key")
-        check(not autoexp_api._read_store().get("_key_locked"), "应清掉 locked 标记")
+        require(not autoexp_api._read_store().get("_key_locked"), "应清掉 locked 标记")
 
 
 @case("清空 Key：两个字段一起删，不留残骸")
@@ -295,8 +267,8 @@ def test_clear_removes_both():
         autoexp_api._write_store({"api_key": SECRET})
         autoexp_api._write_store({"model": "deepseek-chat"})
         data = json.loads(store.read_text(encoding="utf-8"))
-        check("api_key" not in data, "明文 api_key 应被删除")
-        check("api_key_dpapi" not in data, "密文字段应被删除")
+        require("api_key" not in data, "明文 api_key 应被删除")
+        require("api_key_dpapi" not in data, "密文字段应被删除")
         check_eq(data.get("model"), "deepseek-chat", "其它字段应保留")
 
 
@@ -318,9 +290,9 @@ def test_encrypt_failure_never_plaintext():
             autoexp_api._write_store({"api_key": SECRET})
         except OSError as exc:
             raised = exc
-        check(raised is not None, "加密失败时应抛 OSError 让接口返回 500")
-        check("明文" in str(raised), f"错误信息应说明避免了明文落盘：{raised}")
-        check(not store.exists(), "加密失败时不应留下任何文件")
+        require(raised is not None, "加密失败时应抛 OSError 让接口返回 500")
+        require("明文" in str(raised), f"错误信息应说明避免了明文落盘：{raised}")
+        require(not store.exists(), "加密失败时不应留下任何文件")
 
 
 @case("配置文件损坏：读成空配置，不抛异常")
@@ -334,14 +306,14 @@ def test_broken_json():
 @case("启动钩子确实调用了迁移（静态检查）")
 def test_startup_wired():
     app_py = (BACKEND / "app.py").read_text(encoding="utf-8")
-    check("migrate_key_store" in app_py, "app.py 的 lifespan 里应调用 autoexp_api.migrate_key_store")
+    require("migrate_key_store" in app_py, "app.py 的 lifespan 里应调用 autoexp_api.migrate_key_store")
 
 
 @case("Key 在 DPAPI 密文里不会随 AUTOEXP_LLM_CONFIG 漏进子进程配置")
 def test_llm_config_strips_cipher():
     llm_py = (BACKEND.parent.parent / "7-autoresearch-yolo" / "llm.py")
     text = llm_py.read_text(encoding="utf-8")
-    check("api_key_dpapi" in text, "llm.load_config 应剔除 api_key_dpapi，避免密文流进台账")
+    require("api_key_dpapi" in text, "llm.load_config 应剔除 api_key_dpapi，避免密文流进台账")
 
 
 # ---------------------------------------------------------------------------
@@ -354,23 +326,9 @@ def main() -> int:
     print(f"Python {sys.version.split()[0]}  os={os.name}  dpapi={keyvault.available()}")
     print()
 
-    tests = [obj for name, obj in sorted(globals().items()) if name.startswith("test_")]
-    for test in tests:
-        test()
+    run_cases(globals())
 
-    print()
-    print("=" * 60)
-    total = len(PASSED) + len(FAILED)
-    print(f"通过 {len(PASSED)} / {total}")
-    if FAILED:
-        print()
-        for name, detail in FAILED:
-            print(f"[FAIL] {name}")
-            print(detail)
-            print("-" * 60)
-        return 1
-    print("全部通过")
-    return 0
+    return finish()
 
 
 if __name__ == "__main__":

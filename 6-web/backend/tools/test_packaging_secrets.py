@@ -34,6 +34,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from _harness import FAILED, PASSED, check, finish  # noqa: E402
 
 BACKEND = Path(__file__).resolve().parents[1]
 REPO = BACKEND.parents[1]
@@ -42,18 +43,6 @@ SCANNER = PACKAGING / "secret_scan.ps1"
 WEB_SCRIPT = PACKAGING / "package_web_user.ps1"
 DEMO_SCRIPT = PACKAGING / "package_demo_models.ps1"
 RUNTIME_KEY = REPO / "6-web" / "runtime" / "autoexp_llm.json"
-
-PASSED: list[str] = []
-FAILED: list[str] = []
-
-
-def check(name: str, ok: bool, detail: str = "") -> None:
-    if ok:
-        PASSED.append(name)
-        print(f"[PASS] {name}")
-    else:
-        FAILED.append(name)
-        print(f"[FAIL] {name} {detail}")
 
 
 def powershell() -> str:
@@ -237,12 +226,7 @@ def main() -> int:
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 
-    print(f"\n通过 {len(PASSED)} 项，失败 {len(FAILED)} 项。")
-    if FAILED:
-        for name in FAILED:
-            print(f"  未通过：{name}")
-        return 1
-    return 0
+    return finish()
 
 
 if __name__ == "__main__":

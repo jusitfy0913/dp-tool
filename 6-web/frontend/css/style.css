@@ -125,16 +125,124 @@
   --scrim: rgba(3, 6, 10, .78);
   --shadow-modal: 0 24px 64px rgba(0, 0, 0, .6);
 
+  /* ---- 1.12 层次：阴影梯度（越靠后越"高"）
+     单独抽出来的理由和派生色一样：所有浮起元素共用同一条高度语言，
+     改一次就能让卡片、下拉、弹窗的层次一起对齐。 ---- */
+  --shadow-1: 0 1px 2px rgba(0, 0, 0, .35);
+  --shadow-2: 0 4px 14px rgba(0, 0, 0, .42);
+  --shadow-3: 0 12px 34px rgba(0, 0, 0, .50);
+
+  /* ---- 1.13 图像舞台：判图/画布/摄像头专用底色。
+     它必须与 --bg-void 分开：日志和文件列表在浅色主题下要跟着变亮，
+     而判图区必须保持深底——白底会让低对比度缺陷和暗色框线一起消失。 ---- */
+  --stage: #05080b;
+
+  /* ---- 1.14 顶栏玻璃底与焦点环 ---- */
+  --chrome-bg: rgba(13, 20, 28, .82);
+  --focus-ring: 0 0 0 3px var(--cyan-a15);
+
+  /* ---- 1.15 表格斑马纹：用极低不透明度的白，而不是再造一个灰阶，
+     这样它在任何一层表面色上都是"抬高一格"而不是"换了个颜色"。 ---- */
+  --row-alt: rgba(255, 255, 255, .022);
+
   /* ---- 1.11 查看器尺寸（由 viewer.js 按需覆盖） ---- */
   --viewer-min: 300px;
   --viewer-aspect: 4 / 3;
   --viewer-cols: 3;
 }
 
+/* ---------------------------------------------------------------------------
+ * 1.16 浅色主题
+ *
+ * 只覆盖三件事：语义色、结构性颜色、效果强度。尺度组（间距/字号/圆角）
+ * 与字体族两套主题共用，所以这里一个都不写——避免"换个主题排版跟着变"。
+ *
+ * 选择器用 html[data-theme="light"]（0,1,1）而不是 :root（0,1,0），
+ * 权重天然高一级，不需要 !important。
+ *
+ * 状态色是重新推导的，不是简单提亮：深色主题的 --ok #34d399 对白底只有约
+ * 1.9:1，直接沿用会让"成功"提示在白底上几乎看不见。这一组新值全部按
+ * "对 surface-1 / surface-2 均 ≥ 4.5:1" 反算，由 tests/test_contrast.mjs 逐条核。
+ * ------------------------------------------------------------------------- */
+html[data-theme="light"] {
+  /* 背景与表面：白卡 + 极浅灰页面底，靠 1% 的明度差而不是描边来分层 */
+  --bg-void: #eef2f7;
+  --bg: #f4f7fa;
+  --surface-1: #ffffff;
+  --surface-2: #f1f5f9;
+  --surface-3: #e6ecf3;
+
+  --line: #d6dfe8;
+  --line-strong: #b3c2d1;
+
+  --text: #16202b;
+  --text-dim: #55657a;
+
+  /* 强调与状态：全部深一档，保证在浅底上仍是"文字色"而不是"光" */
+  --cyan: #0e7490;
+  --teal: #0f766e;
+  --magenta: #a21caf;
+  --amber: #b45309;
+  --danger: #b91c1c;
+  --ok: #047857;
+
+  --ink-on-accent: #f8fafc;      /* 浅色主题主按钮文字翻白：对 cyan 5.1:1、teal 5.2:1 */
+  --text-faint: #5f7085;         /* 对 surface-2 约 4.7:1，仍弱于 text-dim 的 5.4:1 */
+  --text-log: #26313d;           /* 对浅色日志底约 11.8:1 */
+
+  /* 半透明变体：浅底下同样的 alpha 会显得更淡，统一提一档保证"看得见" */
+  --cyan-a10: rgba(14, 116, 144, .08);
+  --cyan-a12: rgba(14, 116, 144, .12);
+  --cyan-a14: rgba(14, 116, 144, .14);
+  --cyan-a15: rgba(14, 116, 144, .16);
+  --cyan-a40: rgba(14, 116, 144, .34);
+  --cyan-a55: rgba(14, 116, 144, .48);
+
+  --ok-a12: rgba(4, 120, 87, .12);
+  --ok-a14: rgba(4, 120, 87, .14);
+  --ok-a40: rgba(4, 120, 87, .34);
+
+  --danger-a12: rgba(185, 28, 28, .10);
+  --danger-a40: rgba(185, 28, 28, .32);
+  --danger-a45: rgba(185, 28, 28, .40);
+
+  --amber-a12: rgba(180, 83, 9, .12);
+  --amber-a40: rgba(180, 83, 9, .34);
+
+  --muted-a16: rgba(85, 101, 122, .16);
+
+  --amber-deep: #92400e;
+  --danger-deep: #991b1b;
+
+  /* 结构性颜色 */
+  --topbar-top: #ffffff;
+  --scan-line: rgba(22, 32, 43, .5);
+  --scrim: rgba(15, 23, 32, .42);
+  --shadow-modal: 0 24px 64px rgba(15, 23, 32, .22);
+
+  --shadow-1: 0 1px 2px rgba(15, 23, 32, .07);
+  --shadow-2: 0 4px 14px rgba(15, 23, 32, .09);
+  --shadow-3: 0 12px 34px rgba(15, 23, 32, .13);
+
+  --stage: #1a232e;
+  --chrome-bg: rgba(255, 255, 255, .84);
+  --focus-ring: 0 0 0 3px rgba(14, 116, 144, .22);
+
+  --row-alt: rgba(15, 23, 32, .025);
+
+  /* 效果：浅底上没有可"发光"的余量，把发光退成柔和投影，强度减半 */
+  --glow-sm: 0 1px 3px rgba(15, 23, 32, .10);
+  --glow-md: 0 2px 8px rgba(14, 116, 144, .22);
+  --grid-opacity: .035;
+  --scan-opacity: .015;
+}
+
 /* 可读性护栏：系统偏好为减少动效时，把效果组整体归零。
-   语义色与尺度组不受影响 —— 这是把效果单独抽成一组的原因。 */
+   语义色与尺度组不受影响 —— 这是把效果单独抽成一组的原因。
+   选择器写成 html:root（0,1,1）：与上面的主题块同权重，靠"写在后面"取胜，
+   否则浅色主题会把自己的 --glow / --dur 又盖回来。 */
 @media (prefers-reduced-motion: reduce) {
-  :root {
+  html:root {
     --glow-sm: none;
     --glow-md: none;
     --grid-opacity: 0;
@@ -167,7 +275,12 @@ html.reduced-motion {
    这类只有在真机跑起来才发现的坑（例如 .viewer-empty 的 display:grid）。 */
 [hidden] { display: none !important; }
 
-html, body { height: 100%; }
+/* html 给一个确定高度，body 只要求"至少满屏"。
+   这里不能给 body 写 height: 100%：那会把 body 的高度钉死在首屏，
+   而 .chrome 是 sticky —— sticky 的活动范围被限制在包含块（body）内，
+   body 只有一屏高时，顶栏滚过这一屏就跟着滚走了（表现为"吸顶失效"）。 */
+html { height: 100%; }
+body { min-height: 100%; }
 
 body {
   margin: 0;
@@ -212,12 +325,58 @@ body::after {
   );
 }
 
+/* 选区：跟主色走。浏览器默认的蓝在深色底上过亮，在浅色底上又偏灰。 */
+::selection {
+  background: var(--cyan-a40);
+  color: var(--text);
+}
+
+/* 滚动条：两套主题共用一套尺寸，只有颜色跟令牌变。
+   细轨道 + 圆头滑块，嵌在内容区里不会抢走视觉重量（日志、表格、侧栏都会用到）。 */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--line-strong) transparent;
+}
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+  /* 用透明边框 + background-clip 做内缩，滑块才不会是根顶到边的粗条 */
+  border: 3px solid transparent;
+  border-radius: 999px;
+  background: var(--line-strong);
+  background-clip: content-box;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--text-faint);
+  background-clip: content-box;
+}
+::-webkit-scrollbar-corner { background: transparent; }
+
 /* ---------------------------------------------------------------------------
  * 3. 骨架
  * ------------------------------------------------------------------------- */
 
 /* 所有内容容器抬到装饰之上，保证网格与扫描线不压在图像上 */
 .topbar, .tabs, main { position: relative; z-index: 1; }
+
+/* 顶栏 + 页签的整体容器：吸顶并做玻璃底。
+   为什么必须包一层而不是分别 sticky：
+   两块的贴合高度会随顶栏换行（窄屏 .topbar 是 flex-wrap）而变，
+   写死 top 值一定会在某一档宽度上错位；包一层就只需要 top: 0。
+   玻璃底用 backdrop-filter 而不是半透明纯色，行列滚动时下面的内容会柔和透出来。 */
+.chrome {
+  position: sticky;
+  top: 0;
+  z-index: 40;
+  background: var(--chrome-bg);
+  -webkit-backdrop-filter: blur(12px) saturate(1.25);
+  backdrop-filter: blur(12px) saturate(1.25);
+}
+/* 不支持 backdrop-filter 的浏览器（旧 WebView2 / 关了硬件加速）退回不透明底，
+   否则会变成「半透明但没模糊」，滚动时文字互相重叠反而更难读。 */
+@supports not ((backdrop-filter: blur(4px)) or (-webkit-backdrop-filter: blur(4px))) {
+  .chrome { background: linear-gradient(180deg, var(--topbar-top), var(--bg)); }
+}
 
 .topbar {
   display: flex;
@@ -226,7 +385,8 @@ body::after {
   gap: var(--sp-4);
   padding: var(--sp-3) var(--sp-5);
   border-bottom: 1px solid var(--line);
-  background: linear-gradient(180deg, var(--topbar-top), var(--bg));
+  /* 底色交给 .chrome：这里再铺一层渐变会把玻璃效果完全遮住 */
+  background: transparent;
 }
 
 .brand { display: flex; align-items: center; gap: var(--sp-3); }
@@ -365,11 +525,39 @@ body::after {
 }
 .runs-history-btn:hover { border-color: var(--line); color: var(--text); }
 
+/* 主题切换：只显示"点一下会变成什么"——深色时显示太阳，浅色时显示月亮。
+   两个图标都写在 DOM 里，由 [data-theme] 控制显隐，JS 不需要换 innerHTML
+   （换 innerHTML 会丢掉焦点，键盘用户连点两次就跳到页首了）。 */
+.theme-toggle {
+  display: grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+}
+.theme-toggle:hover:not(:disabled) {
+  border-color: var(--line);
+  color: var(--text);
+  background: var(--surface-2);
+}
+.theme-toggle svg { display: block; width: 16px; height: 16px; }
+/* 图标与主题的对应：深色主题显示太阳（点=切到浅色），浅色主题显示月亮。
+   这条别凭直觉改反——默认分支（没有 data-theme）必须落在"深色"这一侧。 */
+.theme-toggle .icon-moon { display: none; }
+html[data-theme="light"] .theme-toggle .icon-sun { display: none; }
+html[data-theme="light"] .theme-toggle .icon-moon { display: block; }
+
 /* 历史面板：从顶栏右下展开的浮层。position: fixed 而不是 absolute，
    因为 .topbar 有自己的层叠上下文，absolute 会被日志区盖住。 */
 .runs-history {
   position: fixed;
-  top: 52px;
+  /* 吸顶之后顶栏始终在视口顶部，浮层要落在它下面而不是原来按滚动位置算的 52px */
+  top: 74px;
   right: var(--sp-3);
   z-index: 60;
   width: min(560px, calc(100vw - 32px));
@@ -539,8 +727,18 @@ main { padding: 0 var(--sp-5) var(--sp-6); }
   background: var(--surface-1);
   border: 1px solid var(--line);
   border-radius: var(--radius-md);
-  padding: var(--sp-4);
+  /* 14px 而不是 16px：卡片内边距省下的 2px 会累加到整列表单高度上 */
+  padding: 14px;
   margin-top: var(--sp-3);
+  /* 静息只给一层最浅的阴影：卡片数量多，每张都重投影会让整页发灰 */
+  box-shadow: var(--shadow-1);
+  transition: border-color var(--dur-base) var(--ease),
+              box-shadow var(--dur-base) var(--ease);
+}
+/* 悬停只"抬一格"：边框提亮 + 阴影加深。不做位移，避免整列卡片跟着鼠标抖。 */
+.card:hover {
+  border-color: var(--line-strong);
+  box-shadow: var(--shadow-2);
 }
 .card::before,
 .card::after {
@@ -575,7 +773,7 @@ main { padding: 0 var(--sp-5) var(--sp-6); }
   display: flex;
   align-items: center;
   gap: var(--sp-2);
-  margin: 0 0 var(--sp-4);
+  margin: 0 0 var(--sp-3);
   font-size: var(--fs-md);
   font-weight: 650;
   letter-spacing: .06em;
@@ -598,18 +796,20 @@ main { padding: 0 var(--sp-5) var(--sp-6); }
 /* ---- 4.1 表单 ---- */
 label {
   display: block;
-  margin-bottom: var(--sp-3);
+  /* 10px 而不是 12px：训练页有 40+ 个字段，每格省 2px 就能少滚一屏 */
+  margin-bottom: 10px;
   color: var(--text-dim);
   font-size: var(--fs-sm);
 }
 
 input[type=text],
+input[type=password],
 input[type=number],
 select,
 textarea {
   width: 100%;
   margin-top: 5px;
-  padding: 9px 11px;
+  padding: 8px 11px;
   background: var(--surface-2);
   border: 1px solid var(--line);
   border-radius: var(--radius-sm);
@@ -620,6 +820,7 @@ textarea {
 }
 
 input[type=text]:hover,
+input[type=password]:hover,
 input[type=number]:hover,
 select:hover { border-color: var(--line-strong); }
 
@@ -628,7 +829,8 @@ select:focus,
 textarea:focus {
   outline: none;
   border-color: var(--cyan);
-  box-shadow: 0 0 0 3px var(--cyan-a15);
+  /* 焦点环走令牌：浅色主题下自动换成更收敛的青色投影 */
+  box-shadow: var(--focus-ring);
 }
 
 input::placeholder { color: var(--text-faint); }
@@ -705,6 +907,40 @@ input[type=range]:focus-visible { outline: 2px solid var(--cyan); outline-offset
 }
 .group:first-of-type { border-top: none; }
 
+/* 表单分区（v1.43）：训练页 40+ 字段必须在"不读字"的情况下也能跳读。
+   靠三条线建立层级：分区之间实线 + 分区标题 + 标题右侧的延伸细线。
+   与 .group 的虚线是刻意的两层：虚线分"同一件事的不同组"，
+   实线分"不同的事"（任务 / 数据 / 超参 / 产出表）。
+   加分区只包 div，不改任何 id，所以各页 JS 完全不受影响。 */
+.form-section {
+  padding-top: var(--sp-3);
+  margin-top: var(--sp-3);
+  border-top: 1px solid var(--line);
+}
+.form-section:first-of-type {
+  padding-top: 0;
+  margin-top: 0;
+  border-top: none;
+}
+.form-section > h3 {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  margin: 0 0 var(--sp-2);
+  font-size: var(--fs-2xs);
+  font-weight: 650;
+  letter-spacing: .1em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+/* 标题右侧的延伸细线：把标题从"另一行文字"变成"一段的开始" */
+.form-section > h3::after {
+  content: "";
+  flex: 1 1 auto;
+  height: 1px;
+  background: var(--line);
+}
+
 /* ---- 4.2 按钮 ---- */
 button {
   padding: 9px 18px;
@@ -716,12 +952,15 @@ button {
   font-size: var(--fs-md);
   font-family: inherit;
   transition: border-color var(--dur-fast) var(--ease), background var(--dur-fast) var(--ease),
-              box-shadow var(--dur-fast) var(--ease);
+              box-shadow var(--dur-fast) var(--ease), transform 80ms var(--ease);
 }
 
 button:hover:not(:disabled) { border-color: var(--cyan); background: var(--surface-3); }
 
-button:focus-visible { outline: 2px solid var(--cyan); outline-offset: 2px; }
+/* 按下下沉 1px：比"变个颜色"更接近真实按键的反馈，也不再需要额外的按下配色 */
+button:active:not(:disabled) { transform: translateY(1px); }
+
+button:focus-visible { outline: 2px solid var(--cyan); outline-offset: 2px; box-shadow: var(--focus-ring); }
 
 button:disabled { opacity: .4; cursor: not-allowed; }
 /* 正在等系统选择窗。不能用 disabled：disabled 会变灰，而且点不了「取消」。 */
@@ -732,9 +971,11 @@ button.primary {
   color: var(--ink-on-accent);
   font-weight: 700;
   border-color: transparent;
+  /* 顶部一条内高光：让渐变面看起来是"凸起的一块"，而不是贴纸 */
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, .28);
 }
 button.primary:hover:not(:disabled) {
-  box-shadow: var(--glow-sm);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, .28), var(--glow-sm);
   filter: brightness(1.06);
 }
 
@@ -765,7 +1006,7 @@ button.danger:hover:not(:disabled) { background: var(--danger-a12); border-color
 .log-actions button.copied {
   color: var(--ok);
   border-color: var(--ok);
-  background: rgba(52, 211, 153, .12);
+  background: var(--ok-a12);
 }
 
 .hint {
@@ -775,6 +1016,47 @@ button.danger:hover:not(:disabled) { background: var(--danger-a12); border-color
   min-height: 18px;
   margin: var(--sp-2) 0 0;
 }
+/* 黄色说明默认不占位置。鼠标放在对应词条上，或用键盘聚焦到该项，才展开。
+   报错（.hint.bad）和脚本写进去的结果行不加 tip，仍然直接显示。 */
+p.hint.tip {
+  display: none;
+  min-height: 0;
+  margin-top: 6px;
+}
+p.hint.tip.is-open {
+  display: block !important;
+}
+.has-tip { cursor: help; }
+.has-tip input,
+.has-tip select,
+.has-tip textarea,
+.has-tip button { cursor: auto; }
+label.has-tip::before,
+summary.has-tip::after,
+.tip-mark {
+  display: inline-grid;
+  place-items: center;
+  width: 14px;
+  height: 14px;
+  border: 1px solid var(--amber-a40);
+  border-radius: 50%;
+  color: var(--amber);
+  font-size: 10px;
+  font-weight: 650;
+  line-height: 1;
+  letter-spacing: 0;
+  text-transform: none;
+}
+label.has-tip::before {
+  content: "?";
+  margin-right: 6px;
+  vertical-align: 1px;
+}
+summary.has-tip::after {
+  content: "?";
+  margin-left: 6px;
+}
+.tip-mark { margin-left: 6px; }
 /* 探测到危险情况（如未转置 YOLO）时用红色，和普通提醒区分开 */
 .hint.bad { color: var(--danger); }
 .hint.ok { color: var(--ok); }
@@ -820,6 +1102,17 @@ details:not([open]) > :not(summary) {
   border: 1px solid var(--line);
   border-radius: var(--radius-sm);
   background: var(--surface-2);
+  transition: transform var(--dur-base) var(--ease),
+              box-shadow var(--dur-base) var(--ease),
+              border-color var(--dur-base) var(--ease);
+}
+/* 计数格、指标卡、KPI 卡共用同一条「悬停抬 1px」的手感 */
+.stat:hover,
+.metric:hover,
+.kpi:hover {
+  transform: translateY(-1px);
+  border-color: var(--line-strong);
+  box-shadow: var(--shadow-1);
 }
 .stat-label { color: var(--text-dim); font-size: var(--fs-2xs); letter-spacing: .04em; }
 .stat b { color: var(--cyan); font-size: var(--fs-lg); font-weight: 600; font-family: var(--font-mono); }
@@ -886,9 +1179,9 @@ details:not([open]) > :not(summary) {
 .resume-active {
   margin: var(--sp-2) 0 0;
   padding: var(--sp-2) var(--sp-3);
-  border: 1px solid var(--amber-a40, #6b5220);
+  border: 1px solid var(--amber-a40);
   border-radius: var(--radius-sm);
-  background: var(--amber-a12, rgba(251, 191, 36, .12));
+  background: var(--amber-a12);
   color: var(--amber);
   font-size: var(--fs-xs);
   line-height: 1.55;
@@ -957,6 +1250,9 @@ details:not([open]) > :not(summary) {
   border-radius: var(--radius-sm);
   font-size: var(--fs-xs);
   color: var(--text-dim);
+  transition: transform var(--dur-base) var(--ease),
+              box-shadow var(--dur-base) var(--ease),
+              border-color var(--dur-base) var(--ease);
 }
 .metric b {
   color: var(--cyan);
@@ -978,6 +1274,9 @@ details:not([open]) > :not(summary) {
   border: 1px solid var(--line);
   border-left: 2px solid var(--cyan);
   border-radius: var(--radius-sm);
+  transition: transform var(--dur-base) var(--ease),
+              box-shadow var(--dur-base) var(--ease),
+              border-color var(--dur-base) var(--ease);
 }
 .kpi-label {
   display: block;
@@ -1005,6 +1304,8 @@ details:not([open]) > :not(summary) {
   margin-bottom: var(--sp-3);
 }
 .bar {
+  position: relative;
+  overflow: hidden;
   height: 100%;
   width: 0;
   background: linear-gradient(90deg, var(--cyan), var(--teal));
@@ -1100,6 +1401,22 @@ details:not([open]) > :not(summary) {
   word-break: break-all;
   color: var(--text-log); /* 对 --bg-void 约 9.9:1 */
 }
+/* 空日志占位：:empty 只在真的没有任何子节点时命中，
+   JS 第一次写入日志就会自动消失，不需要额外的显隐逻辑与状态变量。
+   左对齐而不是居中：日志是逐行追加的，居中的提示语会突然"跳"到左上角。 */
+#logBox:empty::before,
+#exportLog:empty::before {
+  content: "运行日志会显示在这里。点「开始训练」或「开始构建」后逐行输出。";
+  color: var(--text-faint);
+  font-size: var(--fs-xs);
+}
+/* 推理指标条同理：没有结果时给一句"下一步做什么"，而不是留一条空白 */
+#inferMetrics:empty::before {
+  content: "还没有推理结果。填好引擎与图片后点「开始推理」。";
+  color: var(--text-faint);
+  font-size: var(--fs-xs);
+}
+
 /* 日志区禁用闪烁/脉冲类动效：长时间盯屏会疲劳，也会掩盖真正的错误行 */
 .log .err { color: var(--danger); }
 .log .warn { color: var(--amber); }
@@ -1127,7 +1444,7 @@ table.data-table td.ae-cell-change {
 .fp-tag {
   display: inline-block;
   margin-top: 2px;
-  font-family: var(--mono, monospace);
+  font-family: var(--font-mono);
   font-size: 0.78em;
   letter-spacing: 0.02em;
   color: var(--text-dim);
@@ -1168,14 +1485,30 @@ table.env td:first-child { width: 250px; color: var(--text); }
 .data-table th[aria-sort="ascending"]::after { content: " ▲"; color: var(--cyan); }
 .data-table th[aria-sort="descending"]::after { content: " ▼"; color: var(--cyan); }
 .data-table td {
-  padding: 6px 10px;
+  padding: 7px 10px;
   border-bottom: 1px solid var(--line);
   color: var(--text);
 }
 .data-table td.num { text-align: right; color: var(--text-dim); }
 .data-table tbody tr { cursor: default; }
-.data-table tbody tr:hover { background: var(--surface-2); }
+/* 斑马纹：极淡的一层，作用是让视线在长行里不串行，而不是"换个颜色" */
+.data-table tbody tr:nth-child(even) { background: var(--row-alt); }
+.data-table tbody tr:hover {
+  background: var(--surface-2);
+  box-shadow: inset 2px 0 0 var(--cyan-a40);
+}
 .data-table tbody tr.selected { background: var(--cyan-a10); box-shadow: inset 2px 0 0 var(--cyan); }
+
+/* 空数据行：JS 用 td[colspan] 占满整行并写一句提示，这里统一居中弱化，
+   不再需要每个表单独调样式（串联记录、批次结果、OCR 结果都走这条）。 */
+.data-table td[colspan],
+.data-table .empty-row {
+  padding: var(--sp-4) var(--sp-3);
+  color: var(--text-dim);
+  font-size: var(--fs-xs);
+  text-align: center;
+  background: transparent;
+}
 
 /* 验证报告：混淆矩阵格子居中，判对的那条斜线用浅色底，方便扫一眼 */
 .conf-matrix { width: auto; margin: 8px 0 14px; }
@@ -1512,7 +1845,8 @@ code {
   isolation: isolate;
   overflow: hidden;
   aspect-ratio: var(--viewer-aspect);
-  background: var(--bg-void);
+  /* 判图底色走 --stage：浅色主题下它仍然是深底，白底会把低对比度缺陷吃掉 */
+  background: var(--stage);
   cursor: grab;
   touch-action: none;
   user-select: none;
@@ -1619,7 +1953,7 @@ code {
   opacity: 0;
   transform: translate(-50%, -8px);
   pointer-events: none;
-  transition: opacity 160ms ease, transform 160ms ease;
+  transition: opacity var(--dur-base) var(--ease), transform var(--dur-base) var(--ease);
   word-break: break-all;
 }
 .path-toast.show { opacity: 1; transform: translate(-50%, 0); }
@@ -2301,7 +2635,7 @@ textarea.is-bundle {
 .anno-boxtable tbody tr { cursor: pointer; }
 .anno-boxtable tbody tr:hover { background: var(--surface-3); }
 .anno-boxtable tbody tr.active {
-  background: rgba(34, 211, 238, 0.16);
+  background: var(--cyan-a14);
   box-shadow: inset 3px 0 0 var(--cyan);
 }
 .anno-boxtable .empty {
@@ -2333,7 +2667,7 @@ textarea.is-bundle {
   box-shadow: inset 2px 0 0 var(--cyan);
 }
 .anno-imagelist li.is-unlabeled .meta {
-  color: #f5c16c;
+  color: var(--amber);
 }
 .anno-classlist li.is-current {
   box-shadow: inset 2px 0 0 var(--cyan);
@@ -2428,7 +2762,8 @@ textarea.is-bundle {
   height: 12px;
   flex: 0 0 auto;
   border-radius: 3px;
-  border: 1px solid rgba(255, 255, 255, .28);
+  /* 描边用线条令牌：浅色主题下白色描边会完全看不见 */
+  border: 1px solid var(--line-strong);
 }
 
 /* ---- 草稿置信度分档 ----
@@ -2612,7 +2947,7 @@ textarea.is-bundle {
   min-height: 420px;
   border: 1px solid var(--line);
   border-radius: var(--radius-sm);
-  background: var(--bg-void);
+  background: var(--stage);
   overflow: hidden;
   /* 隔离层：装饰性网格与扫描线不得盖到画布内容上 */
   isolation: isolate;
@@ -2631,7 +2966,7 @@ textarea.is-bundle {
   bottom: var(--sp-2);
   border: 1px solid var(--line-strong);
   border-radius: var(--radius-sm);
-  background: var(--bg-void);
+  background: var(--stage);
   cursor: crosshair;
   z-index: 2;
   opacity: .92;
@@ -2882,7 +3217,7 @@ textarea.is-bundle {
    否则两者会因为默认 inline 基线差出几像素，框就会整体偏移。 */
 .camera-wrap {
   position: relative;
-  background: var(--bg-void);
+  background: var(--stage);
   border: 1px solid var(--line);
   border-radius: var(--radius-md);
   overflow: hidden;
@@ -3087,3 +3422,211 @@ textarea.is-bundle {
   color: var(--text-dim);
   overflow-wrap: anywhere;
 }
+
+/* ===========================================================================
+   8. 动效层
+   ---------------------------------------------------------------------------
+   全站只有这一个地方定义 @keyframes，理由是「可归零」：
+   用户开「减少动效」时要能一次把它们全部停掉，如果散落在各节里，
+   很容易漏掉一条 infinite 动画变成空转（看起来像卡死）。
+
+   原则（按这个顺序挑，能省就省）：
+     1. 能用 transition 表达的，不写 keyframe
+     2. 只动 transform / opacity，不动 width / height / top（不触发重排）
+     3. 一次性入场动画不写 fill-mode，否则 transform 会留在计算样式上，
+        变成 position:fixed 子元素的包含块（弹窗会错位）
+     4. 不脉冲、不闪烁承载信息的元素（日志正文、数值、判读结果）
+   ========================================================================== */
+
+/* 页签切换：内容整体淡入并上移 4px。
+   只作用在 .panel 上；面板里没有 position:fixed 的子元素，位移不会影响弹窗定位。 */
+@keyframes tfFadeUp {
+  from { opacity: 0; transform: translateY(4px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.panel.active { animation: tfFadeUp var(--dur-base) var(--ease); }
+
+/* 运行中指示灯：呼吸。scale 只动合成层，不重排。 */
+@keyframes tfPulse {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: .45; }
+}
+.run-dot { animation: tfPulse 1.8s var(--ease) infinite; }
+.dot.ok  { animation: tfPulse 2.4s var(--ease) infinite; }
+
+/* 进度流光：表示「还在动」。只在 1%~99% 之间挂上（由 setProgressBar 控制 is-live），
+   0% 还没开始、100% 已经结束，都不该继续呼吸。 */
+@keyframes tfShimmer {
+  from { background-position: 100% 0; }
+  to   { background-position: -100% 0; }
+}
+.progress.is-live .bar::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(100deg, transparent 20%, rgba(255, 255, 255, .38) 50%, transparent 80%);
+  background-size: 200% 100%;
+  animation: tfShimmer 1.4s linear infinite;
+}
+.progress.is-live { position: relative; }
+
+/* 加载骨架：环境探测期间，把「检测环境…」这行字本身做成微光扫过的占位。
+   比转圈更安静，也不会让顶栏高度跳动。 */
+@keyframes tfSkeleton {
+  0%   { background-position: 140% 0; }
+  100% { background-position: -40% 0; }
+}
+.status.is-pending #envText {
+  color: transparent;
+  background: linear-gradient(90deg,
+    var(--text-faint) 0%, var(--text-dim) 35%, var(--text-faint) 70%);
+  background-size: 220% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  animation: tfSkeleton 1.5s linear infinite;
+}
+/* 同一个类顺手把状态灯变成转圈：点状灯在"未知"状态下其实没有语义 */
+.status.is-pending .dot {
+  background: transparent;
+  box-shadow: none;
+  border: 2px solid var(--line-strong);
+  border-top-color: var(--cyan);
+  animation: tfSpin 900ms linear infinite;
+}
+@keyframes tfSpin {
+  to { transform: rotate(360deg); }
+}
+
+/* 复制反馈：按钮本身绿闪一次，不弹 toast 打断训练观察。
+   动画结束后由 JS 移除 .copied，颜色自然回落到常态。 */
+@keyframes tfFlash {
+  0%   { background: var(--ok-a40); }
+  100% { background: var(--ok-a12); }
+}
+.log-actions button.copied { animation: tfFlash 420ms var(--ease); }
+
+/* 路径提示条：入场用 keyframe（有位移），出场仍走 transition（只淡出）。
+   两者不冲突：只在 .show 上加动画，移除类时动画消失、transition 接管。 */
+@keyframes tfToast {
+  from { opacity: 0; transform: translate(-50%, -10px) scale(.98); }
+  to   { opacity: 1; transform: translate(-50%, 0) scale(1); }
+}
+.path-toast.show { animation: tfToast var(--dur-base) var(--ease); }
+
+/* 弹窗入场：轻微上浮 + 缩放。用 :not([hidden]) 是因为 .modal 的显隐靠 hidden 属性，
+   没有它动画会在开页时就播一遍（此刻元素还没显示，播了也看不到）。 */
+@keyframes tfRise {
+  from { opacity: 0; transform: translateY(8px) scale(.985); }
+  to   { opacity: 1; transform: translateY(0) scale(1); }
+}
+.modal:not(.hidden) .modal-box { animation: tfRise var(--dur-base) var(--ease); }
+
+/* 效果归零：两个入口（系统偏好 / ?reduced-motion=1）都要停掉动画。
+   只把 --dur-* 归零是不够的——infinite 动画的时长虽然为 0，
+   部分浏览器仍会按帧回调，表现为元素闪一下再复原。
+   用 !important 是为了压过各处 (0,2,0) 级别的动画声明。 */
+@media (prefers-reduced-motion: reduce) {
+  html:root * { animation: none !important; }
+}
+html.reduced-motion * { animation: none !important; }
+
+/* ============================================================================
+ * 进入软件：密码 + 预热等待
+ *
+ * 密码通过之前 body 没有 .app-ready，顶栏和主内容不显示，避免表单先闪出来。
+ * 遮罩自己盖住整屏。同一次打开里刷新时，head 里的小脚本会给 html 加上
+ * .boot-resume，这时即使遮罩还标着 is-login，也先画出等待步，不闪密码框。
+ * ========================================================================== */
+/* 密码通过之前不让人看到、点到主界面。
+   用 visibility 而不是 display:none：等待的同时各页会去量宽度，
+   display:none 会把宽度量成 0，分栏和画布会初始化坏。
+   遮罩是不透明的，盖在上面，用户仍然只看得到登录或等待。 */
+body:not(.app-ready) .chrome,
+body:not(.app-ready) main,
+body:not(.app-ready) .modal {
+  visibility: hidden;
+}
+
+.boot-gate {
+  position: fixed;
+  inset: 0;
+  z-index: 80;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--sp-5);
+  background:
+    radial-gradient(ellipse at 50% 0%, var(--cyan-dim), transparent 55%),
+    var(--bg);
+}
+
+body.app-ready .boot-gate { display: none; }
+
+.boot-gate.is-login #bootWait { display: none; }
+.boot-gate.is-wait #bootLogin { display: none; }
+
+/* 刷新后直接等预热：盖过上面的 is-login 规则（多一个 html 选择器）。 */
+html.boot-resume .boot-gate.is-login #bootLogin { display: none; }
+html.boot-resume .boot-gate.is-login #bootWait { display: block; }
+
+.boot-theme {
+  position: absolute;
+  top: var(--sp-4);
+  right: var(--sp-4);
+}
+
+.boot-card {
+  width: min(420px, 100%);
+  background: var(--surface-1);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  padding: var(--sp-5);
+  box-shadow: var(--shadow-3);
+}
+
+.boot-card h1 {
+  margin: 0 0 var(--sp-2);
+  font-size: 18px;
+}
+
+.boot-card .sub {
+  margin: 0 0 var(--sp-4);
+  color: var(--text-dim);
+  line-height: 1.7;
+}
+
+.boot-card button.primary,
+#bootEnter,
+#bootLogin button {
+  width: 100%;
+  margin-top: var(--sp-2);
+}
+
+.boot-msg {
+  min-height: 1.4em;
+  margin: var(--sp-3) 0 0;
+  font-size: var(--fs-sm);
+  color: var(--danger);
+}
+
+.boot-msg.is-ok { color: var(--ok); }
+
+.boot-bar {
+  height: 6px;
+  margin-top: var(--sp-4);
+  border-radius: 99px;
+  background: var(--surface-2);
+  overflow: hidden;
+}
+
+.boot-bar span {
+  display: block;
+  height: 100%;
+  width: 100%;
+  background: linear-gradient(100deg, transparent 20%, var(--cyan) 50%, transparent 80%);
+  background-size: 200% 100%;
+  animation: tfShimmer 1.4s linear infinite;
+}
+
+#operatorCard .boot-msg { min-height: 1.4em; }
+

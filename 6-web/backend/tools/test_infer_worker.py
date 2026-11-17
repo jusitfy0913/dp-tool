@@ -24,6 +24,8 @@ from pathlib import Path
 
 BACKEND = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(BACKEND))
+
+from _harness import check, finish  # noqa: E402
 os.environ["TRTFORGE_TEST_HOOKS"] = "1"
 os.environ["TRTFORGE_INFER_ISOLATION"] = "1"
 
@@ -43,14 +45,7 @@ OCR_DET = REPO / "9-python-paddleOCR/model/legacy_v4/ch_PP-OCRv4_det_infer"
 OCR_REC = REPO / "9-python-paddleOCR/model/legacy_v4/ch_PP-OCRv4_rec_infer"
 OCR_IMAGE = REPO / "ocr/PaddleOCR-main/docs/version2.x/ppocr/images/ch_ppocr_mobile_v2.0/00006737.jpg"
 
-PASSED: list[str] = []
-FAILED: list[str] = []
 SKIPPED: list[str] = []
-
-
-def check(name: str, ok: bool, detail: str = "") -> None:
-    (PASSED if ok else FAILED).append(name)
-    print(f"[{'PASS' if ok else 'FAIL'}] {name} {detail}".rstrip())
 
 
 def skip(name: str, reason: str) -> None:
@@ -265,11 +260,7 @@ def main() -> int:
     finally:
         inferproxy.shutdown()
 
-    print()
-    print(f"通过 {len(PASSED)}，失败 {len(FAILED)}，跳过 {len(SKIPPED)}")
-    for name in FAILED:
-        print(f"  - {name}")
-    return 1 if FAILED else 0
+    return finish()
 
 
 if __name__ == "__main__":

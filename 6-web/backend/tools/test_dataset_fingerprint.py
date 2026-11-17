@@ -26,6 +26,8 @@ from pathlib import Path
 BACKEND = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(BACKEND))
 
+from _harness import check, finish  # noqa: E402
+
 import dataset  # noqa: E402
 import fingerprint  # noqa: E402
 
@@ -34,18 +36,6 @@ try:
 except ImportError:  # pragma: no cover - 测试环境缺依赖时给出明确提示
     print("需要 Pillow 才能生成测试图片：pip install pillow")
     raise
-
-PASSED: list[str] = []
-FAILED: list[str] = []
-
-
-def check(name: str, ok: bool, detail: str = "") -> None:
-    if ok:
-        PASSED.append(name)
-        print(f"[PASS] {name}")
-    else:
-        FAILED.append(name)
-        print(f"[FAIL] {name}" + (f" -> {detail}" if detail else ""))
 
 
 def make_dataset(root: Path, counts: tuple[int, int, int] = (4, 2, 1)) -> Path:
@@ -370,12 +360,7 @@ def main() -> int:
         test_engine_meta_links_dataset(tmp)
         test_launcher_writes_train_meta(tmp)
 
-    print(f"\n通过 {len(PASSED)} 项，失败 {len(FAILED)} 项")
-    if FAILED:
-        for name in FAILED:
-            print(f"  失败：{name}")
-        return 1
-    return 0
+    return finish()
 
 
 if __name__ == "__main__":

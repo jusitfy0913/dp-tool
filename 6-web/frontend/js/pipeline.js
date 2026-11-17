@@ -10,7 +10,13 @@
 // - 刷新页面后仍能看到上一次跑到哪：启动时拉一次 /api/pipeline，有进行中的就接着盯。
 
 import { getJSON, postJSON } from "./api.js";
+import { syncOutputDefaults } from "./outputs.js";
+import { copyText, fmtStamp, setHint as setHintNode } from "./ui.js";
 import { focusRun } from "./train.js";
+
+// 输出目录默认值规则放 outputs.js（train.js 也要用，这里改成 re-export，
+// 测试与调用方仍可从 pipeline.js 取），实现见该模块头注释。
+export { KIND_OUTPUT_DEFAULTS, syncOutputDefaults } from "./outputs.js";
 
 /// 阶段状态 → 展示文案。与后端 pipeline.py 的常量保持一致。
 const STAGE_TEXT = {
@@ -53,6 +59,10 @@ const state = {
 
 let dom = {};
 
+//: 上一次的任务类型，用来判断输入框里是不是「另一个任务的默认值」（是才替换）。
+//: 默认值规则与替换条件在 outputs.js，训练页共用同一份。
+let lastKind = "yolo";
+
 export function initPipeline() {
   dom = {
     badge: document.getElementById("pipeBadge"),
@@ -94,6 +104,11 @@ export function initPipeline() {
   dom.precision.addEventListener("change", syncCalib);
   dom.skipTrain.addEventListener("change", syncSkipTrain);
   dom.anomalySkipTrain.addEventListener("change", syncSkipTrain);
+  // 只有 AnomalyDINO 需要「建库图片数」，其余模型靠 epoch 训练，看到这栏反而困惑
+  document
+    .getElementById("pipeAnomalyModel")
+    ?.addEventListener("change", syncPipeAnomalyModel);
+  syncPipeAnomalyModel();
   dom.btnPickBest.addEventListener("click", pickBestWeights);
   document
     .getElementById("btnPipeLogClose")
@@ -128,6 +143,13 @@ function syncKind() {
   dom.anomalyOptions.hidden = kind !== "anomalib";
   dom.btnStart.textContent = kind === "anomalib" ? "开始全流程（异常检测）" : "开始全流程";
   setHint("");
+  syncOutputDefaults(
+    kind,
+    document.getElementById("project"),
+    document.getElementById("runName"),
+    lastKind,
+  );
+  lastKind = kind;
   syncSkipTrain();
   syncCalib();
 }
@@ -136,6 +158,16 @@ function syncCalib() {
   const box = document.getElementById("pipeCalib");
   if (!box) return;
   box.classList.toggle("hidden", dom.kind.value !== "yolo" || dom.precision.value !== "int8");
+}
+
+/// AnomalyDINO 是零样本模型：没有 epoch，只有「用几张正常图建库」。
+function syncPipeAnomalyModel() {
+  const zeroShot = value("pipeAnomalyModel") === "anomalydino";
+  const label = document.getElementById("pipeAnomalyShotsLabel");
+  if (label) label.hidden = !zeroShot;
+  const sizeInput = document.getElementById("pipeAnomalySize");
+  // 448 = 14×32，DINOv2 patch14 在 448 上正好切出 32×32 网格
+  if (sizeInput && zeroShot && sizeInput.value === "256") sizeInput.value = "448";
 }
 
 function syncSkipTrain() {
@@ -186,8 +218,9 @@ function buildPayload() {
 }
 
 function buildAnomalyPayload() {
-  return {
-    model: value("pipeAnomalyModel") || "patchcore",
+  const model = value("pipeAnomalyModel") || "patchcore";
+  const payload = {
+    model,
     root: value("pipeAnomalyRoot"),
     normal_dir: value("pipeAnomalyNormal") || "train/good",
     abnormal_dir: value("pipeAnomalyAbnormal") || "test/abnormal",
@@ -201,6 +234,13 @@ function buildAnomalyPayload() {
     artifacts_dir: dom.anomalyArtifacts.value.trim(),
     run_val: dom.anomalyRunVal.checked,
   };
+  // 零样本专属字段：发给其它模型只是多几个被忽略的键，但会让后端日志更难读
+  if (model === "anomalydino") {
+    payload.shots = Number(value("pipeAnomalyShots")) || 16;
+    payload.rotation = false;
+    payload.seed = 0;
+  }
+  return payload;
 }
 
 async function onStart() {
@@ -319,7 +359,7 @@ function render(record) {
   if (record.live === false && running) {
     setHint("这条记录来自上一次服务进程，任务已中断；产物文件仍在磁盘上", "warn");
   } else if (isTerminal(record)) {
-    const seconds = record.elapsed ? `，用时 ${fmtDuration(record.elapsed)}` : "";
+    const seconds = record.elapsed ? `，用时 ${fmtSpoken(record.elapsed)}` : "";
     if (record.status === "success") {
       setHint(`全流程完成${seconds}`, "ok");
     } else if (record.status === "cancelled") {
@@ -387,7 +427,7 @@ function renderStages(record) {  dom.stages.hidden = false;
 
     const time = document.createElement("span");
     time.className = "pipe-time";
-    time.textContent = stage.elapsed != null ? fmtDuration(stage.elapsed) : "";
+    time.textContent = stage.elapsed != null ? fmtSpoken(stage.elapsed) : "";
 
     // 每一段都有独立 run_id。活着的 run 直接切训练页日志面板（实时流）；
     // 历史记录没有 run 了（服务重启后内存里就没了），改读 runtime/logs 的日志文件。
@@ -916,7 +956,7 @@ function renderHistory(items) {
 
     const tdTime = document.createElement("td");
     tdTime.className = "num mono";
-    tdTime.textContent = item.elapsed != null ? fmtDuration(item.elapsed) : "—";
+    tdTime.textContent = item.elapsed != null ? fmtSpoken(item.elapsed) : "—";
 
     const tdStart = document.createElement("td");
     tdStart.className = "mono";
@@ -970,30 +1010,14 @@ function setValue(id, text) {
 }
 
 /// 复制到剪贴板。局域网 http 页面里 navigator.clipboard 可能不可用（非安全上下文），
-/// 退回到临时 textarea + execCommand，保证这个按钮永远有反应。
+/// 兜底实现在 ui.js（临时 textarea + execCommand），那边已覆盖这个场景。
 async function copyPath(text) {
-  try {
-    if (navigator.clipboard && window.isSecureContext) {
-      await navigator.clipboard.writeText(text);
-    } else {
-      const area = document.createElement("textarea");
-      area.value = text;
-      area.style.position = "fixed";
-      area.style.opacity = "0";
-      document.body.appendChild(area);
-      area.select();
-      document.execCommand("copy");
-      area.remove();
-    }
-    setHint("路径已复制", "ok");
-  } catch (error) {
-    setHint(`复制失败：${error.message}`, "bad");
-  }
+  const ok = await copyText(text);
+  setHint(ok ? "路径已复制" : "复制失败，请手动选择路径", ok ? "ok" : "bad");
 }
 
 function setHint(text, cls = "") {
-  dom.hint.textContent = text;
-  dom.hint.className = `hint ${cls}`.trim();
+  setHintNode(dom.hint, text, cls);
 }
 
 function fmtNum(value, digits) {
@@ -1008,7 +1032,7 @@ function fmtPct(value) {
 }
 
 /// 秒 → 人类可读。串联动辄一小时，只显示秒数没有尺度感。
-function fmtDuration(seconds) {
+function fmtSpoken(seconds) {
   const total = Math.max(0, Math.round(Number(seconds) || 0));
   if (total < 60) return `${total} 秒`;
   const minutes = Math.floor(total / 60);
@@ -1019,8 +1043,5 @@ function fmtDuration(seconds) {
 
 /// epoch 秒 → 本地时间字符串
 function fmtClock(seconds) {
-  const date = new Date(Number(seconds) * 1000);
-  const pad = (n) => String(n).padStart(2, "0");
-  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ` +
-    `${pad(date.getHours())}:${pad(date.getMinutes())}`;
+  return fmtStamp(seconds, { withYear: true });
 }

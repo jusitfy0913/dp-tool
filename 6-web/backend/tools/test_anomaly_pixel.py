@@ -25,19 +25,9 @@ import numpy as np
 BACKEND = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(BACKEND))
 
+from _harness import FAILED, PASSED, check, finish  # noqa: E402
+
 import anomalymetrics  # noqa: E402
-
-PASSED: list[str] = []
-FAILED: list[str] = []
-
-
-def check(name: str, ok: bool, detail: str = "") -> None:
-    if ok:
-        PASSED.append(name)
-        print(f"[PASS] {name}")
-    else:
-        FAILED.append(name)
-        print(f"[FAIL] {name} {detail}")
 
 
 def near(a, b, eps: float = 1e-6) -> bool:
@@ -224,13 +214,7 @@ def main() -> int:
 
     print()
     total = len(PASSED) + len(FAILED)
-    if FAILED:
-        print(f"通过 {len(PASSED)} 项，失败 {len(FAILED)} 项")
-        for name in FAILED:
-            print(f"  - {name}")
-        return 1
-    print(f"全部通过：{total} 项")
-    return 0
+    return finish()
 
 
 if __name__ == "__main__":

@@ -15,28 +15,19 @@ import numpy as np
 BACKEND = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(BACKEND))
 
+from _harness import check, finish  # noqa: E402
+
 import cv2  # noqa: E402
 
 import ocr_infer  # noqa: E402
 import ocr_models  # noqa: E402
 
-PASSED: list[str] = []
-FAILED: list[str] = []
 REPO = BACKEND.parents[1]
 DET = REPO / "9-python-paddleOCR" / "model" / "legacy_v4" / "ch_PP-OCRv4_det_infer"
 REC = REPO / "9-python-paddleOCR" / "model" / "legacy_v4" / "ch_PP-OCRv4_rec_infer"
 IMAGE = REPO / "ocr" / "PaddleOCR-main" / "docs" / "version2.x" / "ppocr" / "images" / "ch_ppocr_mobile_v2.0" / "00006737.jpg"
 # 这张示例图是登机牌，稳定包含「登机牌」三个字。
 EXPECTED = "登机牌"
-
-
-def check(name: str, ok: bool, detail: str = "") -> None:
-    if ok:
-        PASSED.append(name)
-        print(f"  通过  {name}")
-    else:
-        FAILED.append(name)
-        print(f"  失败  {name}  {detail}")
 
 
 def options(**overrides) -> dict:
@@ -105,13 +96,7 @@ def main() -> int:
     stats = ocr_infer.cache_stats()
     check("第二次命中缓存", stats["hits"] >= 1 and stats["creates"] == 1, str(stats))
 
-    print()
-    print(f"通过 {len(PASSED)} 项，失败 {len(FAILED)} 项")
-    if FAILED:
-        for name in FAILED:
-            print(f"  - {name}")
-        return 1
-    return 0
+    return finish()
 
 
 if __name__ == "__main__":

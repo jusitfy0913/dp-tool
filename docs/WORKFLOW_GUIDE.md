@@ -2,7 +2,7 @@
 
 > 本文回答一个核心问题：**从原始图片到产线推理，每一步该做什么、用什么命令、产出什么文件、怎么验证。**
 > 面向对象：需要独立跑通全流程的工程师（不需要深入算法细节）。
-> 最后更新：2026-11-13（v1.38.0：后端按域拆成 `routers/`，`app.py` 只做装配，接口集合由路由快照测试守着，见 §7.22；v1.37.0：安装版改成双击 exe，环境变量下沉进 `launcher.py`，见 §7.1.3；v1.34.1：显存预检改实测峰值表 + AMP 状态可见可覆盖，见 §7.18；v1.34.0：任务台账落盘 / 日志轮转 / 训练崩溃自动续训，见 §7.1、§7.16；v1.33.0：LLM 决策层，见 §7.17；v1.32.0：YOLO 自主实验循环，见 §7.16；v1.31.0：网页端推理改成进程池，见 §7.15；v1.30.6：分类走 `onnx_infer.dll`，见 §7.13；v1.30.5：OCR 往返拆解 + 识别 batch 按设备取值，见 §7.12；v1.30.4：OCR 文字醒目化 + 异常检测改回「区域」，见 §7.11；v1.30.3：推理往返耗时优化，见 §7.10；v1.30.2：OCR `mklml.dll` 加载修复，见 §7.7.1；v1.30.1：分类真机闭环，见 §7.9；v1.30.0：YOLO 整图分类；v1.28.0：推理进程隔离 infer_worker，见 §7.8；v1.27.0 OCR 见 §7.7）
+> 最后更新：2026-11-17（v1.42.0：局域网访问要令牌，见 §7.1.5（含 421/403/401/429 排障）；训练页与全流程的默认值加护栏测试，修了 `patience` 50/100 与 AnomalyDINO `input_size` 256/448 两处漂移；测试入口 `run_all_tests.py` 同时跑后端与前端单测；删掉 8 个零调用死函数、统一测试脚手架与原子写；§7.16 补「自动实验只支持 YOLO、参数来自 `configs/base.json`、与训练页无关」；v1.41.0：双击 exe 打开的是软件自己的窗口（WebView2，不用 Qt），`config.json` 新增 `ui` 字段，见 §7.1.4；文档补充 §2.11「第一版要标多少：标注量分档与验收线」，含 T0/T1/T2 标注量、n/s/m 差异、良品图比例与第一版验收线；v1.40.1：onnxruntime 降级路径补 ImageNet 归一化 + 判定改回原始分数口径，见 §8「良品图全判 NG」；§3.3.1 补：现成可测的 AnomalyDINO FP16 引擎在本机对 bottle 64 张实跑 AUROC 1.0000，上游参考仓库移入 `11-AnomalyDINO/`；v1.40.0：AnomalyDINO 零样本异常检测，见 §3.3.1；安装包补齐 DLL 传递依赖 + 出包前真跑自检，见 §7.1.3；v1.38.0：后端按域拆成 `routers/`，`app.py` 只做装配，接口集合由路由快照测试守着，见 §7.22；v1.37.0：安装版改成双击 exe，环境变量下沉进 `launcher.py`，见 §7.1.3；v1.34.1：显存预检改实测峰值表 + AMP 状态可见可覆盖，见 §7.18；v1.34.0：任务台账落盘 / 日志轮转 / 训练崩溃自动续训，见 §7.1、§7.16；v1.33.0：LLM 决策层，见 §7.17；v1.32.0：YOLO 自主实验循环，见 §7.16；v1.31.0：网页端推理改成进程池，见 §7.15；v1.30.6：分类走 `onnx_infer.dll`，见 §7.13；v1.30.5：OCR 往返拆解 + 识别 batch 按设备取值，见 §7.12；v1.30.4：OCR 文字醒目化 + 异常检测改回「区域」，见 §7.11；v1.30.3：推理往返耗时优化，见 §7.10；v1.30.2：OCR `mklml.dll` 加载修复，见 §7.7.1；v1.30.1：分类真机闭环，见 §7.9；v1.30.0：YOLO 整图分类；v1.28.0：推理进程隔离 infer_worker，见 §7.8；v1.27.0 OCR 见 §7.7）
 
 
 ---
@@ -64,6 +64,9 @@ python -m pip install torch torchvision ultralytics polars "numpy<3" onnx onnxru
 # Anomalib 链路
 python -m pip install anomalib lightning "numpy<3" onnx onnxruntime Pillow
 
+# AnomalyDINO 链路（不装 anomalib / lightning，只要 timm）
+python -m pip install timm==1.0.14 "numpy<3" onnx onnxruntime Pillow
+
 # Web 工作站
 python -m pip install fastapi uvicorn python-multipart
 # v1.24 文本提示通道需要 tokenizers（只做 BERT 分词，不引入 torch / transformers）
@@ -80,6 +83,7 @@ python -m pip install tokenizers
 ```powershell
 cd 2-python-anomaly\launcher
 python tf_anomalib_launcher.py --mode check-env
+python tf_anomalydino_launcher.py --mode check-env
 
 cd ..\..\1-python-yolo\launcher
 python tf_yolo_launcher.py --mode check-env
@@ -379,7 +383,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_web_studio.ps1
 ```powershell
 python 6-web\backend\tools\test_annotation_drafts.py   # 期望 87/87（v1.24 含 v2 审核块）
 python 6-web\backend\tools\test_autolabel_batch.py     # 期望 42/42
-python 6-web\backend\tools\run_all_tests.py            # 期望 62 个脚本全绿（v1.39.0 起含 test_full_chain）
+python 6-web\backend\tools\run_all_tests.py            # 期望 66 个脚本全绿（v1.40.0 起含 AnomalyDINO 两套与打包自带库核对）
 ```
 
 真跑参考（PCB 6 张、`best.transd_fp16.engine`、`conf=0.3`）：
@@ -661,6 +665,151 @@ python 6-web\backend\tools\e2e_browser.py --headed   # 看得见浏览器
 
 ---
 
+### 2.11 第一版要标多少：标注量分档与验收线
+
+**问题**：第一版 YOLO 到底每个缺陷类别要标多少，标到多少才算「能上设备做初步检出」。
+
+先说清证据等级，别把经验值当实测：
+
+| 内容 | 来源 |
+| --- | --- |
+| 每类约 **490 框** → `mAP50 0.945` / `mAP50-95 0.514` | **本机实测**（`PCB data/PCB缺陷检测`，yolov8n @960，30 epoch） |
+| 「目标检测每类几百到几千框」 | 文档原有经验值，见 `docs/生产过程智能管控_AI算法融合方案.md` |
+| 本节的分档数字、T1 验收线、n/s/m 的差异 | **工程经验值**。仓库没有 s/m 的实测，也没有标好的「标注量 → 指标」曲线 |
+
+#### 2.11.1 数的是「框」，不是「张」
+
+YOLO 学的是**每个缺陷的位置**，决定上限的是这个类别一共画了多少个框。
+
+| 说法 | 含义 | 为什么重要 |
+| --- | --- | --- |
+| 一张图 | 一张照片 | 拍 500 张同一块板，对模型几乎等于 1 张 |
+| 一个框 | 圈住一处缺陷的矩形 | **这才是样本量**。一张图 5 处划痕 = 5 个框 |
+| 一个独立工件 | 不同产品 / 不同底板 / 不同批次 | 比张数更重要。PCB 那份数据 692 张图其实**只有 10 块底板**（见 §7.20） |
+
+下面一律写「每类 X 个框」。换张数时用你自己的密度：PCB 是平均 **4.26 框/张**
+（2950 框 / 692 张），一张图一个缺陷的产品就等于 1:1。
+
+#### 2.11.2 三档目标，三套标注量
+
+「能上设备初步检出」和「稳定量产」不是一回事，别用后面那档去要求第一版。
+
+| 档位 | 目标 | 每类框数 | 每类含该类图 | 独立工件 | 预期 mAP50 | 能不能上线 |
+| --- | --- | --- | --- | --- | --- | --- |
+| **T0 可行性** | 判断这条路走不走得通 | **30** | ≥15 张 | ≥5 个 | 0.40~0.70 | 不能，只看趋势 |
+| **T1 初步检出**（第一版） | 设备报警 + 人工复核 | **100~200** | ≥40 张 | **≥10 个** | 0.80~0.90 | 能，灰度试跑 |
+| **T2 稳定量产** | 少人值守 | **400~800** | ≥150 张 | ≥30 个 | ≥0.93 | 能 |
+
+实测锚点（`runs/pcb/detect_v1`，2026-10 本机）：
+
+| 项目 | 实际值 |
+| --- | --- |
+| 数据 | 692 张 / 6 类 / **每类约 490 框** / 每类约 115 张图 |
+| 指标 | **P 0.951 / R 0.930 / mAP50 0.945 / mAP50-95 0.514** |
+| 速度 | T1000 8GB 上 960 输入 **median 8.41 ms / 张**（125 qps） |
+
+结论：**每类 490 框 → mAP50 0.945**，落在 T2。第一版不用做到这个量，
+但**低于 30 框/类的类别基本学不出来**，它只会变成噪声。
+
+#### 2.11.3 按缺陷难度分档（同样是 150 框，大缺陷够、细划痕不够）
+
+| 缺陷类型 | 举例 | T0 每类框数 | T1 每类框数 | 额外要求 |
+| --- | --- | --- | --- | --- |
+| **大缺陷 / 边界清晰** | 缺件、错件、大孔、断裂、装反 | 30 | **80~120** | 640 输入够 |
+| **中等** | 划痕、污渍、偏位、错字、少锡 | 40 | **150~250** | 建议 960 |
+| **小 / 低对比** | 针孔、细裂纹、氧化、虚焊 | 60 | **300~500** | **必须 960**，仍不稳就换异常检测 |
+
+为什么小缺陷要翻倍：PCB 原图 3034×1586、缺陷框归一化宽约 **0.023 ≈ 70 px**，
+缩到 640 只剩约 30 px。§7.16 里同一 600 秒预算下 **960 跑 12 轮赢 640 跑 24 轮**，
+而 **1152 / 1280 在 8GB 卡上必 OOM**（`7-autoresearch-yolo/configs/space.json` 只放行 640/800/960）。
+
+#### 2.11.4 模型尺寸：n / s / m 该配多少数据
+
+模型入口是自由文本（`yolov8n.pt` / `yolov8s.pt` / `yolov8m.pt` / 本地 `.pt`），
+但**仓库只实测过 n**：`results.tsv` 里 38 次自主实验全部是 `yolov8n.pt`，
+`space.json` 的 `model` 字段被刻意冻结（换成 s/m 会明显改变 600 秒内跑得完的轮数）。
+
+| 模型 | 参数量 | T1 每类框数 | 数据够时的相对提升 | T1000 8GB 上的现实 |
+| --- | --- | --- | --- | --- |
+| **yolov8n** | 3.2 M | **100~150** | 基准 | 960 / batch 8 能跑，8.41 ms |
+| **yolov8s** | 11 M | 150~250 | mAP50-95 约 +2~4（经验值，未实测） | 960 时 batch 要降 |
+| **yolov8m** | 26 M | 300+ | 再 +1~3（经验值，未实测） | 960 大概率 OOM / 只能 batch 1~2 |
+
+**第一版用 yolov8n + 960 起步**，三条理由：
+
+1. 每类 100~200 框撑不起 s/m，s/m 只会更早过拟合；
+2. n 迭代快（PCB 30 轮 27 分钟），半天内就能把「标注够不够」这个问题问清楚；
+3. 换尺寸是**最后一步**：先确认 n 在训练集上也欠拟合（train 的 mAP 都上不去），再换 s。
+
+#### 2.11.5 第一版数据配方与验收线
+
+```
+每类 100~150 框  +  ≥10 个独立工件  +  10~20% 良品图（空标签当背景）
+```
+
+| 指标 | T1 门槛（建议值） | 看哪里 |
+| --- | --- | --- |
+| 总体 mAP50 | ≥ 0.80 | 全流程页精度卡片 |
+| **每个类别** mAP50 | ≥ 0.60 | `val_report.csv` 每类一行（页面只在控制台 `console.table`） |
+| 选定工作点下每类召回 | ≥ 0.85 | `val_report.json` 的 `operating_points.per_class` |
+| 漏检率 `miss_rate` | ≤ 5% | 操作点曲线（§7.21） |
+| 良品误报率 `ok_fp_rate` | ≤ 5% | 同上，**`null` = 没良品图，不是 0** |
+| 单张延迟 | ≤ 20 ms | 推理页（实测 8.41 ms，余量很足） |
+
+**注意**：仓库此前没有 YOLO 的数值验收线，上表是本节建议值，按现场放宽。
+`mAP50` 只是训练时的尺子，**产线口径永远是 `miss_rate` / `ok_fp_rate`**
+（全流程页的「工作点摘要」写的就是这句话）。
+
+```mermaid
+flowchart TD
+    A["每类先标 30 框<br/>yolov8n @960 跑一轮"] --> B{"mAP50 > 0.4<br/>且错的地方看得懂?"}
+    B -->|"否"| C["先别加数据<br/>查：漏标 / 类别定义混乱 / 缺陷太小"]
+    B -->|"是"| D["补到每类 100~150 框<br/>+ 良品图 10~20%"]
+    D --> E["全流程跑 val + 操作点曲线"]
+    E --> F{"每类 mAP50 ≥0.6<br/>召回 ≥0.85<br/>误报 ≤5%?"}
+    F -->|"达标"| G["编译引擎 → 上设备灰度<br/>收漏检 / 误报样本"]
+    F -->|"不达标"| H{"哪类最差?"}
+    H -->|"框少的那类"| I["只补那一类到 300+"]
+    H -->|"小缺陷类"| J["imgsz 提到 960<br/>或改用异常检测"]
+    G --> K["回补到每类 400~800 框 → T2"]
+```
+
+#### 2.11.6 什么时候不该硬上 YOLO
+
+| 情况 | 为什么 | 改用什么 |
+| --- | --- | --- |
+| 某类连 **30 框**都凑不出 | YOLO 学不会，只会学成噪声 | 异常检测（只要良品图）：PaDiM / PatchCore / EfficientAd / AnomalyDINO，见 §3.3、§3.3.1 |
+| 缺陷形态千变万化、类别定义不清 | 类别无法穷举 | 先异常检测兜底，形态收敛后再拆 YOLO 类 |
+| 只是「有没有 / 装没装」的二值判断 | 用检测是杀鸡用牛刀 | 整图分类，每类几十到几百张（见 §7.9） |
+
+#### 2.11.7 这四条怎么在平台上验
+
+```powershell
+# 1) 每类框数、空标、漏标、孤儿标：训练页点「扫描数据集」
+#    （等价接口 POST /api/train/dataset-overview，只读，不写任何文件）
+
+# 2) 独立工件够不够：按底板/批次前缀查重（不写图片，只出报告）
+D:\anaconda3\envs\dpenv\python.exe 7-autoresearch-yolo\labelqc.py "PCB data\PCB缺陷检测" --fail-on error
+
+# 3) 指标：对引擎跑 val，报告就落在 --out 目录
+python 6-web\backend\tools\val_engine.py --engine <best.engine> --data <dataset.yaml> `
+    --split val --target-miss-rate 0.05 --out runtime\val\t1
+# 看 val_report.csv（每类 ap50/ap）与 val_report.json（operating_points / recommended_operating_point）
+```
+
+| 想确认 | 看什么 | 常见误读 |
+| --- | --- | --- |
+| 标注够不够 | 概览里的**每类框数**，有没有某类特别少 | 只看总框数，长尾类被平均值盖住 |
+| 工件够不够 | `labelqc.py` 的组数与跨划分 | 以为 692 张就是 692 个样本，其实只有 10 组 |
+| 指标真不真 | 良品图是否显式声明（`labels` 里空 `.txt`） | `ok_fp_rate = null` 被当成 0 误报 |
+| 工作点能不能用 | `recommended_operating_point` 的 conf | 拿 mAP 当产线指标 |
+
+**对外怎么讲**：本节是内部口径。要跟客户谈「给多少样本、承诺多少检出率、
+验证集要多大才证明得了」，用 `docs/样本量需求与检出率承诺_客户沟通版.md`——
+那里有对答话术、数据交接清单、技术协议可用条款，以及「零漏检需要多少张验收图」的统计底线。
+
+---
+
 
 ## 3. 训练
 
@@ -882,7 +1031,7 @@ python tf_yolo_launcher.py --mode train `
 D:\Anaconda3\envs\dpenv\python.exe 6-web\backend\tools\test_finetune_request.py   # 期望 26 项全过
 ```
 
-### 3.3 Anomalib 训练（三选一）
+### 3.3 Anomalib 训练（Anomalib 自己的三选一）
 
 ```powershell
 cd 2-python-anomaly\launcher
@@ -905,15 +1054,70 @@ python tf_anomalib_launcher.py --mode train-export --model efficientad `
 ```
 
 **模型怎么选**：见 `docs/异常检测模型对比与选型_PatchCore_PaDiM_EfficientAd.md`。`anomalib-main` 源码还有 18 个模型没有接到这里，也没有本机实测，对照见 `docs/异常检测模型对照_AnomalyCLIP与Anomalib.md`。
+只有十几张正常图、又不想等训练时，用下一节的 AnomalyDINO。
+
+### 3.3.1 AnomalyDINO（第四种，15 秒出模型，不走 Lightning）
+
+它**不是 anomalib 的模型**，所以是另一个启动器。所谓「训练」只是一次冻结 DINOv2 主干的前向：
+把正常图抽成 32×32 个 token 存进记忆库，再固化成 ONNX 常量。没有反向传播，没有 epoch。
+
+```powershell
+cd 2-python-anomaly\launcher
+
+# 先确认依赖与权重都在（缺什么直接说缺什么，不会跑到一半才炸）
+python tf_anomalydino_launcher.py --mode check-env
+
+# 建库 + 导出 + 标定，一套 21 秒（16 张正常图）
+python tf_anomalydino_launcher.py --mode build-export `
+  --root ..\anomalib-main\datasets\bottle `
+  --project results --name my_dino --shots 16 --resolution 448
+```
+
+| 参数 | 默认 | 说明 |
+| --- | --- | --- |
+| `--shots` | 16 | 从 `train/good` 里均匀取样几张建库。**少于 8 张直接报错**，不会静默降级 |
+| `--resolution` | 448 | 必须是 **14 的倍数**（448 = 14×32，网格 32×32 无 padding）。改大更准更慢 |
+| `--rotation` | 关 | 8 个角度旋转增强，库行数 ×8，对小缺陷更敏感，建库与导出都变慢 |
+| `--seed` | 0 | 取样随机种子。同一个种子、同一批图，库的 sha256 可复现 |
+
+产物与旧三种同结构（`results/AnomalyDINO/<实验名>/v<N>/weights/lightning/`），
+网页训练页与全流程页的下拉里直接能选，引擎构建、推理页也不用改。
+
+**两条要记住的口径**：
+
+- 推理 DLL 是 **`cv::resize` 拉伸**到 448×448（不是等比例缩放），标定脚本按同一口径复刻，
+  所以阈值与线上判定自洽；但**不要拿它的分数去对标论文原版预处理的结果**。
+- v1 **不做 PCA 背景掩码**，`metadata.json` 里 `masking: false`。背景杂乱的场景准确率会低于论文。
+
+**导出有两条硬约束**（违反会编译失败或热力图全错，测试已覆盖）：
+
+- **必须 opset 16**。opset 17 会把 `F.layer_norm` 导成单个 `LayerNormalization`，
+  TRT 8.5 没有原生实现，解析时 `Plugin not found` 直接失败。
+- **只能导出两个张量**：`anomaly_map`（32×32）+ `pred_score`（1 个元素）。
+  多导出一个全分辨率 mask 会让 DLL 的启发式把它顶替成热力图（`anomalib_infer_c.cpp:453-472`）。
+
+**现成可测的模型**：`results/AnomalyDINO/bottle_spike/v0/weights/lightning/`（`model.onnx` 107.8 MB +
+`model_fp16.engine` + `metadata.json`，16-shot、448 输入）。这是技术验证留下的产物，**没有 `model.ckpt`**，
+推理不需要；复现就按上面的 `--mode build-export` 重跑（16 张图 21 秒）。
+2026-11-14 在本机用 `6-web/backend/tools/val_anomaly.py` 对 MVTec bottle 测试集实跑 64 张：
+AUROC 1.0000、P/R/F1 0.999–1.000、漏检 0%、误报 0%、5.56 s。命令见
+`docs/异常检测模型对照_AnomalyCLIP与Anomalib.md` 的 3.6 节。
+
+**上游参考实现**放在本仓库的 `11-AnomalyDINO/`（v1.40.0 起，之前在同级目录 `deeplearning/11-AnomalyDINO`）。
+它是独立 git 仓库、带 Windows 补丁（`--eval_segm` 与 pytest 的路径问题），整目录被 `.gitignore` 忽略；
+本工程交付链路只用 `launcher/anomalydino_core.py`，不 import 上游代码。
 
 ### 3.4 训练产物
 
 ```text
 results/<ModelName>/<run_name>/v0/weights/lightning/
-├── model.ckpt            Lightning 权重（可继续训练）
+├── model.ckpt            Lightning 权重（可继续训练）—— AnomalyDINO 没有这个文件
 ├── model.onnx            含后处理的 ONNX 图
 └── metadata.json         阈值、归一化、输入尺寸、输出契约
 ```
+
+AnomalyDINO 是零样本建库，没有 `model.ckpt`：只有 `model.onnx`（含库常量）和 `metadata.json`。
+库的信息（行数、sha256、取样了哪几张图、旋转与种子）都写进 `metadata.json`，靠它复现同一套库。
 
 **`metadata.json` 是推理的必要输入**，不是可选项。
 
@@ -1609,6 +1813,7 @@ libiomp5md.dll         yaml-cpp.dll polyclipping.dll
 ### 7.1 启动 Web 工作站
 
 **最快的方式**：双击仓库根目录的 `启动Web端.bat`（自动找 Python、查端口、就绪后开浏览器）。
+想直接看到「软件窗口」而不是浏览器标签页，双击 `启动开发版.bat`（见本节末尾）。
 
 ```bat
 启动Web端.bat                :: 默认 http://127.0.0.1:8060
@@ -1640,6 +1845,95 @@ Stop-Process -Id <提示里的 PID> -Force
 > 页面（静态文件每次读盘）已经是新版，后端（进程内代码）还是旧版，
 > 于是新加的接口参数会被静默忽略。改动后端后务必确认 PID 变了。
 
+#### 开发时想直接看到「软件窗口」（`启动开发版.bat`，v1.41.0 起）
+
+上面那条走的是 uvicorn 直起 + 开浏览器，看到的是浏览器标签页。
+想在**源码形态**下就看到打包后的样子（没有地址栏的应用窗口），双击仓库根目录的
+`启动开发版.bat`（同级还有个快捷方式 `启动 TRTForge Web Studio.lnk`）：
+
+| 项目 | 说明 |
+| --- | --- |
+| 走哪条路 | `6-web\backend\launcher.py`，和打包后的 `app\TRTForgeWeb.exe` 是同一份主流程 |
+| 为什么不是浏览器 | 主线程跑 `webview.start()`，uvicorn 在后台线程；关窗口 = 关软件、端口立刻释放 |
+| 有没有黑框 | 用 `pythonw.exe` 起，没有控制台窗口；出问题看 `6-web\.devroot\runtime\logs\launcher.log` |
+| 二次双击 | 检测到已有实例后把已开着的窗口提到前面，不开第二个，也不开浏览器 |
+
+**`6-web\.devroot\` 是干什么的**：`launcher.py` 把它的启动根当成「安装根」，从这里推
+`frontend\ bin\ launchers\ models\`。仓库根没有这些目录，直接把安装根指到仓库根会得到**空白页**
+（`/static` 挂不上）。所以用一个垫片目录把这些目录 junction 到真实位置：
+
+```text
+6-web\.devroot\
+  config.json    { "port": 8060, "ui": "window", ... }    ← bat 只在缺失时创建，改过不会被覆盖
+  frontend\  -> 6-web\frontend                            （junction）
+  bin\       -> 4-qt-studio\bin                           （junction，推理 DLL）
+  models\    -> 6-web\models                              （junction，模型仓库）
+  launchers\ 硬链接 tf_yolo_launcher.py / tf_anomalib_launcher.py / ...（改仓库里的脚本即时生效）
+```
+
+`.devroot` 里是**本机绝对路径**的 junction，已加进 `.gitignore`，删掉无副作用——`启动开发版.bat`
+下次会重建。想看浏览器模式就改这里的 `config.json`（把 `ui` 改成 `browser`）。
+
+> 端口占用：`启动开发版.bat` 同样受 §7.1 的单实例限制。如果 8060 上已经有一个
+> **浏览器模式**的旧实例（例如之前双击过 `启动Web端.bat`），新进程会认出它并改为打开浏览器。
+> 想看窗口，先结束旧实例：关掉它的控制台窗口，或 `Stop-Process -Id <PID> -Force`。
+>
+> 验收：`python 6-web\backend\tools\test_launcher.py`（51 项，含「源码形态直接跑」「日志不重复写」
+> 「没有自带 exe 时不写 TRTFORGE_TOOL_EXE」三条）。
+
+
+### 7.1.5 局域网访问要登录：令牌与会话（v1.42.0）
+
+默认只监听 `127.0.0.1` 时，「能连上」就等于「坐在这台机器前」。一旦把 `config.json`
+的 `host` 改成 `0.0.0.0`（车间多机共用一台训练机），**任何能 ping 到这台机器的人
+都能训练、建引擎、读日志、改标注**——接口本身没有身份概念。v1.42.0 起在路由之前
+加了一层校验：Host → Origin → 令牌/会话。
+
+| 项 | 默认 | 说明 |
+| --- | --- | --- |
+| `TRTFORGE_AUTH` | `auto` | `auto`=本机免令牌、其它来源必须登录；`on`=一律要令牌；`off`=一律不要（启动时打一行告警） |
+| 令牌 | 自动生成 | 首次启动写 `runtime/web_token.txt`；也可用环境变量 `TRTFORGE_WEB_TOKEN` 指定。删掉文件重启会换一把新的 |
+| 会话 | 7 天 | Cookie `trtforge_session`，`HttpOnly` + `SameSite=Strict`；`TRTFORGE_SESSION_HOURS` 可调 |
+| 登录限流 | 10 次 / 5 分钟 | 同一来源连续输错 10 次锁 300 秒 |
+| 额外主机名 | 空 | 反向代理或域名访问时，用 `TRTFORGE_ALLOWED_HOSTS`（分号分隔）登记，否则 421 |
+
+**判「是不是本机」用的是 TCP 来源地址**，不是 `Host` 头——`Host` 是客户端可伪造的，
+用它判断正是 DNS 重绑定能绕过的原因。
+
+**现场怎么用**
+
+```text
+1. 同事在浏览器打开 http://<训练机IP>:8060  → 自动跳到 /login.html
+2. 到训练机上打开 <安装目录>\runtime\web_token.txt，把那一行发给他
+3. 粘贴令牌 → 进入主界面，之后 7 天内不用再输
+```
+
+脚本 / 第三方调用（没有浏览器 Cookie）改用请求头：
+
+```powershell
+$token = Get-Content .\runtime\web_token.txt
+Invoke-RestMethod -Headers @{ Authorization = "Bearer $token" } http://127.0.0.1:8060/api/health
+```
+
+WebSocket 浏览器不能自定义请求头，所以只认 Cookie；自动化脚本可以退化成
+`ws://host:8060/api/runs/<id>/events?token=<令牌>`。
+
+**排障对照**
+
+| 现象 | 原因 | 处理 |
+| --- | --- | --- |
+| 421 | `Host` 是带点的域名（DNS 重绑定防护），或反向代理改写了 Host | 把域名加进 `TRTFORGE_ALLOWED_HOSTS` 后重启 |
+| 403 | `Origin` 与 `Host` 不同源（跨站伪造），或 `Origin: null`（file:// 打开） | 从正常的 http 地址访问，不要用本地文件打开页面 |
+| 401 | 没登录 / Cookie 过期 / 令牌不对 | 打开 `/login.html` 重新输入；或核对请求头里的 Bearer |
+| 429 | 连续输错 10 次被锁 | 等 5 分钟；急用可重启服务（会话与限流都在内存里） |
+| 页面一直停在登录页 | 浏览器禁用了 Cookie | 允许本站 Cookie，或换浏览器 |
+| 实时日志不再刷新，控制台看到 WebSocket 4401 | 令牌失效（服务重启 / 换了令牌文件） | 重新登录；前端收到 4401 会停止重连，不再刷屏 |
+| 忘了令牌 | 文件被删或换过 | 看 `runtime/web_token.txt`；文件没了就重启服务生成新的 |
+
+> 想在本机也强制登录：设 `TRTFORGE_AUTH=on` 再启动。想在现场临时解开（例如演示）：
+> `off`，但启动日志会明确告警「任何能访问本端口的人都可以操作本软件」。
+
+
 ### 7.1.3 打给使用人员的安装包（推理 + 训练，CUDA 11.8）
 
 对方电脑与开发机一样使用 **CUDA 11.8** 时，用这个脚本打安装包。包里是编译后的程序和运行库，不含 C++ 源码、网页后端源码和训练工程源码。
@@ -1651,12 +1945,11 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\packaging\package_web_user
 产物在 `dist\TRTForgeWeb`（以及同目录的 zip）。交给对方整个文件夹。对方：
 
 1. 安装显卡驱动和 VC++ 2015–2022 x64 运行库。不必再装 CUDA 工具包。
-2. 双击 `install_train_env.bat`（需联网。没有 Anaconda 也会自己下载 micromamba 或 Miniconda，生成 `train-env`，并写入 `config.json`。同时安装 `polars-runtime-compat`、`onnx`、`onnxruntime`，避免无 AVX2 的机器导入 Polars 时崩溃）。
+2. 双击 **`一键安装.bat`**。第一次用包里的 `wheels\` 和嵌入式 Python 装好 `train-env`（不联网），把 Python 路径写入 `config.json`，在桌面放上「TRTForge Web」并打开软件。无 AVX2 的机器会卸掉 `polars-runtime-32`，只留 `polars-runtime-compat`。
 3. 在 `config.json` 的 `data_roots` 里填图片所在文件夹。车间其他电脑要访问时，把 `host` 改成 `0.0.0.0`。
-4. 双击 `app\TRTForgeWeb.exe`。浏览器会自己打开软件。不需要 PowerShell，启动失败会弹中文说明框，
-   详见 `docs/启动与排障说明.md`。
+4. 以后双击桌面上的「TRTForge Web」（`app\TRTForgeWeb.exe`）。启动失败会弹中文说明框，详见 `docs/启动与排障说明.md`。
 
-训练库里的 Ultralytics 是 AGPL-3.0，由对方机器在线安装，不放进安装包。对外发放前确认许可。
+训练库里的 Ultralytics 是 AGPL-3.0，随 `wheels\` 放进安装包，安装时离线装上，不附带它的源码。对外发放前确认许可。
 
 要让对方也能做文字识别，打包时加上 `-WithOcr`。这一项默认关闭，因为 `paddle_inference.dll` 约 1.7GB。可选 `-OcrModelDir` 把模型目录拷进安装包的 `models\ocr`，启动脚本会把它写成 `TRTFORGE_OCR_MODEL_DIR`。
 
@@ -1682,6 +1975,60 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\packaging\package_web_user
 2. 再双击一次，不会起第二个实例，只把浏览器重新打开；
 3. 先用别的程序占住 `config.json` 里的端口，双击后弹中文框，写明端口号与改法；
 4. 从 cmd 运行 `start_web.bat`，窗口里能看到 `INFO: Uvicorn running on ...` 等实时日志。
+
+#### 安装包缺 DLL 的坑：静态检查看不出来（v1.40.0）
+
+**踩过的坑**：v1.40.0 打出来的包，双击 `TRTForgeWeb.exe` 直接闪退，`launcher.log` 一个字都没有。
+事件查看器只写 `异常代码 0xc0000409`（`abort`），模块 `ucrtbase.dll`。
+原因不是代码，是**缺 DLL**：
+
+- Conda 装的 Pillow / `_ctypes` / `_ssl` 把编译库链到 `<env>\Library\bin`
+  （`tiff.dll`、`openjp2.dll`、`ffi.dll`、`libssl-3-x64.dll`…），Nuitka 只搬了 `zlib.dll`；
+- 开发机 `PATH` 里有 conda 的 `Library\bin`，所以开发机一切正常，只有对方机器崩；
+- 打包脚本原来的做法是**手写一份 conda DLL 清单**（只列了 libssl / tcl 那几个），漏就是必然。
+
+现在的两道防线，都在 `packaging\package_web_user.ps1` 里，别删：
+
+| 步骤 | 做什么 | 为什么这么做 |
+| --- | --- | --- |
+| 补 DLL 传递依赖 | 用 `dumpbin /dependents` 扫安装目录里**所有** `.pyd`/`.dll` 的导入表，缺的从 `<env>\Library\bin`、`<env>\DLLs`、`<env>` 补到 exe 旁边，队列继续追（补齐的 DLL 自己也有依赖） | 手写清单早晚漏；闭包是穷举 |
+| 自检 | 装完在**安装目录里真跑** `TRTForgeWeb.exe --tool selfcheck`，逐个 import `numpy`/`cv2`/`PIL.Image`/`onnxruntime`/`fastapi`/`uvicorn`/`routers`/`launcher`/`app`，退出码非 0 就 `throw`，不出 zip | 「文件在不在」已经骗过我们一次；只有真 import 才能证明库能用 |
+
+两条硬约束：
+
+- **`api-ms-win-*`、`ucrtbase.dll`、`vcruntime*`、`msvcp*` 一律不搬**（`Test-SystemDll`）。
+  conda 的 UCRT 转发件搬进包里会和系统 UCRT 打架，症状同样是启动即 `0xC0000409`，比缺库更难查。
+- 找不到 `dumpbin.exe` 就 `throw`，不许「猜着跳过」。Nuitka 本身要求 MSVC，机器上一定有。
+
+排障用法：用户说「双击没反应」时，先在安装目录执行
+
+```powershell
+cd <安装目录>\app
+.\TRTForgeWeb.exe --tool selfcheck
+```
+
+哪一层缺库会打印 `FAIL <模块>: ...` 并附 traceback，同时写出 `OK` 过的模块清单。
+
+#### 训练环境的两道导入检查（v1.40.0）
+
+有**两个不同位置**在做 import 自检，别混淆，也别只留一个：
+
+| 在哪 | 检查什么 | 为什么需要 |
+| --- | --- | --- |
+| 软件包里的 exe（打包时 + 排障时） | numpy / cv2 / PIL.Image / onnxruntime / fastapi / uvicorn / routers / launcher / app | 证明**编译进 exe 的东西**和它依赖的 DLL 能用，和训练环境无关 |
+| `install_train_env.ps1` 装完 | torch / timm / polars / onnx / onnxruntime / cv2 / ultralytics / anomalib 逐个 import | 证明**训练环境**齐了。少一个 `ultralytics` 或 `anomalib`，「安装成功」照样显示，用户点「开始训练」才报错 |
+
+训练环境那段自检的两个实现细节，改之前先看这里：
+
+- **逐个 import，不写成一长串**。`import a, b, c` 里第一个失败就中断，后面缺什么看不见；
+  现在每项一行 `OK  <库> <版本>` 或 `FAIL <库>: <异常>`，最后汇总 `MISSING: ...` 并 `exit 1`。
+- **落临时 `.py` 再跑，不用 `python -c "$脚本"`**。实测 PowerShell 5.1 传原生参数会把脚本里的
+  双引号吃掉，`-c` 直接变成 `SyntaxError: '(' was never closed`；改成单引号又要避开全部字符串引号，
+  脚本一长就没法读。写进 `%TEMP%\trtforge_selfcheck.py` 跑完即删最稳。
+- 自检输出**只用 ASCII**：可能被重定向进日志，中文在非 UTF-8 控制台会抛 `UnicodeEncodeError`，
+  那样「自检失败」会显示成「自检崩了」，反而掩盖了真正缺的库。
+
+这三个约束都有对应断言在 `tools/test_packaging_wheels.py` 里（会红的），别绕过。
 
 #### 示例模型为什么单独一个包（v1.35.2）
 
@@ -1901,7 +2248,7 @@ Anomalib 的判定阈值写在 `metadata.json` 里。页面勾上「沿用 metad
 
 | 界面元素 | 含义 | 应用场景 |
 | --- | --- | --- |
-| 图像阈值（判定 OK / NG） | `image_threshold`，归一化分数 `>=` 它判 NG | 决定漏检与误报的取舍 |
+| 图像阈值（判定 OK / NG） | `image_threshold`，**原始分数** `>=` 它判 NG（DLL 内部是"归一化分数 >= 0.5"，两者等价） | 决定漏检与误报的取舍 |
 | 像素阈值（圈出异常区域） | `pixel_threshold`，异常图上 `>=` 它涂红 | 决定红色区域是大片还是小点 |
 | 模型 + 输入尺寸 | `model_type` / `input_size` | 确认引擎与 metadata 是不是同一套 |
 | 标签「已校准 N%」 | 存在 `calibration` 区块时的样本判对率 | 低于 100% 说明阈值可能偏松，建议复查 |
@@ -1920,6 +2267,101 @@ Anomalib 的判定阈值写在 `metadata.json` 里。页面勾上「沿用 metad
 | 卡片数值与推理结果行不一致 | 结果行显示的是**生效值**（可能被手动覆盖） | 看结果行括注的「原值」或卡片上的 metadata 原值 |
 
 > 验收：`python 6-web\backend\tools\test_metadata_readout.py`（37 项）。
+
+
+### 7.1.4 双击后看到的是软件自己的窗口（v1.41.0，WebView2，不用 Qt）
+
+**v1.41.0 起，双击 `app\TRTForgeWeb.exe` 不再弹系统浏览器**，而是出现一个没有地址栏、没有标签页的窗口，
+里面就是原来那套网页。`http://127.0.0.1:8060` 照旧能访问（本机浏览器、局域网别的机器都行），
+两种方式并存。
+
+用到的是 **WebView2**（系统自带的 Edge 内核），不是 Qt——Qt 在部分客户机上有部署与权限问题，
+而 WebView2 不需要管理员权限、不写注册表、不用分发 GUI 框架。
+
+#### 三种模式：`config.json` 的 `ui` 字段
+
+| 值 | 双击后的行为 | 什么时候用 |
+| --- | --- | --- |
+| `auto`（默认） | 能开窗口就开窗口；开不了自动改用浏览器 | 绝大多数情况，不用改 |
+| `window` | 必须在窗口里打开 | 明确要求「看起来是个软件」的交付 |
+| `browser` | 永远用系统浏览器（v1.40 及以前的行为） | 客户习惯用浏览器、或要用浏览器插件 |
+
+```json
+{
+  "port": 8060,
+  "host": "127.0.0.1",
+  "ui": "auto"
+}
+```
+
+写错的值（比如 `"ui": "qt"`）会被当成 `auto`，不会让软件起不来。
+
+#### 窗口模式下的行为变化
+
+| 动作 | v1.40 及以前（浏览器） | v1.41.0（窗口） |
+| --- | --- | --- |
+| 双击 exe | 打开一个浏览器标签页 | 打开应用窗口 |
+| 再双击一次 | 浏览器把标签页提到前面 | 按标题找回那扇窗并提到前面 |
+| 关掉界面 | 浏览器标签页关了，**服务还在后台跑** | **等于关软件**：服务一起停，端口立刻释放 |
+| 训练日志逐行滚 | WebSocket | 同样走 WebSocket，行为一致 |
+| 点「在新窗口看日志」 | 浏览器新标签页显示原始日志 | 转交系统浏览器打开（窗口里再开一个会是一片空白） |
+| 导出结果 | 浏览器默认下载目录 | WebView2 的下载，默认落在**用户的「下载」文件夹** |
+| 界面记住的分栏宽度等 | 浏览器 localStorage | 存在 `<安装目录>\runtime\webview\`，升级不丢 |
+
+关窗口就停服是刻意的：窗口模式下用户把它当桌面软件用，关窗口就该退出。
+如果确实需要「关窗口后服务继续跑」，把 `launcher.py` 里 `on_close` 的回调去掉即可，一行的事。
+
+#### 窗口起不来会怎样
+
+| 现象 | 原因 | 处理 |
+| --- | --- | --- |
+| 弹一次中文说明，然后浏览器打开 | 这台机器没装 WebView2 运行时，或它加载失败 | 功能不受影响；想修窗口就装一次微软的 **WebView2 Runtime**（免费） |
+| 窗口一片空白 | 后端没起来（端口被占 / 启动失败），页面本身没内容 | 看 `runtime\logs\launcher.log`；缺库时先在 `app` 目录跑 `TRTForgeWeb.exe --tool selfcheck` |
+| 双击后什么都没发生 | 已经有一个实例在跑，但它卡住了 | 等 5 秒重试；或任务管理器结束 `TRTForgeWeb.exe` 再双击 |
+
+**任何情况下窗口失败都不会让软件不可用**：一律退回系统浏览器并提示一次，这是硬要求。
+
+#### 排障与验证
+
+- 日志：`runtime\logs\launcher.log`。会记 `界面模式：窗口（TRTForge Web Studio 1.41.0）` 或
+  `界面模式：浏览器(...)`，降级时会带上具体异常。
+- 想在窗口里看实时日志：设 `TRTFORGE_LEGACY_START=1`（`start_user.ps1` 就是干这个的），
+  这条路径**不开窗口也不开浏览器**，只起服务，需要自己访问地址。
+- 一次性验证 WebView2 在不在：
+
+```powershell
+cd <安装目录>\app
+.\TRTForgeWeb.exe --tool selfcheck
+```
+
+自检清单里有 `webview`、`webview.platforms.winforms`、`desktop` 三项，缺任何一项就说明这个包不能出。
+
+#### 打包时必须一起改的四处（别只改一处）
+
+| 位置 | 改什么 | 为什么 |
+| --- | --- | --- |
+| `package_web_user.ps1` 开头 | 检查编译机装了 `pywebview` / `pythonnet` / `clr_loader`，缺了直接 `throw` | 它们必须**编进 exe**，不能进 `wheels\` 让对方 pip 装 |
+| `package_web_user.ps1` 的 Nuitka 参数 | 加 `--include-module=desktop`；**不要**加 `--include-package=webview` | Nuitka 自带 pywebview 插件，手动 include 会和它的排除决定冲突，直接 `FATAL` |
+| `frozen_entry.py` 的 `_selfcheck()` | 模块清单加 `webview`、`webview.platforms.winforms`、`desktop` | 这是出 zip 的硬门槛；运行期可降级不等于打包可以缺 |
+| `packaging\templates\config.json` | 加 `"ui": "auto"` | 没有这个字段时按 `auto` 处理，但模板里写出来用户才知道可以改 |
+
+补 DLL 的传递闭包**不用动**：`ffi.dll`（`_ctypes` 用）和 `libssl-3-x64.dll` / `libcrypto-3-x64.dll`
+（`ssl` 用）会被自动补齐。实测缺它们时的症状是**空消息的 `ImportError`**，exe 起来直接 `0xC0000409`。
+
+#### 实测记录（2026-11-16，Windows 10 19044）
+
+| 项目 | 结果 |
+| --- | --- |
+| WebView2 运行时 | `157.0.4341.46`，pywebview 6.2.1 选中的后端是 `edgechromium` |
+| 页面加载 | `document.title` = `TRTForge Web Studio`，`/api/health` 返回 `{"ok":true,"version":"1.41.0"}` |
+| WebSocket | `/ws/runs/{id}` 正常握手并收到消息 |
+| 图片上传 | multipart POST 到 `/api/infer/yolo`，服务端正常解析（返回业务 400 而不是网络错误） |
+| 剪贴板 | `navigator.clipboard` 可用（`isSecureContext` 为 true，127.0.0.1 算安全上下文） |
+| 打包形态 | 最小脚本 `--standalone` 编出来能开窗、能加载页面；补上 3 个 DLL 后不再崩 |
+| 体积增量 | 约 **+5 MB**（webview 2.1 MB + pythonnet 0.63 MB + clr_loader/bottle 等） |
+
+> 验收：`python 6-web\backend\tools\test_desktop.py`（12 项）+
+> `python 6-web\backend\tools\test_launcher.py`（47 项，含 10 项界面模式用例）。
 
 
 ### 7.2 推理页操作
@@ -2866,6 +3308,18 @@ Anomalib 的模型 + 后处理占 150~200 ms，池化就能兑现。
 **在哪儿**：`7-autoresearch-yolo/`，与 `7-autoresearch-master/` 并列。后者是 Karpathy 的
 LLM 预训练方法论来源，**不参与本工程构建**；本模块只借用它的问题形式，不复用任何代码。
 
+**适用范围与参数来源（先读这三条，能省掉一半误会）**
+
+| 问题 | 答案 |
+| --- | --- |
+| 支持哪些任务 | **只有 YOLO 检测 / 分割**。`task` 在 `configs/base.json` 里写死，`space.json` 不校验它、`validate_proposal()` 拒绝改它。姿态 / 旋转框 / 分类都没有对应的指标解析与验收口径，`prompts/experimenter.md` 整篇也是按检测事实写的 |
+| 参数从哪来 | `configs/base.json`（基线）+ `experiments/cur.json`（本轮改动）+ `experiments/best.json`（agent 模式的继承起点）。**一个参数都不来自训练页**——Web 端只下发「轮数 / 时间上限 / max_tokens」这类运行控制项 |
+| 和训练页什么关系 | 只有两点：**同一把 GPU 互斥锁**（不会同时抢卡）与**同一份显存预检实现**（`6-web/backend/vram.py`）。产物目录、参数、判定、台账完全独立，改训练页的表单不会影响自动实验 |
+
+> 一个容易误判成 bug 的有意差异：`base.json` 里 `patience=0`（**关闭早停**，
+> 由 `budget_seconds` 时间截断控制轮次），而训练页默认 100。两者不是同一套计时口径，
+> 不要「对齐」成同一个数：预算模式下早停会让「跑满 600 秒」这个前提失效。
+
 **循环**
 
 ```mermaid
@@ -3577,9 +4031,15 @@ D:\Anaconda3\envs\dpenv\python.exe 6-web\backend\tools\run_all_tests.py       # 
 
 ### 打包注意
 
-`packaging/package_web_user.ps1` 必须带 `--include-package=routers`，并在编译后检查
-`frozen_entry.dist\routers` 目录存在，缺了直接中止打包——这类问题只在安装形态下暴露，
-开发机跑 uvicorn 永远看不到。
+`packaging/package_web_user.ps1` 必须带 `--include-package=routers`，缺了直接中止打包——
+这类问题只在安装形态下暴露，开发机跑 uvicorn 永远看不到。
+
+**怎么核对「进没进包」很讲究（v1.40.0 更正）**：Nuitka 的 standalone 会把编译后的
+纯 Python 模块**链进 exe**，`frozen_entry.dist` 里根本没有 `routers` 目录
+（v1.40.0 实测：dist 里没有该目录，96 MB 的 exe 里 10 个路由模块全在）。
+所以检查方式是读 Nuitka 的 `--report=nuitka-report.xml`，逐个比对
+`routers\*.py` 是否作为 `<module name="routers.xxx">` 出现，缺一个就 `throw`。
+以前那种 `Test-Path frozen_entry.dist\routers` 会**误报失败**、挡住正常打包。
 
 ---
 
@@ -3667,11 +4127,18 @@ python 6-web\backend\tools\test_model_bundle.py    # 29 项，不需要 GPU
 | 创建句柄报「输入尺寸是动态的」 | 模型不是静态导出 | 用 Ultralytics 重新导出（默认静态），不要手改 shape |
 | 创建句柄报「请把任务切换为 pose / segment」 | 任务与模型结构不匹配 | 按提示改任务类型，不要改模型 |
 | 异常图判成 OK | 阈值过高 | 确认 `--calibrate-metadata true`，或重跑校准 |
+| 良品图全判 NG（`is_anomaly` 都是 true） | ① 走了 `onnxruntime-fallback` 且版本 < v1.40.1：降级路径漏了 ImageNet 归一化，分数被整体抬高；② 用的 metadata 与引擎不是同一套 | 看返回的 `backend`：是 `onnxruntime-fallback` 就升到 v1.40.1（已修，raw 与引擎差 < 1e-4）；是 `*_dll` 就核对 metadata 是不是同目录那份 |
+| 归一化分数 0.44 却判了 OK，以为判错了 | 两个口径混着比：归一化分数以阈值为 0.5 中心拉伸，判定线恒为 0.5；`image_threshold` 是**原始分数**口径，只能和「原始分数」比 | 比 raw（如 0.1959 < 0.2203 → OK）；界面标签已注明「归一化分数（阈值=0.5）」「图像阈值（原始分数口径）」 |
 | `imagenet_dir 不存在` | EfficientAd 目录缺失（`DATA_NOT_FOUND`），launcher 不会自动下载 | 先 `New-Item -ItemType Directory` 建空目录（见 2.4） |
 | 正常图分数全为 0 | PatchCore 分数饱和 | 属预期；要趋势监控请换 EfficientAd |
 | 引擎编译卡住不动 | builder 在 CPU 侧搜索 tactic | 看 GPU 显存仍在占用即正常，耐心等 |
 | 推理页图像看不清缺陷 | 窗口未放大 | 滚轮以光标为锚点缩放，或点 `1:1` 看原始像素；多个窗口可独立开关 |
 | 前端改了样式但浏览器没变 | 静态资源被缓存 | 硬刷新（`Ctrl+F5`）；后端已带 `Last-Modified`/`ETag`，正常刷新即可拿到新文件 |
+| 另一台机器访问时自动跳到登录页（v1.42.0 起） | `TRTFORGE_AUTH=auto` 下，非本机来源必须登录 | 到训练机看 `runtime/web_token.txt`，把令牌发给对方；详见 §7.1.5 |
+| 接口返回 **421** | `Host` 是带点域名（DNS 重绑定防护）或反向代理改写了 Host | 把域名加进 `TRTFORGE_ALLOWED_HOSTS`（分号分隔）后重启 |
+| 接口返回 **403** | `Origin` 与 `Host` 不同源，或 `Origin: null` | 从正常 http 地址访问；不要用 `file://` 打开页面 |
+| 登录一直提示令牌不对 / **429** | 令牌过期换了新的一把 / 连续输错 10 次锁定 5 分钟 | 重新读 `runtime/web_token.txt`；429 等 5 分钟或重启服务 |
+| 实时日志不再刷新，浏览器控制台有 WebSocket **4401** | 会话失效（服务重启或换令牌） | 重新登录；4401 是「停止重连」的约定码，不会一直刷屏 |
 | 训练页没有「预热」角标，开训还是慢 | 8060 上跑的是旧进程（v1.24 及以前没有预热） | `GET /api/health` 看 `version` 是否为 `1.25.0`；不是就按「端口被旧进程占着」的步骤重启服务 |
 | 角标一直「预热中」不变「预热就绪」 | 预热进程导入依赖很慢，或导入失败后不断重试 | 看服务日志里 `--mode warm` 的输出；手动跑 `python <launcher> --mode warm` 看缺什么依赖。不影响训练，只是没提速 |
 | 预热进程占内存 | 池子里每类各常驻一个进程（几百 MB） | 设 `TRTFORGE_WARM=0` 重启，回到冷启动；或调小 `TRTFORGE_WARM_KINDS` |
@@ -3704,8 +4171,11 @@ python 6-web\backend\tools\test_model_bundle.py    # 29 项，不需要 GPU
 | 想了解 | 看这个 |
 | --- | --- |
 | 三个异常检测模型怎么选 | `docs/异常检测模型对比与选型_PatchCore_PaDiM_EfficientAd.md` |
+| **第一版每个缺陷要标多少、标到多少算能上设备** | **本节 2.11** |
+| **跟客户谈「给多少样本、承诺多少检出率」** | `docs/样本量需求与检出率承诺_客户沟通版.md`（客户版对答口径 + 数据交接清单 + 协议条款） |
 | Web 工作站怎么用 | `docs/TRTForge_Web操作手册.md`。开发细节仍看 `6-web/README.md` |
 | 把网页版打给别人、不附源码 | `packaging/package_web_user.ps1`，说明见下文 7.1.3 |
+| **双击 exe 为什么出现的是窗口而不是浏览器、`ui` 三个值怎么选** | **本节 7.1.4** |
 | 启动失败、端口冲突、改端口与地址 | `docs/启动与排障说明.md` |
 | 项目整体结构与层级 | `readme.md` |
 | DLL C API 调用与打包 | `docs/TRTForge_yolo_infer与anomalib_infer_DLL调用与源码打包说明.md` |

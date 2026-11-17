@@ -27,6 +27,8 @@ from pathlib import Path
 BACKEND_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BACKEND_DIR))
 
+from _harness import check, finish  # noqa: E402
+
 TOOLS = BACKEND_DIR / "tools"
 APP_LIMIT = 400
 
@@ -57,19 +59,6 @@ ROUTERS = (
     "models",
     "annotation",
 )
-
-PASSED = 0
-FAILED = 0
-
-
-def check(name: str, condition: bool, detail: str = "") -> None:
-    global PASSED, FAILED
-    if condition:
-        PASSED += 1
-        print(f"  [PASS] {name}")
-    else:
-        FAILED += 1
-        print(f"  [FAIL] {name} {detail}")
 
 
 def test_app_is_thin() -> None:
@@ -137,8 +126,7 @@ def main() -> int:
     test_compat_shim()
     test_routers_independent()
     test_each_router_has_routes()
-    print(f"\n通过 {PASSED} 项，失败 {FAILED} 项")
-    return 0 if FAILED == 0 else 1
+    return finish()
 
 
 if __name__ == "__main__":

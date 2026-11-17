@@ -24,19 +24,9 @@ from pathlib import Path
 BACKEND = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(BACKEND))
 
+from _harness import check, finish  # noqa: E402
+
 import checkpoints  # noqa: E402
-
-PASSED: list[str] = []
-FAILED: list[str] = []
-
-
-def check(name: str, ok: bool, detail: str = "") -> None:
-    if ok:
-        PASSED.append(name)
-        print(f"[PASS] {name}")
-    else:
-        FAILED.append(name)
-        print(f"[FAIL] {name} {detail}")
 
 
 RESULTS_CSV = (
@@ -146,8 +136,7 @@ def main() -> int:
         check("results 解析出最后一轮指标", results["last_metrics"].get("metrics/mAP50-95(B)") == 0.35, str(results["last_metrics"]))
         check("训练时长取最后一轮累计时间", results["train_seconds"] == 35.1, str(results["train_seconds"]))
 
-    print(f"\n通过 {len(PASSED)} 项，失败 {len(FAILED)} 项")
-    return 1 if FAILED else 0
+    return finish()
 
 
 if __name__ == "__main__":

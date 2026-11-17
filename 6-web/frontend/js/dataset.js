@@ -4,6 +4,7 @@
 // 所以预览与导出各算一次，不需要维护会话，刷新页面也不会丢东西。
 
 import { postJSON } from "./api.js";
+import { setBadge as setBadgeNode, setHint as setHintNode } from "./ui.js";
 
 const MAX_ROWS = 200;
 
@@ -23,12 +24,15 @@ export function initDataset() {
   const hint = document.getElementById("dsHint");
   const badge = document.getElementById("dsBadge");
   const metrics = document.getElementById("dsMetrics");
-  const warnings = document.getElementById("dsWarnings");
+  // 注意：这两个 id 必须带 ds 前缀。训练页的「导出 ONNX」区块里也有 btnExport，
+  // 数据集页原来同名，getElementById 只会返回训练页那个，导致这里禁用/写提示时
+  // 改的是另一页的元素（历史遗留，v1.43 修）。
+  const warnings = document.getElementById("dsPageWarnings");
   const rows = document.getElementById("dsRows");
   const head = document.getElementById("dsHead");
   const result = document.getElementById("dsResult");
   const btnScan = document.getElementById("btnScan");
-  const btnExport = document.getElementById("btnExport");
+  const btnExport = document.getElementById("dsBtnExport");
   const btnQc = document.getElementById("btnQc");
   const qcBadge = document.getElementById("dsQcBadge");
   const qcMetrics = document.getElementById("dsQcMetrics");
@@ -40,13 +44,11 @@ export function initDataset() {
   let lastQc = null; // 最近一次体检结果；导出时据此决定是否把结论写进 manifest
 
   function setHint(text, bad = false) {
-    hint.textContent = text || "";
-    hint.className = bad ? "hint bad" : "hint";
+    setHintNode(hint, text, bad ? "bad" : "");
   }
 
   function setBadge(text, cls) {
-    badge.textContent = text;
-    badge.className = cls ? `badge ${cls}` : "badge";
+    setBadgeNode(badge, text, cls);
   }
 
   function collect() {
@@ -77,7 +79,8 @@ export function initDataset() {
       return;
     }
     ratioHint.textContent = `test = ${100 - t - v}%（其余全部归 test，与 Qt 版一致）`;
-    ratioHint.className = "hint";
+    const open = ratioHint.classList.contains("is-open");
+    ratioHint.className = open ? "hint tip is-open" : "hint tip";
   }
 
   train.addEventListener("input", refreshRatioHint);

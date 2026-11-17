@@ -36,6 +36,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
+import jsonio
+
 # 阶段状态
 PENDING = "pending"
 RUNNING = "running"
@@ -145,9 +147,7 @@ class PipelineManager:
                 if stage_state.get("status") in (PENDING, RUNNING):
                     stage_state["status"] = SKIPPED if stage_state.get("status") == PENDING else CANCELLED
             try:
-                path.write_text(
-                    json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8"
-                )
+                jsonio.write_json(path, record)
             except OSError:
                 continue
 
@@ -455,12 +455,8 @@ class PipelineManager:
         if not self.store_dir:
             return
         path = self.store_dir / f"{record['id']}.json"
-        temp = path.with_suffix(".json.part")
         try:
-            temp.write_text(
-                json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8"
-            )
-            os.replace(temp, path)
+            jsonio.write_json(path, record)
         except OSError:
             # 写盘失败不该让整条链挂掉：状态还在内存里，页面照样能看
             pass

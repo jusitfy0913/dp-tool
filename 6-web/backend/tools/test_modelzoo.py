@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import sys
 import tempfile
@@ -27,19 +28,9 @@ from pathlib import Path
 BACKEND = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(BACKEND))
 
+from _harness import check, finish  # noqa: E402
+
 import modelzoo  # noqa: E402
-
-PASSED: list[str] = []
-FAILED: list[str] = []
-
-
-def check(name: str, ok: bool, detail: str = "") -> None:
-    if ok:
-        PASSED.append(name)
-        print(f"[PASS] {name}")
-    else:
-        FAILED.append(name)
-        print(f"[FAIL] {name} {detail}")
 
 
 # ---------------------------------------------------------------------------
@@ -144,7 +135,7 @@ def test_catalog(tmp: Path) -> None:
     try:
         data = modelzoo.list_models()
         ids = [item["id"] for item in data["items"]]
-        check("清单：内置三项都在", set(ids) == {"mobile_sam", "grounding_dino_swint", "bert_tokenizer"}, str(ids))
+        check("清单：内置四项都在", set(ids) == {"mobile_sam", "grounding_dino_swint", "bert_tokenizer", "dinov2_vits14"}, str(ids))
         check("清单：总数对得上", data["total"] == len(ids), str(data["total"]))
         check("清单：初始全部缺失", data["missing"] == len(ids), str(data["missing"]))
         for item in data["items"]:
@@ -469,7 +460,7 @@ def test_api(tmp: Path) -> None:
         listing = client.get("/api/modelzoo")
         check("接口：清单 200", listing.status_code == 200, listing.text[:200])
         body = listing.json()
-        check("接口：清单带 items", isinstance(body.get("items"), list) and len(body["items"]) == 3, listing.text[:300])
+        check("接口：清单带 items", isinstance(body.get("items"), list) and len(body["items"]) == 4, listing.text[:300])
         check("接口：清单带目录", bool(body.get("dir")), listing.text[:200])
         check("接口：清单带 jobs", isinstance(body.get("jobs"), list), listing.text[:200])
 
@@ -483,6 +474,77 @@ def test_api(tmp: Path) -> None:
         check("接口：取消未知任务 404", missing_cancel.status_code == 404, f"{missing_cancel.status_code}")
     finally:
         modelzoo.reset_for_tests()
+        if old is None:
+            os.environ.pop("TRTFORGE_MODEL_DIR", None)
+        else:
+            os.environ["TRTFORGE_MODEL_DIR"] = old
+
+
+def test_checksum(tmp: Path, base: str) -> None:
+    """带 `sha256` 的条目必须校验：对了才算 done，错了删文件并失败。
+
+    DINOv2 权重是建库的唯一依据，拿到一份错的权重不会报错，
+    只会让所有判定悄悄变掉，所以这一关不能省。
+    """
+    old = os.environ.get("TRTFORGE_MODEL_DIR")
+    os.environ["TRTFORGE_MODEL_DIR"] = str(tmp / "checksum-zoo")
+    modelzoo.reset_for_tests()
+    RangeHandler.slow = False
+    RangeHandler.break_after = 0
+
+    payload = RangeHandler.payload
+    good_id = "test_checksum_ok"
+    bad_id = "test_checksum_bad"
+    register(
+        {
+            "id": good_id,
+            "name": "指纹正确",
+            "use": "单测用",
+            "license": "MIT",
+            "channel": "test",
+            "files": [
+                {
+                    "name": "dinov2/ok.bin",
+                    "urls": [f"{base}/ok.bin"],
+                    "size": len(payload),
+                    "sha256": hashlib.sha256(payload).hexdigest(),
+                }
+            ],
+        }
+    )
+    register(
+        {
+            "id": bad_id,
+            "name": "指纹错误",
+            "use": "单测用",
+            "license": "MIT",
+            "channel": "test",
+            "files": [
+                {
+                    "name": "dinov2/bad.bin",
+                    "urls": [f"{base}/bad.bin"],
+                    "size": len(payload),
+                    "sha256": "0" * 64,
+                }
+            ],
+        }
+    )
+    try:
+        modelzoo.ensure_dir()
+        ok = wait_done(modelzoo.start_download(good_id)["id"])
+        check("指纹：正确时下载完成", ok["status"] == "done", str(ok))
+        check("指纹：子目录路径被创建",
+              (modelzoo.model_dir() / "dinov2" / "ok.bin").is_file(),
+              str(modelzoo.model_dir() / "dinov2" / "ok.bin"))
+
+        bad = wait_done(modelzoo.start_download(bad_id)["id"])
+        check("指纹：不一致时状态 failed", bad["status"] == "failed", str(bad))
+        check("指纹：错误原因写清楚", "sha256" in (bad.get("error") or ""), str(bad.get("error")))
+        check("指纹：坏文件被删掉，不会假装已就绪",
+              not (modelzoo.model_dir() / "dinov2" / "bad.bin").exists())
+    finally:
+        unregister(good_id)
+        unregister(bad_id)
         if old is None:
             os.environ.pop("TRTFORGE_MODEL_DIR", None)
         else:
@@ -503,16 +565,13 @@ def main() -> int:
             test_cancel(tmp, base)
             test_busy_and_failure(tmp)
             test_local_fallback(tmp)
+            test_checksum(tmp, base)
             test_api(tmp)
     finally:
         server.shutdown()
         server.server_close()
 
-    print(f"\n通过 {len(PASSED)} 项，失败 {len(FAILED)} 项")
-    if FAILED:
-        print("失败项：" + "、".join(FAILED))
-        return 1
-    return 0
+    return finish()
 
 
 if __name__ == "__main__":

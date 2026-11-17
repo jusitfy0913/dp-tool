@@ -9,6 +9,7 @@
 // - .transd.onnx 的段序（proto 在前）由 launcher 负责，前端只负责展示
 
 import { postJSON, stopRun } from "./api.js";
+import { setHint as setHintNode } from "./ui.js";
 import { connectRunEvents } from "./ws.js";
 
 const state = {
@@ -61,9 +62,7 @@ function pickCurrentBest() {
 }
 
 function setHint(text, tone = "") {
-  if (!dom.hint) return;
-  dom.hint.textContent = text;
-  dom.hint.className = tone ? `hint ${tone}` : "hint";
+  setHintNode(dom.hint, text, tone);
 }
 
 function appendLog(line, tone = "") {

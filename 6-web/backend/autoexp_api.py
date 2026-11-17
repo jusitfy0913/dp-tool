@@ -38,6 +38,7 @@ from pydantic import BaseModel, Field
 import config
 import gpulock
 import inferproxy
+import jsonio
 import keyvault
 import runners
 from runners import manager
@@ -259,9 +260,7 @@ def _write_store(payload: dict[str, Any]) -> None:
         disk[keyvault.FIELD_SCHEME] = keyvault.SCHEME_DPAPI
 
     LLM_STORE.parent.mkdir(parents=True, exist_ok=True)
-    tmp = LLM_STORE.with_suffix(f".tmp{os.getpid()}")
-    tmp.write_text(json.dumps(disk, ensure_ascii=False, indent=2), encoding="utf-8")
-    os.replace(tmp, LLM_STORE)
+    jsonio.write_json(LLM_STORE, disk)
     if os.name != "nt":
         try:
             os.chmod(LLM_STORE, 0o600)
@@ -681,17 +680,17 @@ def start_agent(request: AgentStartRequest) -> dict[str, Any]:
         # 再查一次跨进程锁：命令行可能在跑 autoexp.py，那条路径不经过
         # manager，`_ensure_idle()` 看不见它。这里拦下来比让 agent 起跑后
         # 一直等锁更好——用户当场就知道是谁占着显卡。
-        holder = gpulock.read()
-        if holder is not None:
-            holder_pid = int(holder.get("pid") or 0)
-            if holder_pid != os.getpid() and gpulock.pid_alive(holder_pid):
-                raise HTTPException(
-                    status_code=409,
-                    detail=(
-                        f"显卡正被占用：{gpulock.describe(holder)}。"
-                        "关闭那个任务或终端后重试。"
-                    ),
-                )
+        # 只看**别的进程**的条目：本进程可能有网页任务在跑（那是另一条路径
+        # 的事），而多持有者下 read() 只给一个，可能正好是本进程自己。
+        foreign = gpulock.foreign_holders()
+        if foreign:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"显卡正被占用：{gpulock.describe_all(foreign)}。"
+                    "关闭那个任务或终端后重试。"
+                ),
+            )
         try:
             info = inferproxy.yield_gpu("自动实验")
         except Exception as exc:  # noqa: BLE001 - 让出失败不能把训练卡在半路

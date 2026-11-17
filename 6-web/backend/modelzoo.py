@@ -18,6 +18,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import ssl
 import threading
@@ -133,6 +134,27 @@ CATALOG: list[dict] = [
             }
         ],
     },
+    {
+        "id": "dinov2_vits14",
+        "name": "DINOv2 ViT-S/14",
+        "use": "AnomalyDINO 建库用的冻结主干（不训练，只在建库与导出时前向）",
+        "license": "Apache-2.0",
+        "channel": "anomaly",
+        "files": [
+            {
+                # 带子目录：训练侧的启动器按 metadata / 页面提示找这个固定位置，
+                # 和示例模型的 ONNX 混在一层里容易放错。
+                "name": "dinov2/dinov2_vits14_pretrain.pth",
+                "urls": [
+                    "https://dl.fbaipublicfiles.com/dinov2/dinov2_vits14/dinov2_vits14_pretrain.pth",
+                ],
+                "size": 88_283_115,
+                # 官方权重是确定的：下完必须对得上，否则建库出来的特征就不是 DINOv2。
+                # 这个值由本机实测文件算出，也与 dl.fbaipublicfiles 上的文件一致。
+                "sha256": "b938bf1bc15cd2ec0feacfe3a1bb553fe8ea9ca46a7e1d8d00217f29aef60cd9",
+            }
+        ],
+    },
 ]
 
 _BY_ID = {item["id"]: item for item in CATALOG}
@@ -197,6 +219,7 @@ def _present_files(entry: dict) -> tuple[list[dict], list[str]]:
                 "name": spec["name"],
                 "path": str(path),
                 "size": spec.get("size") or 0,
+                "sha256": spec.get("sha256") or "",
                 "present": ok,
                 "actual_size": path.stat().st_size if path.is_file() else 0,
             }
@@ -414,6 +437,20 @@ class _Cancelled(Exception):
     """内部信号：用户取消。"""
 
 
+def _verify_sha256(path: Path, expected: str) -> bool:
+    """文件指纹校验：只给写了 `sha256` 的条目用。
+
+    为什么必须校验：DINOv2 权重决定建库特征，换一份「差不多」的权重，
+    推理不报错但判定全变；而下载中断、镜像返回 HTML 错误页都会留下一个
+    看起来正常的文件。
+    """
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest().lower() == expected.strip().lower()
+
+
 def _run(job: DownloadJob, entry: dict) -> None:
     try:
         planned = sum(spec.get("size") or 0 for spec in entry["files"])
@@ -426,6 +463,14 @@ def _run(job: DownloadJob, entry: dict) -> None:
                 continue  # 已就绪的文件不重下
             job.set_current(spec["name"])
             _download_file(job, spec, dest)
+            expected = (spec.get("sha256") or "").strip()
+            if expected and not _verify_sha256(dest, expected):
+                # 删掉坏文件：留着的话下次会判定「已就绪」，永远不下正确的
+                try:
+                    dest.unlink()
+                except OSError:
+                    pass
+                raise ModelError(f"{spec['name']} 校验失败：sha256 与清单不一致")
         with job.lock:
             job.status = "done"
     except _Cancelled:
@@ -447,7 +492,9 @@ def _run(job: DownloadJob, entry: dict) -> None:
 def _drop_parts(entry: dict) -> None:
     """取消后清掉 `.part`：留着半个文件会让下次"续传"接在错误的位置上。"""
     for spec in entry["files"]:
-        part = _file_path(spec["name"]).with_name(spec["name"] + ".part")
+        # 不能对带子目录的名字用 `with_name`（它不接受路径分隔符），
+        # 这里基于已解析好的文件路径加后缀，`dinov2/x.pth` → `dinov2/x.pth.part`。
+        part = _file_path(spec["name"]).with_name(Path(spec["name"]).name + ".part")
         try:
             part.unlink()
         except (FileNotFoundError, OSError):

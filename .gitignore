@@ -127,6 +127,12 @@ results/
 # 上传的临时图片、任务日志、Python 缓存都不入库
 6-web/runtime/
 6-web/backend/__pycache__/
+# 从 backend 目录直接跑 tools/val_anomaly.py 时，报告默认落在 cwd 的 runtime/val 下
+6-web/backend/runtime/
+# 开发态「安装根」垫片（6-web\.devroot）：junction 里写的是本机绝对路径，
+# 换台机器就是错的；config.json 里可能带着本机的端口/数据目录。
+# 由仓库根目录的 启动开发版.bat 自动重建，删掉无副作用。
+6-web/.devroot/
 
 # 内置模型仓库（v1.24）：SAM / GroundingDINO / BERT 分词表
 # 权重是 0.5~1 GB 的二进制文件，仓库只保存清单与下载地址；
@@ -156,6 +162,13 @@ build/infer_dlls/
 # AnomalyCLIP 官方源码与预训练权重（约 692MB，105 个文件），仅作算法对照参考，不入库；
 # 对照结论沉淀在 docs/异常检测模型对照_AnomalyCLIP与Anomalib.md
 /10-AnomalyCLIP-main/
+
+# AnomalyDINO 上游仓库（git clone https://github.com/dammsi/AnomalyDINO.git，约 2MB）。
+# 它自己带 .git，放进本仓库会变成「嵌套仓库」，git 只会记一个 gitlink，
+# 里面的 Windows 补丁和 tools/ 脚本反而进不来，clone 的人拿到的是一份空引用。
+# 所以整目录忽略；本仓库自己的实现是 2-python-anomaly/launcher/anomalydino_core.py，
+# 本地补丁与环境记录在 11-AnomalyDINO/LOCAL_CHANGES.md。
+/11-AnomalyDINO/
 # Anomalib 本地训练产物（PatchCore bottle，约 780MB），测试一致性对比用，可重新训练得到
 2-python-anomaly/launcher/resultsbottle/
 # 仓库根目录运行产物（调试截图等）

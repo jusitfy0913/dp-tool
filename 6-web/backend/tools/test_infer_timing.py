@@ -25,20 +25,9 @@ from pathlib import Path
 BACKEND_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BACKEND_DIR))
 
+from _harness import check, finish  # noqa: E402
+
 import app  # noqa: E402
-
-PASSED = 0
-FAILED = 0
-
-
-def check(name: str, condition: bool, detail: str = "") -> None:
-    global PASSED, FAILED
-    if condition:
-        PASSED += 1
-        print(f"  [PASS] {name}")
-    else:
-        FAILED += 1
-        print(f"  [FAIL] {name} {detail}")
 
 
 def _sample_result() -> dict:
@@ -117,8 +106,7 @@ def main() -> int:
     test_finish_infer()
     test_ipc_floor()
     test_repeat_safe()
-    print(f"\n结果：通过 {PASSED} 项，失败 {FAILED} 项")
-    return 0 if FAILED == 0 else 1
+    return finish()
 
 
 if __name__ == "__main__":

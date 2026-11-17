@@ -14,6 +14,7 @@
 
 import { getJSON, listRuns, postJSON, stopRun } from "./api.js";
 import { createLogActions } from "./logs.js";
+import { fmtDuration, setBadge as setBadgeNode, setHint as setHintNode } from "./ui.js";
 import { connectRunEvents } from "./ws.js";
 
 // 只保留最近若干行，防止长时间构建把内存和 DOM 拖慢
@@ -136,13 +137,11 @@ export function initEngine() {
   // 辅助
   // -------------------------------------------------------------------------
   function setBadge(text, cls) {
-    badge.textContent = text;
-    badge.className = cls ? `badge ${cls}` : "badge";
+    setBadgeNode(badge, text, cls);
   }
 
   function setHint(text, bad = false) {
-    hint.textContent = text || "";
-    hint.className = bad ? "hint bad" : "hint";
+    setHintNode(hint, text, bad ? "bad" : "");
   }
 
   function autoName(path) {
@@ -157,13 +156,7 @@ export function initEngine() {
 
   /** 秒 -> `m:ss`（超过一小时才带小时），用于「已用 / 剩余」 */
   function fmtClock(seconds) {
-    const total = Math.max(0, Math.round(seconds));
-    const h = Math.floor(total / 3600);
-    const m = Math.floor((total % 3600) / 60);
-    const sec = total % 60;
-    const ss = String(sec).padStart(2, "0");
-    if (h) return `${h}:${String(m).padStart(2, "0")}:${ss}`;
-    return `${m}:${ss}`;
+    return fmtDuration(seconds);
   }
 
   /** 秒 -> 中文口语时长，用于「预计约 8 分 7 秒」这类说明文字 */

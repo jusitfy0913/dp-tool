@@ -31,19 +31,9 @@ import numpy as np  # noqa: E402
 
 import compare_backends as cb  # noqa: E402
 import compare_raw_tensors as crt  # noqa: E402
+from _harness import check, finish  # noqa: E402
 
-PASSED: list[str] = []
-FAILED: list[str] = []
 SKIPPED: list[str] = []
-
-
-def check(name: str, ok: bool, detail: str = "") -> None:
-    if ok:
-        PASSED.append(name)
-        print(f"[PASS] {name}")
-    else:
-        FAILED.append(name)
-        print(f"[FAIL] {name} {detail}")
 
 
 def skip(name: str, reason: str) -> None:
@@ -266,13 +256,7 @@ def main(argv: list[str] | None = None) -> int:
     test_report_encoding()
     test_live_dispatch(args.engine, args.onnx, args.images, args.skip_live)
 
-    print()
-    print(f"通过 {len(PASSED)}，失败 {len(FAILED)}，跳过 {len(SKIPPED)}")
-    if FAILED:
-        for name in FAILED:
-            print(f"  [FAIL] {name}")
-        return 1
-    return 0
+    return finish()
 
 
 if __name__ == "__main__":

@@ -26,6 +26,8 @@ from pathlib import Path
 BACKEND = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(BACKEND))
 
+from _harness import check, finish  # noqa: E402
+
 # 缓存指向临时文件：测试不能污染真实运行目录，也不能反过来被真实缓存干扰
 _TMP_CACHE = Path(tempfile.mkdtemp(prefix="dsqc_cache_")) / "cache.json"
 os.environ["TRTFORGE_DSQC_CACHE"] = str(_TMP_CACHE)
@@ -35,18 +37,6 @@ from PIL import Image  # noqa: E402
 
 import dataset  # noqa: E402
 import datasetqc  # noqa: E402
-
-PASSED: list[str] = []
-FAILED: list[str] = []
-
-
-def check(name: str, ok: bool, detail: str = "") -> None:
-    if ok:
-        PASSED.append(name)
-        print(f"[PASS] {name}")
-    else:
-        FAILED.append(name)
-        print(f"[FAIL] {name} {detail}")
 
 
 def _base_plate(seed: int, level: int) -> np.ndarray:
@@ -295,10 +285,7 @@ def main() -> int:
         shutil.rmtree(work, ignore_errors=True)
         shutil.rmtree(_TMP_CACHE.parent, ignore_errors=True)
 
-    print(f"\n通过 {len(PASSED)} 项，失败 {len(FAILED)} 项")
-    for name in FAILED:
-        print(f"  失败：{name}")
-    return 0 if not FAILED else 1
+    return finish()
 
 
 if __name__ == "__main__":

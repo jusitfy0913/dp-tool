@@ -26,8 +26,22 @@ async function readPayload(response) {
 
 function throwIfFailed(response, payload) {
   if (response.ok) return;
+  if (response.status === 401) goLogin();
   const detail = (payload && (payload.detail || payload.message)) || payload || response.statusText;
   throw new ApiError(typeof detail === "string" ? detail : JSON.stringify(detail), response.status, payload);
+}
+
+/**
+ * 没登录就把整页送到登录页，登录成功后回到当前地址。
+ *
+ * 为什么是整页跳转而不是弹提示：令牌是整页级别的凭据，一个请求被拦说明
+ * 页面上其它请求也都会失败。让用户点一次「刷新」不如直接送到该去的地方。
+ * 用 replace 而不是 assign：登录页不该出现在后退历史里。
+ */
+function goLogin() {
+  if (location.pathname === "/login.html") return;
+  const next = location.pathname + location.search;
+  location.replace(`/login.html?next=${encodeURIComponent(next)}`);
 }
 
 async function request(url, options = {}) {

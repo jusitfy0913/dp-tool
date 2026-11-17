@@ -24,20 +24,9 @@ WEB_DIR = BACKEND_DIR.parent
 LAUNCHER_DIR = WEB_DIR.parent / "1-python-yolo" / "launcher"
 
 sys.path.insert(0, str(BACKEND_DIR))
+
+from _harness import check, finish  # noqa: E402
 sys.path.insert(0, str(LAUNCHER_DIR))
-
-PASSED = 0
-FAILED = 0
-
-
-def check(name: str, condition: bool, detail: str = "") -> None:
-    global PASSED, FAILED
-    if condition:
-        PASSED += 1
-        print(f"  [PASS] {name}")
-    else:
-        FAILED += 1
-        print(f"  [FAIL] {name} {detail}")
 
 
 def make_run(tmp: Path, task: str = "detect", names: list[str] | None = None, imgsz: int = 640) -> Path:
@@ -192,8 +181,7 @@ def main() -> int:
     test_launcher_flags()
     test_compat_check(tmp)
 
-    print(f"\n结果：通过 {PASSED} 项，失败 {FAILED} 项")
-    return 0 if FAILED == 0 else 1
+    return finish()
 
 
 if __name__ == "__main__":

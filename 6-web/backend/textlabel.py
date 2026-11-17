@@ -186,11 +186,6 @@ def clamp_box(box, width: int, height: int) -> list[float] | None:
     return [x1, y1, x2, y2]
 
 
-def decode_caption_tokens(input_ids, tokenizer) -> str:
-    """整句解码（调试与"短语为空"时的兜底显示用）。"""
-    return tokenizer.decode([int(v) for v in np.asarray(input_ids).reshape(-1)])
-
-
 def decode_phrase(
     posmap: np.ndarray,
     input_ids,

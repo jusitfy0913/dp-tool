@@ -34,6 +34,7 @@ from pathlib import Path
 from typing import Any
 
 import config
+import jsonio
 
 #: 台账超过这个体积就折叠一次（只保留最近若干任务的最终状态）。
 #: 单条约 600 字节、每任务两条，8MB 大约够 6000 次任务，正常实验室用量很难摸到。
@@ -250,15 +251,9 @@ def compact(force: bool = False) -> bool:
     latest = latest_states()
     kept = sorted(latest.values(), key=lambda r: float(r.get("started_at") or 0.0))[-KEEP_ENTRIES:]
     lines = [json.dumps(record, ensure_ascii=False, default=str) for record in kept]
-    temp = path.with_suffix(".jsonl.part")
     try:
-        temp.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
-        os.replace(temp, path)
+        jsonio.write_text(path, "\n".join(lines) + ("\n" if lines else ""))
     except OSError as exc:
         print(f"[runledger] 台帐折叠失败：{type(exc).__name__}: {exc}", flush=True)
-        try:
-            temp.unlink(missing_ok=True)
-        except OSError:
-            pass
         return False
     return True

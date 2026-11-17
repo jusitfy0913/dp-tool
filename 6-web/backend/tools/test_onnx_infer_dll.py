@@ -32,24 +32,15 @@ REPO = BACKEND.parents[1]
 BIN = Path(os.environ.get("TRTFORGE_ONNX_DLL_DIR") or (REPO / "4-qt-studio" / "bin"))
 sys.path.insert(0, str(BACKEND))
 
+from _harness import check, finish  # noqa: E402
+
 import cv2  # noqa: E402
 import numpy as np  # noqa: E402
 
-PASSED: list[str] = []
-FAILED: list[str] = []
 SKIPPED: list[str] = []
 
 OI_DETECT, OI_SEGMENT, OI_POSE, OI_OBB = 0, 1, 2, 3
 OI_CLASSIFY = 4
-
-
-def check(name: str, ok: bool, detail: str = "") -> None:
-    if ok:
-        PASSED.append(name)
-        print(f"[PASS] {name} {detail}".rstrip())
-    else:
-        FAILED.append(name)
-        print(f"[FAIL] {name} {detail}".rstrip())
 
 
 def skip(name: str, reason: str) -> None:
@@ -602,13 +593,7 @@ def main() -> int:
                     f"输入 {item['input'][0]}x{item['input'][1]}"
                     f"  score={item['score']:.4f}  anomaly={item['is_anomaly']}"
                 )
-    print()
-    print(f"通过 {len(PASSED)}，失败 {len(FAILED)}，跳过 {len(SKIPPED)}")
-    if FAILED:
-        for name in FAILED:
-            print(f"  [FAIL] {name}")
-        return 1
-    return 0
+    return finish()
 
 
 if __name__ == "__main__":

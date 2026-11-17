@@ -29,36 +29,7 @@ from pathlib import Path
 BACKEND = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BACKEND))
 
-PASSED: list[str] = []
-FAILED: list[tuple[str, str]] = []
-
-
-def case(name: str):
-    def wrap(func):
-        def runner():
-            try:
-                func()
-            except Exception as exc:  # noqa: BLE001
-                FAILED.append((name, f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}"))
-                print(f"  [FAIL] {name}")
-            else:
-                PASSED.append(name)
-                print(f"  [ ok ] {name}")
-
-        runner.__name__ = func.__name__
-        return runner
-
-    return wrap
-
-
-def check(condition: bool, message: str) -> None:
-    if not condition:
-        raise AssertionError(message)
-
-
-def check_eq(actual, expected, label: str) -> None:
-    if actual != expected:
-        raise AssertionError(f"{label}：期望 {expected!r}，实际 {actual!r}")
+from _harness import case, check_eq, finish, require, run_cases  # noqa: E402
 
 
 class TempStore:
@@ -158,7 +129,7 @@ def client():
 def test_kind_registered() -> None:
     import runners
 
-    check(
+    require(
         "autoexp-agent" in runners.EXCLUSIVE_RUN_KINDS,
         "autoexp-agent 必须登记在 EXCLUSIVE_RUN_KINDS，否则会和网页训练同时抢显卡",
     )
@@ -171,7 +142,7 @@ def test_ping() -> None:
     check_eq(response.status_code, 200, "状态码")
     body = response.json()
     check_eq(body.get("kind"), "autoexp-agent", "kind")
-    check(body.get("registered_exclusive") is True, "registered_exclusive 必须为 True")
+    require(body.get("registered_exclusive") is True, "registered_exclusive 必须为 True")
 
 
 @case("/status 结构完整且 Key 只给遮罩")
@@ -182,9 +153,9 @@ def test_status_shape() -> None:
     check_eq(response.status_code, 200, "状态码")
     body = response.json()
     for key in ("available", "splits_ready", "noise", "llm", "ledger_rows"):
-        check(key in body, f"缺少字段 {key}")
-    check(body["llm"].get("has_key") is True, "has_key 应为 True")
-    check(
+        require(key in body, f"缺少字段 {key}")
+    require(body["llm"].get("has_key") is True, "has_key 应为 True")
+    require(
         "sk-abcdefgh12345678" not in response.text,
         "/status 的响应体里出现了 Key 原文：这是不可接受的泄露",
     )
@@ -203,9 +174,9 @@ def test_llm_config_masks_key() -> None:
         response = client().get("/api/autoexp/llm-config")
     check_eq(response.status_code, 200, "状态码")
     body = response.json()
-    check(secret not in response.text, "响应体里出现了 Key 原文")
+    require(secret not in response.text, "响应体里出现了 Key 原文")
     check_eq(body.get("key_masked"), "sk-****9876", "遮罩格式")
-    check(body.get("has_key") is True, "has_key")
+    require(body.get("has_key") is True, "has_key")
 
 
 @case("保存配置时空 api_key 表示「保留原 Key」")
@@ -222,7 +193,7 @@ def test_save_keeps_key_when_blank() -> None:
         })
         body = api.get("/api/autoexp/llm-config").json()
     check_eq(body.get("model"), "deepseek-reasoner", "模型应被更新")
-    check(body.get("has_key") is True, "留空时不应把 Key 弄丢")
+    require(body.get("has_key") is True, "留空时不应把 Key 弄丢")
 
 
 @case("__clear__ 能清除已保存的 Key")
@@ -232,7 +203,7 @@ def test_clear_key() -> None:
         api.post("/api/autoexp/llm-config", json={"api_key": "sk-temp-1111"})
         api.post("/api/autoexp/llm-config", json={"api_key": "__clear__"})
         body = api.get("/api/autoexp/llm-config").json()
-    check(body.get("has_key") is False, "清除后 has_key 应为 False")
+    require(body.get("has_key") is False, "清除后 has_key 应为 False")
 
 
 @case("接口地址与 temperature 的非法值被拒绝")
@@ -283,9 +254,9 @@ def test_start_passes_max_errors() -> None:
                                      json={"rounds": 2, "max_errors": 4})
     check_eq(response.status_code, 200, "状态码")
     argv = fake.calls[0]["command"]
-    check("--max-errors" in argv, f"应传 --max-errors：{argv}")
+    require("--max-errors" in argv, f"应传 --max-errors：{argv}")
     check_eq(argv[argv.index("--max-errors") + 1], "4", "max_errors 的值应透传")
-    check("sk-test" not in " ".join(argv), "Key 绝不能进 argv")
+    require("sk-test" not in " ".join(argv), "Key 绝不能进 argv")
 
 
 @case("没填 Key 时 /start 直接拒绝，不发任何请求")
@@ -293,7 +264,7 @@ def test_start_requires_key() -> None:
     with TempStore(), ClearKeyEnv(), IdleBusyCheck():
         response = client().post("/api/autoexp/start", json={"rounds": 3})
     check_eq(response.status_code, 400, "状态码")
-    check("API Key" in response.json().get("detail", ""), "错误信息应点明缺 Key")
+    require("API Key" in response.json().get("detail", ""), "错误信息应点明缺 Key")
 
 
 # ---------------------------------------------------------------------------
@@ -369,7 +340,7 @@ def test_start_hides_key_from_argv() -> None:
     call = fake.calls[0]
 
     joined = " ".join(call["command"])
-    check(secret not in joined, f"Key 出现在了命令行里：{joined}")
+    require(secret not in joined, f"Key 出现在了命令行里：{joined}")
     check_eq(call["env"].get("AUTOEXP_API_KEY"), secret, "Key 应通过环境变量传入")
     # 锁委派必须精确到 pid：只传布尔开关会让子进程看不见「命令行正另跑一轮」
     check_eq(
@@ -380,15 +351,15 @@ def test_start_hides_key_from_argv() -> None:
         call["env"].get("AUTOEXP_INFER_YIELDED"), "1",
         "子进程必须知道推理进程已让出，不能在每一轮结束时提前归还显存",
     )
-    check(callable(call["on_finished"]), "任务结束回调要负责解除让出")
+    require(callable(call["on_finished"]), "任务结束回调要负责解除让出")
     yielded = response.json().get("infer_yielded") or {}
-    check(yielded.get("held") is True, f"启动前应先让出推理显存：{yielded}")
+    require(yielded.get("held") is True, f"启动前应先让出推理显存：{yielded}")
 
     # 轮数/时间上限等参数要真的传下去，否则界面上改了半天没用
-    check("--rounds" in call["command"], "缺少 --rounds")
+    require("--rounds" in call["command"], "缺少 --rounds")
     check_eq(call["command"][call["command"].index("--rounds") + 1], "7", "rounds 取值")
     check_eq(call["command"][call["command"].index("--hours") + 1], "2.5", "hours 取值")
-    check("--events" in call["command"], "缺少 --events，网页就收不到决策事件")
+    require("--events" in call["command"], "缺少 --events，网页就收不到决策事件")
     check_eq(call["kind"], "autoexp-agent", "kind")
 
 
@@ -448,8 +419,8 @@ def test_start_failure_releases_yield() -> None:
         with TempGpuLock(), FakeManagerSwap(fake), IdleBusyCheck():
             response = client().post("/api/autoexp/start", json={"rounds": 1})
     check_eq(response.status_code, 500, "状态码")
-    check("启动自动实验进程失败" in response.json().get("detail", ""), f"应说明启动失败：{response.json()}")
-    check(inferproxy._pool.gpu_hold() == "", f"失败后让出标记必须清掉，实际 {inferproxy._pool.gpu_hold()!r}")
+    require("启动自动实验进程失败" in response.json().get("detail", ""), f"应说明启动失败：{response.json()}")
+    require(inferproxy._pool.gpu_hold() == "", f"失败后让出标记必须清掉，实际 {inferproxy._pool.gpu_hold()!r}")
     check_eq(len(fake.calls), 1, "应确实尝试过启动")
 
 
@@ -470,9 +441,9 @@ def test_history() -> None:
     response = client().get("/api/autoexp/history", params={"limit": 5})
     check_eq(response.status_code, 200, "状态码")
     body = response.json()
-    check(isinstance(body.get("rows"), list), "rows 应为列表")
-    check(isinstance(body.get("total"), int), "total 应为整数")
-    check(len(body["rows"]) <= 5, "limit 应生效")
+    require(isinstance(body.get("rows"), list), "rows 应为列表")
+    require(isinstance(body.get("total"), int), "total 应为整数")
+    require(len(body["rows"]) <= 5, "limit 应生效")
 
 
 @case("/llm-test 在缺 Key 时返回 ok=false 而不是 500")
@@ -481,8 +452,8 @@ def test_llm_test_without_key() -> None:
         response = client().post("/api/autoexp/llm-test")
     check_eq(response.status_code, 200, "状态码（失败也应是可解析的 200）")
     body = response.json()
-    check(body.get("ok") is False, "ok 应为 False")
-    check("Key" in (body.get("error") or ""), f"错误信息应提到 Key，实际：{body.get('error')}")
+    require(body.get("ok") is False, "ok 应为 False")
+    require("Key" in (body.get("error") or ""), f"错误信息应提到 Key，实际：{body.get('error')}")
 
 
 # ---------------------------------------------------------------------------
@@ -495,23 +466,9 @@ def main() -> int:
     print(f"Python {sys.version.split()[0]}")
     print()
 
-    tests = [obj for name, obj in sorted(globals().items()) if name.startswith("test_")]
-    for test in tests:
-        test()
+    run_cases(globals())
 
-    print()
-    print("=" * 60)
-    total = len(PASSED) + len(FAILED)
-    print(f"通过 {len(PASSED)} / {total}")
-    if FAILED:
-        print()
-        for name, detail in FAILED:
-            print(f"[FAIL] {name}")
-            print(detail)
-            print("-" * 60)
-        return 1
-    print("全部通过")
-    return 0
+    return finish()
 
 
 if __name__ == "__main__":

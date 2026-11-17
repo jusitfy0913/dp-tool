@@ -8,10 +8,13 @@ import { initEngine } from "./engine.js";
 import { initExport } from "./export.js";
 import { initInfer } from "./infer.js";
 import { initInferBatch } from "./inferbatch.js";
+import { isAbsolutePath, relativizePath } from "./paths.js";
 import { initPipeline } from "./pipeline.js";
 import { initRunsBar } from "./runsbar.js";
 import { initSplitPanes } from "./splitpanes.js";
 import { initTrain } from "./train.js";
+import { startBoot } from "./boot.js";
+import { bindHintTips } from "./ui.js";
 
 // ---------------------------------------------------------------------------
 // 页签
@@ -101,6 +104,10 @@ async function refreshEnvironment() {
     dot.className = "dot bad";
     text.textContent = "后端未连接";
     capBox.textContent = `无法获取环境信息：${error.message}`;
+  } finally {
+    // 探测结束（成功或失败）都要摘掉骨架态：
+    // 留在 pending 会让顶栏一直显示"正在加载"，即使已经明确报了"后端未连接"。
+    document.getElementById("envStatus")?.classList.remove("is-pending");
   }
 }
 
@@ -113,7 +120,7 @@ async function refreshEnvironment() {
 //   2. 页面内目录浏览（兜底/Shift）——远程访问、服务跑在无桌面会话、
 //      或用户想直接切盘符时用。能力探测失败时自动走这条。
 // ---------------------------------------------------------------------------
-const browseState = { targetId: null, mode: "dir", current: "", patterns: [] };
+const browseState = { targetId: null, mode: "dir", current: "", patterns: [], relRoot: "" };
 
 /** 解析 data-patterns=".pt,.pth" → [".pt", ".pth"]；接受 pt / *.pt 写法。 */
 function splitPatterns(text) {
@@ -126,6 +133,20 @@ function splitPatterns(text) {
       if (item.startsWith(".")) return item;
       return `.${item}`;
     });
+}
+
+/**
+ * 选择框的起始目录。
+ *
+ * 大部分字段里存的本来就是绝对路径，直接用它。但异常检测的三个子目录字段是
+ * 「相对数据集 root」的（`train/good`），把这种相对值交给系统框，它会从「文档」
+ * 开始——用户又得自己钻到数据集目录。所以带 `data-relroot` 的按钮从 root 打开。
+ */
+function browseStart(target, relRootId = "") {
+  const value = (target?.value || "").trim();
+  if (!relRootId || !value || isAbsolutePath(value)) return value;
+  const rootText = (document.getElementById(relRootId)?.value || "").trim();
+  return rootText || value;
 }
 
 /**
@@ -178,12 +199,15 @@ async function pickNative(button) {
 
   const targetId = button.dataset.browse;
   const target = targetId ? document.getElementById(targetId) : null;
+  // data-relroot：这个字段存的是「相对某个目录」的子路径（如 normal_dir 之于 root）。
+  const relRootId = button.dataset.relroot || "";
   const payload = {
     kind,
     field: targetId || "",
     title: button.dataset.title || "",
-    // 字段里通常已经是上次选的文件路径，后端会取父目录作为起始位置
-    initial: (target?.value || "").trim(),
+    // 字段里通常已经是上次选的文件路径，后端会取父目录作为起始位置；
+    // 相对 root 的子目录字段则从 root 打开（见 browseStart）。
+    initial: browseStart(target, relRootId),
     patterns: splitPatterns(button.dataset.patterns),
     label: button.dataset.label || "",
     defaultextension: button.dataset.defaultextension || "",
@@ -214,8 +238,13 @@ async function pickNative(button) {
       return false;
     }
     if (result.paths?.length) {
-      writeValue(targetId, result.paths[0]);
-      toast(`已选择：${result.paths[0]}`, "info");
+      // 子目录字段：选中的目录在 root 里面就存相对写法，训练命令里更直观
+      const chosen = relativizePath(
+        relRootId ? document.getElementById(relRootId)?.value : "",
+        result.paths[0],
+      );
+      writeValue(targetId, chosen);
+      toast(`已选择：${chosen}`, "info");
     }
     // 取消（系统框里取消，或网页上点了「取消」）是有意行为：不动字段、不报错
     return true;
@@ -260,10 +289,20 @@ function initBrowse() {
     browseState.targetId = button.dataset.browse;
     browseState.mode = button.dataset.dialog === "dir" || button.dataset.mode === "dir" ? "dir" : "file";
     browseState.patterns = splitPatterns(button.dataset.patterns);
-    const start = document.getElementById(browseState.targetId)?.value || "";
+    browseState.relRoot = button.dataset.relroot || "";
+    const target = document.getElementById(browseState.targetId);
+    const start = browseStart(target, browseState.relRoot);
     modal.classList.remove("hidden");
     btnPick.textContent = browseState.mode === "file" ? "选择文件/当前目录" : "选择当前目录";
     openAt(start);
+  }
+
+  /** 页面内浏览选中后的落盘：与系统选择框走同一套「相对 root」改写。 */
+  function commit(path) {
+    writeValue(browseState.targetId, relativizePath(
+      browseState.relRoot ? document.getElementById(browseState.relRoot)?.value : "",
+      path,
+    ));
   }
 
   /**
@@ -271,7 +310,8 @@ function initBrowse() {
    *
    * 字段里可能已经是文件路径（选过一次之后再点「浏览」很常见），
    * 直接把它交给 /api/browse 会 404，弹窗里只剩一句「无法读取」，用户以为坏了。
-   * 先按目录试一次，失败就退到父目录再试。
+   * 先按目录试一次，失败就退到父目录再试；相对路径（输出目录的默认值 `results`
+   * 之类还没生成的目录）最后退到仓库根，总比只显示一句「无法读取」强。
    */
   async function openAt(start) {
     const path = (start || "").trim();
@@ -281,7 +321,8 @@ function initBrowse() {
     }
     if (await loadDir(path)) return;
     const parent = path.replace(/[\\/][^\\/]+[\\/]?$/, "");
-    if (parent && parent !== path) await loadDir(parent);
+    if (parent && parent !== path && (await loadDir(parent))) return;
+    if (!isAbsolutePath(path)) await loadDir("");
   }
 
   /** 没有 data-patterns 时的兜底白名单，保持与旧版本一致的行为。 */
@@ -328,14 +369,14 @@ function initBrowse() {
       if (entry.is_dir) {
         await loadDir(entry.path);
       } else if (browseState.mode === "file") {
-        writeValue(browseState.targetId, entry.path);
+        commit(entry.path);
         modal.classList.add("hidden");
       }
     });
     // 双击文件直接选中
     li.addEventListener("dblclick", () => {
       if (!entry.is_dir) {
-        writeValue(browseState.targetId, entry.path);
+        commit(entry.path);
         modal.classList.add("hidden");
       }
     });
@@ -348,7 +389,7 @@ function initBrowse() {
   });
 
   btnPick.addEventListener("click", () => {
-    writeValue(browseState.targetId, browseState.current);
+    commit(browseState.current);
     modal.classList.add("hidden");
   });
 
@@ -375,45 +416,54 @@ export function writeValue(targetId, value) {
 
 // ---------------------------------------------------------------------------
 // 启动
+//
+// 各页初始化不在模块加载时立刻跑：要等进入密码通过、等待画面盖上来之后再跑。
+// 这样密码还没过的时候不会去拉环境、也不会把主界面先画出来。
 // ---------------------------------------------------------------------------
 
 // ?reduced-motion=1 手动关闭发光、扫描线与过渡效果。
 // 用途：验收可读性护栏，以及在核显机器上排除合成层开销。与系统偏好
 // prefers-reduced-motion 走同一套令牌归零规则（见 style.css 第 1.9 节）。
+// 放在遮罩出现之前，等待画面上的进度条也会一起停。
 if (new URLSearchParams(location.search).has("reduced-motion")) {
   document.documentElement.classList.add("reduced-motion");
 }
 
-initTabs();
-initTrain();
-initPipeline();
-initExport();
-initEngine();
-initDataset();
-initAnnotate();
-initInfer();
-initInferBatch();
-// 自动实验是外置模块：它只读 /api/autoexp/*，不参与上面任何一页的状态。
-// 放在 infer 之后初始化，是为了让它的事件接管晚于训练页——两边同时存在时，
-// 训练页先注册的监听优先，不会被这个模块影响。
-initAutoexp();
-initBrowse();
-// 顶栏的「运行中任务」条要在各页初始化之后挂：它只是读 /api/runs，
-// 不依赖页面状态，但放在最后能保证各页的接管监听已经注册好。
-initRunsBar();
+function startApplication() {
+  bindHintTips();
+  initTabs();
+  initTrain();
+  initPipeline();
+  initExport();
+  initEngine();
+  initDataset();
+  initAnnotate();
+  initInfer();
+  initInferBatch();
+  // 自动实验是外置模块：它只读 /api/autoexp/*，不参与上面任何一页的状态。
+  // 放在 infer 之后初始化，是为了让它的事件接管晚于训练页——两边同时存在时，
+  // 训练页先注册的监听优先，不会被这个模块影响。
+  initAutoexp();
+  initBrowse();
+  // 顶栏的「运行中任务」条要在各页初始化之后挂：它只是读 /api/runs，
+  // 不依赖页面状态，但放在最后能保证各页的接管监听已经注册好。
+  initRunsBar();
 
-// 顶栏条里点某个任务 → 先把页签切到它所属的页面，再把事件交给页面自己接管
-// （训练页恢复日志与按钮、构建页恢复进度）。页面没接管也不影响：条上仍能停。
-document.addEventListener("trtf:attach-run", (event) => {
-  const kind = String(event.detail?.run?.kind || "");
-  if (kind === "engine-build") activateTab("engine");
-  else if (kind === "infer-batch" || kind === "infer-video") activateTab("infer");
-  else if (kind === "autoexp-agent") activateTab("autoexp");
-  else activateTab("train");
-});
-// 分栏拖动条必须在各页初始化之后插入：这些 init 会在卡片里生成表单与列表，
-// 晚一步插入才不会打乱它们按 DOM 顺序取元素。漏掉这一句的后果不是「不能拖」，
-// 而是第二块内容掉进 10px 宽的拖动条列里，被挤成一条竖线（v1.25.0 修）。
-initSplitPanes();
-refreshVersion();
-refreshEnvironment();
+  // 顶栏条里点某个任务 → 先把页签切到它所属的页面，再把事件交给页面自己接管
+  // （训练页恢复日志与按钮、构建页恢复进度）。页面没接管也不影响：条上仍能停。
+  document.addEventListener("trtf:attach-run", (event) => {
+    const kind = String(event.detail?.run?.kind || "");
+    if (kind === "engine-build") activateTab("engine");
+    else if (kind === "infer-batch" || kind === "infer-video") activateTab("infer");
+    else if (kind === "autoexp-agent") activateTab("autoexp");
+    else activateTab("train");
+  });
+  // 分栏拖动条必须在各页初始化之后插入：这些 init 会在卡片里生成表单与列表，
+  // 晚一步插入才不会打乱它们按 DOM 顺序取元素。漏掉这一句的后果不是「不能拖」，
+  // 而是第二块内容掉进 10px 宽的拖动条列里，被挤成一条竖线（v1.25.0 修）。
+  initSplitPanes();
+  refreshVersion();
+  refreshEnvironment();
+}
+
+startBoot(startApplication);

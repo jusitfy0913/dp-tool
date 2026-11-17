@@ -53,7 +53,7 @@ LOG_BACKUPS = max(0, int(os.environ.get("TRTFORGE_LOG_BACKUPS", "3")))
 
 #: 应用版本号。放在 config 而不是 app：数据集导出（dataset.py）也要把它写进 manifest，
 #: 而 dataset 反过来 import app 会形成循环。app.py 只做 `APP_VERSION = config.APP_VERSION`。
-APP_VERSION = "1.39.0"
+APP_VERSION = "1.44.0"
 
 # 任务日志的保留天数（按整个任务的所有分片一起判断，最旧一份多久没更新就删）。
 # 之所以还要这一层：单任务有上限，但「任务数 × 上限」仍然会无限增长。
@@ -96,6 +96,12 @@ ANOMALIB_LAUNCHER_DIR = Path(
     or REPO_ROOT / "2-python-anomaly" / "launcher"
 ).resolve()
 ANOMALIB_LAUNCHER = ANOMALIB_LAUNCHER_DIR / "tf_anomalib_launcher.py"
+
+# AnomalyDINO 与 Anomalib 共用同一个 launcher 目录，但是**另一个启动器**：
+# 它不 import anomalib / lightning，只做「DINOv2 前向建库 + 导出 ONNX」。
+# 产物结构（results/<模型类名>/<name>/v<N>/weights/lightning/）与 Anomalib 一致，
+# 所以下游扫描、编译、精度评估都不用区分这两条路。
+ANOMALYDINO_LAUNCHER = ANOMALIB_LAUNCHER_DIR / "tf_anomalydino_launcher.py"
 
 # Anomalib 默认数据集根：仓库自带 bottle
 DEFAULT_ANOMALIB_ROOT = Path(
@@ -297,12 +303,6 @@ def resolve_python() -> str | None:
     return resolved
 
 
-def invalidate_python_cache() -> None:
-    """清掉解释器缓存（测试或用户改了环境后用）。"""
-    global _PYTHON_CACHE
-    _PYTHON_CACHE = None
-
-
 def _has_training_deps(python_exe: str) -> bool:
     """检查解释器是否装了 torch（训练的最低要求）。"""
     import subprocess
@@ -376,6 +376,9 @@ def capabilities() -> dict:
         "python": resolve_python(),
         "yolo_launcher": str(YOLO_LAUNCHER) if YOLO_LAUNCHER.is_file() else None,
         "anomalib_launcher": str(ANOMALIB_LAUNCHER) if ANOMALIB_LAUNCHER.is_file() else None,
+        "anomalydino_launcher": str(ANOMALYDINO_LAUNCHER)
+        if ANOMALYDINO_LAUNCHER.is_file()
+        else None,
         "anomalib_dataset_root": str(DEFAULT_ANOMALIB_ROOT) if DEFAULT_ANOMALIB_ROOT.is_dir() else None,
         "bin_dir": str(BIN_DIR),
         "yolo_dll": (BIN_DIR / "yolo_infer.dll").is_file(),

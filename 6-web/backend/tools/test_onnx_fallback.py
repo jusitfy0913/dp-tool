@@ -22,23 +22,12 @@ BACKEND_DIR = Path(__file__).resolve().parent.parent
 REPO_ROOT = BACKEND_DIR.parent.parent
 sys.path.insert(0, str(BACKEND_DIR))
 
+from _harness import check, finish  # noqa: E402
+
 import cv2
 import numpy as np
 
 import onnx_fallback as F
-
-PASSED = 0
-FAILED = 0
-
-
-def check(name: str, condition: bool, detail: str = "") -> None:
-    global PASSED, FAILED
-    if condition:
-        PASSED += 1
-        print(f"  [PASS] {name}")
-    else:
-        FAILED += 1
-        print(f"  [FAIL] {name} {detail}")
 
 
 def imread_unicode(path: str) -> np.ndarray | None:
@@ -228,8 +217,97 @@ def test_anomalib() -> None:
         check("缺模型文件时报错", True)
 
 
+def test_score_semantics() -> None:
+    """判定口径必须与 DLL 一致：分数比的是**原始分数**，不是归一化后的 0~1。
+
+    这一节是 v1.40.1 的回归护栏。旧写法 `normalized >= image_threshold` 把两个
+    量纲混着比，等价于把阈值偷偷改成 `scoreMin + threshold * (scoreMax - scoreMin)`：
+    AnomalyDINO（分数 0.06~0.50、阈值 0.2203）实际判定线变成 0.156，
+    bottle 的 good 图被大面积误报成 NG。
+    """
+    print("\n[3] 分数口径（与 DLL 逐字对齐）")
+    meta = {
+        "model_type": "AnomalyDINO",
+        "normalization": "imagenet",
+        "image_threshold": 0.22035031020641327,
+        "pred_scores": {"min": 0.0601799413561821, "max": 0.49606022238731384},
+        "pred_scores.min": 0.0601799413561821,
+        "pred_scores.max": 0.49606022238731384,
+    }
+    lo, hi = F._score_range(meta)
+    check("pred_scores 范围读得对", abs(lo - 0.06018) < 1e-4 and abs(hi - 0.49606) < 1e-4, f"{lo},{hi}")
+
+    # 判定线 = 原始分数阈值。0.21（好图典型分数）必须 OK，0.23 必须 NG。
+    check("raw 0.21 < 阈值 0.2203 判 OK",
+          not (0.21 >= meta["image_threshold"]))
+    check("raw 0.23 > 阈值 0.2203 判 NG",
+          bool(0.23 >= meta["image_threshold"]))
+
+    # 归一化展示：阈值处正好 0.5（DLL anomalib_post.hpp:33-39 的公式）
+    at_thr = F._display_score(meta["image_threshold"], meta["image_threshold"], meta)
+    check("归一化分数在阈值处为 0.5", abs(at_thr - 0.5) < 1e-6, str(at_thr))
+    low = F._display_score(0.21, meta["image_threshold"], meta)
+    check("低分图的归一化分数 < 0.5", low < 0.5, str(low))
+    high = F._display_score(0.30, meta["image_threshold"], meta)
+    check("高分图的归一化分数 > 0.5", high > 0.5, str(high))
+    saturated = F._display_score(0.9, 0.2203, {"pred_scores.min": 0.0, "pred_scores.max": 0.0})
+    check("min==max 时退化为裁剪，不除零", 0.0 <= saturated <= 1.0, str(saturated))
+
+    # 归一化口径判定，顺序与 DLL 一致
+    check("metadata 写了 imagenet 就用 imagenet",
+          F._normalization_mode({"normalization": "imagenet"}) == "imagenet")
+    check("metadata 写了 none 就不归一化",
+          F._normalization_mode({"normalization": "none"}) == "none")
+    check("缺字段 + post_processed 契约 → none",
+          F._normalization_mode({"output_contract": "anomalib_post_processed_0_1"}) == "none")
+    check("缺字段 + EfficientAd → none",
+          F._normalization_mode({}, "EfficientAd") == "none")
+    check("缺字段 + 其他模型 → imagenet",
+          F._normalization_mode({}, "AnomalyDINO") == "imagenet")
+
+
+def test_anomalydino_parity() -> None:
+    """有 AnomalyDINO 模型时，直接比「降级 vs 引擎」的原始分数与判定。
+
+    这是用户报的现象本身：降级路径若漏了 ImageNet 归一化，同一张 good 图的
+    raw 会从 0.097 抬到 0.20（超过 0.2203 的判定线附近），good 就变成 NG。
+    """
+    print("\n[4] AnomalyDINO 降级 vs 引擎 一致性")
+    onnx = (REPO_ROOT / "2-python-anomaly" / "launcher" / "results" / "AnomalyDINO"
+            / "bottle_spike" / "v0" / "weights" / "lightning" / "model.onnx")
+    meta_path = onnx.with_name("metadata.json")
+    if not (onnx.is_file() and meta_path.is_file()):
+        print("  [SKIP] 缺少 AnomalyDINO 模型")
+        return
+    good_dir = (REPO_ROOT / "2-python-anomaly" / "anomalib-main" / "datasets"
+                / "bottle" / "test" / "good")
+    if not good_dir.is_dir():
+        print("  [SKIP] 缺少 bottle 测试集")
+        return
+
+    meta = F._load_metadata(str(meta_path))
+    threshold = float(meta["image_threshold"])
+    names = sorted(p.name for p in good_dir.glob("*.png"))[:5]
+    ng = 0
+    raw_scores = []
+    for name in names:
+        image = imread_unicode(str(good_dir / name))
+        if image is None:
+            continue
+        result = F.run_anomalib(str(onnx), str(meta_path), image, "Auto")
+        raw_scores.append(result["raw_score"])
+        ng += 1 if result["is_anomaly"] else 0
+    check(f"good 图判 NG 的数量为 0（{ng}/{len(raw_scores)}）", ng == 0, str(ng))
+    check("good 图 raw 全部低于阈值", all(s < threshold for s in raw_scores),
+          f"max={max(raw_scores):.4f} thr={threshold:.4f}")
+    # 引擎路径实测（T1000/FP16，000.png）= 0.0971；ONNX/CPU 应落在 1e-3 量级内
+    if raw_scores:
+        check("首张 good 图 raw 与引擎路径一致（±0.005）",
+              abs(raw_scores[0] - 0.0971) < 0.005, f"{raw_scores[0]:.4f} vs 0.0971")
+
+
 def test_capability() -> None:
-    print("\n[3] 能力探测")
+    print("\n[5] 能力探测")
     ok, detail = F.available()
     check("available() 返回可用", ok, detail)
     check("detail 含 provider 信息", "provider" in detail.lower() or "onnxruntime" in detail)
@@ -237,7 +315,7 @@ def test_capability() -> None:
 
 def test_api_fallback() -> None:
     """模拟 DLL 损坏，确认 API 自动降级且返回结构不变。"""
-    print("\n[4] API 降级端到端（模拟 DLL 不可用）")
+    print("\n[6] API 降级端到端（模拟 DLL 不可用）")
     try:
         from fastapi.testclient import TestClient
     except Exception as exc:  # pragma: no cover
@@ -311,15 +389,17 @@ def test_api_fallback() -> None:
                       timing.get("payload_bytes") == len(resp.content),
                       f"{timing.get('payload_bytes')} vs {len(resp.content)}")
 
-            # 4b. 给 .engine 且同目录没有 .onnx —— 应 503 并说清怎么修
+            # 4b. 给一个不存在的 .engine —— v1.42.0 起在路径层就拒（400）。
+            # 以前要走完「DLL 不可用 → 推导同目录 ONNX → 推导失败」才报 503，
+            # 那时的提示是「找不到 ONNX」，而真正的问题是文件根本不存在。
             fake_engine = BACKEND_DIR / "no_such_engine.engine"
             resp = client.post(
                 "/api/infer/yolo",
                 files={"image": ("t.png", image_bytes, "image/png")},
                 data={"engine": str(fake_engine), "task": "detect"},
             )
-            check("找不到对应 ONNX 时返回 503", resp.status_code == 503, f"实际 {resp.status_code}")
-            check("503 里给出修复指引", ".onnx" in resp.text, resp.text[:150])
+            check("引擎文件不存在时返回 400", resp.status_code == 400, f"实际 {resp.status_code}")
+            check("400 里带上用户给的路径", "no_such_engine.engine" in resp.text, resp.text[:150])
 
             # 4c. Anomalib：engine 用 .onnx，metadata 用真实文件，应走降级
             base = REPO_ROOT / "2-python-anomaly" / "launcher" / "results"
@@ -372,11 +452,10 @@ def main() -> int:
     test_capability()
     test_yolo()
     test_anomalib()
+    test_score_semantics()
+    test_anomalydino_parity()
     test_api_fallback()
-    print(f"\n{'=' * 56}")
-    print(f"通过 {PASSED} 项，失败 {FAILED} 项")
-    print("=" * 56)
-    return 1 if FAILED else 0
+    return finish()
 
 
 if __name__ == "__main__":

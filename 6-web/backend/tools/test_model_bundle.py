@@ -28,42 +28,14 @@ from pathlib import Path
 BACKEND = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BACKEND))
 
+from _harness import case, check_eq, finish, require, run_cases  # noqa: E402
+
 import bundle  # noqa: E402
 import models as models_mod  # noqa: E402
 
-PASSED: list[str] = []
-FAILED: list[tuple[str, str]] = []
 
 ENGINE_BYTES = b"FAKE-TENSORRT-ENGINE" * 8
 ONNX_BYTES = b"FAKE-ONNX" * 8
-
-
-def case(name: str):
-    def wrap(func):
-        def runner():
-            try:
-                func()
-            except Exception as exc:  # noqa: BLE001
-                FAILED.append((name, f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}"))
-                print(f"  [FAIL] {name}")
-            else:
-                PASSED.append(name)
-                print(f"  [ ok ] {name}")
-
-        runner.__name__ = func.__name__
-        return runner
-
-    return wrap
-
-
-def check(condition: bool, message: str) -> None:
-    if not condition:
-        raise AssertionError(message)
-
-
-def check_eq(actual, expected, label: str) -> None:
-    if actual != expected:
-        raise AssertionError(f"{label}：期望 {expected!r}，实际 {actual!r}")
 
 
 class FixedRuntime:
@@ -149,8 +121,8 @@ def _build(tree: TempTree, **overrides):
 def test_build_engine_bundle():
     with TempTree() as tree:
         result, target = _build(tree)
-        check(result["ok"], f"造包应成功：{result.get('error')}")
-        check(target.is_dir(), "包目录应存在")
+        require(result["ok"], f"造包应成功：{result.get('error')}")
+        require(target.is_dir(), "包目录应存在")
 
         manifest = json.loads((target / "manifest.json").read_text(encoding="utf-8"))
         check_eq(manifest["schema"], bundle.SCHEMA, "schema")
@@ -169,8 +141,8 @@ def test_build_engine_bundle():
         check_eq(roles.get("model"), "model.engine", "model 文件名")
         check_eq(roles.get("labels"), "labels.json", "labels 文件名")
 
-        check((target / "README.txt").is_file(), "应生成 README.txt")
-        check("换机器之前务必确认" in (target / "README.txt").read_text(encoding="utf-8"),
+        require((target / "README.txt").is_file(), "应生成 README.txt")
+        require("换机器之前务必确认" in (target / "README.txt").read_text(encoding="utf-8"),
               "README 应说明换机要重编引擎")
 
         origin = json.loads((target / "origin.meta.json").read_text(encoding="utf-8"))
@@ -184,7 +156,7 @@ def test_build_onnx_bundle():
             result = bundle.build_bundle(
                 tree.onnx, tree.out, "onnx_only", labels=tree.labels, kind="yolo", task="detect"
             )
-        check(result["ok"], f"造包应成功：{result.get('error')}")
+        require(result["ok"], f"造包应成功：{result.get('error')}")
         manifest = result["manifest"]
         check_eq(manifest["runtime"]["format"], "onnx", "runtime.format")
         check_eq(manifest["runtime"]["trt_version"], None, "ONNX 不应记 TensorRT 版本")
@@ -200,14 +172,14 @@ def test_build_does_not_touch_source():
         _build(tree)
         check_eq(tree.engine.read_bytes(), before_bytes, "引擎内容被改了")
         check_eq(tree.engine.stat().st_mtime_ns, before_mtime, "引擎修改时间被改了")
-        check(tree.onnx.is_file(), "ONNX 不应被删除")
+        require(tree.onnx.is_file(), "ONNX 不应被删除")
 
 
 @case("同分区用硬链接，linked=true")
 def test_build_links_on_same_volume():
     with TempTree() as tree:
         result, target = _build(tree)
-        check(result["ok"], "造包应成功")
+        require(result["ok"], "造包应成功")
         check_eq(result["manifest"]["linked"], True, "同分区应硬链接")
         check_eq((target / "model.engine").stat().st_size, len(ENGINE_BYTES), "硬链接大小应与原文件一致")
 
@@ -216,26 +188,26 @@ def test_build_links_on_same_volume():
 def test_build_overwrite_guard():
     with TempTree() as tree:
         first, _ = _build(tree)
-        check(first["ok"], "第一次应成功")
+        require(first["ok"], "第一次应成功")
         second, _ = _build(tree)
-        check(not second["ok"], "重复造包应被拒绝")
-        check("已存在" in second["error"], f"错误信息应说明已存在：{second.get('error')}")
+        require(not second["ok"], "重复造包应被拒绝")
+        require("已存在" in second["error"], f"错误信息应说明已存在：{second.get('error')}")
         third, _ = _build(tree, overwrite=True)
-        check(third["ok"], "显式 overwrite 应成功")
+        require(third["ok"], "显式 overwrite 应成功")
 
 
 @case("模型文件不存在或不支持的后缀都给出可读错误")
 def test_build_rejects_bad_input():
     with TempTree() as tree:
         missing = bundle.build_bundle(tree.root / "nope.engine", tree.out, "x")
-        check(not missing["ok"], "不存在的文件应失败")
-        check("不存在" in missing["error"], "错误应说明文件不存在")
+        require(not missing["ok"], "不存在的文件应失败")
+        require("不存在" in missing["error"], "错误应说明文件不存在")
 
         weird = tree.root / "weights.pt"
         weird.write_bytes(b"x")
         bad = bundle.build_bundle(weird, tree.out, "y")
-        check(not bad["ok"], "不支持的 suffix 应失败")
-        check("后缀" in bad["error"], "错误应说明后缀不支持")
+        require(not bad["ok"], "不支持的 suffix 应失败")
+        require("后缀" in bad["error"], "错误应说明后缀不支持")
 
 
 @case("包名里的路径分隔符被收敛，不能建到目录外")
@@ -243,7 +215,7 @@ def test_build_sanitizes_bundle_id():
     with TempTree() as tree:
         with FixedRuntime():
             result = bundle.build_bundle(tree.engine, tree.out, "../../evil")
-        check(result["ok"], "应成功但落在 out_root 内")
+        require(result["ok"], "应成功但落在 out_root 内")
         check_eq(Path(result["path"]).parent.resolve(), tree.out.resolve(), "不能建到 out_root 之外")
 
 
@@ -265,7 +237,7 @@ def test_verify_ok():
         names = {item["name"] for item in verdict["checks"]}
         for expected in ("清单版本", "必填字段", "包内路径", "文件存在", "文件完整性",
                          "种类匹配", "任务匹配", "TensorRT 版本"):
-            check(expected in names, f"缺少检查项：{expected}")
+            require(expected in names, f"缺少检查项：{expected}")
 
 
 @case("schema 不认识 → block")
@@ -290,7 +262,7 @@ def test_verify_missing_fields():
         verdict = _verify(target)
         check_eq(verdict["level"], bundle.LEVEL_BLOCK, "缺必填字段必须 block")
         detail = next(item["detail"] for item in verdict["checks"] if item["name"] == "必填字段")
-        check("runtime" in detail and "task" in detail, f"应列出缺失字段：{detail}")
+        require("runtime" in detail and "task" in detail, f"应列出缺失字段：{detail}")
 
 
 @case("包内路径越界（绝对路径 / ..）→ block，且不打开该路径")
@@ -305,7 +277,7 @@ def test_verify_path_escape():
         verdict = _verify(target)
         check_eq(verdict["level"], bundle.LEVEL_BLOCK, "越界路径必须 block")
         names = {item["name"] for item in verdict["checks"]}
-        check("包内路径" in names, "应报告包内路径检查")
+        require("包内路径" in names, "应报告包内路径检查")
 
 
 @case("哈希不一致 → block，并给出登记值与实际值")
@@ -316,7 +288,7 @@ def test_verify_hash_mismatch():
         verdict = _verify(target)
         check_eq(verdict["level"], bundle.LEVEL_BLOCK, "哈希不符必须 block")
         detail = next(item["detail"] for item in verdict["checks"] if item["name"] == "文件完整性")
-        check("model.engine" in detail, f"应指明文件：{detail}")
+        require("model.engine" in detail, f"应指明文件：{detail}")
 
 
 @case("文件缺失 → block")
@@ -327,7 +299,7 @@ def test_verify_missing_file():
         verdict = _verify(target)
         check_eq(verdict["level"], bundle.LEVEL_BLOCK, "缺文件必须 block")
         detail = next(item["detail"] for item in verdict["checks"] if item["name"] == "文件存在")
-        check("model.engine" in detail, f"应指明缺失文件：{detail}")
+        require("model.engine" in detail, f"应指明缺失文件：{detail}")
 
 
 @case("清单不可读 → block，不抛异常")
@@ -351,7 +323,7 @@ def test_verify_kind_conflict():
         verdict = _verify(target, kind="anomalib")
         check_eq(verdict["level"], bundle.LEVEL_BLOCK, "种类冲突必须 block")
         detail = next(item["detail"] for item in verdict["checks"] if item["name"] == "种类匹配")
-        check("yolo" in detail, f"应说明包的种类：{detail}")
+        require("yolo" in detail, f"应说明包的种类：{detail}")
 
 
 @case("任务冲突 → block")
@@ -361,7 +333,7 @@ def test_verify_task_conflict():
         verdict = _verify(target, kind="yolo", task="segment")
         check_eq(verdict["level"], bundle.LEVEL_BLOCK, "任务冲突必须 block")
         detail = next(item["detail"] for item in verdict["checks"] if item["name"] == "任务匹配")
-        check("detect" in detail, f"应说明训练时的任务：{detail}")
+        require("detect" in detail, f"应说明训练时的任务：{detail}")
 
 
 @case("TensorRT 主版本不同 → block")
@@ -372,7 +344,7 @@ def test_verify_trt_major_differs():
             verdict = bundle.verify_bundle(target)
         check_eq(verdict["level"], bundle.LEVEL_BLOCK, "主版本不同必须 block")
         detail = next(item["detail"] for item in verdict["checks"] if item["name"] == "TensorRT 版本")
-        check("重新编译" in (next(item["fix"] for item in verdict["checks"]
+        require("重新编译" in (next(item["fix"] for item in verdict["checks"]
                                  if item["name"] == "TensorRT 版本")), f"应给出修复建议：{detail}")
 
 
@@ -405,7 +377,7 @@ def test_verify_gpu_arch_differs():
             verdict = bundle.verify_bundle(target)
         check_eq(verdict["level"], bundle.LEVEL_WARN, "架构不同应为 warn")
         detail = next(item["detail"] for item in verdict["checks"] if item["name"] == "显卡架构")
-        check("T1000" in detail and "4060" in detail, f"应给出两个型号：{detail}")
+        require("T1000" in detail and "4060" in detail, f"应给出两个型号：{detail}")
 
 
 @case("异常检测包缺 metadata → block")
@@ -415,7 +387,7 @@ def test_verify_anomalib_requires_metadata():
             result = bundle.build_bundle(
                 tree.engine, tree.out, "anomaly_no_meta", kind="anomalib", task="anomaly"
             )
-        check(result["ok"], "造包应成功（造包不强制 metadata）")
+        require(result["ok"], "造包应成功（造包不强制 metadata）")
         verdict = _verify(Path(result["path"]))
         check_eq(verdict["level"], bundle.LEVEL_BLOCK, "异常检测缺 metadata 必须 block")
 
@@ -428,7 +400,7 @@ def test_build_anomalib_with_metadata():
                 tree.engine, tree.out, "anomaly_ok",
                 metadata=tree.metadata, kind="anomalib", task="anomaly",
             )
-        check(result["ok"], "造包应成功")
+        require(result["ok"], "造包应成功")
         check_eq(result["manifest"]["anomaly"]["image_threshold"], 0.51, "图像阈值应进清单")
         verdict = _verify(Path(result["path"]), kind="anomalib")
         check_eq(verdict["level"], bundle.LEVEL_OK, "带 metadata 的异常检测包应通过")
@@ -446,11 +418,11 @@ def test_find_bundle():
         bundle.default_root = lambda: tree.out
         try:
             by_id = bundle.find_bundle("pcb_v1")
-            check(by_id is not None, "按 id 应能找到")
+            require(by_id is not None, "按 id 应能找到")
             check_eq(by_id.resolve(), target.resolve(), "按 id 找到的路径")
             by_path = bundle.find_bundle(str(target))
-            check(by_path is not None, "按路径应能找到")
-            check(bundle.find_bundle("不存在") is None, "找不到应返回 None")
+            require(by_path is not None, "按路径应能找到")
+            require(bundle.find_bundle("不存在") is None, "找不到应返回 None")
         finally:
             bundle.default_root = original
 
@@ -464,11 +436,11 @@ def test_resolve_bundle():
                 labels=tree.labels, metadata=tree.metadata, kind="anomalib", task="anomaly",
             )
         resolved = bundle.resolve_bundle(result["path"])
-        check(resolved["ok"], f"应解析成功：{resolved.get('error')}")
+        require(resolved["ok"], f"应解析成功：{resolved.get('error')}")
         check_eq(resolved["kind"], "anomalib", "kind")
-        check(resolved["model"].endswith("model.engine"), f"模型路径：{resolved['model']}")
-        check(resolved["labels"].endswith("labels.json"), f"标签路径：{resolved['labels']}")
-        check(resolved["metadata"].endswith("metadata.json"), f"metadata 路径：{resolved['metadata']}")
+        require(resolved["model"].endswith("model.engine"), f"模型路径：{resolved['model']}")
+        require(resolved["labels"].endswith("labels.json"), f"标签路径：{resolved['labels']}")
+        require(resolved["metadata"].endswith("metadata.json"), f"metadata 路径：{resolved['metadata']}")
 
 
 @case("quick_check 不读内容也能给出结论")
@@ -500,7 +472,7 @@ def test_models_reports_bundles_and_skips_internal():
                 built = bundle.build_bundle(
                     tree.engine, tree.out, "listed", labels=tree.labels, kind="yolo", task="detect"
                 )
-            check(built["ok"], "造包应成功")
+            require(built["ok"], "造包应成功")
             payload = models_mod.scan_models()
         finally:
             models_mod.SCAN_TARGETS = original_targets
@@ -508,8 +480,8 @@ def test_models_reports_bundles_and_skips_internal():
             bundle.default_root = original_default
 
         paths = {item["path"] for item in payload["entries"]}
-        check(any(path.endswith("other_fp16.engine") for path in paths), "散装引擎应仍被列出")
-        check(
+        require(any(path.endswith("other_fp16.engine") for path in paths), "散装引擎应仍被列出")
+        require(
             not any("model.engine" in path.replace("\\", "/") for path in paths),
             f"包内 model.engine 不应被当成散装条目：{paths}",
         )
@@ -533,7 +505,7 @@ def test_models_without_bundles():
             models_mod.config = original_config
             bundle.default_root = original_default
         check_eq(payload["bundles"], [], "没有包时 bundles 为空")
-        check(any(item["path"].endswith("best_fp16.engine") for item in payload["entries"]),
+        require(any(item["path"].endswith("best_fp16.engine") for item in payload["entries"]),
               "散装条目应照常返回")
 
 
@@ -545,7 +517,7 @@ def test_routes_registered():
              for m in (getattr(route, "methods", None) or [])}
     for expected in (("GET", "/api/bundles"), ("POST", "/api/bundles/build"),
                      ("POST", "/api/bundles/verify"), ("GET", "/api/bundles/{bundle_id}/manifest")):
-        check(expected in table, f"缺少路由：{expected}")
+        require(expected in table, f"缺少路由：{expected}")
 
 
 @case("推理接口接受 bundle 参数且 engine 变为可选")
@@ -555,11 +527,11 @@ def test_infer_accepts_bundle():
     import app  # noqa: PLC0415
 
     signature = inspect.signature(app.infer_yolo)
-    check("bundle" in signature.parameters, "infer_yolo 应有 bundle 参数")
+    require("bundle" in signature.parameters, "infer_yolo 应有 bundle 参数")
     check_eq(signature.parameters["engine"].default.default, "", "engine 应可选（默认空串）")
 
     anomaly_signature = inspect.signature(app.infer_anomalib)
-    check("bundle" in anomaly_signature.parameters, "infer_anomalib 应有 bundle 参数")
+    require("bundle" in anomaly_signature.parameters, "infer_anomalib 应有 bundle 参数")
     check_eq(anomaly_signature.parameters["metadata"].default.default, "", "metadata 应可选")
 
 
@@ -572,23 +544,9 @@ def main() -> int:
     print(f"Python {sys.version.split()[0]}  schema={bundle.SCHEMA}")
     print()
 
-    tests = [obj for name, obj in sorted(globals().items()) if name.startswith("test_")]
-    for test in tests:
-        test()
+    run_cases(globals())
 
-    print()
-    print("=" * 60)
-    total = len(PASSED) + len(FAILED)
-    print(f"通过 {len(PASSED)} / {total}")
-    if FAILED:
-        print()
-        for name, detail in FAILED:
-            print(f"[FAIL] {name}")
-            print(detail)
-            print("-" * 60)
-        return 1
-    print("全部通过")
-    return 0
+    return finish()
 
 
 if __name__ == "__main__":

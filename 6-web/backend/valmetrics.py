@@ -427,19 +427,6 @@ def cap_errors(found: dict[str, Any], limit: int = 500) -> dict[str, Any]:
     return found
 
 
-def box_iou_matrix(a: Sequence[Sequence[float]], b: Sequence[Sequence[float]]) -> np.ndarray:
-    """批量 IoU 矩阵，给需要一次性算 N×M 的调用方用（当前主流程不依赖它）。"""
-    a_array = np.asarray(a, dtype=np.float64).reshape(-1, 4)
-    b_array = np.asarray(b, dtype=np.float64).reshape(-1, 4)
-    if a_array.size == 0 or b_array.size == 0:
-        return np.zeros((len(a_array), len(b_array)), dtype=np.float64)
-    matrix = np.zeros((len(a_array), len(b_array)), dtype=np.float64)
-    for i, row in enumerate(a_array):
-        for j, col in enumerate(b_array):
-            matrix[i, j] = iou_xyxy(row, col)
-    return matrix
-
-
 # ---------------------------------------------------------------------------
 # 漏检-过杀工作点
 #

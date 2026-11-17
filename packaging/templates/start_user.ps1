@@ -2,12 +2,18 @@
 # 排障用。正常启动不再经过本脚本。
 #
 # 正常启动：双击 app\TRTForgeWeb.exe（或安装目录里的 start_web.bat）。
-# 读 config.json、设环境变量、单实例检查、开浏览器都由 backend\launcher.py 完成，
+# 读 config.json、设环境变量、单实例检查、开窗口都由 backend\launcher.py 完成，
 # 失败时会弹中文说明框，并把全过程写进 runtime\logs\launcher.log。
+#
+# 默认情况下双击后看到的是**软件自己的窗口**（WebView2），不是浏览器标签页。
+# 想改回浏览器：把 config.json 里的 "ui" 改成 "browser"。
 #
 # 什么时候才用这个脚本：
 #   1. 双击 exe 没反应，想在窗口里看到完整报错；
 #   2. 怀疑单实例判断或端口探测有问题，想绕过启动器直接跑 uvicorn。
+#
+# 注意：本脚本会设 TRTFORGE_LEGACY_START=1，那条路径**不开窗口**，只起服务，
+# 需要自己在浏览器里访问下面的地址。这是排障用的，不是日常启动方式。
 #
 # 用法（在安装目录里打开命令行）：
 #   powershell -NoProfile -ExecutionPolicy Bypass -File .\start_user.ps1
@@ -38,14 +44,14 @@ if (-not (Test-Path -LiteralPath $exe)) {
 }
 
 $env:TRTFORGE_HOME = $Root
-# 让 launcher 跳过互斥量与开浏览器，直接在当前窗口跑 uvicorn。
+# 让 launcher 跳过互斥量、不开窗口也不开浏览器，直接在当前窗口跑 uvicorn。
 $env:TRTFORGE_LEGACY_START = "1"
 
 Write-Host "TRTForge Web Studio（排障启动）"
 Write-Host "  安装目录 : $Root"
 Write-Host "  地址     : http://${openHost}:$port/"
 Write-Host "  日志     : $(Join-Path $Root 'runtime\logs\launcher.log')"
-Write-Host "  模式     : 已跳过单实例检查与浏览器打开，需要手动访问上面的地址"
+Write-Host "  模式     : 已跳过单实例检查与窗口打开，请手动在浏览器里访问上面的地址"
 Write-Host ""
 
 & $exe

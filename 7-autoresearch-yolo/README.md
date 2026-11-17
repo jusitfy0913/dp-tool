@@ -5,6 +5,18 @@
 但**不复用它的任何代码**——那边是 LLM 预训练（`prepare.py` 是 BPE 语料与 `val_bpb`），
 与目标检测无关。
 
+## 零、先读这三条边界（否则容易误判成 bug）
+
+| 问题 | 答案 |
+| --- | --- |
+| **支持哪些任务** | **只有 YOLO 检测 / 分割**。`task` 写死在 `configs/base.json`，`space.json` 不校验它，`validate_proposal()` 拒绝修改。姿态 / 旋转框 / 分类既没有对应的 `results.csv` 指标解析，也没有验收口径 |
+| **参数从哪来** | `configs/base.json`（基线）+ `experiments/cur.json`（本轮改动）+ `experiments/best.json`（`agent` 模式的继承起点）。**一个参数都不来自网页训练页**；网页只下发轮数 / 时间上限 / `max_tokens` 这类运行控制项 |
+| **与训练页什么关系** | 只有两点：同一把 **GPU 互斥锁**（`runtime/gpu_lock.json`，见 §9）与同一份 **显存预检实现**（`6-web/backend/vram.py`，见 §8.1）。产物目录、参数空间、判定规则、台账完全独立 |
+
+> 有意不同、别去「对齐」的一项：`base.json` 的 `patience=0` 表示**关闭早停**，
+> 由 `budget_seconds` 的时间截断决定跑多少轮；训练页默认 100 是给「跑满 epochs」用的。
+> 预算模式下开早停会让「每个配置都跑 600 秒」这个横比前提失效。
+
 ## 一、它解决什么问题
 
 手动调 YOLO 有三个实际痛点：

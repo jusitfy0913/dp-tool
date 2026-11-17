@@ -4,7 +4,9 @@
 > 用途：告诉使用者「三个模型到底差在哪、什么场景选哪个、参数怎么填、坑在哪」。
 > 最后更新：2026-10-30
 >
-> 网页里只能选这三个。`10-AnomalyCLIP-main` 以及 Anomalib examples 里另外 14 个模型没有接入，见 `docs/异常检测模型对照_AnomalyCLIP与Anomalib.md`。
+> 网页里除了这三个，v1.40.0 起还能选 AnomalyDINO（零样本、不走 Lightning，数据与用法见
+> `docs/异常检测模型对照_AnomalyCLIP与Anomalib.md` 第 3 节）。`10-AnomalyCLIP-main` 以及 Anomalib
+> examples 里另外 14 个模型没有接入，见同一篇文档。
 
 ---
 

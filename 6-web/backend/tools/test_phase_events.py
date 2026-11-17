@@ -32,21 +32,10 @@ YOLO_LAUNCHER = WEB_DIR.parent / "1-python-yolo" / "launcher" / "tf_yolo_launche
 ANOMALIB_LAUNCHER = WEB_DIR.parent / "2-python-anomaly" / "launcher" / "tf_anomalib_launcher.py"
 
 sys.path.insert(0, str(BACKEND_DIR))
+
+from _harness import check, finish  # noqa: E402
 sys.path.insert(0, str(YOLO_LAUNCHER.parent))
 sys.path.insert(0, str(ANOMALIB_LAUNCHER.parent))
-
-PASSED = 0
-FAILED = 0
-
-
-def check(name: str, condition: bool, detail: str = "") -> None:
-    global PASSED, FAILED
-    if condition:
-        PASSED += 1
-        print(f"  [PASS] {name}")
-    else:
-        FAILED += 1
-        print(f"  [FAIL] {name} {detail}")
 
 
 def capture_phase(module, phase: str, label: str) -> dict:
@@ -173,8 +162,7 @@ def main() -> int:
     test_contract()
     test_warm_clock()
     test_real_warm_handshake()
-    print(f"\n结果：通过 {PASSED} 项，失败 {FAILED} 项")
-    return 0 if FAILED == 0 else 1
+    return finish()
 
 
 if __name__ == "__main__":

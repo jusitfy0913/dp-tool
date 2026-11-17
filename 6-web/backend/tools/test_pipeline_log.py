@@ -21,22 +21,12 @@ from pathlib import Path
 BACKEND = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(BACKEND))
 
+from _harness import check, finish  # noqa: E402
+
 import app as backend_app  # noqa: E402
 import config  # noqa: E402
 import pipeline  # noqa: E402
 from fastapi import HTTPException  # noqa: E402
-
-PASSED: list[str] = []
-FAILED: list[str] = []
-
-
-def check(name: str, ok: bool, detail: str = "") -> None:
-    if ok:
-        PASSED.append(name)
-        print(f"[PASS] {name}")
-    else:
-        FAILED.append(name)
-        print(f"[FAIL] {name}" + (f" -> {detail}" if detail else ""))
 
 
 def main() -> int:
@@ -122,8 +112,7 @@ def main() -> int:
         log_file.unlink(missing_ok=True)
         record_path.unlink(missing_ok=True)
 
-    print(f"\n通过 {len(PASSED)} 项，失败 {len(FAILED)} 项")
-    return 0 if not FAILED else 1
+    return finish()
 
 
 if __name__ == "__main__":

@@ -11,7 +11,7 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import Response
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 import config
 import dataset
@@ -20,11 +20,21 @@ import pipeline as pipeline_mod
 import traininfo
 
 # 共享状态：任务管理器、并发闸门、路径白名单（见 web_state.py）
-from web_state import _START_LOCK, _ensure_allowed_path, _reject_if_busy, pipeline_manager
+from web_state import (
+    _START_LOCK,
+    _ensure_allowed_dir,
+    _ensure_allowed_path,
+    _ensure_safe_name,
+    _looks_like_path,
+    _reject_if_busy,
+    pipeline_manager,
+)
 
 # 串联要复用训练域的拼命令逻辑与引擎域的 ONNX 探测，避免两份实现漂移
 from routers.engine import _looks_like_untransposed_yolo, _probe_onnx
 from routers.train import (
+    ZERO_SHOT_INPUT_SIZE,
+    ZERO_SHOT_MODELS,
     AnomalibTrainRequest,
     YoloExportRequest,
     YoloTrainRequest,
@@ -32,6 +42,7 @@ from routers.train import (
     build_anomalib_train_command,
     build_export_command,
     build_train_command,
+    build_train_export_command,
 )
 
 router = APIRouter()
@@ -54,7 +65,10 @@ class PipelineYoloRequest(BaseModel):
     device: str = Field(default="0")
     project: str = Field(default="runs/trtforge", description="相对路径按 launcher 目录解析")
     name: str = Field(default="", description="留空自动生成 exp_<时间戳>")
-    patience: int = Field(default=50, ge=0)
+    # 与训练页 / launcher（tf_yolo_launcher.py --patience default=100）保持一致。
+    # 以前这里是 50：同一批参数在「训练页跑」和「全流程跑」下早停轮数不同，
+    # 同一份数据两次跑出的模型不可比，日志里还看不出差别。
+    patience: int = Field(default=100, ge=0)
     workers: int = Field(default=8, ge=0)
     pretrained: str = Field(default="true")
 
@@ -138,10 +152,13 @@ def _pipeline_probe_transd(transd_onnx: Path) -> dict:
 @router.post("/api/pipeline/yolo")
 def pipeline_yolo(request: PipelineYoloRequest) -> dict:
     """一键跑完「训练 → 导出 → 校验 → 编译 → 标签 → 引擎验证」。"""
-    data_yaml = Path(request.data).expanduser()
+    data_yaml = _ensure_allowed_path(request.data)
     if not data_yaml.is_file():
         raise HTTPException(status_code=400, detail=f"dataset.yaml 不存在：{request.data}")
-    _ensure_allowed_path(str(data_yaml))
+    if _looks_like_path(request.model):
+        _ensure_allowed_path(request.model)
+    # 串联也要校验 project/name：它和训练页是两个入口，少一处就等于少一道门。
+    _ensure_allowed_dir(request.project, config.YOLO_LAUNCHER_DIR, "输出目录")
     is_classify = request.task == "classify"
     if not is_classify and request.task != "detect" and request.run_val:
         raise HTTPException(
@@ -161,7 +178,9 @@ def pipeline_yolo(request: PipelineYoloRequest) -> dict:
             )
 
     python = _resolve_python(request.python)
-    name = request.name.strip() or f"exp_{time.strftime('%Y%m%d_%H%M%S')}"
+    name = _ensure_safe_name(
+        request.name.strip() or f"exp_{time.strftime('%Y%m%d_%H%M%S')}", "实验名"
+    )
     run_dir = _pipeline_run_dir(request.project, name)
 
     weights = run_dir / "weights" / "best.pt"
@@ -372,14 +391,19 @@ class AnomalibPipelineRequest(BaseModel):
     验证目录这几项，塞进训练表单会让「只想训一次」的人看到一堆用不到的字段。
     """
 
-    model: str = Field(default="patchcore", description="patchcore / padim / efficientad")
+    model: str = Field(default="patchcore", description="patchcore / padim / efficientad / anomalydino")
     root: str = Field(default="", description="Folder 数据集根目录；skip_train 时可留空")
     normal_dir: str = "train/good"
     abnormal_dir: str = "test/abnormal"
     normal_test_dir: str = "test/good"
     project: str = Field(default="results", description="相对路径按 launcher 目录解析")
     name: str = Field(default="", description="留空自动生成 pipe_<时间戳>")
-    input_size: int = Field(default=256, ge=64, le=1024)
+    input_size: int = Field(
+        default=256,
+        ge=64,
+        le=1024,
+        description="留空取模型默认：AnomalyDINO 448（14×32），其余 256",
+    )
     max_epochs: str = "auto"
     train_batch_size: int = Field(default=4, ge=1)
     eval_batch_size: int = Field(default=4, ge=1)
@@ -390,6 +414,10 @@ class AnomalibPipelineRequest(BaseModel):
     imagenet_dir: str = ""
     calib_normal_dir: str = ""
     calib_abnormal_dir: str = ""
+    # --- 仅 anomalydino 使用；其它模型忽略这三个字段 ---
+    shots: int = Field(default=16, description="AnomalyDINO 建库用多少张正常图，-1=全部")
+    rotation: bool = Field(default=False, description="AnomalyDINO 是否做 8 角度旋转增强")
+    seed: int = Field(default=0, ge=0, description="AnomalyDINO few-shot 取图偏移")
 
     precision: str = Field(default="fp16", description="引擎精度 fp16 / fp32")
     workspace_mb: int = Field(default=4096, ge=256, le=65536)
@@ -411,6 +439,17 @@ class AnomalibPipelineRequest(BaseModel):
     val_abnormal_dir: str = Field(default="", description="留空则用 root/abnormal_dir")
 
     python: str | None = Field(default=None, description="覆盖训练解释器")
+
+    @model_validator(mode="after")
+    def _apply_model_defaults(self) -> "AnomalibPipelineRequest":
+        """AnomalyDINO 不填 input_size 时补 448，其余保持 256。
+
+        与 `AnomalibTrainRequest` 用同一份常量：两条入口（训练页 / 全流程）
+        对同一个模型必须给出同一个尺寸，否则同一次实验换个入口就换了精度口径。
+        """
+        if "input_size" not in self.model_fields_set and self.model in ZERO_SHOT_MODELS:
+            self.input_size = ZERO_SHOT_INPUT_SIZE
+        return self
 
 
 def _is_number(value: Any) -> bool:
@@ -586,14 +625,16 @@ def pipeline_anomalib(request: AnomalibPipelineRequest) -> dict:
     拆成三个进程，只会多两次模型加载，并把「导出拿到的不是刚训的模型」
     这类错埋进编排层。
     """
-    if not config.ANOMALIB_LAUNCHER.is_file():
+    zero_shot = request.model == "anomalydino"
+    launcher = config.ANOMALYDINO_LAUNCHER if zero_shot else config.ANOMALIB_LAUNCHER
+    if not launcher.is_file():
         raise HTTPException(
-            status_code=500, detail=f"找不到 launcher：{config.ANOMALIB_LAUNCHER}"
+            status_code=500, detail=f"找不到 launcher：{launcher}"
         )
-    if request.model not in ("patchcore", "padim", "efficientad"):
+    if request.model not in ("patchcore", "padim", "efficientad", "anomalydino"):
         raise HTTPException(
             status_code=400,
-            detail=f"model 只能是 patchcore / padim / efficientad，实际 {request.model}",
+            detail=f"model 只能是 patchcore / padim / efficientad / anomalydino，实际 {request.model}",
         )
     if request.precision not in ("fp16", "fp32"):
         raise HTTPException(status_code=400, detail="precision 只能是 fp16 / fp32")
@@ -606,14 +647,33 @@ def pipeline_anomalib(request: AnomalibPipelineRequest) -> dict:
             detail="找不到 trtexec.exe（设置 TRTFORGE_TRTEXEC 或确认 CUDA\\bin 下有它）",
         )
 
-    name = request.name.strip() or f"pipe_{time.strftime('%Y%m%d_%H%M%S')}"
+    name = _ensure_safe_name(
+        request.name.strip() or f"pipe_{time.strftime('%Y%m%d_%H%M%S')}", "实验名"
+    )
+    _ensure_allowed_dir(request.project, config.ANOMALIB_LAUNCHER_DIR, "输出目录")
     project_root = _anomaly_project_root(request.project)
 
     root: Path | None = None
     if request.root.strip():
-        root = Path(request.root).expanduser()
+        root = _ensure_allowed_path(request.root)
         if not root.is_dir():
             raise HTTPException(status_code=400, detail=f"数据集根目录不存在：{request.root}")
+        # 相对子目录按 root 解析；绝对路径原样校验。两种都必须落在白名单内。
+        for label, sub in (
+            ("正常训练目录", request.normal_dir),
+            ("异常测试目录", request.abnormal_dir),
+            ("正常测试目录", request.normal_test_dir),
+            ("ImageNet 目录", request.imagenet_dir),
+            ("校准正常目录", request.calib_normal_dir),
+            ("校准异常目录", request.calib_abnormal_dir),
+        ):
+            raw = str(sub or "").strip()
+            if not raw:
+                continue
+            target = Path(raw).expanduser()
+            if not target.is_absolute():
+                target = root / target
+            _ensure_allowed_path(str(target))
 
     # 跳过训练时必须是「已经能拿到 metadata.json 与 .onnx」的目录：
     # 让用户自己挑目录，比让后端去猜上一次训练的版本号可靠。
@@ -624,7 +684,7 @@ def pipeline_anomalib(request: AnomalibPipelineRequest) -> dict:
                 status_code=400,
                 detail="跳过训练时必须给出产物目录（包含 metadata.json 与 .onnx）",
             )
-        seed_dir = Path(request.artifacts_dir).expanduser()
+        seed_dir = _ensure_allowed_path(request.artifacts_dir)
         if not seed_dir.is_dir():
             raise HTTPException(
                 status_code=400, detail=f"产物目录不存在：{request.artifacts_dir}"
@@ -649,11 +709,11 @@ def pipeline_anomalib(request: AnomalibPipelineRequest) -> dict:
     val_abnormal: Path | None = None
     if request.run_val:
         if request.val_normal_dir.strip():
-            val_normal = Path(request.val_normal_dir).expanduser()
+            val_normal = _ensure_allowed_path(request.val_normal_dir)
         elif root is not None and (root / request.normal_test_dir).is_dir():
             val_normal = root / request.normal_test_dir
         if request.val_abnormal_dir.strip():
-            val_abnormal = Path(request.val_abnormal_dir).expanduser()
+            val_abnormal = _ensure_allowed_path(request.val_abnormal_dir)
         elif root is not None and (root / request.abnormal_dir).is_dir():
             val_abnormal = root / request.abnormal_dir
         if val_normal is None and val_abnormal is None:
@@ -684,13 +744,21 @@ def pipeline_anomalib(request: AnomalibPipelineRequest) -> dict:
             imagenet_dir=request.imagenet_dir,
             calib_normal_dir=request.calib_normal_dir,
             calib_abnormal_dir=request.calib_abnormal_dir,
+            shots=request.shots,
+            rotation=request.rotation,
+            seed=request.seed,
         )
+        train_command, train_cwd = build_train_export_command(train_request, python)
         stages.append(
             pipeline_mod.StagePlan(
                 name="train_export",
-                label="训练 + 导出 ONNX + 校准 metadata",
-                command=build_anomalib_train_command(train_request, python),
-                cwd=str(config.ANOMALIB_LAUNCHER_DIR),
+                label=(
+                    "建库 + 导出 ONNX + 校准 metadata"
+                    if zero_shot
+                    else "训练 + 导出 ONNX + 校准 metadata"
+                ),
+                command=train_command,
+                cwd=str(train_cwd),
                 # 产物落在哪个 vN 目录训练完才知道，不在这里预言；
                 # 下一段 probe 找不到会直接失败并说明找过哪里。
                 meta={"model": request.model, "input_size": request.input_size},

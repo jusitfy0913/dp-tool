@@ -12,6 +12,7 @@
 
 import { listRuns, listRunHistory, stopRun } from "./api.js";
 import { runLogUrl } from "./logs.js";
+import { fmtDuration, fmtStamp } from "./ui.js";
 
 //: 轮询间隔。3 秒足够让「开训 / 结束」在一眼之内出现在顶栏，
 //: 又不会让 127.0.0.1 上的服务多出可观察的负担。
@@ -52,14 +53,7 @@ export function isNoteworthyRun(run) {
 }
 
 /** 秒数 → 「12:03」/「1:02:03」。导出给单测：时长格式一旦错位，用户会读成别的意思。 */
-export function fmtElapsed(seconds) {
-  const total = Math.max(0, Math.round(Number(seconds) || 0));
-  const h = Math.floor(total / 3600);
-  const m = Math.floor((total % 3600) / 60);
-  const s = total % 60;
-  const pad = (n) => String(n).padStart(2, "0");
-  return h > 0 ? `${h}:${pad(m)}:${pad(s)}` : `${m}:${pad(s)}`;
-}
+export const fmtElapsed = fmtDuration;
 
 /** 结束状态 → 中文 + 颜色类。导出给单测，界面文案不该散落在两处。 */
 const STATUS_META = {
@@ -77,13 +71,7 @@ export function statusMeta(status) {
 }
 
 /** epoch 秒 → 「11-11 14:12」。历史列表用，跨天靠日期区分。 */
-export function fmtClock(seconds) {
-  const value = Number(seconds);
-  if (!Number.isFinite(value) || value <= 0) return "";
-  const date = new Date(value * 1000);
-  const pad = (n) => String(n).padStart(2, "0");
-  return `${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
-}
+export const fmtClock = fmtStamp;
 
 export function initRunsBar() {
   const bar = document.getElementById("runsBar");

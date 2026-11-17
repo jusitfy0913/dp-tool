@@ -3,6 +3,13 @@
 
 import { getJSON, listRuns, postJSON, stopRun } from "./api.js";
 import { createLogActions } from "./logs.js";
+import { syncOutputDefaults } from "./outputs.js";
+import {
+  fmtDuration,
+  setBadge as setBadgeNode,
+  setHint as setHintNode,
+  setMetric as setMetricChip,
+} from "./ui.js";
 import { connectRunEvents } from "./ws.js";
 
 //: 训练页能接管的任务类型。
@@ -170,6 +177,8 @@ export function initTrain() {
   // 切换任务类型时自动改写权重名，与 Qt 版一致：
   // detect -> yolov8n.pt / segment -> yolov8n-seg.pt / pose -> yolov8n-pose.pt / obb -> yolov8n-obb.pt
   document.getElementById("yoloTask").addEventListener("change", syncYoloModel);
+  // AnomalyDINO 与三种 Anomalib 模型共用一张表单，但字段可见性不同
+  document.getElementById("anomModel").addEventListener("change", syncAnomModel);
 
   // 增强预设：只写「与默认不同」的项，其余留空，便于用户看出到底改了什么。
   // 小缺陷预设针对 PCB 这类 70px 缺陷：关掉 mosaic（拼图会让缺陷再缩小一半）、
@@ -307,6 +316,17 @@ function setDefaultRunName() {
   dom.runName.value = `exp_${stamp}`;
 }
 
+/**
+ * 实验名是不是「自动生成的默认值」。
+ *
+ * 切任务类型时只有这种值允许被替换成另一边的默认值。用户手填的名字（哪怕叫
+ * `exp`）要保住——以前切到异常检测会无条件改成 `latest`，把人刚起的名冲掉。
+ */
+function isDefaultRunName(value) {
+  const text = String(value || "").trim();
+  return !text || text === "exp" || text === "latest" || /^exp_\d{8}_\d{6}$/.test(text);
+}
+
 /** 按 YOLO 任务类型改写默认权重名。只改默认别名，用户自定义路径不动。 */
 function syncYoloModel() {
   const task = formValue("yoloTask");
@@ -318,21 +338,54 @@ function syncYoloModel() {
   }
 }
 
+//: 上一次的任务类型，用于判断 project/name 里还是不是「另一边任务的默认值」。
+let lastKind = "yolo";
+
 function syncKind() {
-  const isYolo = dom.kind.value === "yolo";
+  const kind = dom.kind.value;
+  const isYolo = kind === "yolo";
   dom.yoloGroup.classList.toggle("hidden", !isYolo);
   dom.anomalibGroup.classList.toggle("hidden", isYolo);
-  // 两种任务的默认输出目录不同：YOLO 落 runs，Anomalib 落 results
-  dom.project.value = isYolo ? "runs/trtforge" : "results";
+  // 两种任务的默认输出目录不同：YOLO 落 runs，Anomalib 落 results。
+  // 只替换仍是旧默认值或空着的字段——用户手填、或用「浏览」选好的目录不能被
+  // 切一下任务就冲掉（规则与全流程页同一份，见 outputs.js）。
+  syncOutputDefaults(kind, dom.project, null, lastKind);
+  lastKind = kind;
   // Anomalib 的实验名默认用 latest，与 launcher 默认值一致；
   // 切回 YOLO 时重新生成带时间戳的名字，避免沿用 "latest" 覆盖旧结果。
+  // 只改自动生成的默认名，用户自己起的名字两种任务下都保留。
   if (!isYolo) {
-    dom.runName.value = "latest";
-  } else if (!dom.runName.value || dom.runName.value === "latest") {
+    if (isDefaultRunName(dom.runName.value)) dom.runName.value = "latest";
+    syncAnomModel();
+  } else if (isDefaultRunName(dom.runName.value)) {
     setDefaultRunName();
   }
   // 预热状态是分任务类型的：切到 Anomalib 时 yolo 的「预热就绪」不适用
   refreshWarmStatus(false);
+}
+
+/**
+ * AnomalyDINO 是零样本模型：没有 epoch，只有「用几张正常图建库」。
+ * 这里只切换可见性与默认值，不改用户已经填过的其它字段——
+ * 来回切换模型不应该把数据集路径清空。
+ */
+function syncAnomModel() {
+  const zeroShot = formValue("anomModel") === "anomalydino";
+  document.getElementById("anomalyDinoGroup")?.classList.toggle("hidden", !zeroShot);
+  document.getElementById("anomalyDinoHint")?.classList.toggle("hidden", !zeroShot);
+  // 448 是 14 的倍数（32×32 网格）；256 不是，DINOv2 的 patch 切不整齐
+  const sizeInput = document.getElementById("anomInputSize");
+  const epochsInput = document.getElementById("anomMaxEpochs");
+  if (zeroShot && sizeInput && (sizeInput.value === "256" || !sizeInput.value)) {
+    sizeInput.value = "448";
+  }
+  if (zeroShot && epochsInput) {
+    epochsInput.value = "1";
+    epochsInput.disabled = true;
+  } else if (epochsInput) {
+    epochsInput.disabled = false;
+    if (epochsInput.value === "1") epochsInput.value = "auto";
+  }
 }
 
 function formValue(id) {
@@ -412,8 +465,9 @@ function buildYoloPayload() {
 }
 
 function buildAnomalibPayload() {
-  return {
-    model: formValue("anomModel"),
+  const model = formValue("anomModel");
+  const payload = {
+    model,
     root: formValue("anomRoot"),
     normal_dir: formValue("anomNormal") || "train/good",
     abnormal_dir: formValue("anomAbnormal") || "test/abnormal",
@@ -424,6 +478,13 @@ function buildAnomalibPayload() {
     max_epochs: formValue("anomMaxEpochs") || "auto",
     python: formValue("pythonPath") || null,
   };
+  // 零样本专属字段只在这个模型下带上：发给其它模型只会让后端多几个没用的字段
+  if (model === "anomalydino") {
+    payload.shots = Number(formValue("anomShots")) || 16;
+    payload.rotation = formValue("anomRotation") === "true";
+    payload.seed = 0;
+  }
+  return payload;
 }
 
 async function onSubmit(event) {
@@ -871,6 +932,10 @@ function setProgressBar(pct) {
   progress.pct = value;
   dom.progressBar.style.width = `${value.toFixed(1)}%`;
   dom.pctText.textContent = `${value.toFixed(1)}%`;
+  // 流光只在"真的在动"时出现：0% 还没开始、100% 已经结束，
+  // 这两种状态继续呼吸会让人误以为任务还在跑（样式见 css 第 8 节 .is-live）。
+  const track = dom.progressBar.closest(".progress");
+  if (track) track.classList.toggle("is-live", value > 0 && value < 99.9);
 }
 
 function setStage(text, cls = "") {
@@ -984,24 +1049,14 @@ function perEpochSeconds() {
   return median(progress.epochDeltas.slice(-3));
 }
 
-function fmtClock(seconds) {
-  const total = Math.max(0, Math.round(seconds));
-  const h = Math.floor(total / 3600);
-  const m = Math.floor((total % 3600) / 60);
-  const sec = total % 60;
-  const ss = String(sec).padStart(2, "0");
-  if (h) return `${h}:${String(m).padStart(2, "0")}:${ss}`;
-  return `${m}:${ss}`;
-}
-
 /** 刷新「已用 / 每轮 / 剩余」。freeze=true 时把已用定格在当前位置。 */
 function renderElapsed(freeze = false) {
   if (!progress.startedAt) return;
   const elapsed = (Date.now() - progress.startedAt) / 1000;
-  dom.elapsedText.textContent = `已用 ${fmtClock(elapsed)}`;
+  dom.elapsedText.textContent = `已用 ${fmtDuration(elapsed)}`;
 
   const per = perEpochSeconds();
-  dom.speedText.textContent = per ? `每轮 ≈ ${fmtClock(per)}` : "每轮 —";
+  dom.speedText.textContent = per ? `每轮 ≈ ${fmtDuration(per)}` : "每轮 —";
 
   if (!per || !progress.total || !progress.epoch) {
     dom.etaText.textContent = "预计剩余 —";
@@ -1011,7 +1066,7 @@ function renderElapsed(freeze = false) {
   // 本轮已经跑掉的时间要从剩余里扣掉，否则最后一轮的剩余时间会看着不动
   const inEpoch = progress.lastEpochAt ? (Date.now() - progress.lastEpochAt) / 1000 : 0;
   const remain = Math.max(0, left * per - (freeze ? 0 : inEpoch));
-  dom.etaText.textContent = `预计剩余 ${fmtClock(remain)}`;
+  dom.etaText.textContent = `预计剩余 ${fmtDuration(remain)}`;
 }
 
 function startProgressView(elapsed = 0) {
@@ -1293,32 +1348,18 @@ const METRIC_LABELS = {
 };
 
 function setMetric(name, value) {
-  const label = METRIC_LABELS[name] || name;
-  const id = `metric-${name}`;
-  let chip = document.getElementById(id);
-  if (!chip) {
-    chip = document.createElement("div");
-    chip.className = "metric";
-    chip.id = id;
-    chip.dataset.name = name;
-    dom.metrics.appendChild(chip);
-  }
-  chip.innerHTML = `${escapeHtml(label)} <b>${escapeHtml(String(value))}</b>`;
-}
-
-function escapeHtml(text) {
-  return text.replace(/[&<>"']/g, (ch) => ({
-    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
-  }[ch]));
+  setMetricChip(dom.metrics, name, value, {
+    label: METRIC_LABELS[name] || name,
+    update: true,
+  });
 }
 
 function setBadge(text, cls = "") {
-  dom.badge.textContent = text;
-  dom.badge.className = `badge ${cls}`.trim();
+  setBadgeNode(dom.badge, text, cls);
 }
 
 function setHint(text) {
-  dom.hint.textContent = text;
+  setHintNode(dom.hint, text);
 }
 
 function resetRunView() {

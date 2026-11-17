@@ -9,6 +9,7 @@
 //   摄像头          → 同步单帧接口，一次一个请求，前端自己画框（低延迟）
 
 import { postForm, postJSON, stopRun } from "./api.js";
+import { setBadge } from "./ui.js";
 import { connectRunEvents } from "./ws.js";
 
 const state = {
@@ -48,10 +49,7 @@ function shortName(path) {
 }
 
 function badge(text, cls = "") {
-  const node = $("batchBadge");
-  if (!node) return;
-  node.textContent = text;
-  node.className = `badge ${cls}`.trim();
+  setBadge($("batchBadge"), text, cls);
 }
 
 function setHint(text, isError = false) {

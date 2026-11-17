@@ -274,12 +274,6 @@ def load(project_path: str | Path) -> tuple[dict, dict]:
     return images, meta
 
 
-def review_of(project_path: str | Path) -> dict:
-    """只取审核状态（批量任务的 `scope=pending` 判断用）。"""
-    _images, meta = load(project_path)
-    return meta.get("review") or {}
-
-
 # ---------------------------------------------------------------------------
 # 写
 # ---------------------------------------------------------------------------

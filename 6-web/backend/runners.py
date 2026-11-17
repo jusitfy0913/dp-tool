@@ -18,8 +18,10 @@ loop.call_soon_threadsafe 保证线程安全。
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
+import signal
 import subprocess
 import threading
 import time
@@ -65,6 +67,61 @@ EXCLUSIVE_RUN_PREFIX = "pipeline-"
 def is_exclusive_kind(kind: str) -> bool:
     """该 kind 的任务是否独占 GPU / 产物目录。"""
     return kind in EXCLUSIVE_RUN_KINDS or kind.startswith(EXCLUSIVE_RUN_PREFIX)
+
+
+def kill_process_tree(process: subprocess.Popen, timeout: float = 15.0) -> bool:
+    """结束子进程**及其全部子孙进程**，返回是否确认已退出。
+
+    为什么不能只 ``terminate()``：Windows 上终止父进程不会级联，而真实链路是
+    ``launcher -> ultralytics -> DataLoader worker × N``（Windows 上默认还会用
+    spawn 起独立进程）。只杀 launcher 的结果是：界面显示「已停止」，显存却还在
+    被那几个 worker 占着，下一个任务立刻 OOM——这是最难排查的一类问题，
+    因为「停止」这个动作看起来成功了。
+
+    ``taskkill /T`` 按父子关系递归，``/F`` 不等对方响应。杀完再 ``wait()``
+    回收句柄，否则进程会以僵尸态留到父进程退出。
+
+    POSIX 上走进程组（Popen 时用了 ``start_new_session``，见 ``_spawn``）：
+    先 SIGTERM 给一次清理机会，3 秒不退再 SIGKILL。
+    """
+    if process.poll() is not None:
+        return True
+
+    if os.name == "nt":
+        with contextlib.suppress(OSError, subprocess.SubprocessError):
+            subprocess.run(
+                ["taskkill", "/T", "/F", "/PID", str(process.pid)],
+                capture_output=True,
+                timeout=timeout,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            process.wait(timeout=5)
+        if process.poll() is not None:
+            return True
+        # taskkill 失败（权限、进程刚换了一代）时仍有下面这道兜底
+    else:
+        with contextlib.suppress(OSError, ProcessLookupError):
+            os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+
+    with contextlib.suppress(OSError):
+        process.terminate()
+    try:
+        process.wait(timeout=3)
+        return True
+    except subprocess.TimeoutExpired:
+        pass
+
+    if os.name != "nt":
+        with contextlib.suppress(OSError, ProcessLookupError):
+            os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+    with contextlib.suppress(OSError):
+        process.kill()
+    try:
+        process.wait(timeout=3)
+    except subprocess.TimeoutExpired:
+        return False
+    return True
 
 
 
@@ -246,16 +303,31 @@ class RunManager:
             except Exception:  # noqa: BLE001 - 热启动任何异常都退回冷启动
                 worker.terminate()
 
-        process = subprocess.Popen(
-            command,
-            cwd=cwd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            env=child_env,
-            bufsize=0,
-            # Windows 下不弹控制台窗口
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        )
+        # Windows：不弹控制台窗口。
+        # POSIX：独立进程组，kill_process_tree 才能用 killpg 一次性结束整棵树
+        # （没有这一步时孙子进程会漏掉，PyTorch 的 worker 正属于这一类）。
+        spawn_kwargs: dict[str, Any] = {}
+        if os.name == "nt":
+            spawn_kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        else:
+            spawn_kwargs["start_new_session"] = True
+
+        try:
+            process = subprocess.Popen(
+                command,
+                cwd=cwd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                env=child_env,
+                bufsize=0,
+                **spawn_kwargs,
+            )
+        except Exception:
+            # 进程没起来：立刻还回锁。否则这一条会一直挂在本 pid 名下，
+            # 本进程之后连自己都被判成「显卡被占用」，只能手工删锁文件。
+            if lock_held:
+                gpulock.release(kind, run_id)
+            raise
 
         run = Run(
             run_id=run_id,
@@ -397,6 +469,11 @@ class RunManager:
             runs = sorted(self._runs.values(), key=lambda r: r.started_at, reverse=True)
         return [r.snapshot() for r in runs]
 
+    def active_count(self) -> int:
+        """仍在运行的任务数（关停等待时间按它放大，见 ``launcher._shutdown_timeout``）。"""
+        with self._lock:
+            return sum(1 for run in self._runs.values() if run.status == "running")
+
     def active_exclusive(self) -> list[dict]:
         """正在运行、且属于「独占」类的任务摘要（新的在前）。
 
@@ -422,7 +499,7 @@ class RunManager:
         return [runledger.to_snapshot(record) for record in records]
 
     def stop(self, run_id: str) -> bool:
-        """终止任务。先 terminate，3 秒不退再 kill。"""
+        """终止任务（连同它的子孙进程）。"""
         run = self.get(run_id)
         if run is None or run.process is None:
             return False
@@ -430,28 +507,53 @@ class RunManager:
         if proc.poll() is not None:
             return False
         try:
-            # 先标记再 terminate，顺序不能反。
+            # 先标记再动手，顺序不能反。
             # 读线程在自己的 finally 里会 `if run.status == "running"` 才覆盖状态，
             # 并立刻广播 finished。若等 proc.wait() 返回后再标记，读线程可能已经
             # 把 terminate 导致的退出码 1 判成 "failed" 并广播出去，
             # 用户主动停止就会显示成「构建失败」（实测会随机复现）。
             run.status = "cancelled"
-            proc.terminate()
-            try:
-                proc.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                proc.kill()
+            if not kill_process_tree(proc):
+                run.status = "running"
+                return False
         except Exception:  # noqa: BLE001 - 停止失败也要让状态可读
             run.status = "running"
             return False
         return True
 
     def shutdown_all(self) -> None:
-        """服务退出时清理，避免残留训练进程。"""
+        """服务退出时清理，避免残留训练进程与显存占用。
+
+        并行发信号再统一等：串行 stop 每个最多等十几秒，开过三个任务时
+        关窗口就会卡将近一分钟，用户会以为卡死并强杀进程——那正好留下
+        最脏的状态。并行之后总耗时约等于最慢的那一个。
+
+        超时不再等待（daemon 线程随进程退出）：真正的兜底是 ``launcher``
+        那边的强制退出，这里只负责尽量干净。
+        """
         with self._lock:
-            run_ids = list(self._runs.keys())
-        for run_id in run_ids:
-            self.stop(run_id)
+            runs = [
+                run
+                for run in self._runs.values()
+                if run.process is not None and run.process.poll() is None
+            ]
+        if not runs:
+            return
+        for run in runs:
+            run.status = "cancelled"
+        threads = [
+            threading.Thread(
+                target=kill_process_tree,
+                args=(run.process,),
+                name=f"kill-{run.run_id}",
+                daemon=True,
+            )
+            for run in runs
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=20)
 
     # ------------------------------------------------------------------
     # 订阅
@@ -575,8 +677,10 @@ class RunManager:
             run.progress_stop.set()
         # 释放跨进程 GPU 锁。必须在最前面做：下面的补发事件、写日志都可能抛异常，
         # 一旦抛在被释放之前，这把锁就会一直挂到进程死亡，把整台机器锁死。
+        # 带 kind/label 只删自己那一条：同进程可能还有别的任务在跑，
+        # 无参释放（老行为）会把它们的条目一起抹掉。
         if run.gpu_lock_held:
-            gpulock.release()
+            gpulock.release(run.kind, run.run_id)
             run.gpu_lock_held = False
         exit_code = None
         try:

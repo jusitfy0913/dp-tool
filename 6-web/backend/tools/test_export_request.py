@@ -16,19 +16,9 @@ from pathlib import Path
 BACKEND = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(BACKEND))
 
+from _harness import check, finish  # noqa: E402
+
 import app  # noqa: E402
-
-PASSED: list[str] = []
-FAILED: list[str] = []
-
-
-def check(name: str, ok: bool, detail: str = "") -> None:
-    if ok:
-        PASSED.append(name)
-        print(f"[PASS] {name}")
-    else:
-        FAILED.append(name)
-        print(f"[FAIL] {name} {detail}")
 
 
 def make(**overrides):
@@ -123,8 +113,7 @@ def main() -> int:
     custom = app.build_export_command(make(), r"D:\envs\py\python.exe")
     check("解释器可覆盖", custom[0] == r"D:\envs\py\python.exe", custom[0])
 
-    print(f"\n通过 {len(PASSED)} 项，失败 {len(FAILED)} 项")
-    return 1 if FAILED else 0
+    return finish()
 
 
 if __name__ == "__main__":

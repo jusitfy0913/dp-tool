@@ -17,18 +17,34 @@ Web 后端本来只有一道闸门 ``_reject_if_busy()``：它查自己内存里
 ## 协议
 
 一个 JSON 文件，位于 ``<repo>/runtime/gpu_lock.json``（已 gitignore）。
-同一时刻最多一个持有者。
+
+**v1.42.0 起支持多个持有者**，按 ``pid + kind + label`` 区分：
 
 ```json
-{"owner": "autoexp", "pid": 12345, "kind": "autoexp-run",
- "label": "exp_0011 提高分辨率到 960", "since": "2026-11-10T13:20:00+08:00"}
+{"holders": {
+  "web|yolo-train|run_abc": {"owner": "web", "pid": 12345, "kind": "yolo-train",
+                             "label": "run_abc", "since": "2026-11-10T13:20:00+08:00"},
+  "web|infer-video|run_jkl": {"owner": "web", "pid": 12345, "kind": "infer-video",
+                              "label": "run_jkl", "since": "2026-11-10T13:21:00+08:00"}
+}}
 ```
+
+为什么不干脆「文件里只有一把锁」：同一个 Web 进程里可能有两个任务
+（``infer-batch`` 与 ``yolo-train`` 之外，还包括「停止一个、另一个还在跑」的场景）。
+单持有者版本下，后到的 ``release()`` 只比 pid 就把整个文件删掉，
+另一个还在跑的任务等于失去了互斥保护——正是这个文件本来要防的事。
+``release`` 现在只删自己那条，删空了才删文件。
+
+**旧格式仍可读**（``{"owner": ..., "pid": ...}``，单持有者的扁平结构）。
+autoexp 与老版本 Web 会写出这种形状，读到就当作一个持有者处理，
+下次 ``acquire`` 时自然升级成新结构，不需要手工删文件。
 
 判定规则：
 
 - 文件不存在 → 空闲
-- 文件存在但 ``pid`` 已死 → 视为**陈旧**，可被覆盖（进程被强杀时会留下这种）
-- 文件存在且 ``pid`` 存活 → 被占用
+- 某条目的 ``pid`` 已死 → 该条目视为**陈旧**，读取时忽略、写入时清掉
+- 所有条目都陈旧 → 空闲
+- 存在其它进程的存活条目 → 被占用
 
 ## 为什么不用操作系统的文件锁
 
@@ -137,29 +153,99 @@ def _pid_alive_windows(pid: int) -> bool:
         kernel32.CloseHandle(handle)
 
 
-def read() -> dict[str, Any] | None:
-    """读当前持有者。返回 None 表示空闲（不存在、损坏或已陈旧）。"""
+def holder_key(kind: str = "", label: str = "") -> str:
+    """一个持有者在文件里的键：``kind|label``。
+
+    为什么用这个组合：调用方本来就靠它区分任务（``kind`` 是任务类型，
+    ``label`` 在 Web 端就是 ``run_id``，天然唯一）。同一进程两个任务因此
+    各有各的条目，互不覆盖。两者都空时退化成 ``"|"``——
+    那是「整进程一把锁」的老语义，仍然可用。
+    """
+    return f"{kind or ''}|{label or ''}"
+
+
+def _split_holders(data: Any) -> dict[str, dict[str, Any]]:
+    """把文件内容统一成 ``{key: holder}``，兼容旧的单持有者扁平格式。
+
+    单独抽出来是因为「读到的到底是什么形状」有两个来源：
+    新版本写 ``holders``，老版本（含 autoexp）写扁平字段。
+    所有需要看懂锁的地方都必须走这里，否则迟早有一处漏了兼容。
+    """
+    if not isinstance(data, dict):
+        return {}
+    raw = data.get("holders")
+    if isinstance(raw, dict):
+        out: dict[str, dict[str, Any]] = {}
+        for key, item in raw.items():
+            if not isinstance(item, dict):
+                continue
+            try:
+                item["pid"] = int(item.get("pid") or 0)
+            except (TypeError, ValueError):
+                continue
+            out[str(key)] = item
+        return out
+    # 旧格式：owner/pid/kind/label 平铺在顶层
+    try:
+        pid = int(data.get("pid") or 0)
+    except (TypeError, ValueError):
+        return {}
+    if pid <= 0:
+        return {}
+    holder = dict(data)
+    holder["pid"] = pid
+    return {holder_key(str(holder.get("kind") or ""), str(holder.get("label") or "")): holder}
+
+
+def holders() -> dict[str, dict[str, Any]]:
+    """所有**存活**的持有者，键是 :func:`holder_key`。
+
+    不存在、损坏、全部陈旧时返回 ``{}``（区别于「文件读不了」——
+    两者在本模块的语义里都是「当作空闲」，因为坏文件不能永久锁死机器，
+    代价是极端情况下漏判一次并发，比让所有人都用不了强）。
+    """
     path = lock_path()
     try:
         raw = path.read_text(encoding="utf-8")
     except (OSError, ValueError):
-        return None
+        return {}
     try:
         data = json.loads(raw)
     except ValueError:
-        # 写了一半 / 内容坏了：当作没有占用。这里的取舍是「坏文件不能永久锁死机器」，
-        # 代价是极端情况下会漏判一次并发，比让所有人都用不了强。
+        return {}
+    alive = {
+        key: item
+        for key, item in _split_holders(data).items()
+        if item.get("pid") and pid_alive(int(item["pid"]))
+    }
+    return alive
+
+
+def read() -> dict[str, Any] | None:
+    """读一个持有者（多持有者时取最早进入的那个）。
+
+    保留这个签名是为了 ``web_state`` / ``autoexp_api`` 的现成调用
+    （它们只需要「有没有人占着、是谁」）。要看全部请用 :func:`holders`。
+    """
+    alive = holders()
+    if not alive:
         return None
-    if not isinstance(data, dict):
-        return None
-    try:
-        pid = int(data.get("pid") or 0)
-    except (TypeError, ValueError):
-        return None
-    if not pid_alive(pid):
-        return None  # 陈旧锁
-    data["pid"] = pid
-    return data
+    return min(alive.values(), key=lambda item: str(item.get("since") or ""))
+
+
+def foreign_holders(pid: int | None = None) -> dict[str, dict[str, Any]]:
+    """**其它进程**的存活持有者（默认排除本进程）。
+
+    为什么不能再用 ``read()`` 做这件事：多持有者之后 ``read()`` 只返回一个，
+    它可能恰好是本进程自己那条（例如网页正跑着推理），于是「另一个终端
+    在跑 autoexp」就被漏掉了——而这正是这道闸门存在的理由。
+    """
+    me = os.getpid() if pid is None else pid
+    return {
+        key: item
+        for key, item in holders().items()
+        if int(item.get("pid") or 0) != me
+    }
 
 
 def describe(holder: dict[str, Any] | None) -> str:
@@ -182,6 +268,29 @@ def describe(holder: dict[str, Any] | None) -> str:
     return f"{detail}，PID {pid}"
 
 
+def describe_all(subjects: dict[str, dict[str, Any]] | None = None) -> str:
+    """把全部持有者拼成一句人话（多任务时用）。
+
+    ``release`` 失败、或用户点「谁占着显卡」时，只报一个持有者会让人以为
+    另一个任务已经停了。这里按进入时间排序，逐个列出。
+    """
+    items = list((subjects if subjects is not None else holders()).values())
+    if not items:
+        return "空闲"
+    items.sort(key=lambda item: str(item.get("since") or ""))
+    return "；".join(describe(item) for item in items)
+
+
+def _write(data: dict[str, Any]) -> None:
+    """原子写锁文件（临时文件 + ``os.replace``）。"""
+    path = lock_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # 临时名带 pid：两个进程同时写时各自的临时文件不会互相覆盖。
+    tmp = path.with_suffix(f".tmp{os.getpid()}")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp, path)
+
+
 def acquire(owner: str, kind: str = "", label: str = "") -> tuple[bool, str]:
     """申请占用。
 
@@ -189,26 +298,35 @@ def acquire(owner: str, kind: str = "", label: str = "") -> tuple[bool, str]:
 
     注意这里**不排队、不等待**：调用方都是「拿不到就立刻拒绝并提示用户」，
     等待只会让界面卡住，而用户需要的是马上知道「谁在占着 GPU」。
-    """
-    current = read()
-    if current is not None and int(current.get("pid") or 0) != os.getpid():
-        return False, describe(current)
 
-    path = lock_path()
+    同进程的其它任务（已有条目、pid 相同）不算冲突——它们本来就是
+    同一个进程里的两条流水线，本来就该各自记账。旧实现在这里直接
+    「放行并覆盖」，把别人的条目冲掉，等于让先跑的那个任务失去保护。
+    """
+    alive = holders()
+    for key, item in alive.items():
+        if int(item.get("pid") or 0) != os.getpid():
+            return False, describe(item)
+
+    key = holder_key(kind, label)
+    # 同 pid 的其它条目保持原样，只写自己这一条。
+    # 唯一的例外：本进程已经有「同 kind 但还没写 label」的占位条目。
+    # autoexp 的姿势就是先占位（exp_id 还没分配）、拿到 id 后再 acquire 一次补
+    # label；不在这里清掉旧键的话，文件里会同时留着两条，看状态时像两个任务。
+    if label:
+        placeholder = holder_key(kind, "")
+        if int(alive.get(placeholder, {}).get("pid") or 0) == os.getpid():
+            alive.pop(placeholder, None)
+    entry = {
+        "owner": owner,
+        "pid": os.getpid(),
+        "kind": kind,
+        "label": label,
+        "since": datetime.now().astimezone().isoformat(timespec="seconds"),
+    }
+    alive[key] = entry
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        payload = {
-            "owner": owner,
-            "pid": os.getpid(),
-            "kind": kind,
-            "label": label,
-            "since": datetime.now().astimezone().isoformat(timespec="seconds"),
-        }
-        # 先写临时文件再 rename：避免别的进程读到写了一半的 JSON。
-        # rename 在同一分区上是原子的。
-        tmp = path.with_suffix(f".tmp{os.getpid()}")
-        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        os.replace(tmp, path)
+        _write({"holders": alive})
     except OSError as exc:
         # 写不了锁文件不能让训练本身跑不起来（比如只读目录）。
         # 降级为「无锁」并在调用方日志里留一句，属于可接受的退让。
@@ -216,26 +334,41 @@ def acquire(owner: str, kind: str = "", label: str = "") -> tuple[bool, str]:
     return True, ""
 
 
-def release() -> None:
+def release(kind: str = "", label: str = "") -> None:
     """释放占用。
 
-    只删自己的锁：如果文件里的 pid 不是本进程，说明已经换人了
-    （例如自己被判定为陈旧后另一个进程接手），这时删掉会误伤别人。
+    只删**自己那一条**（同一个 pid + 同一个 ``kind|label``）：
+
+    - 文件里的 pid 不是本进程 → 说明已经换人了（例如自己被判定为陈旧后
+      另一个进程接手），这时删掉会误伤别人；
+    - pid 是本进程但有其它任务 → 那些条目必须留着，否则还在跑的任务
+      在下一个进程眼里就变成「显卡空闲」。
+
+    删空了才删文件。读写都按 :func:`_split_holders` 兼容旧格式。
     """
     path = lock_path()
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return
-    if not isinstance(data, dict):
+    alive = _split_holders(data)
+    key = holder_key(kind, label)
+    if kind or label:
+        # 有明确标识：只删自己那一条，且必须确实是本进程写的
+        item = alive.get(key)
+        mine = [key] if item is not None and int(item.get("pid") or 0) == os.getpid() else []
+    else:
+        # 不带任何标识：释放本进程的全部条目（老调用方与 Hold 的默认行为）
+        mine = [k for k, v in alive.items() if int(v.get("pid") or 0) == os.getpid()]
+    if not mine:
         return
+    for k in mine:
+        alive.pop(k, None)
     try:
-        if int(data.get("pid") or 0) != os.getpid():
-            return
-    except (TypeError, ValueError):
-        return
-    try:
-        path.unlink()
+        if alive:
+            _write({"holders": alive})
+        else:
+            path.unlink()
     except OSError:
         pass
 
@@ -262,16 +395,15 @@ class Hold:
 
     def __exit__(self, exc_type, exc, tb) -> bool:
         if self.held:
-            release()
+            release(self.kind, self.label)
         return False
 
 
 def self_check() -> int:
     """命令行自检：``python gpulock.py status``。"""
     if len(sys.argv) > 1 and sys.argv[1] == "status":
-        holder = read()
         print(f"锁文件：{lock_path()}")
-        print(f"状态：{describe(holder)}")
+        print(f"状态：{describe_all()}")
         return 0
     print(__doc__ or "")
     return 0

@@ -2,9 +2,9 @@
 
 本项目围绕工业视觉深度学习训练与 TensorRT 部署闭环建设，当前核心产品显示名为 **DefectVision AI Studio（AI 缺陷检测视觉工作站）**。项目核心方向是把标注、数据集导出、YOLO/Anomalib 训练、ONNX 导出、TensorRT 引擎构建和 C++ 推理验证整合为一套工业 AI 缺陷检测闭环平台。
 
-日常操作请用浏览器版。给人看的步骤、截图和流程图在 [Web 操作手册](docs/TRTForge_Web操作手册.md)。整套网页怎么拼、用了哪些技术，看 [Web Studio 架构与功能介绍](docs/WebStudio架构与功能介绍.md)。现有缺陷、安全漏洞和商业化路线图看 [商业化差距分析与优化建议](docs/商业化差距分析与优化建议.md)。桌面版步骤仍看 [Qt 操作手册](docs/TRTForge_操作手册.md)。
+日常操作请用浏览器版。给人看的步骤、截图和流程图在 [Web 操作手册](docs/TRTForge_Web操作手册.md)。从建标注工程一路点到推理，看 [从标注到推理逐步手册](docs/从标注到推理_逐步手册.md)。整套网页怎么拼、用了哪些技术，看 [Web Studio 架构与功能介绍](docs/WebStudio架构与功能介绍.md)。现有缺陷、安全漏洞和商业化路线图看 [商业化差距分析与优化建议](docs/商业化差距分析与优化建议.md)。桌面版步骤仍看 [Qt 操作手册](docs/TRTForge_操作手册.md)。
 
-要发给别人使用、又不附带源码时，在开发机执行 `packaging/package_web_user.ps1`。对方电脑需为 CUDA 11.8，先运行安装包里的 `install_train_env.bat` 配置训练环境（不必预先安装 Anaconda；无 AVX2 的机器会自动改用 Polars 兼容包），再用 `config.json` 填写数据目录。**启动只需双击 `app\TRTForgeWeb.exe`，不需要 PowerShell**；启动失败会弹中文说明框并写 `runtime\logs\launcher.log`，排障步骤见 [启动与排障说明](docs/启动与排障说明.md)。细节见 [WORKFLOW_GUIDE 7.1.3](docs/WORKFLOW_GUIDE.md)。
+要发给别人使用、又不附带源码时，在开发机执行 `packaging/package_web_user.ps1`。对方电脑需为 CUDA 11.8。把整个 `TRTForgeWeb` 文件夹交给对方后，对方双击 **`一键安装.bat`**：第一次用包里自带的库装好训练环境（不必联网，不必预先安装 Anaconda；无 AVX2 的机器会自动改用 Polars 兼容包），在桌面放上「TRTForge Web」并打开软件。以后双击桌面图标即可。启动失败会弹中文说明框并写 `runtime\logs\launcher.log`，排障步骤见 [启动与排障说明](docs/启动与排障说明.md)。细节见 [WORKFLOW_GUIDE 7.1.3](docs/WORKFLOW_GUIDE.md)。
 
 **安装包分两个**，因为模型换得比软件勤，合在一起会让每次换模型都重打 1.8 GB：
 
@@ -129,6 +129,7 @@ Qt 界面内部仍按四个功能分目录：`src/annotation` 标注，`src/trai
 | --- | --- |
 | YOLO 训练 / 导出 | `torch`、`torchvision`、`ultralytics`、`polars`、`onnx`、`onnxruntime` |
 | Anomalib 训练 / 导出 | `torch`、`anomalib`、`lightning`、`onnx`、`onnxruntime`、`Pillow`、`numpy<3` |
+| **AnomalyDINO 建库 / 导出** | `torch`、**`timm==1.0.14`**、`onnx`、`onnxruntime`、`Pillow`、`numpy<3`（**不需要** `anomalib` / `lightning`） |
 
 一次性装齐：
 
@@ -148,9 +149,12 @@ cd 1-python-yolo\launcher
 python tf_yolo_launcher.py --mode check-env
 cd ..\..\2-python-anomaly\launcher
 python tf_anomalib_launcher.py --mode check-env
+python tf_anomalydino_launcher.py --mode check-env
 ```
 
-两条都输出 `"missing":[]` 才算环境可用。注意：
+三条都输出 `"missing":[]` 才算环境可用。`check-env` 只查异常检测时，可用
+`python tf_anomalydino_launcher.py --mode check-env` 单独确认 `timm` 与 DINOv2 权重是否到位
+（权重缺了会报 `MISSING_DEP` 并给出下载入口）。注意：
 - 仓库里没有 `.venv` 时，程序只能从 `VIRTUAL_ENV` / `CONDA_PREFIX` / PATH 探测，base 环境通常没有 torch，因此必须手动填 `python.exe` 路径，否则报「未找到可用 Python」。
 - `.gitignore` 中旧的 `ultralytics/`、`anomalib/` 已改为锚定仓库根的 `/ultralytics/`、`/anomalib/`。旧写法会把 `1-python-yolo/ultralytics-main/ultralytics` 与 `2-python-anomaly/anomalib-main/src/anomalib` 整包忽略，导致训练源码进不了版本库。
 
@@ -161,6 +165,289 @@ python tf_anomalib_launcher.py --mode check-env
 引擎构建页选择 ONNX 后会在后台线程自动识别第一个输入 tensor 的名称和维度，并弹出“ONNX 加载中”进度提示；识别完成后提供统一 `H/W` 输入，修改一次高度和宽度即可同步覆盖 `min / opt / max` 三组动态 shape。
 
 ## 版本更新记录
+
+### v1.44.0 — 2026-11-17（进入密码 + 等训练环境预热完再进主界面）
+
+**一句话**：打开软件后先看到密码框，通过之后全屏等待，直到训练环境预热完成才进入主界面。
+还没设过密码时留空或随便填都能进；在「环境说明」里设过之后，必须输对。
+
+这和 v1.42.0 的局域网访问令牌不是一回事。令牌防的是别的电脑连上来；
+进入密码防的是坐在这台电脑前的人。本机打开不需要令牌，但会看到这次的密码和等待。
+远程用户先过令牌，再过进入密码。
+
+| 改动 | 行为 |
+| --- | --- |
+| 未设置密码 | `runtime/operator_password.json` 不存在。登录接口接受任意内容，包括空字符串 |
+| 设置 / 修改 / 清除 | 「环境说明」页。首次不用旧密码；改或清除必须填对当前密码。两个新密码都留空就是清除 |
+| 存盘 | 只存盐和 PBKDF2 哈希，不存明文。连续输错 8 次锁 60 秒 |
+| 记住本次 | `sessionStorage`，关掉窗口再开要重新输。同一次打开里刷新不再问密码，但仍会走等待 |
+| 等待 | 再调一次 `POST /api/warm/prewarm`，轮询到默认的训练环境都是 `ready` 才进入。预热没开就直接进。超过 2 分钟，或某一类 15 秒还没启动，给出「仍然进入」 |
+
+**验证**：`python 6-web\backend\tools\test_operator_password.py`；
+`python 6-web\backend\tools\test_frontend_html.py`（遮罩在顶栏之前、密码卡片在环境说明页）。
+
+### v1.43.0 — 2026-11-17（前端深/浅双主题、受控动效层、吸顶顶栏与表单分区）
+
+**一句话**：这一版不动任何接口和业务逻辑，只改看起来那一层——**加了一套能记住的浅色主题**、
+**把动效从 0 个补到 8 个并且能整体归零**、**把长表单按语义分了段、顶栏吸顶不再跟着滚走**。
+零构建的约束没破：没有引入任何第三方 CSS / 字体 / 图标库，CSS 文件仍只有一个 `style.css`。
+
+#### 一、双主题
+
+| 改动 | 改前 | 改后 |
+| --- | --- | --- |
+| 主题 | 只有深色，写死在 `:root` | `:root` 深色 + `html[data-theme="light"]` 覆盖块（权重 0,1,1，不用 `!important`） |
+| 切换入口 | 无 | 顶栏右侧太阳/月亮图标，双内联 SVG，由 CSS 按 `[data-theme]` 控显隐，JS 不换图标 |
+| 记忆 | 无 | `localStorage["trtforge.theme"]`，默认 `dark`（不自动跟随系统，避免第一次打开就变白） |
+| 出图/调试 | 无 | 网址加 `?theme=light` 或 `?theme=dark` 强制指定并记忆；手动点图标后会把 `?theme=` 从地址栏清掉 |
+| 白闪 | — | 新增 `js/theme.js`，**classic script** 在 `<head>` 内 CSS 之后同步加载，先于首帧写 `dataset.theme` |
+
+浅色的主要工作量是**重推状态色**，不是换背景：深色那套 `--ok: #34d399` 对白底只有约 1.9:1，
+文字直接看不见。浅色值换成 `--cyan: #0e7490` / `--teal: #0f766e` / `--ok: #047857` /
+`--amber: #b45309` / `--danger: #b91c1c` / `--magenta: #a21caf`，`--ink-on-accent` 翻白。
+
+**`--bg-void` 拆成两个令牌**是关键改动：原来它同时当「日志/列表底」和「图像舞台」用，
+浅色下必须分开，否则要么日志变刺眼白、要么判图区变白影响判读。
+新增 `--stage`（两主题都深底，给 `.viewer-stage` / `.anno-stage` / `.anno-mini` / `.camera-wrap`），
+`.log` / `.filelist` / `.pipe-log` 继续跟随 `--bg-void`。
+
+#### 二、动效层（8 个 keyframes，全部可归零）
+
+`tfFadeUp`（页签切换三档级联）、`tfPulse`（运行灯呼吸）、`tfShimmer`（进度条流光，由
+`train.js` 的 `setProgressBar()` 开关 `.is-live` 类控制）、`tfSpin`（按钮 `is-busy` 转圈）、
+`tfToast`（提示滑入）、`tfSkeleton`（骨架屏微光）、`tfFlash`（复制成功绿闪）、`tfRise`（卡片首次微升）。
+
+两个 reduced-motion 块（`@media (prefers-reduced-motion: reduce)` 与 `html.reduced-motion`）
+里补的是 `animation: none !important`，而不只是把 `--dur-*` 归零 —— 否则 `infinite` 动画会变成空转。
+
+#### 三、层次、结构与状态
+
+- `.topbar` 与 `.tabs` 包进 `.chrome`，`position: sticky; top: 0` + `backdrop-filter: blur(12px)`。
+  配套把 `body { height: 100% }` 改成 `html { height: 100% }` + `body { min-height: 100% }`，
+  否则 sticky 的滚动范围被限制在首屏高度，滚一下就滑走。
+- 新增 `--shadow-1/2/3`、`--focus-ring`、`--row-alt`、`--chrome-bg` 并把散落的阴影字面值收进令牌；
+  卡片 hover 提亮、指标卡微升 1px、`button.primary` 加内高光并在 `:active` 下沉 1px。
+- 训练页表单插 4 段 `.form-section`（任务 / 模型与数据 / 超参 / 输出与动作），引擎页 2 段 ——
+  **只加包裹层与小标题，任何 `id` 都没动**。
+- `#logBox` / `#exportLog` / `#inferMetrics` 用 `:empty::before` 出空状态提示（纯 CSS）；
+  `::selection` 与两套窄滚动条补上。
+- 顺手修掉两处**重复 `id`**：数据集页的导出按钮与告警行原来也叫 `btnExport` / `dsWarnings`，
+  与训练页撞车，现改名 `dsBtnExport` / `dsPageWarnings`（HTML 与 `dataset.js` 同步）。
+
+#### 四、验收
+
+```powershell
+node 6-web/frontend/tests/test_contrast.mjs   # 48 项：两套令牌逐条核算 + 键集合一致性
+node 6-web/frontend/tests/test_theme.mjs      # 23 项：默认值 / 存储 / ?theme= / 多标签同步
+python 6-web/backend/tools/test_frontend_html.py          # 标签闭合、id 唯一、theme.js 位置、表单分区
+python 6-web/backend/tools/run_all_tests.py   # 89 个脚本全通过（0 失败）
+```
+
+对比度护栏现在**逐主题**跑，并断言两套令牌的键集合必须一致 —— 防止以后只在一边加令牌。
+文档：`6-web/README.md` 的「设计令牌」章节已改写为双主题（顺手修正 `--duration-base`
+应为 `--dur-base` 的笔误），`docs/TRTForge_Web操作手册.md` 与
+`docs/WebStudio架构与功能介绍.md` 各补一节「切换主题」。
+
+### v1.42.0 — 2026-11-17（局域网访问要令牌；训练默认值加护栏；删死代码、统一测试与原子写）
+
+**一句话**：这一版不加算法能力，只做四件事——**把「能连上就能操作」的洞堵上**、
+**把训练页与启动器的默认值钉死**、**把抄了七八份的小工具收敛成一份**、
+**把异常检测那堆只能手打的目录改成弹窗可选**。
+
+#### 一、安全与资源
+
+| 改动 | 改前 | 改后 |
+| --- | --- | --- |
+| 访问控制 | 改 `host=0.0.0.0` 后，任何能 ping 到本机的人都能训练 / 建引擎 / 读日志 | `backend/auth.py`：Host 校验（挡 DNS 重绑定）→ Origin 校验（挡跨站伪造）→ 令牌 / 会话。默认 `auto`=本机免令牌、其它来源要登录 |
+| 登录方式 | 无 | `frontend/login.html`；令牌在 `runtime/web_token.txt`（或环境变量 `TRTFORGE_WEB_TOKEN`）；Cookie 会话 7 天，`HttpOnly`+`SameSite=Strict`；连续输错 10 次锁 5 分钟 |
+| 实时日志 | WebSocket 无鉴权 | 握手校验 Cookie（脚本可用 `?token=`），失败关连接码 **4401**；前端收到后停止重连 |
+| 路径白名单 | `--model` / `--data` / `--project` / `--name` 未校验；pipeline 的 `name` 可目录穿越 | 训练、引擎五个入口、推理的 `engine`/`labels`/`bundle`、全流程的 `name` 全部过白名单，并统一走 `_sanitize_part` |
+| trtexec 额外参数 | `extra_args` 原样进命令行 | 改成单一白名单常量，`--plugins` / `--saveEngine` / `--loadEngine` / `--onnx` / `--export*` / `--timingCacheFile` / `--int8` / `--calib` 一律拒绝 |
+| 上传文件 | 只按后缀判断 | `_save_upload` 与 `/api/infer/frame` 增加文件头校验（JPEG/PNG/BMP/TIFF/WebP），后缀改了也骗不过去 |
+| 关任务 | 只 `terminate()` 直接子进程，Windows 上孙进程（DataLoader worker）留在显存里 | `taskkill /T /F` 杀整棵树（POSIX 用进程组）；先并行发信号再统一等 |
+| 关窗口 | 固定等 10 秒后硬退，清理线程可能被掐断 | 等待按活跃任务数放大（`min(120, 20+15×N)` 秒），超时才 `force_exit` |
+| GPU 锁 | 同 PID 直接放行并覆盖别人的条目；`release` 只比 PID 就删整把锁 | 多持有者结构，按 `kind|label` 各占一条；只删自己那条，空了才删文件；别的 PID 持锁照样 409 |
+
+#### 二、简化（不改行为）
+
+| 改动 | 收益 |
+| --- | --- |
+| `tools/_harness.py` | 每个测试脚本各抄一份 `check`/`main`（两套参数顺序还相反）收敛成一份；71 个后端脚本里 **64 个已改用**，剩下 7 个自带夹具/快照/线程结构（`annotation_project`、`concurrency`、`engine_progress`、`exit_codes`、`full_chain`、`route_table`、`tool_command`）保持独立。约删 2300 行 |
+| `backend/jsonio.py` | 9 份原子写收敛；临时名统一 `.{pid}.{uuid8}` + `try/finally` 清理，保留标注页的 `newline="\n"` |
+| `frontend/js/ui.js` | `escapeHtml` / `setHint` / `setBadge` / `setMetric` / 剪贴板 / 时间格式化各抄多份，统一后**局域网 http 下「复制」不再静默失败**（补了 `execCommand` 兜底） |
+| 删 8 个零调用函数 | `promptlabel.mask_to_boxes`、`valmetrics.box_iou_matrix`、`labels.cache_clear`、`annotation_drafts.review_of`、`config.invalidate_python_cache`、`onnx_fallback.reset_sessions`、`textlabel.decode_caption_tokens`、`vram._empty_store` |
+| 测试入口 | `run_all_tests.py` 以前只扫 `tools/test_*.py`，前端 `.mjs` 单测只能手工 `node` 跑。现在按 `TEST_SOURCES` 清单同时跑（后端 `tools/` + `2-python-anomaly/launcher/tools` + 前端 `frontend/tests`），缺 `node` 会**明确报错**而不是少跑一层 |
+
+#### 三、默认值漂移（真 bug）
+
+| 问题 | 修法 |
+| --- | --- |
+| 全流程 `patience` 默认 50，训练页与 `tf_yolo_launcher.py` 都是 100 | 统一 100（同一份数据走两条入口早停轮数不同，模型不可比且日志看不出来） |
+| `AnomalibTrainRequest.input_size` 默认 256，AnomalyDINO 启动器默认 448，而后端**总是显式拼进命令行** → 启动器的 448 永远用不上 | 加 `model_validator`：不填时按模型分流（AnomalyDINO 448 / 其它 256）；显式传 256 仍是 256。全流程请求同一处理 |
+| 训练页与全流程共用 `project`/`name` 输入框，切任务时不换默认值 | 切任务按 `kind` 换默认（YOLO `runs/trtforge`+`exp` ↔ 异常检测 `results`+`latest`）；**用户手填的值一律保留** |
+| 没有护栏，改一个默认值到底层不同步只能靠人发现 | 新增 `tools/test_train_defaults.py`：逐键比对 Pydantic 默认与 `build_parser().parse_args(["--mode","train"])`，并要求「每个字段都必须登记类别」，新增字段漏登记就失败 |
+
+#### 四、异常检测的目录都能弹窗选
+
+| 字段 | 改前 | 改后 |
+| --- | --- | --- |
+| `normal_dir` / `abnormal_dir` / `normal_test_dir` | 只能手打 `train/good` 这类相对路径，拼错就是「目录不存在」 | 每个字段带**浏览**按钮，系统框从数据集 root 打开；选完自动改写成相对 root 的写法 |
+| 输出目录 `project` | 只能手打 | 带**浏览**按钮，产物写到 `project/实验名称` |
+| 全流程页的异常检测分支 | 同三个子目录只能手打 | 同样加浏览按钮，规则一致 |
+| 切任务类型 | 训练页无条件覆盖 `project`，用户刚选的输出目录会丢 | 只有仍是旧默认值/空值才替换，手填或浏览选中的一律保留（规则抽到 `js/outputs.js`，与全流程页共用） |
+
+改写逻辑是纯函数（`frontend/js/paths.js`）：选中目录在 root 内 → 存 `a/b/c`；在 root 外或 root
+为空/相对 → 原样存绝对路径（正常图库可能就在另一块盘上，不能猜）。
+
+**验证**：`python 6-web\backend\tools\run_all_tests.py` → **87 个脚本全通过**
+（73 个后端 + 14 个前端 `.mjs`，0 失败）。新增 `test_auth` / `test_path_guard` /
+`test_trtexec_args` / `test_upload_magic` / `test_shutdown_tree` / `test_gpulock` /
+`test_train_defaults` / `test_pipeline_defaults.mjs` / `test_browse_paths.mjs`。
+
+**升级注意**：`config.json` 不变。升级后第一次启动会生成 `runtime/web_token.txt`；
+本机用浏览器仍是直接进；**同事的机器要输一次令牌**（见 `docs/WORKFLOW_GUIDE.md` §7.1.5）。
+想回到旧行为：`TRTFORGE_AUTH=off`，启动日志会打印一行告警。
+
+### v1.41.0 — 2026-11-16（双击 exe 打开的是软件自己的窗口，不再弹浏览器；WebView2，不用 Qt）
+
+**一句话**：网页没换，换的是「外面那层壳」。双击 `app\TRTForgeWeb.exe` 出现一个没有地址栏、
+没有标签页的窗口，里面就是原来那套界面；`http://127.0.0.1:8060` 照旧能访问，两种方式并存。
+
+用的是 **WebView2**（系统自带的 Edge 内核），不是 Qt——Qt 在部分客户机上有部署与权限问题，
+而 WebView2 不需要管理员权限、不写注册表、不用额外分发 GUI 框架。
+
+| 改前 | 改后 |
+| --- | --- |
+| `uvicorn.run()` 占住主线程，另起后台线程等健康检查后 `webbrowser.open(url)` | uvicorn 挪到**后台线程**，主线程留给 `webview.start()`（WinForms 要求主线程建窗口） |
+| 双击后是浏览器标签页 | 双击后是应用窗口 |
+| 关浏览器标签页，服务继续在后台跑 | 关窗口 = 关软件：`server.should_exit = True`，端口立刻释放 |
+| 二次双击只重新打开浏览器 | 先 `FindWindowW` + `SetForegroundWindow` 把已有窗口提到前面，找不到才开浏览器 |
+| 没有「窗口起不来」这个概念 | 缺 WebView2 / pythonnet 加载失败 → 中文提示框**一次** + 退回浏览器，软件不会打不开 |
+| `config.json` 只有 host / port / python / data_roots | 新增 `"ui"`：`auto`（默认）/ `window` / `browser`，非法值回落 `auto` |
+| 页面里 `window.open(url, "_blank")` 开新窗口 | 在窗口模式下转交系统浏览器（窗口里再开一个会是空白页） |
+| WebView2 用户数据在 `%TEMP%`，退出时 pywebview 删不掉报 `WinError 5` | 固定到 `<安装目录>\runtime\webview`，`private_mode=False`，localStorage 能持久化 |
+
+**新增文件** `6-web/backend/desktop.py`（`webview_available` / `run_window` / `activate_existing_window`），
+`launcher.py` 里新增 `resolve_ui_mode` / `should_use_window` / `open_ui` / `show_existing_ui`。
+
+**开发机怎么先看到效果**：不用打包，双击仓库根目录的 `启动开发版.bat`（或快捷方式
+`启动 TRTForge Web Studio.lnk`）。它走同一个 `launcher.py`，需要一个「安装根」垫片
+`6-web\.devroot\`（junction 到 `frontend` / `bin` / `models` / `launchers`，bat 首次自动建、已进 `.gitignore`）。
+顺带修了两个源码形态才会踩到的问题：`launcher.py` 缺 `__main__` 守卫（`python launcher.py`
+会静默退出，退出码 0、日志都不生成）；`ensure_stdio` 把 stderr 指到同一个日志文件后，
+每条日志会被写两遍（看起来像启动了两次）。
+
+**顺手修掉一个一直存在的 bug**：`install_root()` 只认 `sys.frozen`，而 **Nuitka 不设这个变量**
+（它设的是模块级 `__compiled__`）。所以直接双击 `app\TRTForgeWeb.exe`（不经过 bat）时，
+安装根会被算成**安装目录的上一级**，`config.json` 读不到、前端目录跟着指错；
+通过 `start_web.bat` 启动因为设了 `TRTFORGE_HOME` 才一直没暴露。现在加了 `is_compiled()` 判断。
+
+同一处还有第二个坑：Nuitka standalone 下 `sys.executable` 指向 `<dist>\python.exe`，**这个文件不存在**，
+真正在跑的是 `sys.argv[0]`。所以新增 `_executable()`，优先取存在的那条路径；用 `sys.executable`
+只是「它的父目录恰好叫 app」才歪打正着。
+
+**打包侧**（`packaging/package_web_user.ps1`）：编译机缺 `pywebview`/`pythonnet`/`clr_loader` 直接 `throw`；
+Nuitka 参数加 `--include-module=desktop`，**不加** `--include-package=webview`——Nuitka 自带 pywebview
+插件，手动 include 会和插件的排除决定冲突，实测直接 `FATAL`。`frozen_entry._selfcheck()` 的模块清单
+加了 `webview`、`webview.platforms.winforms`、`desktop`，缺了就不出 zip。
+
+**实测**（Windows 10 19044，WebView2 `157.0.4341.46`，pywebview 6.2.1）：
+窗口能开、页面加载完成（`/api/health` 返回版本号）、WebSocket 正常、multipart 上传正常、
+剪贴板可用；打包形态补上 `ffi.dll` / `libssl-3-x64.dll` / `libcrypto-3-x64.dll` 后同一个 exe 也能开窗。
+体积增量约 **+5 MB**。
+
+源码形态的端到端实测（端口 8071，`ui=window`）：窗口 1440×900 出现、标题 `TRTForge Web Studio 1.41.0`、
+`/api/health` 返回 1.41.0；第二次双击只把窗口提到前面、不开浏览器；向窗口发 `WM_CLOSE` 后
+进程退出、端口立刻释放、日志依次写「窗口已关闭，通知服务退出」「服务退出」。`ui=browser` 时
+不开窗口、服务在后台继续跑。
+
+> 验收：`tools/test_desktop.py`（12 项）+ `tools/test_launcher.py`（47 项，含 10 项界面模式用例）。
+
+### v1.40.1 — 2026-11-14（降级推理漏了 ImageNet 归一化：bottle 的 good 图全被判 NG）
+
+**一句话**：两条 DLL 都没加载成功时，网页会退回 onnxruntime 做降级推理。这条路径
+**少做了一步 ImageNet 归一化**（mean/std 只在 DLL 里做），而且**拿归一化分数去比原始分数阈值**，
+两个错叠在一起，同一张好图的 raw 从 0.097 抬到 0.20，越过 0.2203 的判定线 → 整批 good 判 NG。
+
+| 改前 | 改后 |
+| --- | --- |
+| 输入只 `/255` 就喂 ONNX，减均值除方差一概没有 | 按 metadata 的 `normalization` 做（`imagenet` → `(x-mean)/std`），缺字段时按 DLL 的推导规则补：`anomalib_post_processed_0_1` 契约或 EfficientAd 视为 `none`，其余 `imagenet` |
+| `is_anomaly = normalized >= image_threshold`（0~1 相对值 vs 原始阈值） | `is_anomaly = raw_score >= image_threshold`，与 DLL 的 `normalized >= 0.5` 严格等价 |
+| 归一化分数用 `(raw-min)/(max-min)` 拉伸，阈值落点不在 0.5 | 改用 DLL 的公式 `clamp01((raw - threshold)/(max - min) + 0.5)`，阈值处正好 0.5 |
+| 推理页把「归一化分数 0.44」和「图像阈值 0.2203」并排显示，容易被读成 NG | 标签改成「归一化分数（阈值=0.5）」「图像阈值（原始分数口径）」，两个尺度不再混看 |
+
+**实测**（`AnomalyDINO/bottle_spike`，MVTec bottle 20 张 good）：
+- 修复前降级路径：`000.png` raw `0.1996`（引擎是 `0.0975`，被抬高一倍），**20/20 判 NG**
+- 修复后降级路径：`000.png` raw `0.097477`，与引擎路径 `0.097477` 差 **< 1e-6**，**20/20 判 OK**；异常图 `broken_large` 仍判 NG（raw 0.3258）
+- `test_onnx_fallback.py` 从 84 项扩到 **103 项**，新增「分数口径」与「AnomalyDINO 降级 vs 引擎一致」两节
+
+**顺带修掉的文档错误**：`WORKFLOW_GUIDE` §7 原写「归一化分数 `>=` image_threshold 判 NG」，
+实际是原始分数 `>=` 阈值（归一化后恒为 `>= 0.5`）。按错的口径去核，会把正常判定看成 bug。
+
+### v1.40.0 — 2026-11-13（AnomalyDINO：第 4 个异常检测模型，16 张正常图 21 秒出模型）
+
+**一句话**：异常检测多了一个**不需要训练**的选项。给它 16 张正常图，21 秒后得到一个能判 OK/NG、
+能指出位置的 ONNX + TensorRT 引擎——`anomalib_infer.dll` 一行没改，网页与全流程页也没有新增接口。
+
+它是 DINOv2（ViT-S/14）特征 + 记忆库 + 1-最近邻余弦距离，和 PatchCore 同构，
+只是特征换成自监督大模型、且「训练」只是一次冻结主干的前向（没有 Lightning、没有 epoch、没有反向传播）。
+
+| 改前 | 改后 |
+| --- | --- |
+| 异常检测只有 PatchCore / PaDiM / EfficientAd | 第 4 项 AnomalyDINO，零标注、零 Lightning |
+| 训练最短的 PaDiM 也要 28 秒 | 16 张建库 + 导出 + 标定 **21 秒** |
+| 新模型要改 DLL 才能进推理链 | 库固化成 ONNX 常量，导出两个张量就够，C++ 零改动 |
+| 上游要 `torch.hub` 拉 GitHub、要 DINOv2 仓库代码 | 改 `timm` + 官方 `.pth`，权重走「模型仓库」下载，离线可用 |
+
+**本机实测（T1000 8GB / TRT 8.5 / FP16 / bottle）**：
+
+| 项目 | 结果 |
+| --- | --- |
+| 主干与上游 `torch.hub` 一致性 | 逐 token 余弦 min 0.9999998，逐元素最大差 4.5e-4 |
+| FP16 引擎 vs ONNX（经真实 DLL） | 分数最大差 8.7e-4，8/8 张判定一致 |
+| 单张 GPU 计算 | 56.3 ms（PyTorch 端到端 66.3 ms） |
+| 精度（16-shot） | AUROC 1.0000 / 0.9976；F1 0.992，漏检 1.6%，误报 0% |
+
+**三个容易踩的坑**（都已写进代码注释与测试）：
+
+| 坑 | 后果 | 做法 |
+| --- | --- | --- |
+| `pos_embed` 用 timm 默认插值 | 逐 token 余弦只有 0.9928，结果"像但不对" | 按上游 `scale_factor=((grid+0.1)/37)` 预插值，余弦 1.000 |
+| 用 opset 17 导出 | TRT 8.5 解析 `LayerNormalization` 报 `Plugin not found` | 固定 opset 16 |
+| 多导出一个全分辨率 mask | DLL 的「元素数更大就接管」会让 mask 顶替热力图 | 只导 `anomaly_map`(32×32) + `pred_score`(1) |
+
+新增 `anomalydino_core.py`（纯算法）+ `tf_anomalydino_launcher.py`（流程与事件协议），
+打包时两个文件编进同一个 `.pyd`；`timm==1.0.14` 进离线 wheelhouse，
+DINOv2 权重 88.3 MB 走 modelzoo（带 sha256）。细节见
+[6-web/README](6-web/README.md#anomalydino-零样本异常检测v1400)、
+[docs/WORKFLOW_GUIDE](docs/WORKFLOW_GUIDE.md) 的「3.3.1」与
+[docs/异常检测模型对照](docs/异常检测模型对照_AnomalyCLIP与Anomalib.md) 的第 3 节。
+
+验收：新增两套后端测试（`test_anomalydino_launcher.py` 80 项、`test_anomaly_contract.py` 18 项）
+与一套打包核对（`test_packaging_wheels.py` 81 项，缺库/漏编辅助模块/自检退化都会让它红），
+后端共 **66 个脚本全绿**；`tf_anomalydino_launcher_bin.pyd` 在只有 pyd 的目录里跑通
+`--mode check-env`（证明 `anomalydino_core` 真的编进去了）。
+
+**打包同时修掉一个会让安装包根本起不来的老问题**（不是 AnomalyDINO 引入的，是这轮打真包才暴露）：
+
+| 现象 | 原因 | 修法 |
+| --- | --- | --- |
+| 双击 `TRTForgeWeb.exe` 直接闪退，`launcher.log` 里连一行都没有；事件查看器只写 `0xC0000409` | Conda 的 Pillow / `_ctypes` / `_ssl` 把编译库链到 `<env>\Library\bin`（`tiff.dll`、`openjp2.dll`、`ffi.dll`…），Nuitka 只搬了 `zlib.dll` | 打包时扫全部 `.pyd`/`.dll` 的 **PE 导入表做传递闭包**，缺什么从编译环境补（v1.40.0 补齐 18 个），`api-ms-win-*` 这类系统转发 DLL 一律不搬 |
+| 开发机好好的，只有对方机器崩 | 开发机 `PATH` 里有 conda 的 `Library\bin`，静态检查（文件在不在）也看不出 | 出 zip 前在**安装目录里真跑一遍** `TRTForgeWeb.exe --tool selfcheck`（逐个 import numpy / cv2 / PIL / onnxruntime / fastapi / uvicorn / routers / launcher / app），不过就 `throw`，不出 zip |
+
+`--tool selfcheck` 也留给排障用：用户说「双击没反应」时，先在安装目录执行它，缺哪个库一行就看得出来。
+
+**训练环境那头的自检也补齐了**：`install_train_env.ps1` 原来只试 `import torch, timm, polars, onnx, onnxruntime`，
+`ultralytics` / `anomalib` / `cv2` 装坏了照样显示「安装成功」，用户点「开始训练」才炸。现在改成逐个 import
+8 个库、每项打印 `OK` / `FAIL <库>: <原因>`、末尾汇总 `MISSING: ...` 并 `exit 1`。
+顺带发现并绕开一个 PS 5.1 的坑：`python -c "<多行脚本>"` 里的双引号会被 PowerShell 吃掉，
+实测直接 `SyntaxError: '(' was never closed`，改为写 `%TEMP%\trtforge_selfcheck.py` 再执行、跑完即删。
+
+**可测模型与上游仓库归位**（2026-11-14）：官方 `AnomalyDINO` 仓库从仓库同级目录移入 `11-AnomalyDINO/`
+（它自带 `.git`，整目录进 `.gitignore`，否则只会变成一个空 gitlink）；现成可测的 FP16 引擎在
+`2-python-anomaly/launcher/results/AnomalyDINO/bottle_spike/v0/weights/lightning/`，
+本机按 `tools/val_anomaly.py` 实跑 64 张（20 正常 + 44 异常）**AUROC 1.0000、P/R/F1 1.000、漏检 0%、误报 0%、5.56 s**。
+测法与命令见 `docs/异常检测模型对照_AnomalyCLIP与Anomalib.md` 的 3.6 节。
 
 ### v1.39.0 — 2026-11-13（标注页前端拆模块：4700 行 → 4 个可单测的纯逻辑模块）
 
@@ -2739,12 +3026,15 @@ TRTForge 标注工作台支持在底部设置 `train / val / test` 自动划分�
 | `docs/机器视觉引导对位系统精度解构与验证方法.md` | 说明机器视觉引导对位系统中工装治具、执行机构、视觉测量、手眼标定和工艺过程误差的拆解、验证方法与现场问题归因 |
 | `docs/DefectVision_AI_Studio_软件结构优化计划.md` | 第二阶段软件结构优化计划，说明 `MainWindow` 拆分、`AppSettings`、统一日志事件和目录整理策略 |
 | `docs/异常检测模型对比与选型_PatchCore_PaDiM_EfficientAd.md` | **三模型选型必读**：PatchCore / PaDiM / EfficientAd 的原理、训练耗时、ONNX 与引擎体积、编译耗时、推理延迟、实测准确率、阈值校准与踩坑记录 |
-| `docs/异常检测模型对照_AnomalyCLIP与Anomalib.md` | AnomalyCLIP 与 Anomalib 源码 21 个模型的对照：只有 3 个有本机实测，其余只做了原理分类 |
+| `docs/异常检测模型对照_AnomalyCLIP与Anomalib.md` | AnomalyCLIP、Anomalib 源码 21 个模型与 AnomalyDINO 的对照：只有 4 个有本机实测，其余只做了原理分类 |
+| `docs/生产过程智能管控_AI算法融合方案.md` | **对外方案配的算法层**：把《面向生产过程的有效智能管控》PPT 的承诺翻译成算法问题，给出检测/姿态/异常检测/跟踪如何融合成顺序、次数、时长判定 |
 | `docs/WORKFLOW_GUIDE.md` | **全流程作业指南**：环境准备 → 标注 → 训练 → ONNX 导出 → trtexec 编译 → 推理验证 → 故障排查 |
 | `docs/模型包说明.md` | **模型交付必读**：`.tfbundle` 目录结构、`manifest.json` 字段表、`ok/warn/block` 三档含义与排查步骤 |
 | `docs/TRTForge_yolo_infer与anomalib_infer_DLL调用与源码打包说明.md` | 说明 `yolo_infer` / `anomalib_infer` 的 C API、调用顺序、内存与依赖，以及 `package_inference_sdk.ps1` 离线打包源码与文档 |
 | `docs/trtexec_gui_YOLO_TRT推理流程说明.md` | 说明 TRTForge YOLO TensorRT 推理库的加载、前处理、解码、坐标还原和 C API |
 | `openspec/changes/add-anomalib-training-export` | Anomalib 异常检测训练导出集成设计，覆盖 PatchCore、PaDiM、EfficientAd 的 Qt UI、Python launcher、ONNX 导出和 metadata 契约 |
+| `openspec/changes/archive/2026-11-14-add-anomalydino-inference` | AnomalyDINO 零样本异常检测接入设计（已归档）：DINOv2 主干、记忆库固化进 ONNX、opset 16 与两输出契约、离线打包 |
+| `11-AnomalyDINO/` | AnomalyDINO **上游参考实现**（`git clone github.com/dammsi/AnomalyDINO`，v1.40.0 起放在本仓库内，整目录被 `.gitignore` 忽略）。本工程不 import 它；补丁与环境记录见其中的 `LOCAL_CHANGES.md`。现成可测引擎见 `2-python-anomaly/launcher/results/AnomalyDINO/bottle_spike/v0/weights/lightning/` |
 
 ## YOLO 训练入口
 

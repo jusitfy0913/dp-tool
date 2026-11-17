@@ -22,6 +22,7 @@
 from __future__ import annotations
 
 import json
+import io
 import os
 import socket
 import sys
@@ -36,38 +37,9 @@ BACKEND = Path(__file__).resolve().parent.parent
 REPO_ROOT = BACKEND.parent.parent
 sys.path.insert(0, str(BACKEND))
 
+from _harness import case, check_eq, finish, require, run_cases  # noqa: E402# noqa: E402
+
 import launcher  # noqa: E402
-
-PASSED: list[str] = []
-FAILED: list[tuple[str, str]] = []
-
-
-def case(name: str):
-    def wrap(func):
-        def runner():
-            try:
-                func()
-            except Exception as exc:  # noqa: BLE001
-                FAILED.append((name, f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}"))
-                print(f"  [FAIL] {name}")
-            else:
-                PASSED.append(name)
-                print(f"  [ ok ] {name}")
-
-        runner.__name__ = func.__name__
-        return runner
-
-    return wrap
-
-
-def check(condition: bool, message: str) -> None:
-    if not condition:
-        raise AssertionError(message)
-
-
-def check_eq(actual, expected, label: str) -> None:
-    if actual != expected:
-        raise AssertionError(f"{label}：期望 {expected!r}，实际 {actual!r}")
 
 
 # ---------------------------------------------------------------------------
@@ -139,6 +111,11 @@ def make_root(base: Path, **cfg) -> Path:
     root = base / "install"
     root.mkdir(parents=True, exist_ok=True)
     (root / "config.json").write_text(json.dumps(cfg, ensure_ascii=False), encoding="utf-8")
+    # 安装包布局里一定有 app\TRTForgeWeb.exe（自带工具分支靠它）。
+    # 默认建一个，让「完整环境变量清单」这条用例仍然覆盖 TRTFORGE_TOOL_EXE；
+    # 想验「源码形态没有 exe」的用例自己删掉它或另建一个干净目录。
+    (root / "app").mkdir(exist_ok=True)
+    (root / "app" / "TRTForgeWeb.exe").write_bytes(b"")
     return root
 
 
@@ -279,7 +256,7 @@ def test_env_values():
 def test_env_python():
     with tempfile.TemporaryDirectory() as tmp:
         root = make_root(Path(tmp))
-        check("TRTFORGE_PYTHON" not in launcher.environment(root, {}), "没有训练环境时不该写")
+        require("TRTFORGE_PYTHON" not in launcher.environment(root, {}), "没有训练环境时不该写")
         (root / "train-env").mkdir()
         (root / "train-env" / "python.exe").write_bytes(b"")
         env = launcher.environment(root, {})
@@ -301,12 +278,21 @@ def test_env_tcl():
     with tempfile.TemporaryDirectory() as tmp:
         root = make_root(Path(tmp))
         env = launcher.environment(root, {})
-        check("TCL_LIBRARY" not in env, "没有 tcl8.6 时不该写")
+        require("TCL_LIBRARY" not in env, "没有 tcl8.6 时不该写")
         (root / "app" / "tcl8.6").mkdir(parents=True)
         (root / "app" / "tk8.6").mkdir(parents=True)
         env = launcher.environment(root, {})
         check_eq(env.get("TCL_LIBRARY"), str(root / "app" / "tcl8.6"), "TCL_LIBRARY")
         check_eq(env.get("TK_LIBRARY"), str(root / "app" / "tk8.6"), "TK_LIBRARY")
+
+
+@case("没有自带 exe 时不写 TRTFORGE_TOOL_EXE（源码形态直接调 tools 脚本）")
+def test_env_no_tool_exe_in_source():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = make_root(Path(tmp))
+        (root / "app" / "TRTForgeWeb.exe").unlink()
+        env = launcher.environment(root, {})
+        require("TRTFORGE_TOOL_EXE" not in env, "没有 exe 时不该指向不存在的文件")
 
 
 @case("BROWSE_ROOTS 用系统路径分隔符连接")
@@ -330,8 +316,8 @@ def test_apply_path():
             host, port = launcher.apply_environment(root, launcher.load_config(root))
             check_eq((host, port), ("127.0.0.1", 8099), "返回值")
             path = os.environ["PATH"]
-            check(path.startswith(str(root / "bin") + os.pathsep), f"bin 不在最前：{path}")
-            check(r"C:\Windows\system32" in path, "原 PATH 被覆盖")
+            require(path.startswith(str(root / "bin") + os.pathsep), f"bin 不在最前：{path}")
+            require(r"C:\Windows\system32" in path, "原 PATH 被覆盖")
         finally:
             os.environ["PATH"] = saved
             for key in BASE_ENV_KEYS | {"TRTFORGE_PYTHON"}:
@@ -345,15 +331,15 @@ def test_ps1_no_env():
     # 出现在排障脚本里不算配置漂移。其余一律不许再设。
     allowed = {"PYTHONIOENCODING", "PYTHONUNBUFFERED", "TRTFORGE_HOME"}
     for key in sorted(BASE_ENV_KEYS - allowed):
-        check(f"$env:{key}" not in text, f"start_user.ps1 里又出现了 $env:{key}")
-    check("TRTFORGE_LEGACY_START" in text, "排障脚本应显式走回退模式")
+        require(f"$env:{key}" not in text, f"start_user.ps1 里又出现了 $env:{key}")
+    require("TRTFORGE_LEGACY_START" in text, "排障脚本应显式走回退模式")
 
 
 @case("start_web_cmd.bat 不再自带端口配置")
 def test_cmd_bat_no_dup_config():
     raw = (REPO_ROOT / "packaging" / "templates" / "start_web_cmd.bat").read_text(encoding="utf-8")
-    check("set \"PORT=" not in raw, "start_web_cmd.bat 又写死了 PORT")
-    check("start_web.bat" in raw, "start_web_cmd.bat 应转调 start_web.bat")
+    require("set \"PORT=" not in raw, "start_web_cmd.bat 又写死了 PORT")
+    require("start_web.bat" in raw, "start_web_cmd.bat 应转调 start_web.bat")
 
 
 # ---------------------------------------------------------------------------
@@ -367,10 +353,10 @@ def test_mutex():
     name = f"Local\\TRTForgeTest-{uuid.uuid4().hex}"
     handle1, created1 = launcher.acquire_mutex(name)
     try:
-        check(created1, "第一次创建应成功")
+        require(created1, "第一次创建应成功")
         handle2, created2 = launcher.acquire_mutex(name)
         try:
-            check(not created2, "第二次应识别为已存在")
+            require(not created2, "第二次应识别为已存在")
         finally:
             launcher.release_mutex(handle2)
     finally:
@@ -378,7 +364,7 @@ def test_mutex():
     # 全部释放后应当能重新创建，否则「关掉程序再打开」会一直判成已有实例
     handle3, created3 = launcher.acquire_mutex(name)
     try:
-        check(created3, "释放后应能重新创建")
+        require(created3, "释放后应能重新创建")
     finally:
         launcher.release_mutex(handle3)
 
@@ -390,7 +376,7 @@ def test_mutex_distinct():
     handle_a, created_a = launcher.acquire_mutex(f"Local\\TRTForgeTest-{uuid.uuid4().hex}")
     handle_b, created_b = launcher.acquire_mutex(f"Local\\TRTForgeTest-{uuid.uuid4().hex}")
     try:
-        check(created_a and created_b, "不同用户会话应各自能开一个实例")
+        require(created_a and created_b, "不同用户会话应各自能开一个实例")
     finally:
         launcher.release_mutex(handle_a)
         launcher.release_mutex(handle_b)
@@ -403,21 +389,21 @@ def test_mutex_distinct():
 @case("端口空闲：port_free 为真")
 def test_port_free():
     port = free_port()
-    check(launcher.port_free("127.0.0.1", port), "空端口应可绑定")
+    require(launcher.port_free("127.0.0.1", port), "空端口应可绑定")
     check_eq(launcher.health_version("127.0.0.1", port, timeout=0.5), None, "空端口读不到版本")
 
 
 @case("端口上是本软件：port_free 为假但能读到版本")
 def test_port_our_instance():
     with FakeHealthServer() as server:
-        check(not launcher.port_free("127.0.0.1", server.port), "已被监听应不可绑定")
+        require(not launcher.port_free("127.0.0.1", server.port), "已被监听应不可绑定")
         check_eq(launcher.health_version("127.0.0.1", server.port), "9.9.9", "版本号")
 
 
 @case("端口被别的程序占用：port_free 为假且读不到版本")
 def test_port_other_app():
     with FakeListener() as listener:
-        check(not launcher.port_free("127.0.0.1", listener.port), "被占用应不可绑定")
+        require(not launcher.port_free("127.0.0.1", listener.port), "被占用应不可绑定")
         check_eq(launcher.health_version("127.0.0.1", listener.port, timeout=1.0), None, "版本号")
 
 
@@ -449,16 +435,16 @@ def test_health_not_json():
 @case("wait_healthy 超时返回 False 而不是抛异常")
 def test_wait_healthy_timeout():
     port = free_port()
-    check(not launcher.wait_healthy("127.0.0.1", port, timeout=1.0), "超时应返回 False")
+    require(not launcher.wait_healthy("127.0.0.1", port, timeout=1.0), "超时应返回 False")
 
 
 @case("端口占用文案里带端口号和 config.json 路径")
 def test_port_text():
     text = launcher._port_in_use_text(Path(r"D:\TRTForgeWeb"), 8060)
-    check("8060" in text, "没写端口")
-    check("8061" in text, "没给可改的替代端口")
-    check("config.json" in text, "没指路到 config.json")
-    check("已被其它程序占用" in text, "第一段没说清发生了什么")
+    require("8060" in text, "没写端口")
+    require("8061" in text, "没给可改的替代端口")
+    require("config.json" in text, "没指路到 config.json")
+    require("已被其它程序占用" in text, "第一段没说清发生了什么")
 
 
 # ---------------------------------------------------------------------------
@@ -475,15 +461,15 @@ def test_ensure_stdio_none():
         sys.stderr = None
         try:
             launcher.ensure_stdio(log)  # 不抛异常就是通过一半
-            check(sys.stdout is not None, "stdout 没被重定向")
-            check(sys.stderr is not None, "stderr 没被重定向")
+            require(sys.stdout is not None, "stdout 没被重定向")
+            require(sys.stderr is not None, "stderr 没被重定向")
             print("启动器测试：中文输出")
             sys.stdout.flush()
         finally:
             sys.stdout, sys.stderr = saved_out, saved_err
             log.close()
         content = (Path(tmp) / "runtime" / "logs" / "launcher.log").read_text(encoding="utf-8")
-        check("中文输出" in content, "重定向没写进日志文件")
+        require("中文输出" in content, "重定向没写进日志文件")
 
 
 @case("有控制台时 ensure_stdio 不改动 stdout")
@@ -504,8 +490,8 @@ def test_log_utf8():
         path = Path(tmp) / "runtime" / "logs" / "launcher.log"
         raw = path.read_bytes()
         text = raw.decode("utf-8")
-        check("安装根" in text, "中文没写进去")
-        check(path.read_text(encoding="utf-8").count("\n") == 1, "应只有一行")
+        require("安装根" in text, "中文没写进去")
+        require(path.read_text(encoding="utf-8").count("\n") == 1, "应只有一行")
         # 追加而不是覆盖：第二次启动不能把上次的记录冲掉
         log2 = launcher.Log(Path(tmp))
         log2.open()
@@ -513,7 +499,7 @@ def test_log_utf8():
         log2.close()
         check_eq(len(path.read_text(encoding="utf-8").splitlines()), 2, "追加行数")
         # 时间戳形如 2026-11-13 15:37:01
-        check(path.read_text(encoding="utf-8").startswith("20"), "缺时间戳")
+        require(path.read_text(encoding="utf-8").startswith("20"), "缺时间戳")
 
 
 # ---------------------------------------------------------------------------
@@ -588,25 +574,336 @@ def test_no_heavy_import():
 @case("回退开关 TRTFORGE_LEGACY_START 被识别")
 def test_legacy_flag():
     source = (BACKEND / "launcher.py").read_text(encoding="utf-8")
-    check("TRTFORGE_LEGACY_START" in source, "回退开关不见了")
-    check("_port_in_use_text" in source, "端口占用文案函数不见了")
+    require("TRTFORGE_LEGACY_START" in source, "回退开关不见了")
+    require("_port_in_use_text" in source, "端口占用文案函数不见了")
+
+
+# ---------------------------------------------------------------------------
+# 8. 界面模式（window / browser / auto）
+# ---------------------------------------------------------------------------
+
+@case("ui 字段解析：三个合法值 + 大小写 + 非法值回落 auto")
+def test_resolve_ui_mode():
+    check_eq(launcher.resolve_ui_mode({}), launcher.UI_AUTO, "缺省")
+    check_eq(launcher.resolve_ui_mode({"ui": "window"}), launcher.UI_WINDOW, "window")
+    check_eq(launcher.resolve_ui_mode({"ui": "BROWSER"}), launcher.UI_BROWSER, "大小写不敏感")
+    check_eq(launcher.resolve_ui_mode({"ui": " auto "}), launcher.UI_AUTO, "两侧空白")
+    check_eq(launcher.resolve_ui_mode({"ui": "qt"}), launcher.UI_AUTO, "非法值回落")
+    check_eq(launcher.resolve_ui_mode({"ui": 123}), launcher.UI_AUTO, "非字符串回落")
+    check_eq(launcher.resolve_ui_mode({"ui": None}), launcher.UI_AUTO, "null 回落")
+
+
+@case("ui=browser 不去探测窗口，也不 import desktop")
+def test_should_use_window_browser():
+    calls: list[int] = []
+    saved = sys.modules.get("desktop")
+    fake = type(sys)("desktop")
+    fake.webview_available = lambda: calls.append(1) or True
+    sys.modules["desktop"] = fake
+    try:
+        require(not launcher.should_use_window({"ui": "browser"}), "browser 不该开窗")
+        check_eq(len(calls), 0, "browser 不该探测 WebView2")
+    finally:
+        if saved is None:
+            sys.modules.pop("desktop", None)
+        else:
+            sys.modules["desktop"] = saved
+
+
+@case("ui=auto 跟着 WebView2 的可用来回切")
+def test_should_use_window_auto():
+    saved = sys.modules.get("desktop")
+    available = {"value": True}
+    fake = type(sys)("desktop")
+    fake.webview_available = lambda: available["value"]
+    sys.modules["desktop"] = fake
+    try:
+        require(launcher.should_use_window({}), "auto + 可用 → 开窗")
+        available["value"] = False
+        require(not launcher.should_use_window({}), "auto + 不可用 → 浏览器")
+    finally:
+        if saved is None:
+            sys.modules.pop("desktop", None)
+        else:
+            sys.modules["desktop"] = saved
+
+
+@case("ui=window 明确要求开窗，不探测")
+def test_should_use_window_explicit():
+    saved = sys.modules.get("desktop")
+    if "desktop" in sys.modules:
+        sys.modules.pop("desktop")
+    try:
+        require(launcher.should_use_window({"ui": "window"}), "window 应直接尝试")
+    finally:
+        if saved is not None:
+            sys.modules["desktop"] = saved
+
+
+@case("desktop 模块缺失时 should_use_window 不抛异常")
+def test_should_use_window_no_module():
+    saved = sys.modules.get("desktop")
+    sys.modules["desktop"] = None  # import 会直接失败
+    try:
+        require(not launcher.should_use_window({}), "模块缺失应判为不能开窗")
+    finally:
+        if saved is None:
+            sys.modules.pop("desktop", None)
+        else:
+            sys.modules["desktop"] = saved
+
+
+@case("窗口起不来时退回浏览器并弹一次说明，不抛异常")
+def test_open_ui_fallback():
+    saved = sys.modules.get("desktop")
+    fake = type(sys)("desktop")
+    fake.window_title = lambda version: f"TRTForge Web Studio {version}".strip()
+    fake.webview_available = lambda: True
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("WebView2 初始化失败")
+
+    fake.run_window = boom
+    sys.modules["desktop"] = fake
+    opened: list[str] = []
+    boxes: list[str] = []
+    saved_browser = launcher.open_browser
+    saved_box = launcher.message_box
+    saved_should = launcher.should_use_window
+    launcher.open_browser = lambda url: opened.append(url) or True
+    launcher.message_box = lambda text, title="TRTForge": boxes.append(text)
+    launcher.should_use_window = lambda cfg: True
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            log = launcher.Log(root)
+            log.open()
+            try:
+                used = launcher.open_ui("http://127.0.0.1:8060/", root, log, lambda: None, "1.41.0")
+            finally:
+                log.close()
+        check_eq(used, False, "窗口失败应返回 False")
+        check_eq(opened, ["http://127.0.0.1:8060/"], "应退回浏览器")
+        check_eq(len(boxes), 1, "只提示一次")
+        require("浏览器" in boxes[0] and "WebView2" in boxes[0], "说明要讲清降级与原因")
+    finally:
+        launcher.open_browser = saved_browser
+        launcher.message_box = saved_box
+        launcher.should_use_window = saved_should
+        if saved is None:
+            sys.modules.pop("desktop", None)
+        else:
+            sys.modules["desktop"] = saved
+
+
+@case("窗口正常关闭时 open_ui 返回 True 且回调停止服务")
+def test_open_ui_window():
+    saved = sys.modules.get("desktop")
+    fake = type(sys)("desktop")
+    fake.window_title = lambda version: "TRTForge Web Studio " + version
+    fake.webview_available = lambda: True
+    seen: dict = {}
+
+    def run_window(url, root, title="", on_close=None):
+        seen["url"] = url
+        seen["title"] = title
+        if on_close is not None:
+            on_close()
+        return 0
+
+    fake.run_window = run_window
+    sys.modules["desktop"] = fake
+    opened: list[str] = []
+    saved_browser = launcher.open_browser
+    saved_should = launcher.should_use_window
+    launcher.open_browser = lambda url: opened.append(url) or True
+    launcher.should_use_window = lambda cfg: True
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            log = launcher.Log(root)
+            log.open()
+            stopped: list[int] = []
+            try:
+                used = launcher.open_ui(
+                    "http://127.0.0.1:8060/", root, log, lambda: stopped.append(1), "1.41.0"
+                )
+            finally:
+                log.close()
+        require(used, "应返回 True 表示开了窗口")
+        check_eq(opened, [], "开成窗口就不该再开浏览器")
+        check_eq(stopped, [1], "关窗口要通知停服")
+        check_eq(seen["url"], "http://127.0.0.1:8060/", "窗口 URL")
+        check_eq(seen["title"], "TRTForge Web Studio 1.41.0", "窗口标题带版本")
+    finally:
+        launcher.open_browser = saved_browser
+        launcher.should_use_window = saved_should
+        if saved is None:
+            sys.modules.pop("desktop", None)
+        else:
+            sys.modules["desktop"] = saved
+
+
+@case("二次启动优先激活已有窗口，失败才开浏览器")
+def test_show_existing_ui():
+    saved = sys.modules.get("desktop")
+    fake = type(sys)("desktop")
+    fake.window_title = lambda version: "TRTForge Web Studio " + version
+    fake.webview_available = lambda: True
+    activated: list[str] = []
+    fake.activate_existing_window = lambda title: activated.append(title) or False
+    sys.modules["desktop"] = fake
+    opened: list[str] = []
+    saved_browser = launcher.open_browser
+    launcher.open_browser = lambda url: opened.append(url) or True
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            log = launcher.Log(Path(tmp))
+            log.open()
+            try:
+                launcher.show_existing_ui("http://127.0.0.1:8060/", "1.41.0", log)
+                check_eq(activated, ["TRTForge Web Studio 1.41.0"], "先按标题找窗口")
+                check_eq(opened, ["http://127.0.0.1:8060/"], "找不到才开浏览器")
+
+                # 找得到窗口时不该再开浏览器
+                activated.clear()
+                opened.clear()
+                fake.activate_existing_window = lambda title: activated.append(title) or True
+                launcher.show_existing_ui("http://127.0.0.1:8060/", "1.41.0", log)
+                check_eq(opened, [], "激活成功就不该开浏览器")
+            finally:
+                log.close()
+    finally:
+        launcher.open_browser = saved_browser
+        if saved is None:
+            sys.modules.pop("desktop", None)
+        else:
+            sys.modules["desktop"] = saved
+
+
+@case("is_compiled 在源码形态下为 False")
+def test_is_compiled_source():
+    require(not launcher.is_compiled(), "源码形态不该判成打包形态")
+
+
+@case("install_root 优先 TRTFORGE_HOME")
+def test_install_root_env():
+    with tempfile.TemporaryDirectory() as tmp:
+        saved = os.environ.get("TRTFORGE_HOME")
+        os.environ["TRTFORGE_HOME"] = tmp
+        try:
+            check_eq(launcher.install_root(), Path(tmp).resolve(), "install_root")
+        finally:
+            if saved is None:
+                os.environ.pop("TRTFORGE_HOME", None)
+            else:
+                os.environ["TRTFORGE_HOME"] = saved
+
+
+@case("_executable 优先用存在的 argv[0]（Nuitka 的 sys.executable 是假路径）")
+def test_executable_pick():
+    with tempfile.TemporaryDirectory() as tmp:
+        exe = Path(tmp) / "TRTForgeWeb.exe"
+        exe.write_bytes(b"")
+        saved = sys.argv[:]
+        try:
+            sys.argv = [str(exe)]
+            check_eq(launcher._executable(), exe.resolve(), "应取 argv[0]")
+            # argv[0] 不存在（例如被别的程序塞了个假路径）→ 回落 sys.executable
+            sys.argv = [str(Path(tmp) / "missing.exe")]
+            check_eq(launcher._executable(), Path(sys.executable).resolve(), "回落 sys.executable")
+        finally:
+            sys.argv = saved
+
+
+@case("打包形态按 <root>\\app\\exe 反推安装根（不是 app 目录本身）")
+def test_install_root_compiled_layout():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp) / "TRTForgeWeb"
+        app = root / "app"
+        app.mkdir(parents=True)
+        exe = app / "TRTForgeWeb.exe"
+        exe.write_bytes(b"")
+        saved_env = os.environ.pop("TRTFORGE_HOME", None)
+        saved_compiled = launcher.is_compiled
+        saved_executable = launcher._executable
+        launcher.is_compiled = lambda: True
+        launcher._executable = lambda: exe
+        try:
+            check_eq(launcher.install_root(), root.resolve(), "安装根应是 app 的上一级")
+        finally:
+            launcher.is_compiled = saved_compiled
+            launcher._executable = saved_executable
+            if saved_env is not None:
+                os.environ["TRTFORGE_HOME"] = saved_env
+
+
+@case("排障模式不出窗口：run() 里 TRTFORGE_LEGACY_START 分支在 open_ui 之前返回")
+def test_legacy_returns_before_window():
+    source = (BACKEND / "launcher.py").read_text(encoding="utf-8")
+    legacy = source.index("TRTFORGE_LEGACY_START")
+    serve = source.index("return _serve_blocking(host, port)")
+    open_ui_index = source.index("open_ui(url, root, log, _stop_server")
+    require(legacy < serve < open_ui_index, "排障分支必须在启动窗口之前就返回")
+
+
+# ---------------------------------------------------------------------------
+# 9. 源码形态直接运行 + 日志不重复写
+# ---------------------------------------------------------------------------
+
+@case("launcher.py 有 __main__ 守卫（源码形态 python launcher.py 能直接启动）")
+def test_launcher_main_guard():
+    source = (BACKEND / "launcher.py").read_text(encoding="utf-8")
+    # 没有这段时 `python launcher.py` 只是把模块执行一遍就退出：退出码 0、
+    # 端口没监听、日志文件都不生成——看起来像「双击没反应」，没有任何线索。
+    require('if __name__ == "__main__":' in source, "缺少 __main__ 守卫")
+    require("raise SystemExit(run())" in source, "守卫里必须调用 run()")
+
+
+@case("stderr 已指向自身日志文件时不再重复回显（无控制台启动不再每条两遍）")
+def test_log_no_double_write():
+    with tempfile.TemporaryDirectory() as tmp:
+        log = launcher.Log(Path(tmp))
+        log.open()
+        saved = sys.stderr
+        own = open(log.path, "a", encoding="utf-8")  # noqa: SIM115 - 测试里手动关
+        try:
+            sys.stderr = own
+            require(log._stderr_is_own_file(), "应识别出 stderr 就是日志文件")
+            log.write("一行")
+        finally:
+            sys.stderr = saved
+            own.close()
+            log.close()
+        lines = [ln for ln in log.path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+        check_eq(len(lines), 1, f"日志里应只有一行，实际 {len(lines)} 行: {lines}")
+
+
+@case("stderr 是控制台（未重定向）时仍然回显")
+def test_log_echo_to_console():
+    with tempfile.TemporaryDirectory() as tmp:
+        log = launcher.Log(Path(tmp))
+        log.open()
+        saved = sys.stderr
+        buffer = io.StringIO()
+        try:
+            sys.stderr = buffer
+            require(not log._stderr_is_own_file(), "控制台不该被当成日志文件")
+            log.write("回显")
+        finally:
+            sys.stderr = saved
+            log.close()
+        require("回显" in buffer.getvalue(), "没有回显到 stderr")
+        require("回显" in log.path.read_text(encoding="utf-8"), "没有写进日志文件")
 
 
 def main() -> int:
     print("启动器测试")
     print("=" * 60)
-    for name, func in sorted(globals().items()):
-        if name.startswith("test_") and callable(func):
-            func()
+    run_cases(globals())
 
     print("-" * 60)
-    if FAILED:
-        for name, detail in FAILED:
-            print(f"\n[FAIL] {name}\n{detail}")
-        print(f"\n通过 {len(PASSED)} 项，失败 {len(FAILED)} 项")
-        return 1
-    print(f"通过 {len(PASSED)} 项，失败 0 项")
-    return 0
+    return finish()
 
 
 if __name__ == "__main__":

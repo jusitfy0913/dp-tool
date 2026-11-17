@@ -29,6 +29,8 @@ from pathlib import Path
 BACKEND = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(BACKEND))
 
+from _harness import check, finish  # noqa: E402
+
 import numpy as np  # noqa: E402
 from fastapi import HTTPException, UploadFile  # noqa: E402
 
@@ -36,18 +38,6 @@ import app  # noqa: E402
 import config  # noqa: E402
 import infer_batch  # noqa: E402
 import routers.infer as infer_routes  # noqa: E402
-
-PASSED: list[str] = []
-FAILED: list[str] = []
-
-
-def check(name: str, ok: bool, detail: str = "") -> None:
-    if ok:
-        PASSED.append(name)
-        print(f"[PASS] {name}")
-    else:
-        FAILED.append(name)
-        print(f"[FAIL] {name} {detail}")
 
 
 def as_pairs(command: list[str]) -> dict[str, str]:
@@ -338,7 +328,7 @@ def main() -> int:
             "timing": {"inference_ms": 3.2},
         }
         infer_routes._run_yolo_once = lambda *args, **kwargs: (dict(fake_result), None)
-        upload = UploadFile(filename="frame.jpg", file=io.BytesIO(frame_png))
+        upload = UploadFile(filename="frame.png", file=io.BytesIO(frame_png))
         response = app.infer_frame(image=upload, engine=str(engine), task="detect", conf=0.25, nms=0.45, labels=str(labels))
         payload = json.loads(response.body)
         check("单帧接口返回框", payload.get("count") == 1, str(payload.get("count")))
@@ -406,14 +396,7 @@ def main() -> int:
         infer_routes._run_yolo_once = original_once
         shutil.rmtree(root, ignore_errors=True)
 
-    print()
-    print(f"通过 {len(PASSED)} 项，失败 {len(FAILED)} 项")
-    if FAILED:
-        print("失败项：")
-        for name in FAILED:
-            print(f"  - {name}")
-        return 1
-    return 0
+    return finish()
 
 
 if __name__ == "__main__":

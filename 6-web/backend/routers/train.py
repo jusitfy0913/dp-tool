@@ -10,19 +10,28 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 import ampcheck
 import augpreview
 import checkpoints
 import config
 import fingerprint
+import modelzoo
 import traininfo
 import vram
 import web_state
 
 # 共享状态：并发闸门与路径白名单（见 web_state.py）
-from web_state import _START_LOCK, _ensure_allowed_path, _reject_if_busy
+from web_state import (
+    _START_LOCK,
+    _ensure_allowed_dir,
+    _ensure_allowed_path,
+    _ensure_safe_name,
+    _looks_like_path,
+    _reject_if_busy,
+    _resolve_python,
+)
 
 router = APIRouter()
 # ---------------------------------------------------------------------------
@@ -84,15 +93,23 @@ class YoloTrainRequest(BaseModel):
 
 
 class AnomalibTrainRequest(BaseModel):
-    """Anomalib 训练参数。"""
+    """Anomalib / AnomalyDINO 训练参数。
 
-    model: str = Field(default="patchcore", description="patchcore/padim/efficientad")
+    一份请求模型服务两条路：`model` 取 `patchcore/padim/efficientad` 时走 Anomalib，
+    取 `anomalydino` 时走零样本建库导出。两者共用同一批数据集字段（Folder 布局一致），
+    差别只在少数字段——那几项对 Anomalib 是无意义的，所以不存在「填错就静默走错路」。
+    """
+
+    model: str = Field(default="patchcore", description="patchcore/padim/efficientad/anomalydino")
     root: str = Field(..., description="Folder 数据集根目录")
     normal_dir: str = "train/good"
     abnormal_dir: str = "test/abnormal"
     normal_test_dir: str = "test/good"
     project: str = "results"
     name: str = "latest"
+    # 256 是 Anomalib 系列的默认；AnomalyDINO 必须用 448（14×32，DINOv2 的 patch14
+    # 才能切出整齐网格），由下面的校验器按模型改写。字段仍保留 256 作为文档上的默认，
+    # 是为了「不填 input_size 就等价于 Anomalib 默认」这条直觉成立。
     input_size: int = 256
     max_epochs: str = "auto"
     train_batch_size: int = 4
@@ -106,27 +123,33 @@ class AnomalibTrainRequest(BaseModel):
     # 用独立数据校准 metadata 阈值；留空表示不校准，沿用训练集统计
     calib_normal_dir: str = ""
     calib_abnormal_dir: str = ""
+    # --- 仅 anomalydino 使用 ---
+    shots: int = Field(default=16, description="建库用多少张正常图，-1=全部")
+    rotation: bool = Field(default=False, description="是否做 8 角度旋转增强")
+    seed: int = Field(default=0, description="few-shot 取图偏移")
     python: str | None = Field(default=None, description="覆盖训练解释器")
 
+    @model_validator(mode="after")
+    def _apply_model_defaults(self) -> "AnomalibTrainRequest":
+        """按模型补默认值：AnomalyDINO 的 input_size 默认 448，其余 256。
 
-def _resolve_python(override: str | None) -> str:
-    """确定训练用解释器，找不到时给出可执行建议。"""
-    if override:
-        candidate = Path(override)
-        if candidate.is_file():
-            return str(candidate)
-        raise HTTPException(status_code=400, detail=f"指定的 Python 不存在：{override}")
+        为什么必须在这里做：Pydantic 的默认值不能引用另一个字段。以前启动器
+        `tf_anomalydino_launcher.py` 的 `--input-size` 默认是 448，而这个请求模型
+        写死 256，后端又总是把它显式拼进命令行——于是「不填」也会被翻译成 256，
+        启动器的 448 永远用不上（模型 patch14 切不整齐，导出的 ONNX 尺寸与文档不符）。
 
-    resolved = config.resolve_python()
-    if not resolved:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "未找到可用的训练解释器。请在页面上填写 python.exe 路径，"
-                "或设置环境变量 TRTFORGE_PYTHON。"
-            ),
-        )
-    return resolved
+        只在调用方**没写** input_size 时改写；用户显式传 256 就是 256，
+        否则「想用 256 跑一次」会被悄悄改成 448。
+        """
+        if "input_size" not in self.model_fields_set and self.model in ZERO_SHOT_MODELS:
+            self.input_size = ZERO_SHOT_INPUT_SIZE
+        return self
+
+
+#: AnomalyDINO 专用参数只对这些模型名有效
+ZERO_SHOT_MODELS = {"anomalydino"}
+#: 零样本模型默认输入尺寸。448 = 14×32，DINOv2 patch14 能切出整齐网格。
+ZERO_SHOT_INPUT_SIZE = 448
 
 
 def build_train_command(request: "YoloTrainRequest", python: str) -> list[str]:
@@ -365,9 +388,18 @@ def train_yolo(request: YoloTrainRequest) -> dict:
     if not config.YOLO_LAUNCHER.is_file():
         raise HTTPException(status_code=500, detail=f"找不到 launcher：{config.YOLO_LAUNCHER}")
 
-    data_yaml = Path(request.data)
+    data_yaml = _ensure_allowed_path(request.data)
     if not data_yaml.is_file():
         raise HTTPException(status_code=400, detail=f"dataset.yaml 不存在：{request.data}")
+
+    # ``model`` 可以是模型名（``yolov8n.pt``，交给 Ultralytics 下载），也可以是
+    # 显式权重路径。后者必须落在白名单内：这个字段会直接进子进程命令行。
+    if _looks_like_path(request.model):
+        _ensure_allowed_path(request.model)
+    # ``project`` / ``name`` 是**写**目录。父目录走白名单（挡住 ../ 与盘外路径），
+    # 名字再单独消毒（挡住分隔符与 ..）。两道缺一不可。
+    _ensure_allowed_dir(request.project, config.YOLO_LAUNCHER_DIR, "输出目录")
+    request.name = _ensure_safe_name(request.name, "实验名")
 
     python = _resolve_python(request.python)
 
@@ -533,20 +565,104 @@ def build_anomalib_train_command(request: "AnomalibTrainRequest", python: str) -
     return command
 
 
+def build_anomalydino_command(request: "AnomalibTrainRequest", python: str) -> list[str]:
+    """拼 AnomalyDINO 建库 + 导出命令行。
+
+    与 `build_anomalib_train_command` 刻意保持**同一批基础参数名**（`--root`、
+    `--normal-dir`、`--project`、`--name`、`--input-size`、`--calib-limit` ...），
+    这样训练页那两个模型共用一套表单字段；差异只在四个零样本专属参数上。
+    """
+    command = [
+        python, str(config.ANOMALYDINO_LAUNCHER),
+        "--mode", "build-export",
+        "--root", str(Path(request.root).expanduser()),
+        "--normal-dir", request.normal_dir,
+        "--abnormal-dir", request.abnormal_dir,
+        "--normal-test-dir", request.normal_test_dir,
+        "--project", request.project,
+        "--name", request.name,
+        "--input-size", str(request.input_size),
+        # 零样本没有 epoch，这个字段只为让训练页的通用参数原样透传，launcher 会忽略
+        "--max-epochs", str(request.max_epochs),
+        "--train-batch-size", str(request.train_batch_size),
+        "--calib-limit", str(request.calib_limit),
+        "--calibrate-metadata", "true" if request.calibrate_metadata else "false",
+        "--shots", str(request.shots),
+        "--rotation", "true" if request.rotation else "false",
+        "--seed", str(request.seed),
+    ]
+    for flag, value in (
+        ("--calib-normal-dir", request.calib_normal_dir),
+        ("--calib-abnormal-dir", request.calib_abnormal_dir),
+    ):
+        if value.strip():
+            command += [flag, value.strip()]
+    # 权重优先用 modelzoo 下载的那份：安装形态的目标机器上没有 torch.hub 缓存，
+    # 让启动器自己找会一路失败到 "找不到权重"；显式传进去，日志里也能看到实际用的文件。
+    checkpoint = _anomalydino_checkpoint()
+    if checkpoint:
+        command += ["--checkpoint", checkpoint]
+    return command
+
+
+def _anomalydino_checkpoint() -> str | None:
+    """modelzoo 里已下载的 DINOv2 权重路径；没下载过就返回 None。"""
+    return modelzoo.resolve("dinov2_vits14", "dinov2/dinov2_vits14_pretrain.pth")
+
+
+def build_train_export_command(
+    request: "AnomalibTrainRequest", python: str
+) -> tuple[list[str], Path]:
+    """按模型名选启动器，返回 (命令行, 工作目录)。
+
+    工作目录必须跟着启动器走：`--project results` 是相对路径，由启动器的 cwd 解析。
+    选错目录的后果不是报错，而是产物写到另一个 `results/` 下、随后全流程「找不到产物」。
+    """
+    if request.model in ZERO_SHOT_MODELS:
+        return build_anomalydino_command(request, python), config.ANOMALIB_LAUNCHER_DIR
+    return build_anomalib_train_command(request, python), config.ANOMALIB_LAUNCHER_DIR
+
+
 @router.post("/api/train/anomalib")
 def train_anomalib(request: AnomalibTrainRequest) -> dict:
-    """启动 Anomalib 训练并导出。"""
-    if not config.ANOMALIB_LAUNCHER.is_file():
+    """启动 Anomalib 训练并导出；`model=anomalydino` 时走零样本建库导出。"""
+    launcher = (
+        config.ANOMALYDINO_LAUNCHER
+        if request.model in ZERO_SHOT_MODELS
+        else config.ANOMALIB_LAUNCHER
+    )
+    if not launcher.is_file():
         raise HTTPException(
-            status_code=500, detail=f"找不到 launcher：{config.ANOMALIB_LAUNCHER}"
+            status_code=500, detail=f"找不到 launcher：{launcher}"
         )
 
-    root = Path(request.root)
+    root = _ensure_allowed_path(request.root)
     if not root.is_dir():
         raise HTTPException(status_code=400, detail=f"数据集根目录不存在：{request.root}")
 
+    # 子目录既允许相对 root（默认 ``train/good``），也允许绝对路径；两种都校验。
+    for field_name, value in (
+        ("normal_dir", request.normal_dir),
+        ("abnormal_dir", request.abnormal_dir),
+        ("normal_test_dir", request.normal_test_dir),
+        ("imagenet_dir", request.imagenet_dir),
+        ("calib_normal_dir", request.calib_normal_dir),
+        ("calib_abnormal_dir", request.calib_abnormal_dir),
+    ):
+        raw = str(value or "").strip()
+        if not raw:
+            continue
+        target = Path(raw).expanduser()
+        if not target.is_absolute():
+            target = root / target
+        _ensure_allowed_path(str(target))
+
+    # 输出目录与实验名：与 YOLO 侧同一套规则。
+    _ensure_allowed_dir(request.project, config.ANOMALIB_LAUNCHER_DIR, "输出目录")
+    request.name = _ensure_safe_name(request.name, "实验名")
+
     python = _resolve_python(request.python)
-    command = build_anomalib_train_command(request, python)
+    command, cwd = build_train_export_command(request, python)
 
     with _START_LOCK:
         _reject_if_busy()
@@ -554,8 +670,8 @@ def train_anomalib(request: AnomalibTrainRequest) -> dict:
             run = web_state.manager.create(
                 "anomalib-train",
                 command,
-                str(config.ANOMALIB_LAUNCHER_DIR),
-                warm_kind="anomalib",
+                str(cwd),
+                warm_kind="anomalydino" if request.model in ZERO_SHOT_MODELS else "anomalib",
             )
         except OSError as exc:
             raise HTTPException(status_code=500, detail=f"启动训练进程失败：{exc}") from exc
@@ -802,8 +918,13 @@ def check_env(kind: str, python: str | None = None) -> dict:
         launcher, cwd = config.YOLO_LAUNCHER, config.YOLO_LAUNCHER_DIR
     elif kind == "anomalib":
         launcher, cwd = config.ANOMALIB_LAUNCHER, config.ANOMALIB_LAUNCHER_DIR
+    elif kind == "anomalydino":
+        launcher, cwd = config.ANOMALYDINO_LAUNCHER, config.ANOMALIB_LAUNCHER_DIR
     else:
-        raise HTTPException(status_code=400, detail=f"未知类型：{kind}，可选 yolo / anomalib")
+        raise HTTPException(
+            status_code=400,
+            detail=f"未知类型：{kind}，可选 yolo / anomalib / anomalydino",
+        )
 
     if not launcher.is_file():
         raise HTTPException(status_code=500, detail=f"找不到 launcher：{launcher}")

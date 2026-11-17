@@ -45,6 +45,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+import jsonio
+
 # ---------------------------------------------------------------------------
 # 参数：改这些会直接改变「放不放行」，改之前先看 design.md
 # ---------------------------------------------------------------------------
@@ -216,10 +218,6 @@ def gpu_name() -> str | None:
 # ---------------------------------------------------------------------------
 # 实测峰值表
 # ---------------------------------------------------------------------------
-def _empty_store() -> dict[str, Any]:
-    return {"_comment": _COMMENT, "updated_at": None, "samples": {}}
-
-
 _COMMENT = (
     "显存实测峰值表。键格式 imgsz x batch x 精度（如 960x4xfp32），"
     "值为该组合历次训练的最大峰值（torch.cuda.max_memory_reserved，MB）。"
@@ -267,9 +265,7 @@ def save_samples(samples: dict[str, dict[str, Any]], path: Path | None = None) -
         "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "samples": samples,
     }
-    tmp = target.with_suffix(target.suffix + ".tmp")
-    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    os.replace(tmp, target)
+    jsonio.write_json(target, payload)
 
 
 def record_sample(

@@ -20,20 +20,9 @@ WEB_DIR = BACKEND_DIR.parent
 LAUNCHER_DIR = WEB_DIR.parent / "1-python-yolo" / "launcher"
 
 sys.path.insert(0, str(BACKEND_DIR))
+
+from _harness import check, finish  # noqa: E402
 sys.path.insert(0, str(LAUNCHER_DIR))
-
-PASSED = 0
-FAILED = 0
-
-
-def check(name: str, condition: bool, detail: str = "") -> None:
-    global PASSED, FAILED
-    if condition:
-        PASSED += 1
-        print(f"  [PASS] {name}")
-    else:
-        FAILED += 1
-        print(f"  [FAIL] {name} {detail}")
 
 
 # 增强参数：launcher 的 --参数 名 -> 传入值 -> build_train_kwargs 里的键
@@ -113,11 +102,15 @@ def test_backend() -> None:
         return
 
     import app as backend_app
+    import config
     import web_state
 
     tmp = Path(tempfile.mkdtemp(prefix="augapi_"))
     data_yaml = tmp / "dataset.yaml"
     data_yaml.write_text("path: .\ntrain: images/train\nval: images/val\nnames: {0: ok}\n", encoding="utf-8")
+    # 临时目录在仓库外，v1.42.0 起训练接口会按白名单拒绝它。这里登记成
+    # 「本机用户亲手选的目录」——等价于页面上用原生对话框选中的效果。
+    config.allow_path(str(tmp))
 
     captured: dict[str, list[str]] = {}
 
@@ -183,15 +176,13 @@ def test_backend() -> None:
             check("close_mosaic=-1 返回 400", resp.status_code == 400, f"实际 {resp.status_code}")
     finally:
         web_state.manager = original_manager
+        config.clear_runtime_allowed()
 
 
 def main() -> int:
     test_launcher()
     test_backend()
-    print(f"\n{'=' * 56}")
-    print(f"通过 {PASSED} 项，失败 {FAILED} 项")
-    print("=" * 56)
-    return 1 if FAILED else 0
+    return finish()
 
 
 if __name__ == "__main__":

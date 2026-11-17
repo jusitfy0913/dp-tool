@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import shlex
 from pathlib import Path
 from typing import Any
 
@@ -15,10 +14,17 @@ import config
 import enginemeta
 import models as models_mod
 import progress
+import trtexecargs
 import web_state
 
 # 共享状态：并发闸门与路径白名单（见 web_state.py）
-from web_state import _START_LOCK, _ensure_allowed_path, _reject_if_busy
+from web_state import (
+    _START_LOCK,
+    _ensure_allowed_dir,
+    _ensure_allowed_path,
+    _ensure_safe_name,
+    _reject_if_busy,
+)
 
 router = APIRouter()
 # ---------------------------------------------------------------------------
@@ -105,7 +111,7 @@ def probe_onnx(onnx: str) -> dict:
 
     前端选完文件即可调用，让用户在点「开始构建」之前就知道选对没有。
     """
-    onnx_path = Path(onnx).expanduser()
+    onnx_path = _ensure_allowed_path(onnx)
     if not onnx_path.is_file():
         raise HTTPException(status_code=400, detail=f"ONNX 文件不存在：{onnx}")
 
@@ -153,7 +159,7 @@ def save_operating_point(request: OperatingPointRequest) -> dict:
 
     只改旁挂文件：不碰引擎、不碰 metadata.json，所以不会改变已有部署的判定行为。
     """
-    engine = Path(request.engine).expanduser()
+    engine = _ensure_allowed_path(request.engine)
     if not engine.is_file():
         raise HTTPException(status_code=400, detail=f"引擎文件不存在：{request.engine}")
     payload = enginemeta.write_operating_point(
@@ -178,7 +184,7 @@ def save_operating_point(request: OperatingPointRequest) -> dict:
 @router.get("/api/engine/operating-point")
 def get_operating_point(engine: str) -> dict:
     """读回引擎工作点；没有就返回空对象，让前端沿用默认值。"""
-    path = Path(engine).expanduser()
+    path = _ensure_allowed_path(engine)
     point = enginemeta.read_operating_point(path)
     return {"engine": str(path), "path": str(enginemeta.metadata_path(path)), "operating_point": point or None}
 
@@ -196,15 +202,17 @@ def build_engine(request: EngineBuildRequest) -> dict:
             ),
         )
 
-    onnx_path = Path(request.onnx).expanduser()
+    onnx_path = _ensure_allowed_path(request.onnx)
     if not onnx_path.is_file():
         raise HTTPException(status_code=400, detail=f"ONNX 文件不存在：{request.onnx}")
     if onnx_path.suffix.lower() != ".onnx":
         raise HTTPException(status_code=400, detail="只接受 .onnx 文件")
 
-    # 输出路径：留空则按 ONNX 同名 + 精度后缀推导，减少填错
+    # 输出路径：留空则按 ONNX 同名 + 精度后缀推导，减少填错。
+    # 显式给出时必须走父目录白名单——否则这个字段能把任意文件名落到任意目录。
     if request.engine.strip():
         engine_path = Path(request.engine.strip()).expanduser()
+        _ensure_allowed_dir(str(engine_path.parent), None, "输出目录")
     else:
         tag = request.precision if request.precision in ("fp16", "int8") else "fp32"
         engine_path = onnx_path.with_name(f"{onnx_path.stem}_{tag}.engine")
@@ -215,6 +223,11 @@ def build_engine(request: EngineBuildRequest) -> dict:
         raise HTTPException(
             status_code=400, detail="输出文件名需以 .engine / .trt / .plan 结尾"
         )
+
+    # 模型包名会拼成输出目录名，先消毒：非法值应当在点击「构建」时就被拒，
+    # 而不是等引擎编译完（几分钟）后再在回调里静默失败。
+    if request.bundle_id.strip():
+        request.bundle_id = _ensure_safe_name(request.bundle_id, "模型包名")
 
     # 预检：拦住「未转置」的 YOLO 输出
     probe = _probe_onnx(onnx_path)
@@ -288,7 +301,12 @@ def build_engine(request: EngineBuildRequest) -> dict:
                 status_code=400,
                 detail="第一次做 INT8 校准不能加额外参数。同一批图再次编译会走 trtexec，那时可以加。",
             )
-        command += shlex.split(request.extra_args.strip(), posix=False)
+        # 只放行调优类参数：trtexec 自带 --saveEngine / --plugins / --exportOutput
+        # 这类读写任意文件、加载外部 DLL 的开关，原样拼进去等于执行任意操作。
+        try:
+            command += trtexecargs.check(request.extra_args)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     # 进度估算的信息：trtexec 的耗时几乎全在 tactic 搜索，而它主要由
     # 「ONNX 体积 × 输入面积」决定。把这三项交给 progress 模块，

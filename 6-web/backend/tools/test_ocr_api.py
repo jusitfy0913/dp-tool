@@ -19,6 +19,8 @@ import numpy as np
 BACKEND = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(BACKEND))
 
+from _harness import check, finish  # noqa: E402
+
 from fastapi import HTTPException, UploadFile  # noqa: E402
 
 import app  # noqa: E402
@@ -26,21 +28,10 @@ import inferproxy  # noqa: E402
 import ocr_infer  # noqa: E402
 import ocr_models  # noqa: E402
 
-PASSED: list[str] = []
-FAILED: list[str] = []
 REPO = BACKEND.parents[1]
 LEGACY = REPO / "9-python-paddleOCR" / "model" / "legacy_v4"
 V6_DET = REPO / "9-python-paddleOCR" / "model" / "PP-OCRv6_medium_det_infer"
 V6_REC = REPO / "9-python-paddleOCR" / "model" / "PP-OCRv6_medium_rec_infer"
-
-
-def check(name: str, ok: bool, detail: str = "") -> None:
-    if ok:
-        PASSED.append(name)
-        print(f"  通过  {name}")
-    else:
-        FAILED.append(name)
-        print(f"  失败  {name}  {detail}")
 
 
 def tiny_upload() -> UploadFile:
@@ -205,13 +196,7 @@ def main() -> int:
         inferproxy.run_ocr = original_run_ocr
         app._OCR_WARM_STATE.update({"running": False, "ok": None, "ms": None, "error": "", "source": ""})
 
-    print()
-    print(f"通过 {len(PASSED)} 项，失败 {len(FAILED)} 项")
-    if FAILED:
-        for name in FAILED:
-            print(f"  - {name}")
-        return 1
-    return 0
+    return finish()
 
 
 if __name__ == "__main__":

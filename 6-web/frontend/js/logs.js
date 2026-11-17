@@ -6,45 +6,16 @@
 // 2. 任务结束后内存里的 run 就没了，但 `runtime/logs/{run_id}.log` 一直在，
 //    后端 `/api/runs/{id}/log` 直接吐文件，比让用户自己去翻目录靠谱。
 
+import { copyText } from "./ui.js";
+
 /** 任务日志的下载地址（后端返回 text/plain，浏览器里可以直接全选复制）。 */
 export function runLogUrl(runId) {
   return `/api/runs/${encodeURIComponent(runId)}/log`;
 }
 
-/**
- * 复制文本到剪贴板。
- *
- * 两级兜底：`navigator.clipboard` 只在安全上下文可用（http://局域网IP 就没有），
- * 而本项目经常被同事用 `http://<同事机器>:8060` 打开，所以必须有 textarea 兜底。
- * @returns {Promise<boolean>} 是否真的复制成功（失败要如实告诉用户）
- */
-export async function copyText(text) {
-  if (!text) return false;
-  try {
-    if (navigator.clipboard && window.isSecureContext) {
-      await navigator.clipboard.writeText(text);
-      return true;
-    }
-  } catch {
-    // 落到下面的 execCommand 兜底
-  }
-  const area = document.createElement("textarea");
-  area.value = text;
-  area.setAttribute("readonly", "");
-  area.style.position = "fixed";
-  area.style.top = "-1000px";
-  area.style.opacity = "0";
-  document.body.appendChild(area);
-  area.select();
-  let ok = false;
-  try {
-    ok = document.execCommand("copy");
-  } catch {
-    ok = false;
-  }
-  area.remove();
-  return ok;
-}
+// 复制能力统一在 ui.copyText 实现：这里保留同名再导出，
+// 是为了不改动已经 import 本模块的调用方（logs.js 属于最早的使用者）。
+export { copyText };
 
 /**
  * 把「复制 / 日志文件」两个按钮接到一块日志面板上。

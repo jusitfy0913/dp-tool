@@ -35,6 +35,8 @@ import tempfile
 import threading
 from pathlib import Path
 
+import jsonio
+
 # ``RUNTIME_DIR`` 由 config 推导，这里不强依赖 config，避免循环导入。
 _RUNTIME = Path(__file__).resolve().parents[1] / "runtime"
 STATE_FILE = _RUNTIME / "dialog_state.json"
@@ -326,10 +328,7 @@ def _load_state() -> dict:
 
 def _save_state(state: dict) -> None:
     try:
-        STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-        temp = STATE_FILE.with_suffix(".tmp")
-        temp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
-        os.replace(temp, STATE_FILE)
+        jsonio.write_json(STATE_FILE, state)
     except OSError:
         # 记不住目录不影响本次选择，静默忽略
         pass

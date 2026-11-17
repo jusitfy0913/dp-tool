@@ -22,6 +22,13 @@ import {
   renderOcrTable,
 } from "./ocr.js";
 import { applyOverlayScale, buildOverlay, setOverlayHighlight } from "./overlay.js";
+import {
+  copyText,
+  escapeHtml,
+  setBadge as setBadgeNode,
+  setHint as setHintNode,
+  setMetric as setMetricChip,
+} from "./ui.js";
 import { createViewerStrip } from "./viewer.js";
 
 let dom = {};
@@ -740,6 +747,8 @@ function normalizeModelType(raw) {
   if (lower.includes("patchcore")) return "PatchCore";
   if (lower.includes("padim")) return "PaDiM";
   if (lower.includes("efficientad")) return "EfficientAd";
+  // 必须排在最后：`anomalydino` 里也含 "anomal"，先匹配会把 DINO 当别的类型
+  if (lower.includes("anomalydino")) return "AnomalyDINO";
   return "";
 }
 
@@ -1054,7 +1063,12 @@ function renderAnomalib(result) {
   badge.innerHTML = `判定 <b>${escapeHtml(verdict)}</b>`;
   dom.metrics.appendChild(badge);
 
-  setMetric("归一化分数", Number(result.normalized_score).toFixed(4));
+  // 两个分数口径必须说清楚在哪个尺度上比：
+  //   - 归一化分数以 image_threshold 为 0.5 中心拉伸，判定线永远是 0.5；
+  //   - 图像阈值是原始分数口径，只能和「原始分数」比。
+  // 旧标签直接写"归一化分数"和"图像阈值"，用户拿 0.44（好图的归一化分数）
+  // 去比 0.2203（阈值），很容易得出"明明是 NG"的错误结论。
+  setMetric("归一化分数（阈值=0.5）", Number(result.normalized_score).toFixed(4));
   setMetric("原始分数", Number(result.raw_score).toFixed(4));
 
   // 生效阈值与 metadata 原值并列显示：覆盖之后如果只显示生效值，
@@ -1063,7 +1077,7 @@ function renderAnomalib(result) {
   const imageThr = thresholds.image || {};
   const pixelThr = thresholds.pixel || {};
   setMetric(
-    "图像阈值",
+    "图像阈值（原始分数口径）",
     `${fmtThreshold(imageThr.effective)}${imageThr.overridden ? `（覆盖，原 ${fmtThreshold(imageThr.metadata)}）` : "（metadata）"}`,
   );
   setMetric(
@@ -1507,16 +1521,14 @@ function exportJson() {
   download(`infer_${stamp()}.json`, JSON.stringify(payload, null, 2), "application/json");
 }
 
-function copyOcrText() {
+async function copyOcrText() {
   const text = ocrPlainText(lastResult?.lines || []);
   if (!text) {
     setHint("没有可复制的文字");
     return;
   }
-  navigator.clipboard?.writeText(text).then(
-    () => setHint("已复制全部文字"),
-    () => setHint("复制失败，请改用导出 TXT"),
-  );
+  const ok = await copyText(text);
+  setHint(ok ? "已复制全部文字" : "复制失败，请改用导出 TXT");
 }
 
 function exportTxt() {
@@ -1613,23 +1625,13 @@ function colorCss(rgb) {
 }
 
 function setMetric(name, value) {
-  const chip = document.createElement("div");
-  chip.className = "metric";
-  chip.innerHTML = `${escapeHtml(name)} <b>${escapeHtml(String(value))}</b>`;
-  dom.metrics.appendChild(chip);
-}
-
-function escapeHtml(text) {
-  return String(text).replace(/[&<>"']/g, (ch) => ({
-    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
-  }[ch]));
+  setMetricChip(dom.metrics, name, value);
 }
 
 function setBadge(text, cls = "") {
-  dom.badge.textContent = text;
-  dom.badge.className = `badge ${cls}`.trim();
+  setBadgeNode(dom.badge, text, cls);
 }
 
 function setHint(text) {
-  dom.hint.textContent = text;
+  setHintNode(dom.hint, text);
 }

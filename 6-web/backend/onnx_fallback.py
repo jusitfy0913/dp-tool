@@ -379,27 +379,60 @@ def _load_metadata(metadata_path: str) -> dict:
         raise FallbackError(f"metadata.json 解析失败：{exc}") from exc
 
 
-def _normalize_score(value: float, meta: dict) -> float:
-    """把原始分数映射到 0..1。
+#: ImageNet 归一化参数，与 `anomalib_infer_c.cpp:370-372`、`anomalib_onnx.cpp:324-327` 一致。
+IMAGENET_MEAN = (0.485, 0.456, 0.406)
+IMAGENET_STD = (0.229, 0.224, 0.225)
 
-    `output_contract == anomalib_post_processed_0_1` 时 ONNX 输出已经归一化，直接用；
-    否则（如 efficientad_distribution_calibrated）用 metadata 记录的 min/max 线性拉伸。
+
+def _normalization_mode(meta: dict, model_type: str = "") -> str:
+    """决定要不要做 ImageNet 归一化，判定顺序**逐字复刻 DLL**。
+
+    `anomalib_infer_c.cpp:586-594` 的逻辑是：
+
+        normalization 为空时，`anomalib_post_processed_0_1` 契约视为 none，
+        其余模型里名字带 "efficient" 的也是 none，别的默认 imagenet。
+
+    这不是可选项：metadata 里写 `imagenet` 的模型（AnomalyDINO、PatchCore 的
+    原始口径等）导出的 ONNX **图里没有归一化节点**，mean/std 只在 DLL 里做。
+    降级路径若只除以 255 就喂进去，等于把输入整体平移了一大截，主干特征全错，
+    分数被系统性抬高——表现就是「bottle 的 good 图全被判 NG」。
     """
-    contract = str(meta.get("output_contract", "")).strip()
-    if contract == "anomalib_post_processed_0_1":
-        return float(np.clip(value, 0.0, 1.0))
+    mode = str(meta.get("normalization", "") or "").strip().lower()
+    if mode:
+        return mode
+    if str(meta.get("output_contract", "") or "").strip().lower() == "anomalib_post_processed_0_1":
+        return "none"
+    who = str(meta.get("model_type") or model_type or "").lower()
+    return "none" if "efficient" in who else "imagenet"
 
-    # 兼容两种写法：嵌套 pred_scores.min 与扁平 "pred_scores.min"
+
+def _score_range(meta: dict) -> tuple[float, float]:
+    """取 metadata 里 pred_scores 的 min/max，兼容嵌套与扁平两种写法。"""
     lo = meta.get("pred_scores.min")
     hi = meta.get("pred_scores.max")
     if lo is None or hi is None:
         nested = meta.get("pred_scores") or {}
         lo = nested.get("min", 0.0)
         hi = nested.get("max", 1.0)
-    lo, hi = float(lo), float(hi)
-    if hi - lo <= 1e-12:
-        return float(np.clip(value, 0.0, 1.0))
-    return float(np.clip((value - lo) / (hi - lo), 0.0, 1.0))
+    try:
+        return float(lo), float(hi)
+    except (TypeError, ValueError):
+        return 0.0, 1.0
+
+
+def _display_score(raw_score: float, threshold: float, meta: dict) -> float:
+    """展示用的归一化分数，公式与 DLL 完全一致（`anomalib_post.hpp:33-39`）：
+
+        clamp01(((raw - image_threshold) / (scoreMax - scoreMin)) + 0.5)
+
+    也就是「阈值处正好是 0.5」。降级路径若改用自己的 min→0 / max→1 拉伸，
+    同一个模型同一张图，页面上的分数会和引擎路径（或 Qt 端）对不上。
+    """
+    lo, hi = _score_range(meta)
+    span = hi - lo
+    if abs(span) < 1e-6:
+        return float(np.clip(raw_score, 0.0, 1.0))
+    return float(np.clip(((float(raw_score) - float(threshold)) / span) + 0.5, 0.0, 1.0))
 
 
 def run_anomalib(
@@ -440,9 +473,15 @@ def run_anomalib(
 
     rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
     resized = cv2.resize(rgb, (in_w, in_h), interpolation=cv2.INTER_LINEAR)
-    tensor = np.ascontiguousarray(
-        (resized.astype(np.float32) / 255.0).transpose(2, 0, 1)[None]
-    )
+    # 与 DLL 同口径：先 /255，再看 metadata 要不要减均值除方差。
+    # 缺了这一步，imagenet 归一化的模型（AnomalyDINO 就是）分数会被整体抬高一截。
+    floats = resized.astype(np.float32) / 255.0
+    normalization = _normalization_mode(meta, model_type)
+    if normalization == "imagenet":
+        mean = np.asarray(IMAGENET_MEAN, dtype=np.float32)
+        std = np.asarray(IMAGENET_STD, dtype=np.float32)
+        floats = (floats - mean) / std
+    tensor = np.ascontiguousarray(floats.transpose(2, 0, 1)[None])
 
     started = time.perf_counter()
     outs = sess.run(None, {input_meta.name: tensor})
@@ -463,10 +502,15 @@ def run_anomalib(
             arr = arr[0]
         map_2d = arr.astype(np.float32)
 
-    normalized = _normalize_score(raw_score, meta)
     threshold = float(meta.get("image_threshold", 0.5))
     pixel_threshold = float(meta.get("pixel_threshold", threshold))
-    is_anomaly = normalized >= threshold
+    # 判定线必须落在**原始分数**上：DLL 是 `normalized >= 0.5`，
+    # 而 normalized 以阈值为中心归一化，两者严格等价于 `raw >= threshold`。
+    # 若拿归一化后的 0..1 数值直接去比原始阈值（本模块旧写法），
+    # 相当于把阈值悄悄改成了 `scoreMin + threshold * (scoreMax - scoreMin)`——
+    # AnomalyDINO 上等于 0.156 而不是标定的 0.2203，好图会被大面积误报成 NG。
+    is_anomaly = raw_score >= threshold
+    normalized = _display_score(raw_score, threshold, meta)
 
     payload = {
         "backend": BACKEND_ANOMALIB,
@@ -476,6 +520,9 @@ def run_anomalib(
         "metadata": {
             "model_type": str(meta.get("model_type", model_type)),
             "normalization": str(meta.get("normalization", "none")),
+            # 实际生效的归一化：metadata 没写时按 DLL 规则推导，这里回显推导结果，
+            # 排查「降级后分数偏高」时能一眼看出有没有做 mean/std
+            "normalization_effective": normalization,
             "output_contract": str(meta.get("output_contract", "")),
             "image_threshold": threshold,
             "pixel_threshold": pixel_threshold,
@@ -577,8 +624,3 @@ def _encode_jpeg(image: np.ndarray, quality: int = 90) -> bytes:
         raise FallbackError("JPEG 编码失败")
     return buffer.tobytes()
 
-
-def reset_sessions() -> None:
-    """释放缓存的 session（测试或模型切换时用）。"""
-    _yolo_sessions.clear()
-    _anom_sessions.clear()

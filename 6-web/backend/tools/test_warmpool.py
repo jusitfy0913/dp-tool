@@ -26,22 +26,11 @@ from pathlib import Path
 BACKEND_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BACKEND_DIR))
 
+from _harness import check, finish  # noqa: E402
+
 import config  # noqa: E402
 import runners  # noqa: E402
 import warmpool  # noqa: E402
-
-PASSED = 0
-FAILED = 0
-
-
-def check(name: str, condition: bool, detail: str = "") -> None:
-    global PASSED, FAILED
-    if condition:
-        PASSED += 1
-        print(f"  [PASS] {name}")
-    else:
-        FAILED += 1
-        print(f"  [FAIL] {name} {detail}")
 
 
 #: 假 launcher：就绪后等一行 argv，然后按真实 launcher 的格式发事件并退出。
@@ -233,8 +222,7 @@ def main() -> int:
     test_runner_integration(tmp)
     test_offline_env()
 
-    print(f"\n结果：通过 {PASSED} 项，失败 {FAILED} 项")
-    return 0 if FAILED == 0 else 1
+    return finish()
 
 
 if __name__ == "__main__":

@@ -10,6 +10,7 @@
 //      为什么、结果算不算数。所以事件不是拼成一行 JSON，而是分行渲染。
 
 import { getJSON, postJSON } from "./api.js";
+import { copyText, fmtDuration } from "./ui.js";
 import { connectRunEvents } from "./ws.js";
 
 const API = "/api/autoexp";
@@ -47,13 +48,7 @@ function beginBlock(title) {
 }
 
 function fmtClock(seconds) {
-  const total = Math.max(0, Math.round(seconds));
-  const h = Math.floor(total / 3600);
-  const m = Math.floor((total % 3600) / 60);
-  const s = total % 60;
-  const mm = String(m).padStart(2, "0");
-  const ss = String(s).padStart(2, "0");
-  return h > 0 ? `${h}:${mm}:${ss}` : `${m}:${ss}`;
+  return fmtDuration(seconds);
 }
 
 // ---------------------------------------------------------------------------
@@ -649,11 +644,10 @@ export function initAutoexp() {
 
   dom.copyLog?.addEventListener("click", async () => {
     if (!dom.log) return;
-    try {
-      await navigator.clipboard.writeText(dom.log.innerText);
-      if (dom.startHint) dom.startHint.textContent = "日志已复制到剪贴板";
-    } catch {
-      if (dom.startHint) dom.startHint.textContent = "复制失败，请手动选中日志文本";
+    // 走 ui.copyText：局域网 http 下 navigator.clipboard 不可用，需要兜底
+    const ok = await copyText(dom.log.innerText);
+    if (dom.startHint) {
+      dom.startHint.textContent = ok ? "日志已复制到剪贴板" : "复制失败，请手动选中日志文本";
     }
   });
 

@@ -26,19 +26,9 @@ LAUNCHER = REPO / "1-python-yolo" / "launcher" / "tf_yolo_launcher.py"
 
 import onnx  # noqa: E402
 from onnx import TensorProto, helper  # noqa: E402
+from _harness import check, finish  # noqa: E402
 
-PASSED: list[str] = []
-FAILED: list[str] = []
 EVENTS: list[dict] = []
-
-
-def check(name: str, ok: bool, detail: str = "") -> None:
-    if ok:
-        PASSED.append(name)
-        print(f"[PASS] {name}")
-    else:
-        FAILED.append(name)
-        print(f"[FAIL] {name} {detail}")
 
 
 def load_launcher():
@@ -197,8 +187,7 @@ def main() -> int:
         except FileNotFoundError:
             check("文件不存在时报错", True)
 
-    print(f"\n通过 {len(PASSED)} 项，失败 {len(FAILED)} 项")
-    return 1 if FAILED else 0
+    return finish()
 
 
 if __name__ == "__main__":

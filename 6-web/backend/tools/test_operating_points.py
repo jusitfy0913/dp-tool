@@ -20,19 +20,9 @@ from pathlib import Path
 BACKEND = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(BACKEND))
 
+from _harness import check, finish  # noqa: E402
+
 import valmetrics  # noqa: E402
-
-PASSED: list[str] = []
-FAILED: list[str] = []
-
-
-def check(name: str, ok: bool, detail: str = "") -> None:
-    if ok:
-        PASSED.append(name)
-        print(f"[PASS] {name}")
-    else:
-        FAILED.append(name)
-        print(f"[FAIL] {name} {detail}")
 
 
 def near(a, b, eps: float = 1e-6) -> bool:
@@ -227,13 +217,7 @@ def main() -> int:
     check("空输入不崩", empty_report["num_images"] == 0 and len(empty_report["points"]) == 1)
     check("空输入 recall 为 None", empty_report["points"][0]["recall"] is None)
 
-    print()
-    print(f"通过 {len(PASSED)} 项，失败 {len(FAILED)} 项")
-    if FAILED:
-        for name in FAILED:
-            print(f"  !! {name}")
-        return 1
-    return 0
+    return finish()
 
 
 if __name__ == "__main__":

@@ -168,15 +168,6 @@ def _load_labels_uncached(file: Path) -> dict:
     return result
 
 
-def cache_clear() -> None:
-    """清空标签缓存。
-
-    只给测试用：同一秒内改写标签文件（mtime 精度不足或内容长度不变）时
-    缓存可能仍命中旧值，测试必须能显式清空。
-    """
-    _LABEL_CACHE.clear()
-
-
 def name_for(class_id: int, classes: list[str] | None) -> str:
     """把类别号映射成类别名；越界或没有类别表时回退为 `cls{id}`。"""
     label = int(class_id)
