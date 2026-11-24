@@ -2,7 +2,7 @@
 
 本项目围绕工业视觉深度学习训练与 TensorRT 部署闭环建设，当前核心产品显示名为 **DefectVision AI Studio（AI 缺陷检测视觉工作站）**。项目核心方向是把标注、数据集导出、YOLO/Anomalib 训练、ONNX 导出、TensorRT 引擎构建和 C++ 推理验证整合为一套工业 AI 缺陷检测闭环平台。
 
-日常操作请用浏览器版。给人看的步骤、截图和流程图在 [Web 操作手册](docs/TRTForge_Web操作手册.md)。从建标注工程一路点到推理，看 [从标注到推理逐步手册](docs/从标注到推理_逐步手册.md)。整套网页怎么拼、用了哪些技术，看 [Web Studio 架构与功能介绍](docs/WebStudio架构与功能介绍.md)。现有缺陷、安全漏洞和商业化路线图看 [商业化差距分析与优化建议](docs/商业化差距分析与优化建议.md)。桌面版步骤仍看 [Qt 操作手册](docs/TRTForge_操作手册.md)。
+日常操作请用浏览器版。给人看的步骤、截图和流程图在 [Web 操作手册](docs/TRTForge_Web操作手册.md)。以后把 Web 软件迁到 Linux、以及 Windows 和 Linux 怎么保持同一套功能，见 [Web 软件 Linux 迁移与双平台拉齐计划](docs/Web软件Linux迁移与双平台拉齐计划.md)。从建标注工程一路点到推理，看 [从标注到推理逐步手册](docs/从标注到推理_逐步手册.md)。整套网页怎么拼、用了哪些技术，看 [Web Studio 架构与功能介绍](docs/WebStudio架构与功能介绍.md)。现有缺陷、安全漏洞和商业化路线图看 [商业化差距分析与优化建议](docs/商业化差距分析与优化建议.md)。桌面版步骤仍看 [Qt 操作手册](docs/TRTForge_操作手册.md)。
 
 要发给别人使用、又不附带源码时，在开发机执行 `packaging/package_web_user.ps1`。对方电脑需为 CUDA 11.8。把整个 `TRTForgeWeb` 文件夹交给对方后，对方双击 **`一键安装.bat`**：第一次用包里自带的库装好训练环境（不必联网，不必预先安装 Anaconda；无 AVX2 的机器会自动改用 Polars 兼容包），在桌面放上「TRTForge Web」并打开软件。以后双击桌面图标即可。启动失败会弹中文说明框并写 `runtime\logs\launcher.log`，排障步骤见 [启动与排障说明](docs/启动与排障说明.md)。细节见 [WORKFLOW_GUIDE 7.1.3](docs/WORKFLOW_GUIDE.md)。
 
